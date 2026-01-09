@@ -1,0 +1,13 @@
+    Checking kaleidux-daemon v0.1.0 (/home/chris/projects/code/awww/Kaleidux/kaleidux-daemon)
+kaleidux-daemon/src/shaders.rs:714:32: error: couldn't read `kaleidux-daemon/src/shaders/transitions/dissolve.glsl`: Is a directory (os error 21)
+kaleidux-daemon/src/main.rs:6:5: warning: unused import: `std::path::PathBuf`
+kaleidux-daemon/src/main.rs:9:42: warning: unused import: `KEntry`
+kaleidux-daemon/src/orchestration.rs:3:17: warning: unused import: `Path`
+kaleidux-daemon/src/queue.rs:3:5: warning: unused import: `std::time::SystemTime`
+kaleidux-daemon/src/monitor_manager.rs:3:17: warning: unused import: `Duration`
+kaleidux-daemon/src/monitor_manager.rs:6:5: warning: unused import: `crate::video::VideoFrame`
+kaleidux-daemon/src/monitor_manager.rs:8:22: warning: unused import: `Context`
+kaleidux-daemon/src/shaders.rs:2:5: warning: unused import: `std::collections::HashMap`
+kaleidux-daemon/src/main.rs:31:9: warning: unused variable: `args`: help: if this is intentional, prefix it with an underscore: `_args`
+warning: `kaleidux-daemon` (bin "kaleidux-daemon") generated 9 warnings
+error: could not compile `kaleidux-daemon` (bin "kaleidux-daemon") due to 1 previous error; 9 warnings emitted

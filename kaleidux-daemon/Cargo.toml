@@ -1,0 +1,47 @@
+[package]
+name = "kaleidux-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kaleidux-common = { workspace = true }
+wgpu = { workspace = true }
+wgpu-hal = { workspace = true }
+gstreamer = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-allocators = { workspace = true }
+ash = { workspace = true }
+naga = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = "0.2"
+clap = { workspace = true }
+toml = { workspace = true }
+humantime-serde = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }
+walkdir = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+anyhow = "1.0"
+raw-window-handle.workspace = true
+
+# Specifically for Wayland and X11
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb", "randr"] }
+image = "0.25"
+rhai = { workspace = true }
+bytemuck = { version = "1.24.0", features = ["derive"] }
+tikv-jemallocator = "0.6"
+libc = "0.2"
+sysinfo = { version = "0.37.2", features = ["component"] }
+parking_lot = "0.12"
+futures = "0.3"

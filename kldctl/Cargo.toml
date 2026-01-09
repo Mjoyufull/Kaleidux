@@ -1,0 +1,16 @@
+[package]
+name = "kldctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kaleidux-common = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1.0"
+dirs = { workspace = true }
+toml = { workspace = true }

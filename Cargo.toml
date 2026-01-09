@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "kaleidux-daemon",
+    "kldctl",
+    "kaleidux-common",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1-kneecap"
+edition = "2021"
+authors = ["Mjoyufull"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/Mjoyufull/Kaleidux"
+
+[workspace.dependencies]
+# Core Graphics & Video
+wgpu = { version = "23.0", features = ["glsl"] }
+wgpu-hal = "23.0"
+naga = { version = "23.0", features = ["glsl-in", "wgsl-out"] }
+gstreamer = "0.23"
+gstreamer-video = "0.23"
+gstreamer-app = "0.23"
+gstreamer-allocators = "0.23"
+ash = "0.38"
+
+# Logic & Scripting
+rhai = { version = "1.19", features = ["serde"] }
+
+# Communication
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full", "tracing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+raw-window-handle = "0.6"
+
+# Common logic
+kaleidux-common = { path = "./kaleidux-common" }
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+humantime-serde = "1.1"
+regex = "1.10"
+dirs = "5.0"
+walkdir = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"

@@ -1,0 +1,156 @@
+# ~/.config/kaleidux/config.toml
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kaleidux Configuration - Dynamic Wallpaper Daemon
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  GLOBAL SETTINGS                                                            │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+[global]
+# Monitor behavior options:
+#   "independent"  - Each monitor has its own wallpaper queue (default)
+#   "synchronized" - All monitors show the same wallpaper
+#   "grouped"      - Group specific monitors together
+monitor-behavior = "independent"
+
+# Default video/image ratio (0-100):
+#   0   = images only
+#   50  = equal chance
+#   100 = videos only
+video-ratio = 50
+
+# Default sorting strategy:
+#   "loveit"     - Weighted random using popularity and recency (default)
+#   "random"     - Pure random selection
+#   "ascending"  - Alphabetical order
+#   "descending" - Reverse alphabetical order
+sorting = "loveit"
+
+# Default transition duration in milliseconds
+transition-time = 1000
+# Default volume (0.0 to 10.0), default 1.0
+volume = 1.0
+
+# Optional: Path to Rhai script for custom logic
+# script-path = "~/.config/kaleidux/automation.rhai"
+
+# How often to tick Rhai scripts (seconds)
+script-tick-interval = 1
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  DEFAULT OUTPUT SETTINGS (applies to all outputs unless overridden)         │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+[any]
+# Directory containing wallpapers (supports images and videos)
+path = "~/Pictures/Wallpapers"
+
+# How long to display each wallpaper (humantime format: 5m, 1h, 30s, 2h30m)
+duration = "5m"
+
+# Default transition effect
+transition = { type = "fade" }
+
+# Sorting strategy for this output (overrides global)
+# sorting = "random"
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  PER-OUTPUT OVERRIDES                                                       │
+# │  Output names: Use 'kldctl query' or 'hyprctl monitors' to find them        │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# Example: Primary monitor with video wallpapers
+# [DP-1]
+# path = "~/Videos/Wallpapers"
+# duration = "10m"
+# video-ratio = 80
+# transition = { type = "cube", persp = 0.4, unzoom = 0.8, reflection = 0.4, floating = 3.0 }
+# transition-time = 2000
+# volume = 0.8
+
+# Example: Secondary monitor with static images
+# [DP-2]
+# path = "~/Pictures/Wallpapers/Minimal"
+# duration = "30m"
+# video-ratio = 0
+# transition = { type = "fade" }
+
+# Example: Match monitors by description using regex
+# ["re:Dell.*"]
+# transition = { type = "angular", starting_angle = 90.0 }
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  GROUPED MONITORS (requires monitor-behavior = "grouped" in [global])       │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# To use grouped monitors, change [global] to:
+#   monitor-behavior = { grouped = [["DP-1", "DP-2"], ["HDMI-A-1"]] }
+#
+# This creates:
+#   Group 0: DP-1 and DP-2 share the same wallpaper
+#   Group 1: HDMI-A-1 has its own wallpaper
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TRANSITIONS REFERENCE                                                      │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# Simple transitions (no parameters):
+#   book-flip, bow-tie-horizontal, bow-tie-vertical, burn, cannabis-leaf,
+#   circle, color-phase, cross-hatch, cross-warp, displacement, dreamy,
+#   fade, glitch-displace, glitch-memories, heart, horizontal-close,
+#   horizontal-open, inverted-page-curl, left-right, luma, multiply-blend,
+#   overexposure, random-noisex, swirl, window-blinds, random
+
+# Parametric transitions (with default values shown):
+#   angular:            { type = "angular", starting_angle = 90.0 }
+#   bounce:             { type = "bounce", shadow_colour = [0.0, 0.0, 0.0, 0.6], shadow_height = 0.075, bounces = 3.0 }
+#   butterfly-wave-scrawler: { type = "butterfly-wave-scrawler", amplitude = 1.0, waves = 30.0, color_separation = 0.3 }
+#   circle-crop:        { type = "circle-crop", bgcolor = [0.0, 0.0, 0.0, 1.0] }
+#   circle-open:        { type = "circle-open", smoothness = 0.3, opening = true }
+#   colour-distance:    { type = "colour-distance", power = 5.0 }
+#   cross-zoom:         { type = "cross-zoom", strength = 0.4 }
+#   cube:               { type = "cube", persp = 0.7, unzoom = 0.3, reflection = 0.4, floating = 3.0 }
+#   directional:        { type = "directional", direction = [0.0, 1.0] }
+#   directional-scaled: { type = "directional-scaled", direction = [0.0, 1.0], scale = 0.7 }
+#   directional-warp:   { type = "directional-warp", direction = [1.0, 0.0] }
+#   directional-wipe:   { type = "directional-wipe", direction = [1.0, -1.0], smoothness = 0.5 } # alias: "wipe"
+#   dissolve:           { type = "dissolve", line_width = 0.1, spread_clr = [1.0, 0.0, 0.0], hot_clr = [0.9, 0.9, 0.2], pow = 5.0, intensity = 1.0 }
+#   doom:               { type = "doom", bars = 30, amplitude = 2.0, noise = 0.1, frequency = 0.5, drip_scale = 0.5 }
+#   doorway:            { type = "doorway", reflection = 0.4, perspective = 0.4, depth = 3.0 }
+#   dreamy-zoom:        { type = "dreamy-zoom", rotation = 6.0, scale = 1.2 }
+#   edge:               { type = "edge", thickness = 0.001, brightness = 8.0 }
+#   fade-color:         { type = "fade-color", color = [0.0, 0.0, 0.0], color_phase = 0.4 }
+#   fade-grayscale:     { type = "fade-grayscale", intensity = 0.3 }
+#   film-burn:          { type = "film-burn", seed = 2.31 }
+#   fly-eye:            { type = "fly-eye", size = 0.04, zoom = 0.5, color_separation = 0.3 }
+#   grid-flip:          { type = "grid-flip", size = [4, 4], pause = 0.1, divider_width = 0.05, bgcolor = [0.0, 0.0, 0.0, 1.0], randomness = 0.1 }
+#   hexagonalize:       { type = "hexagonalize", steps = 50, horizontal_hexagons = 20.0 }
+#   kaleidoscope:       { type = "kaleidoscope", speed = 0.5, angle = 1.0, power = 0.3 }
+#   linear-blur:        { type = "linear-blur", intensity = 0.1 }
+#   luminance-melt:     { type = "luminance-melt", direction = true, luma_threshold = 0.05 }
+#   morph:              { type = "morph", strength = 0.1 }
+#   mosaic:             { type = "mosaic", endx = 2, endy = -1 }
+#   perlin:             { type = "perlin", scale = 4.0, smoothness = 0.01, seed = 12.0 }
+#   pinwheel:           { type = "pinwheel", speed = 2.0 }
+#   pixelize:           { type = "pixelize", squares_min = [20, 20], steps = 50 }
+#   polar-function:     { type = "polar-function", segments = 5 }
+#   polka-dots-curtain: { type = "polka-dots-curtain", dots = 20.0, center = [0.0, 0.0] }
+#   power-kaleido:      { type = "power-kaleido", scale = 2.0, radius = 1.5, angle = 0.0 }
+#   radial:             { type = "radial", smoothness = 1.0 }
+#   random-squares:     { type = "random-squares", size = [10, 10], smoothness = 0.5 }
+#   rectangle:          { type = "rectangle", bgcolor = [0.0, 0.0, 0.0, 1.0] }
+#   ripple:             { type = "ripple", amplitude = 100.0, speed = 50.0 }
+#   rolls:              { type = "rolls", rolls_type = 0, rot_down = false }
+#   rotate-scale-fade:  { type = "rotate-scale-fade", center = [0.5, 0.5], rotations = 1.0, scale = 8.0, back_color = [0.15, 0.15, 0.15, 1.0] }
+#   rotate-scale-vanish:{ type = "rotate-scale-vanish", fade_in_second = true, reverse_effect = false, reverse_rotation = false }
+#   simple-zoom:        { type = "simple-zoom", zoom_quickness = 0.8 }
+#   slides:             { type = "slides", slides_type = 0, slides_in = false }
+#   squeeze:            { type = "squeeze", color_separation = 0.1 }
+#   static-fade:        { type = "static-fade", n_noise_pixels = 200.0, static_luminosity = 0.8 }
+#   stereo-viewer:      { type = "stereo-viewer", zoom = 0.88, corner_radius = 0.22 }
+#   swap:               { type = "swap", reflection = 0.4, perspective = 0.2, depth = 3.0 }
+#   tv-static:          { type = "tv-static", offset = 0.05 }
+#   water-drop:         { type = "water-drop", amplitude = 30.0, speed = 30.0 }
+#   wind:               { type = "wind", size = 0.05 }
+#   custom:             { type = "custom", shader = "name_of_shader_file", params = [0.1, 0.5] } # params map to getFromParams(0..27)

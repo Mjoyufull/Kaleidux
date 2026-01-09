@@ -1,0 +1,128 @@
+# Kaleidux Transitions Examples
+# This file demonstrates all supported transitions and their parameters.
+# You can copy and paste these into your config.toml under [outputs.<name>] or [outputs.default].
+
+# --- Common Transitions ---
+
+# simple cross-fade
+# transition = "fade"
+
+# zoom with cross-fade
+# transition = { crosszoom = { strength = 0.4 } }
+
+# slide from any direction
+# transition = { directional = { direction = [0.0, 1.0] } }
+
+# wipe in a direction
+# transition = { directionalwipe = { direction = [1.0, -1.0], smoothness = 0.5 } }
+
+# 3D cube rotation
+# transition = { cube = { persp = 0.7, unzoom = 0.3, reflection = 0.4, floating = 3.0 } }
+
+# pixelated transition
+# transition = { pixelize = { squares_min = [20, 20], steps = 50 } }
+
+# --- Specialized Transitions ---
+
+# transition = { angular = { starting-angle = 0.0 } }
+# transition = "bookflip"
+# transition = { bounce = { shadow-colour = [0.0, 0.0, 0.0, 0.6], shadow-height = 0.075, bounces = 3.0 } }
+# transition = "bowtiehorizontal"
+# transition = "bowtievertical"
+# transition = { bowtiewithparameter = { adjust = 0.5, reverse = false } }
+# transition = "burn"
+# transition = { butterflywavescrawler = { amplitude = 1.0, waves = 30.0, color-separation = 0.3 } }
+# transition = "cannabisleaf"
+# transition = "circle"
+# transition = { circlecrop = { bgcolor = [0.0, 0.0, 0.0, 1.0] } }
+# transition = { circleopen = { smoothness = 0.3, opening = true } }
+# transition = "colorphase"
+# transition = { colourdistance = { power = 5.0 } }
+# transition = "coord-from-in"
+# transition = { crazyparametricfun = { a = 4.0, b = 1.0, amplitude = 120.0, smoothness = 0.1 } }
+# transition = "crosshatch"
+# transition = "crosswarp"
+# transition = { directionaleasing = { direction = [0.0, 1.0] } }
+# transition = { directionalscaled = { direction = [0.0, 1.0], scale = 0.7 } }
+# transition = { directionalwarp = { direction = [1.0, 0.0] } }
+# transition = "displacement"
+# transition = { dissolve = { line_width = 0.1, spread_clr = [1.0, 0.0, 0.0], hot_clr = [0.9, 0.9, 0.2], pow = 5.0, intensity = 1.0 } }
+# transition = { doom = { bars = 30, amplitude = 2.0, noise = 0.1, frequency = 0.5, drip_scale = 0.5 } }
+# transition = { doorway = { reflection = 0.4, perspective = 0.4, depth = 3.0 } }
+# transition = "dreamy"
+# transition = { dreamyzoom = { rotation = 6.0, scale = 1.2 } }
+# transition = { edge = { thickness = 0.001, brightness = 8.0 } }
+# transition = { fadecolor = { color = [0.0, 0.0, 0.0], color_phase = 0.4 } }
+# transition = { fadegrayscale = { intensity = 0.3 } }
+# transition = { filmburn = { seed = 2.31 } }
+# transition = { flyeye = { size = 0.04, zoom = 0.5, color_separation = 0.3 } }
+# transition = "glitchdisplace"
+# transition = "glitchmemories"
+# transition = { gridflip = { size = [4, 4], pause = 0.1, divider_width = 0.05, bgcolor = [0.0, 0.0, 0.0, 1.0], randomness = 0.1 } }
+# transition = "heart"
+# transition = { hexagonalize = { steps = 50, horizontal_hexagons = 20.0 } }
+# transition = "horizontalclose"
+# transition = "horizontalopen"
+# transition = "invertedpagecurl"
+# transition = { kaleidoscope = { speed = 0.5, angle = 1.0, power = 0.3 } }
+# transition = "leftright"
+# transition = { linearblur = { intensity = 0.1 } }
+# transition = "luma"
+# transition = { luminancemelt = { direction = true, luma_threshold = 0.05 } }
+# transition = { morph = { strength = 0.1 } }
+# transition = { mosaic = { endx = 2, endy = -1 } }
+# transition = { mosaic_transition = { mosaic_num = 10.0 } }
+# transition = "multiplyblend"
+# transition = "overexposure"
+# transition = { perlin = { scale = 4.0, smoothness = 0.01, seed = 12.0 } }
+# transition = { pinwheel = { speed = 2.0 } }
+# transition = { polarfunction = { segments = 5 } }
+# transition = { polkadotscurtain = { dots = 20.0, center = [0.0, 0.0] } }
+# transition = { powerkaleido = { scale = 2.0, radius = 1.5, angle = 0.0 } }
+# transition = { radial = { smoothness = 1.0 } }
+# transition = "randomnoisex"
+# transition = { randomsquares = { size = [10, 10], smoothness = 0.5 } }
+# transition = "rectangle"
+# transition = { rectanglecrop = { bgcolor = [0.0, 0.0, 0.0, 1.0] } }
+# transition = { ripple = { amplitude = 100.0, speed = 50.0 } }
+# transition = { rolls = { rolls_type = 0, rot_down = false } }
+# transition = "rotate"
+# transition = { rotatescalefade = { center = [0.5, 0.5], rotations = 1.0, scale = 8.0, back_color = [0.15, 0.15, 0.15, 1.0] } }
+# transition = { rotatescalevanish = { fade_in_second = true, reverse_effect = false, reverse_rotation = false } }
+# transition = "scale_in"
+# transition = { simplezoom = { zoom_quickness = 0.8 } }
+# transition = { simplezoomout = { zoom_quickness = 0.8, fade_edge = true } }
+# transition = { slides = { slides_type = 0, slides_in = false } }
+# transition = { squareswire = { squares = [10, 10], direction = [1.0, -0.5], smoothness = 1.6 } }
+# transition = { squeeze = { color_separation = 0.1 } }
+# transition = { staticfade = { n_noise_pixels = 200.0, static_luminosity = 0.8 } }
+# transition = { static_wipe = { up_to_down = true, max_static_span = 0.5 } }
+# transition = { stereoviewer = { zoom = 0.88, corner_radius = 0.22 } }
+# transition = { swap = { reflection = 0.4, perspective = 0.2, depth = 3.0 } }
+# transition = "swirl"
+# transition = "tangentmotionblur"
+# transition = "topbottom"
+# transition = { tvstatic = { offset = 0.05 } }
+# transition = { undulatingburnout = { smoothness = 0.03, center = [0.5, 0.5], color = [0.0, 0.0, 0.0] } }
+# transition = "verticalclose"
+# transition = "verticalopen"
+# transition = { waterdrop = { amplitude = 30.0, speed = 30.0 } }
+# transition = { wind = { size = 0.05 } }
+# transition = "windowblinds"
+# transition = { windowslice = { count = 10.0, smoothness = 0.5 } }
+# transition = "wipedown"
+# transition = "wipeleft"
+# transition = "wiperight"
+# transition = "wipeup"
+# transition = "x-axis-translation"
+# transition = "zoomincircles"
+# transition = { zoomleftwipe = { zoom_quickness = 0.8 } }
+# transition = { zoomrightwipe = { zoom_quickness = 0.8 } }
+
+# Picking a random transition from the built-in list
+# transition = "random"
+
+# --- Custom Transitions ---
+
+# Using a custom shader file and named parameters
+# transition = { custom = { shader = "/path/to/my_shader.glsl", params = { my_param = 0.5, other_val = 1.2 } } }
