@@ -1,5 +1,5 @@
 {
-  description: "Kaleidux: High-performance dynamic wallpaper daemon for Wayland and X11";
+  description = "Kaleidux: High-performance dynamic wallpaper daemon for Wayland and X11";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
