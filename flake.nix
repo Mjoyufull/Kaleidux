@@ -11,25 +11,24 @@
   outputs = { self, nixpkgs, utils, naersk }:
     utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = nixpkgs.legacyPackages.${system};
         naersk-lib = pkgs.callPackage naersk { };
         
         runtimeDeps = with pkgs; [
-          libwayland-client
-          libwayland-egl
+          wayland
+          egl-wayland
           vulkan-loader
           libxkbcommon
-          wayland
           xorg.libX11
           xorg.libXcursor
           xorg.libXrandr
           xorg.libXi
-          gstreamer
-          gst-plugins-base
-          gst-plugins-good
-          gst-plugins-bad
-          gst-plugins-ugly
-          gst-libav
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-plugins-ugly
+          gst_all_1.gst-libav
         ];
 
         buildDeps = with pkgs; [
@@ -39,9 +38,7 @@
           llvmPackages.libclang.lib
         ];
 
-      in
-      {
-        defaultPackage = naersk-lib.buildPackage {
+        kaleidux = naersk-lib.buildPackage {
           src = ./.;
           
           nativeBuildInputs = buildDeps;
@@ -51,7 +48,7 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           
           # Fix for gstreamer-sys
-          PKG_CONFIG_PATH = "${pkgs.gstreamer.dev}/lib/pkgconfig:${pkgs.gst-plugins-base.dev}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.gst_all_1.gstreamer.dev}/lib/pkgconfig:${pkgs.gst_all_1.gst-plugins-base.dev}/lib/pkgconfig";
 
           # Post-install hook to wrap binaries with runtime path
           postInstall = ''
@@ -81,6 +78,23 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeDeps;
         };
+
+      in
+      {
+        
+        packages = {
+          default = kaleidux;
+          kaleidux = kaleidux;
+        };
+
+        
+        defaultPackage = kaleidux;
+
+        
+        devShells.default = devShell;
+
+        
+        devShell = devShell;
       }
     );
 }
