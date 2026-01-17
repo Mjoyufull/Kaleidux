@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
 use tracing_subscriber::{prelude::*, EnvFilter, Registry};
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::filter::LevelFilter;
@@ -74,13 +73,6 @@ fn switch_wallpaper_content(
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
     log_prefix: &str,
 ) {
-    // #region agent log
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-        use std::io::Write;
-        writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:entry","message":"switch_wallpaper_content() called","data":{{"name":"{}","path":"{}","content_type":"{:?}","renderer_exists":{}}},"timestamp":{}}}"#, 
-            name, path.display(), content_type, renderers.contains_key(name), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-    });
-    // #endregion
     info!("{}: {} -> {:?}", log_prefix, name, path.display());
     debug!("[SWITCH] {}: content_type={:?}, renderer exists={}", name, content_type, renderers.contains_key(name));
 
@@ -105,33 +97,12 @@ fn switch_wallpaper_content(
             let path_clone = path.to_path_buf();
             let tx = image_tx.clone();
             
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:spawn_image_decode","message":"Spawning image decode task","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
-                    name, path.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
             debug!("[ASSET] {}: Offloading image decode: {}", name, path.display());
             tokio::task::spawn_blocking(move || {
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_decode_start","message":"Image decode started","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
-                        name_clone, path_clone.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
                 match image::open(&path_clone) {
                     Ok(img) => {
                         let rgba = img.to_rgba8();
                         let (width, height) = rgba.dimensions();
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_decode_success","message":"Image decode succeeded, sending to channel","data":{{"name":"{}","width":{},"height":{}}},"timestamp":{}}}"#, 
-                                name_clone, width, height, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                        });
-                        // #endregion
                         let send_result = tx.send(LoadedImage {
                             name: name_clone.clone(),
                             data: Some(rgba.into_raw()),
@@ -139,13 +110,6 @@ fn switch_wallpaper_content(
                             height,
                             path: path_clone,
                         });
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_send_result","message":"Image send result","data":{{"name":"{}","send_success":{}}},"timestamp":{}}}"#, 
-                                name_clone, send_result.is_ok(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                        });
-                        // #endregion
                         if send_result.is_err() {
                             debug!("[ASSET] {}: Failed to send decoded image (channel closed)", name_clone);
                         }
@@ -364,6 +328,7 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
     
     // Initialize directory watcher for cache invalidation
     let cache = monitor_manager.get_cache();
+    // Directory watcher for cache invalidation (used in main loop)
     let mut dir_watcher = match cache::DirectoryWatcher::new(cache.clone()) {
         Ok(mut watcher) => {
             // Watch all content directories from config
@@ -736,10 +701,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         }
         for (source_id, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(source_id.as_str()) {
-                let video_start = std::time::Instant::now();
+                let _video_start = std::time::Instant::now();
                 r.upload_frame(&frame);
                 // Record video CPU time (frame processing)
-                let video_duration = video_start.elapsed();
+                let video_duration = _video_start.elapsed();
                 metrics.record_video_cpu_time(video_duration);
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == source_id.as_str()) {
@@ -761,24 +726,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         
         // Handle Images
         while let Ok(msg) = image_rx.try_recv() {
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"main.rs:wayland_loop:image_received","message":"Image received in main loop","data":{{"name":"{}","has_data":{},"width":{},"height":{}}},"timestamp":{}}}"#, 
-                    msg.name, msg.data.is_some(), msg.width, msg.height, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
             debug!("[IMAGE] Received image for {}: data={}, size={}x{}", msg.name, msg.data.is_some(), msg.width, msg.height);
              if let Some(r) = renderers.get_mut(&msg.name) {
                      if let Some(data) = msg.data {
                      debug!("[IMAGE] Uploading image data for {}: {} bytes", msg.name, data.len());
-                     // #region agent log
-                     let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                         use std::io::Write;
-                         writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"main.rs:wayland_loop:upload_image","message":"Uploading image to renderer","data":{{"name":"{}","data_len":{}}},"timestamp":{}}}"#, 
-                             msg.name, data.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                     });
-                     // #endregion
                      let _ = r.upload_image_data(data, msg.width, msg.height);
                      debug!("[IMAGE] Rendering after upload for {}", msg.name);
                      if r.configured {
@@ -1154,16 +1105,19 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         }
         
         // Frames / Images / Video Players
-        let mut latest_frames = HashMap::new();
-        while let Ok((src, evt)) = frame_rx.try_recv() {
-            if let video::VideoEvent::Frame(f) = evt { latest_frames.insert(src, f); }
-        }
+        let latest_frames = {
+            let mut frames = HashMap::new();
+            while let Ok((src, evt)) = frame_rx.try_recv() {
+                if let video::VideoEvent::Frame(f) = evt { frames.insert(src, f); }
+            }
+            frames
+        };
         for (src, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(src.as_str()) {
-                let video_start = std::time::Instant::now();
+                let _video_start = std::time::Instant::now();
                 r.upload_frame(&frame);
                 // Record video CPU time (frame processing)
-                let video_duration = video_start.elapsed();
+                let video_duration = _video_start.elapsed();
                 metrics.record_video_cpu_time(video_duration);
                 // X11: Render immediately if video
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
@@ -1251,7 +1205,7 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         
         // Process directory watcher events (cache invalidation)
         if let Some(ref mut watcher) = dir_watcher {
-            watcher.process_events().await;
+            let _ = watcher.process_events().await;
         }
         
         // Flush stats every 5 seconds (batched writes)

@@ -63,13 +63,6 @@ impl OutputOrchestrator {
     pub fn tick(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
         let now = Instant::now();
         
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:entry","message":"OutputOrchestrator::tick() called","data":{{"name":"{}","current_path":{:?},"display_start_time":{:?},"next_change":{:?},"queue_is_some":{}}},"timestamp":{}}}"#, 
-                self._name, self.current_path, self.display_start_time, self.next_change, self.queue.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
         
         // If content is displaying, check if duration has elapsed based on actual display start time
         if let Some(display_start) = self.display_start_time {
@@ -78,13 +71,6 @@ impl OutputOrchestrator {
                 debug!("Duration expired for {}: {} elapsed (target: {:?})", 
                     self._name, format!("{:.2}s", elapsed.as_secs_f64()), self.config.duration);
                 let result = self.pick_next();
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:duration_expired","message":"Duration expired, pick_next result","data":{{"name":"{}","result":{:?}}},"timestamp":{}}}"#, 
-                        self._name, result.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
                 return result;
             }
         } else if let Some(next) = self.next_change {
@@ -93,56 +79,21 @@ impl OutputOrchestrator {
             if now >= next {
                 debug!("Timer expired for {}: Switching now (next was {:?})", self._name, next);
                 let result = self.pick_next();
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:timer_expired","message":"Timer expired, pick_next result","data":{{"name":"{}","result":{:?}}},"timestamp":{}}}"#, 
-                        self._name, result.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
                 return result;
             }
         } else if self.current_path.is_none() {
             if self.queue.is_none() {
                 warn!("[TICK] {}: Queue is None, cannot pick content", self._name);
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:queue_none","message":"Queue is None, returning None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
-                        self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
                 return None;
             }
             info!("[TICK] {}: Initial tick - picking first content (queue exists)", self._name);
             let result = self.pick_next();
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:initial_pick","message":"Initial pick_next result","data":{{"name":"{}","result":{:?},"path":{:?}}},"timestamp":{}}}"#, 
-                    self._name, result.is_some(), result.as_ref().map(|(p,_)| p), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
             return result;
         }
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:no_action","message":"No action taken, returning None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
-                self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
         None
     }
 
     pub fn pick_next(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:entry","message":"pick_next() called","data":{{"name":"{}","queue_is_some":{}}},"timestamp":{}}}"#, 
-                self._name, self.queue.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
         if let Some(queue) = &mut self.queue {
             info!("[PICK] {}: Calling queue.pick_next()", self._name);
             if let Some(path) = queue.pick_next() {
@@ -154,30 +105,9 @@ impl OutputOrchestrator {
                 // Set next_change as fallback (in case content never loads)
                 self.next_change = Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
                 debug!("Scheduled next change for {} in {:?} (path: {})", self._name, self.config.duration, path.display());
-                // #region agent log
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:success","message":"pick_next() succeeded","data":{{"name":"{}","path":"{}","content_type":"{:?}"}},"timestamp":{}}}"#, 
-                        self._name, path.display(), content_type, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                });
-                // #endregion
                 return Some((path, content_type));
             }
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:queue_empty","message":"queue.pick_next() returned None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
-                    self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
         } else {
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:no_queue","message":"Queue is None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
-                    self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-            });
-            // #endregion
         }
         None
     }
@@ -360,25 +290,11 @@ impl MonitorManager {
         let mut changes = HashMap::new();
         let now = Instant::now();
 
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:entry","message":"MonitorManager::tick() called","data":{{"output_count":{},"behavior":"{:?}"}},"timestamp":{}}}"#, 
-                self.outputs.len(), self.config.global.monitor_behavior, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
 
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for (name, orch) in &mut self.outputs {
                     if let Some(res) = orch.tick() {
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:change_collected","message":"Change collected from output","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
-                                name, res.0.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-                        });
-                        // #endregion
                         changes.insert(name.clone(), res);
                     }
                 }
@@ -490,13 +406,6 @@ impl MonitorManager {
             }
         }
 
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:return","message":"MonitorManager::tick() returning changes","data":{{"change_count":{}}},"timestamp":{}}}"#, 
-                changes.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
-        });
-        // #endregion
 
         changes
     }

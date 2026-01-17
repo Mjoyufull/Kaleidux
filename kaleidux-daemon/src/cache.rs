@@ -235,19 +235,21 @@ impl FileCache {
 
     pub fn clear_file_cache(&self) -> Result<()> {
         // Clear cache by removing all entries
+        // Collect all keys first in a separate read transaction to avoid deadlock
+        let keys: Vec<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let read_table = read_txn.open_table(FILE_CACHE_TABLE)?;
+            read_table.iter()?
+                .filter_map(|item| {
+                    item.ok().map(|(key, _)| key.value().to_vec())
+                })
+                .collect()
+        };
+        
+        // Now remove all keys in a write transaction
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
-            // Collect all keys first, then remove them
-            let keys: Vec<Vec<u8>> = {
-                let read_txn = self.db.begin_read()?;
-                let read_table = read_txn.open_table(FILE_CACHE_TABLE)?;
-                read_table.iter()?
-                    .filter_map(|item| {
-                        item.ok().map(|(key, _)| key.value().to_vec())
-                    })
-                    .collect()
-            };
             for key in keys {
                 table.remove(key.as_slice())?;
             }

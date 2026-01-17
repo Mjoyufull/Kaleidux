@@ -69,7 +69,7 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Create a new video player with a bounded channel for backpressure
     pub fn new(uri: &str, source_id: Arc<String>, session_id: u64, frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>) -> anyhow::Result<Self> {
-        let video_start = std::time::Instant::now();
+        let _video_start = std::time::Instant::now();
         let creation_start = std::time::Instant::now();
         // Use playbin - the same high-level element that gSlapper uses
         let pipeline = gst::ElementFactory::make("playbin")
@@ -264,9 +264,17 @@ impl VideoPlayer {
         // Note: We spawn a std::thread but the semaphore limits how many can run concurrently
         // The semaphore is acquired synchronously before the thread starts its loop
         let handle = std::thread::spawn(move || {
-            // Try to acquire permit (non-blocking, but we're in a thread so it's ok to wait)
-            // In practice, tokio's blocking thread pool will limit threads, and semaphore provides additional control
-            let _permit = semaphore.try_acquire().ok();
+            // Acquire permit - block until available to ensure proper resource control
+            // Using blocking acquire in a thread is safe and ensures threads wait when pool is at capacity
+            let permit = match semaphore.try_acquire() {
+                Ok(p) => p,
+                Err(_) => {
+                    // If try_acquire fails, log and return - thread won't run without permit
+                    tracing::warn!("[VIDEO] Bus watcher pool at capacity, skipping bus watcher for {}", source_id);
+                    return;
+                }
+            };
+            let _permit = permit; // Hold permit for thread lifetime
             
             while is_running.load(Ordering::SeqCst) {
                 // Wait for up to 100ms for a message

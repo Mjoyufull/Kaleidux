@@ -193,7 +193,7 @@ impl PerformanceMetrics {
     }
     
     pub fn get_peak_memory(&self) -> Option<f64> {
-        self.memory_samples.lock().iter().map(|(_, mb)| *mb).max_by(|a, b| a.partial_cmp(b).unwrap())
+        self.memory_samples.lock().iter().map(|(_, mb)| *mb).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
     
     pub fn record_startup_start(&self) {
@@ -214,8 +214,7 @@ impl PerformanceMetrics {
     pub fn record_file_discovery(&self, duration: Duration) {
         let mut metrics = self.startup_metrics.lock();
         metrics.file_discovery_duration = Some(duration);
-        // Also record as component CPU time
-        self.record_file_discovery_cpu_time(duration);
+        // Note: Component CPU time is recorded separately at the call site to avoid double-counting
     }
     
     /// Record CPU time spent in renderer operations
@@ -464,7 +463,7 @@ impl PerformanceMetrics {
             return 0.0;
         }
         let mut sorted: Vec<f64> = times.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = (sorted.len() as f64 * percentile) as usize;
         sorted.get(idx.min(sorted.len() - 1)).copied().unwrap_or(0.0)
     }

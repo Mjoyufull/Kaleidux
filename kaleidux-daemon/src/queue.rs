@@ -243,24 +243,39 @@ impl SmartQueue {
                 files.push(p.clone());
                 
                 // Update cache with file metadata
-                if let Ok(metadata) = std::fs::metadata(&p) {
-                    if let Ok(mtime) = metadata.modified()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
-                        .map(|d| d.as_secs())
-                    {
-                        let size = metadata.len();
-                        if let Ok(discovered_at) = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()) {
-                            let file_metadata = crate::cache::FileMetadata {
-                                mtime,
-                                size,
-                                content_type: match ct {
-                                    ContentType::Image => 0,
-                                    ContentType::Video => 1,
-                                },
-                                discovered_at,
-                            };
-                            cache_updates.push((p, file_metadata));
+                match std::fs::metadata(&p) {
+                    Ok(metadata) => {
+                        match metadata.modified()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                            .map(|d| d.as_secs())
+                        {
+                            Ok(mtime) => {
+                                let size = metadata.len();
+                                match SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()) {
+                                    Ok(discovered_at) => {
+                                        let file_metadata = crate::cache::FileMetadata {
+                                            mtime,
+                                            size,
+                                            content_type: match ct {
+                                                ContentType::Image => 0,
+                                                ContentType::Video => 1,
+                                            },
+                                            discovered_at,
+                                        };
+                                        cache_updates.push((p, file_metadata));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[QUEUE] Failed to get current time for cache update: {} (path: {:?})", e, p);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[QUEUE] Failed to extract mtime for cache update: {} (path: {:?})", e, p);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[QUEUE] Failed to get metadata for cache update: {} (path: {:?})", e, p);
                     }
                 }
             }

@@ -478,6 +478,9 @@ pub struct Renderer {
     // Metrics tracking
     metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
     video_first_frame_time: Option<std::time::Instant>, // Track when video session starts
+    
+    // Background task handle for shader precompilation (aborted on drop)
+    shader_precompile_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl Renderer {
@@ -524,7 +527,7 @@ impl Renderer {
         // Clone name for background task before moving it into Self
         let name_for_bg = name.clone();
         
-        let r = Self {
+        let mut r = Self {
             name,
             ctx: ctx.clone(),
             surface,
@@ -578,9 +581,11 @@ impl Renderer {
             batch_start_time: None,
             metrics,
             video_first_frame_time: None,
+            shader_precompile_handle: None,
         };
         // Precompile shaders in background to avoid blocking startup
-        tokio::spawn(async move {
+        // Store abort handle to prevent resource leaks when Renderer is dropped
+        let shader_precompile_handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
             // Pre-compile common transition shader code (the expensive GLSL->WGSL conversion)
             // Pipelines will be created on first use, but shader compilation is cached
@@ -604,7 +609,9 @@ impl Renderer {
             }
             let duration = start.elapsed();
             tracing::debug!("[RENDER] {}: Background shader precompilation completed in {:.2}ms", name_for_bg, duration.as_secs_f64() * 1000.0);
-        });
+        }).abort_handle();
+        
+        r.shader_precompile_handle = Some(shader_precompile_handle);
         Ok(r)
     }
 
@@ -1193,56 +1200,55 @@ impl Renderer {
         
         if needs_recreate {
             let tex_view = match blit_source {
-                    BlitSource::Current => self.current_texture_view.as_ref(),
-                    BlitSource::Prev => self.prev_texture_view.as_ref(),
-                    BlitSource::Composition => self.composition_texture_view.as_ref(),
-                };
-                let tex_view = match tex_view {
-                    Some(v) => {
-                        // Create bind group with the texture
-                        self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("Blit Bind Group"),
-                            layout: &self.ctx.blit_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: self.uniform_buffer.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(v),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                                },
-                            ],
-                        }));
-                        self.blit_source_is_composition = is_comp;
-                        self.blit_source_is_prev = is_prev;
-                        v
-                    },
-                    None => {
-                        // Fallback logic: if Composition fails, try Prev, then Current
-                        let fallback_view = match blit_source {
-                            BlitSource::Composition => {
-                                warn!("[RENDER] {}: Composition texture view missing, falling back to prev", self.name);
-                                self.prev_texture_view.as_ref().or_else(|| {
-                                    warn!("[RENDER] {}: Prev texture view also missing, falling back to current", self.name);
-                                    self.current_texture_view.as_ref()
-                                })
-                            }
-                            BlitSource::Prev => {
-                                warn!("[RENDER] {}: Prev texture view missing, falling back to current", self.name);
+                BlitSource::Current => self.current_texture_view.as_ref(),
+                BlitSource::Prev => self.prev_texture_view.as_ref(),
+                BlitSource::Composition => self.composition_texture_view.as_ref(),
+            };
+            match tex_view {
+                Some(v) => {
+                    // Create bind group with the texture
+                    self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Blit Bind Group"),
+                        layout: &self.ctx.blit_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(v),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                            },
+                        ],
+                    }));
+                    self.blit_source_is_composition = is_comp;
+                    self.blit_source_is_prev = is_prev;
+                },
+                None => {
+                    // Fallback logic: if Composition fails, try Prev, then Current
+                    let fallback_view = match blit_source {
+                        BlitSource::Composition => {
+                            warn!("[RENDER] {}: Composition texture view missing, falling back to prev", self.name);
+                            self.prev_texture_view.as_ref().or_else(|| {
+                                warn!("[RENDER] {}: Prev texture view also missing, falling back to current", self.name);
                                 self.current_texture_view.as_ref()
-                            }
-                            BlitSource::Current => {
-                                error!("[RENDER] {}: Current texture view missing, cannot render", self.name);
-                                None
-                            }
-                        };
-                        
-                        match fallback_view {
+                            })
+                        }
+                        BlitSource::Prev => {
+                            warn!("[RENDER] {}: Prev texture view missing, falling back to current", self.name);
+                            self.current_texture_view.as_ref()
+                        }
+                        BlitSource::Current => {
+                            error!("[RENDER] {}: Current texture view missing, cannot render", self.name);
+                            None
+                        }
+                    };
+                    
+                    match fallback_view {
                             Some(v) => {
                                 // Update source to match fallback
                                 let is_comp = false;
@@ -1268,7 +1274,6 @@ impl Renderer {
                                 }));
                                 self.blit_source_is_composition = is_comp;
                                 self.blit_source_is_prev = is_prev;
-                                v
                             }
                             None => {
                                 error!("Texture view missing for blit source {:?} and all fallbacks failed (current={}, prev={}, composition={})", 
@@ -1535,7 +1540,7 @@ impl Renderer {
             info!("[TRANSITION] {}: Image data uploaded (Instant) - transition signaled as complete", self.name);
         }
         
-        let duration = upload_start.elapsed();
+        let _duration = upload_start.elapsed();
         // Removed TRACE log - use debug! if needed for troubleshooting
         
         Ok(())
@@ -1793,5 +1798,14 @@ impl Renderer {
                     },
                 ],
             }));
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Abort background shader precompilation task to prevent resource leaks
+        if let Some(handle) = self.shader_precompile_handle.take() {
+            handle.abort();
+        }
     }
 }
