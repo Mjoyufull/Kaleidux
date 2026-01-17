@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
 use clap::{Parser, Subcommand};
 use kaleidux_common::{Request, Response};
 use tokio::net::UnixStream;

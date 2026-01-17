@@ -132,7 +132,7 @@ pub struct PartialOutputConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
+    pub async fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()
             .context("Failed to get config directory")?
             .join("kaleidux");
@@ -143,7 +143,7 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let content = std::fs::read_to_string(&config_path)
+        let content = tokio::fs::read_to_string(&config_path).await
             .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
         
         // Parse as raw TOML table first to work around serde(flatten) issues

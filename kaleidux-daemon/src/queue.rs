@@ -55,6 +55,7 @@ pub struct SmartQueue {
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
     pub cache: Arc<FileCache>,
+    pending_stats_updates: HashMap<PathBuf, FileStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,24 +65,28 @@ pub enum ContentType {
 }
 
 impl SmartQueue {
-    pub fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
+    pub async fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
         let cache = Arc::new(FileCache::new()?);
-        Self::new_with_cache(path, video_ratio, strategy, cache, None)
+        Self::new_with_cache(path, video_ratio, strategy, cache, None).await
     }
     
-    pub fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
+    pub async fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
+        tracing::info!("[QUEUE] new_with_cache called for path: {:?}", path);
         let stats = Self::load_stats_from_cache(&cache)?;
+        tracing::info!("[QUEUE] Loaded stats, blacklist size: {}", stats.blacklist.len());
         
-        // Run file discovery in blocking task to avoid blocking main thread
+        // Run file discovery in background task to avoid blocking startup
         let path_buf = path.to_path_buf();
         let blacklist_clone = stats.blacklist.clone();
         let cache_clone = cache.clone();
         let metrics_clone = metrics.clone();
         
-        // Use tokio::task::spawn_blocking for CPU-intensive work
-        let pool = tokio::task::block_in_place(|| {
+        tracing::info!("[QUEUE] Starting file discovery for: {:?}", path_buf);
+        // Use spawn_blocking to run on thread pool (truly async, non-blocking)
+        let pool = tokio::task::spawn_blocking(move || {
             Self::discover_content(&path_buf, &blacklist_clone, cache_clone, metrics_clone)
-        })?;
+        }).await??;
+        tracing::info!("[QUEUE] File discovery completed, found {} files", pool.len());
         
         let mut pool = pool;
         // Sort the pool initially for sequential strategies
@@ -103,6 +108,7 @@ impl SmartQueue {
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
+            pending_stats_updates: HashMap::new(),
         })
     }
     
@@ -139,6 +145,7 @@ impl SmartQueue {
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
+            pending_stats_updates: HashMap::new(),
         })
     }
 
@@ -176,13 +183,14 @@ impl SmartQueue {
         cache: Arc<FileCache>,
         metrics: Option<Arc<crate::metrics::PerformanceMetrics>>
     ) -> Result<Vec<PathBuf>> {
+        let discovery_start = std::time::Instant::now();
         let mut files = Vec::new();
         let mut cache_updates = Vec::new();
 
         // Use jwalk for parallel directory traversal
         let walk_dir = WalkDir::new(path)
             .follow_links(true)
-            .parallelism(jwalk::Parallelism::RayonNewPool(0)); // 0 = auto-detect CPU count
+            .parallelism(jwalk::Parallelism::RayonNewPool(0)); // 0 = auto-detect CPU count, optimal thread usage
 
         // Collect entries in parallel
         let entries: Vec<_> = walk_dir
@@ -265,6 +273,12 @@ impl SmartQueue {
 
         if files.is_empty() {
             anyhow::bail!("No supported images or videos found in {:?}", path);
+        }
+
+        // Record file discovery CPU time
+        if let Some(m) = &metrics {
+            let discovery_duration = discovery_start.elapsed();
+            m.record_file_discovery_cpu_time(discovery_duration);
         }
 
         Ok(files)
@@ -417,31 +431,42 @@ impl SmartQueue {
     }
 
     fn update_stats(&mut self, path: &PathBuf) {
-        // Update the stat
-        {
-            let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
-                count: 0,
-                last_seen: None,
-                love_multiplier: 1.0,
-            });
-            stat.count += 1;
-            stat.last_seen = Some(Utc::now());
-        }
+        // Update the stat in memory
+        let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
+            count: 0,
+            last_seen: None,
+            love_multiplier: 1.0,
+        });
+        stat.count += 1;
+        stat.last_seen = Some(Utc::now());
         
-        // Limit stats growth (LRU-ish removal) - done after dropping the borrow
+        // Add to pending updates for batched write
+        self.pending_stats_updates.insert(path.clone(), stat.clone());
+        
+        // Limit stats growth (LRU-ish removal)
         if self.stats.files.len() > 5000 {
             let oldest = self.stats.files.iter()
                 .min_by_key(|(_, s)| s.last_seen.map(|d| d.timestamp()).unwrap_or(0))
                 .map(|(p, _)| p.clone());
             if let Some(p) = oldest {
                 self.stats.files.remove(&p);
+                self.pending_stats_updates.remove(&p);
             }
         }
-        
-        // Save to redb cache (non-blocking, batched)
-        if let Some(stat) = self.stats.files.get(path) {
-            let _ = self.cache.set_file_stats(path, stat);
+    }
+    
+    /// Flush pending stats updates to cache in a batch
+    pub fn flush_stats(&mut self) -> Result<()> {
+        if self.pending_stats_updates.is_empty() {
+            return Ok(());
         }
+        
+        let updates: Vec<_> = self.pending_stats_updates.drain()
+            .map(|(path, stats)| (path, stats))
+            .collect();
+        
+        self.cache.batch_set_file_stats(&updates)?;
+        Ok(())
     }
 
     fn load_stats_from_cache(cache: &FileCache) -> Result<LoveitData> {
@@ -457,12 +482,9 @@ impl SmartQueue {
         })
     }
 
-    pub fn save_stats(&self) -> Result<()> {
-        // Batch save all stats to redb
-        let updates: Vec<_> = self.stats.files.iter()
-            .map(|(path, stats)| (path.clone(), stats.clone()))
-            .collect();
-        self.cache.batch_set_file_stats(&updates)?;
+    pub fn save_stats(&mut self) -> Result<()> {
+        // Flush any pending stats updates first
+        self.flush_stats()?;
         
         // Save playlists
         for (name, playlist) in &self.stats.playlists {

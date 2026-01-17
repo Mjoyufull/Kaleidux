@@ -98,8 +98,8 @@ impl ShaderManager {
 
         let full_glsl = format!("{}\n{}\n{}\nvoid main() {{ o_color = transition(v_uv); }}", GLSL_PRELUDE, defines, stripped_user_code);
         
-        // Log the generated shader for debugging purposes (level info or debug)
-        tracing::debug!("Compiling GLSL shader '{}'. Source:\n---\n{}\n---", name, full_glsl);
+        // Log the generated shader for debugging purposes
+        tracing::debug!("Compiling GLSL shader '{}'", name);
 
         let mut parser = naga::front::glsl::Frontend::default();
         let module = parser.parse(&naga::front::glsl::Options {
@@ -139,7 +139,7 @@ impl ShaderManager {
         }
     }
 
-    pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
+    pub async fn load_external_glsl_async(name: &str) -> anyhow::Result<String> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Failed to get config directory"))?
             .join("kaleidux")
@@ -147,11 +147,33 @@ impl ShaderManager {
         
         // Try .glsl then .wgsl (though compile_glsl expects glsl)
         let path = config_dir.join(format!("{}.glsl", name));
-        if path.exists() {
-            return std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e));
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return tokio::fs::read_to_string(path).await.map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e));
         }
         
         anyhow::bail!("Shader not found in ~/.config/kaleidux/shaders/: {}", name)
+    }
+    
+    pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
+        // Use block_in_place to call async version from sync context
+        tokio::task::block_in_place(|| -> anyhow::Result<String> {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if let Ok(result) = handle.block_on(Self::load_external_glsl_async(name)) {
+                    return Ok(result);
+                }
+            }
+            // Fallback to sync if no runtime available
+            let config_dir = dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get config directory"))?
+                .join("kaleidux")
+                .join("shaders");
+            let path = config_dir.join(format!("{}.glsl", name));
+            if path.exists() {
+                std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e))
+            } else {
+                Err(anyhow::anyhow!("Shader not found in ~/.config/kaleidux/shaders/: {}", name))
+            }
+        })
     }
 
     pub fn get_builtin_shader(transition: &Transition) -> anyhow::Result<String> {

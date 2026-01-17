@@ -3,6 +3,9 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Result, Context};
 use serde::{Serialize, Deserialize};
 use redb::{Database, ReadableTable, TableDefinition};
+use notify::{Watcher, RecommendedWatcher, RecursiveMode, Event, EventKind};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 // Table definitions for redb
 const FILE_CACHE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_cache");
@@ -251,5 +254,78 @@ impl FileCache {
         }
         write_txn.commit()?;
         Ok(())
+    }
+    
+    /// Invalidate cache entry for a specific file
+    pub fn invalidate_file(&self, path: &Path) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
+            let path_str = path.to_string_lossy();
+            let path_bytes = path_str.as_bytes();
+            table.remove(path_bytes)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+}
+
+/// Directory watcher for cache invalidation
+pub struct DirectoryWatcher {
+    watcher: RecommendedWatcher,
+    event_rx: mpsc::Receiver<notify::Result<Event>>,
+    cache: Arc<FileCache>,
+    watched_dirs: Vec<PathBuf>,
+}
+
+impl DirectoryWatcher {
+    pub fn new(cache: Arc<FileCache>) -> Result<Self> {
+        let (event_tx, event_rx) = mpsc::channel(100);
+        
+        let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            let _ = event_tx.blocking_send(res);
+        })?;
+        
+        Ok(Self {
+            watcher,
+            event_rx,
+            cache,
+            watched_dirs: Vec::new(),
+        })
+    }
+    
+    /// Watch a directory for changes
+    pub fn watch(&mut self, path: &Path) -> Result<()> {
+        if path.exists() && path.is_dir() {
+            self.watcher.watch(path, RecursiveMode::Recursive)?;
+            self.watched_dirs.push(path.to_path_buf());
+            tracing::info!("[CACHE] Watching directory for changes: {}", path.display());
+        }
+        Ok(())
+    }
+    
+    /// Process file system events and invalidate cache entries
+    pub async fn process_events(&mut self) {
+        while let Ok(Ok(event)) = self.event_rx.try_recv() {
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                    for path in event.paths {
+                        if path.is_file() {
+                            // Invalidate cache entry for this file
+                            if let Err(e) = self.cache.invalidate_file(&path) {
+                                tracing::warn!("[CACHE] Failed to invalidate cache for {}: {}", path.display(), e);
+                            } else {
+                                tracing::debug!("[CACHE] Invalidated cache for: {}", path.display());
+                            }
+                        } else if path.is_dir() {
+                            // Directory changed - mark all files in this directory as dirty
+                            // For now, we'll just log it. Full directory invalidation could be added later.
+                            tracing::debug!("[CACHE] Directory changed: {}", path.display());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }

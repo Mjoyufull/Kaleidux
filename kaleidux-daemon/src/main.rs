@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
 use tracing_subscriber::{prelude::*, EnvFilter, Registry};
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::filter::LevelFilter;
@@ -73,7 +74,15 @@ fn switch_wallpaper_content(
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
     log_prefix: &str,
 ) {
+    // #region agent log
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:entry","message":"switch_wallpaper_content() called","data":{{"name":"{}","path":"{}","content_type":"{:?}","renderer_exists":{}}},"timestamp":{}}}"#, 
+            name, path.display(), content_type, renderers.contains_key(name), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+    });
+    // #endregion
     info!("{}: {} -> {:?}", log_prefix, name, path.display());
+    debug!("[SWITCH] {}: content_type={:?}, renderer exists={}", name, content_type, renderers.contains_key(name));
 
     let was_playing_video = video_players.contains_key(name);
     if was_playing_video {
@@ -96,22 +105,54 @@ fn switch_wallpaper_content(
             let path_clone = path.to_path_buf();
             let tx = image_tx.clone();
             
+            // #region agent log
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:spawn_image_decode","message":"Spawning image decode task","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
+                    name, path.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+            });
+            // #endregion
             debug!("[ASSET] {}: Offloading image decode: {}", name, path.display());
             tokio::task::spawn_blocking(move || {
+                // #region agent log
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_decode_start","message":"Image decode started","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
+                        name_clone, path_clone.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                });
+                // #endregion
                 match image::open(&path_clone) {
                     Ok(img) => {
                         let rgba = img.to_rgba8();
                         let (width, height) = rgba.dimensions();
-                        let _ = tx.send(LoadedImage {
-                            name: name_clone,
+                        // #region agent log
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_decode_success","message":"Image decode succeeded, sending to channel","data":{{"name":"{}","width":{},"height":{}}},"timestamp":{}}}"#, 
+                                name_clone, width, height, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                        });
+                        // #endregion
+                        let send_result = tx.send(LoadedImage {
+                            name: name_clone.clone(),
                             data: Some(rgba.into_raw()),
                             width,
                             height,
                             path: path_clone,
                         });
+                        // #region agent log
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"main.rs:switch_wallpaper_content:image_send_result","message":"Image send result","data":{{"name":"{}","send_success":{}}},"timestamp":{}}}"#, 
+                                name_clone, send_result.is_ok(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                        });
+                        // #endregion
+                        if send_result.is_err() {
+                            debug!("[ASSET] {}: Failed to send decoded image (channel closed)", name_clone);
+                        }
                     }
                     Err(e) => {
                         error!("Failed to decode image {}: {}", path_clone.display(), e);
+                        // Note: metrics not available in this closure context
                         let _ = tx.send(LoadedImage {
                             name: name_clone,
                             data: None,
@@ -173,6 +214,10 @@ fn create_and_start_video_player(
         ) {
             Ok(mut vp) => {
                 vp.set_volume(vol);
+                // Pre-buffer video to reduce first frame latency
+                if let Err(e) = vp.prebuffer() {
+                    debug!("[VIDEO] {}: Pre-buffering failed (non-fatal): {}", name_str, e);
+                }
                 if vp.start().is_ok() {
                     if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp)) {
                          error!("Failed to send video player back: {}", e);
@@ -183,7 +228,8 @@ fn create_and_start_video_player(
                 }
             }
             Err(e) => {
-                error!("Failed to create video player: {}", e);
+                    error!("Failed to create video player: {}", e);
+                    // Note: metrics not available in this closure context
                 let _ = player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
             }
         }
@@ -272,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 2. Load Configuration
-    let config = match orchestration::Config::load() {
+    let config = match orchestration::Config::load().await {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load configuration: {}. Using defaults.", e);
@@ -281,33 +327,60 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 3. Initialize GStreamer
+    let gstreamer_start = Instant::now();
     gstreamer::init()?;
+    let gstreamer_duration = gstreamer_start.elapsed();
     info!("GStreamer initialized.");
-
-    // 4. Start Resource Monitor
-    let monitor = monitor::SystemMonitor::new();
-    tokio::spawn(async move {
-        monitor.run().await;
-    });
+    
+    // 4. Resource Monitor will be started in backend loops with metrics
     
     // Detect Backend
     let use_x11 = std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_ok();
     
     if use_x11 {
         info!("Starting X11 Backend...");
-        run_x11_loop(config, log_level).await
+        run_x11_loop(config, log_level, gstreamer_duration).await
     } else {
         info!("Starting Wayland Backend...");
-        run_wayland_loop(config, log_level).await
+        run_wayland_loop(config, log_level, gstreamer_duration).await
     }
 }
 
-async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) -> anyhow::Result<()> {
+async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, gstreamer_duration: std::time::Duration) -> anyhow::Result<()> {
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
     let metrics = Arc::new(metrics::PerformanceMetrics::new());
-    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config, Some(metrics.clone()))?;
+    metrics.record_startup_start();
+    metrics.record_gstreamer_init(gstreamer_duration);
+    
+    // Start resource monitor with metrics
+    let monitor = monitor::SystemMonitor::new_with_metrics(Some(metrics.clone()));
+    tokio::spawn(async move {
+        monitor.run().await;
+    });
+    
+    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config.clone(), Some(metrics.clone()))?;
     let mut last_metrics_log = Instant::now();
+    
+    // Initialize directory watcher for cache invalidation
+    let cache = monitor_manager.get_cache();
+    let mut dir_watcher = match cache::DirectoryWatcher::new(cache.clone()) {
+        Ok(mut watcher) => {
+            // Watch all content directories from config
+            for (_, output_config) in &config.outputs {
+                if let Some(path) = &output_config.path {
+                    if let Err(e) = watcher.watch(path) {
+                        tracing::warn!("[CACHE] Failed to watch directory {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Some(watcher)
+        }
+        Err(e) => {
+            tracing::warn!("[CACHE] Failed to create directory watcher: {}", e);
+            None
+        }
+    };
     
     // Log metrics immediately for DEBUG (3) and TRACE (4) levels
     if log_level.map(|l| l >= 3).unwrap_or(false) {
@@ -346,7 +419,7 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
         let description = info.description.as_deref().unwrap_or("unknown").to_string();
         
         info!("Creating surface for output: {} ({})", name, description);
-        monitor_manager.add_output(&name, &description);
+        monitor_manager.add_output(&name, &description).await;
         let output_config = match monitor_manager.get_output_config(&name) {
             Some(cfg) => cfg,
             None => continue,
@@ -364,7 +437,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
 
     if let Some((_, first_surface_arc)) = surface_infos.first() {
         info!("Initializing WGPU context with first surface as compatible...");
+        let wgpu_start = Instant::now();
         let (ctx, surface) = renderer::WgpuContext::with_surface(first_surface_arc.clone()).await?;
+        let wgpu_duration = wgpu_start.elapsed();
+        metrics.record_wgpu_init(wgpu_duration);
         let adapter_name = ctx.adapter.get_info().name.clone();
         wgpu_ctx = Some(ctx);
         initial_surface = Some(surface);
@@ -372,7 +448,6 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
     }
 
     if let Some(ctx) = wgpu_ctx.clone() {
-        let mut renderer_futures = Vec::new();
         let first_name = surface_infos.first().map(|(n, _)| n.clone());
         
         for (name, surface_arc) in surface_infos {
@@ -381,25 +456,60 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
             let init_surf = if is_first { initial_surface.take() } else { None };
             
             let metrics_clone = metrics.clone();
-            renderer_futures.push(async move {
-                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf, Some(metrics_clone)).await)
+            
+            info!("[STARTUP] Initializing renderer for {}", name);
+            
+            // Offload WGPU surface creation to blocking thread to avoid checking generic runtime
+            let name_for_bg = name.clone();
+            let spawn_handler = tokio::task::spawn_blocking(move || {
+                renderer::Renderer::new(name_for_bg, ctx_clone, surface_arc, init_surf, Some(metrics_clone))
             });
-        }
-        
-        let results = futures::future::join_all(renderer_futures).await;
-        for (name, res) in results {
-            match res {
-                Ok(mut r) => {
-                    if let Some(output_config) = monitor_manager.get_output_config(&name) {
-                        r.apply_config(output_config);
+
+            // Set a timeout strictly for the initialization
+            match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
+                Ok(join_res) => {
+                    match join_res {
+                        Ok(render_res) => {
+                            match render_res {
+                                Ok(mut r) => {
+                                    if let Some(output_config) = monitor_manager.get_output_config(&name) {
+                                        r.apply_config(output_config);
+                                    }
+                                    renderers.insert(name.clone(), r);
+                                    info!("[STARTUP] Renderer initialized successfully for {}", name);
+                                }
+                                Err(e) => {
+                                    error!("Failed to create renderer for output {}: {}", name, e);
+                                    metrics.record_error("renderer_creation");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Thread join error for output {}: {}", name, e);
+                            metrics.record_error("renderer_thread_error");
+                        }
                     }
-                    renderers.insert(name, r);
                 }
-                Err(e) => error!("Failed to create renderer for output {}: {}", name, e),
+                Err(_) => {
+                    // Timeout occurred
+                    error!("TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.", name);
+                    metrics.record_error("renderer_creation_timeout");
+                }
             }
+            // Poll device to process submission/initialization commands
+            ctx.device.poll(wgpu::Maintain::Poll);
         }
+        // All renderers created - full initialization complete
+        metrics.record_full_init();
+        if log_level.map(|l| l >= 3).unwrap_or(false) {
+            metrics.log_startup_summary();
+        }
+        info!("[STARTUP] All renderers created, count: {}", renderers.len());
+    } else {
+        warn!("[STARTUP] No WGPU context available, cannot create renderers!");
     }
     
+    info!("[STARTUP] Creating video players HashMap");
     let mut video_players: HashMap<String, video::VideoPlayer> = HashMap::new();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
@@ -408,6 +518,7 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
     let script_cmd_tx = cmd_tx.clone();
 
     // IPC Socket Setup
+    info!("[STARTUP] Setting up IPC socket");
     let socket_path = dirs::runtime_dir()
         .map(|d| d.join("kaleidux.sock"))
         .unwrap_or_else(|| {
@@ -415,8 +526,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
             std::path::PathBuf::from(format!("/tmp/kaleidux-{}.sock", uid))
         });
     
+    info!("[STARTUP] IPC socket path: {:?}", socket_path);
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
+    info!("[STARTUP] IPC socket bound successfully");
     
     #[cfg(unix)]
     {
@@ -465,11 +578,14 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
         shutdown_clone.store(true, Ordering::SeqCst);
     });
 
+    info!("[STARTUP] Creating script manager");
     let mut script_manager = scripting::ScriptManager::new(script_cmd_tx);
     if let Some(path) = &script_path {
-        let _ = script_manager.load(path);
+        info!("[STARTUP] Loading script from: {:?}", path);
+        let _ = script_manager.load(path).await;
     }
     let mut last_script_tick = Instant::now();
+    info!("[STARTUP] Script manager initialized");
 
     let target_frame_time = std::time::Duration::from_micros(16667); // ~60 FPS
     let mut connection_error_count = 0u32;
@@ -477,9 +593,20 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
     let mut connection_dead = false;
     let mut last_error_time = Instant::now();
     let mut last_pool_cleanup = Instant::now();
+    let mut last_stats_flush = Instant::now();
+    let mut first_frame_recorded = false;
     
     // Initial Load
+    info!("[STARTUP] Reached Initial Load section, renderers count: {}", renderers.len());
+    info!("[STARTUP] About to call monitor_manager.tick()");
     let initial_changes = monitor_manager.tick();
+    info!("[STARTUP] Initial changes: {} outputs", initial_changes.len());
+    for (name, (path, content_type)) in &initial_changes {
+        info!("[STARTUP] Change: {} -> {:?} ({:?})", name, path, content_type);
+    }
+    if initial_changes.is_empty() {
+        warn!("[STARTUP] No initial content changes - wallpapers may not load!");
+    }
     let mut next_session_id = 1u64;
     let batch_id = rand::random::<u64>();
     for (name, (path, content_type)) in initial_changes {
@@ -601,12 +728,19 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
         while let Ok((source_id, event)) = frame_rx.try_recv() {
             match event {
                 video::VideoEvent::Frame(frame) => { latest_frames.insert(source_id, frame); }
-                video::VideoEvent::Error(msg) => { error!("Video error {}: {}", source_id, msg); }
+                video::VideoEvent::Error(msg) => {
+                    error!("Video error {}: {}", source_id, msg);
+                    metrics.record_error("video_decode");
+                }
             }
         }
         for (source_id, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(source_id.as_str()) {
+                let video_start = std::time::Instant::now();
                 r.upload_frame(&frame);
+                // Record video CPU time (frame processing)
+                let video_duration = video_start.elapsed();
+                metrics.record_video_cpu_time(video_duration);
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == source_id.as_str()) {
                         // Deadlock fix: if this is the first frame of a transition (progress == 0),
@@ -614,6 +748,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
                         // even if a callback is technically "pending" from the switch event.
                         if !r.frame_callback_pending || r.transition_progress == 0.0 {
                             let _ = r.render(renderer::BackendContext::Wayland{surface: layer_surface, qh: &qh}, loop_start);
+                            if !first_frame_recorded {
+                                metrics.record_first_frame();
+                                first_frame_recorded = true;
+                            }
                             r.request_frame_callback(layer_surface, &qh);
                         }
                     }
@@ -623,12 +761,33 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
         
         // Handle Images
         while let Ok(msg) = image_rx.try_recv() {
+            // #region agent log
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"main.rs:wayland_loop:image_received","message":"Image received in main loop","data":{{"name":"{}","has_data":{},"width":{},"height":{}}},"timestamp":{}}}"#, 
+                    msg.name, msg.data.is_some(), msg.width, msg.height, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+            });
+            // #endregion
+            debug!("[IMAGE] Received image for {}: data={}, size={}x{}", msg.name, msg.data.is_some(), msg.width, msg.height);
              if let Some(r) = renderers.get_mut(&msg.name) {
-                 if let Some(data) = msg.data {
+                     if let Some(data) = msg.data {
+                     debug!("[IMAGE] Uploading image data for {}: {} bytes", msg.name, data.len());
+                     // #region agent log
+                     let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                         use std::io::Write;
+                         writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"main.rs:wayland_loop:upload_image","message":"Uploading image to renderer","data":{{"name":"{}","data_len":{}}},"timestamp":{}}}"#, 
+                             msg.name, data.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                     });
+                     // #endregion
                      let _ = r.upload_image_data(data, msg.width, msg.height);
+                     debug!("[IMAGE] Rendering after upload for {}", msg.name);
                      if r.configured {
                           if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == &msg.name) {
                               let _ = r.render(renderer::BackendContext::Wayland{surface: layer_surface, qh: &qh}, loop_start);
+                              if !first_frame_recorded {
+                                  metrics.record_first_frame();
+                                  first_frame_recorded = true;
+                              }
                           }
                      }
                  } else {
@@ -665,6 +824,10 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
                 r.last_frame_request = None;
                 if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == &name) {
                      let _ = r.render(renderer::BackendContext::Wayland { surface: layer_surface, qh: &qh }, loop_start);
+                     if !first_frame_recorded {
+                         metrics.record_first_frame();
+                         first_frame_recorded = true;
+                     }
                 }
             }
         }
@@ -695,8 +858,23 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
             last_pool_cleanup = Instant::now();
         }
         
+        // Flush stats every 5 seconds (batched writes)
+        if last_stats_flush.elapsed().as_secs() >= 5 {
+            let _ = monitor_manager.flush_all_stats();
+            last_stats_flush = Instant::now();
+        }
+        
         // Log metrics summary every 30 seconds (or 10 seconds for testing)
         if last_metrics_log.elapsed().as_secs() >= 10 {
+            // Record resource counts for leak detection
+            if let Some(ctx) = &wgpu_ctx {
+                let texture_count = ctx.texture_pool.lock().values().map(|v| v.len()).sum();
+                let pipeline_count = ctx.transition_pipelines.lock().len() 
+                    + ctx.blit_pipelines.lock().len() 
+                    + ctx.mipmap_pipelines.lock().len();
+                metrics.record_texture_count(texture_count);
+                metrics.record_pipeline_count(pipeline_count);
+            }
             metrics.log_summary();
             last_metrics_log = Instant::now();
         }
@@ -712,13 +890,44 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) 
     Ok(())
 }
 
-async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> anyhow::Result<()> {
+async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstreamer_duration: std::time::Duration) -> anyhow::Result<()> {
     // Similar to run_wayland_loop but with X11 backend
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
     let metrics = Arc::new(metrics::PerformanceMetrics::new());
-    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config, Some(metrics.clone()))?;
+    metrics.record_startup_start();
+    metrics.record_gstreamer_init(gstreamer_duration);
+    
+    // Start resource monitor with metrics
+    let monitor = monitor::SystemMonitor::new_with_metrics(Some(metrics.clone()));
+    tokio::spawn(async move {
+        monitor.run().await;
+    });
+    
+    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config.clone(), Some(metrics.clone()))?;
     let mut last_metrics_log = Instant::now();
+    let mut first_frame_recorded_x11 = false;
+    let mut last_stats_flush_x11 = Instant::now();
+    
+    // Initialize directory watcher for cache invalidation
+    let cache = monitor_manager.get_cache();
+    let mut dir_watcher = match cache::DirectoryWatcher::new(cache.clone()) {
+        Ok(mut watcher) => {
+            // Watch all content directories from config
+            for (_, output_config) in &config.outputs {
+                if let Some(path) = &output_config.path {
+                    if let Err(e) = watcher.watch(path) {
+                        tracing::warn!("[CACHE] Failed to watch directory {}: {}", path.display(), e);
+                    }
+                }
+            }
+            Some(watcher)
+        }
+        Err(e) => {
+            tracing::warn!("[CACHE] Failed to create directory watcher: {}", e);
+            None
+        }
+    };
     
     // Log metrics immediately for DEBUG (3) and TRACE (4) levels
     if log_level.map(|l| l >= 3).unwrap_or(false) {
@@ -735,7 +944,7 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
 
     let mut surface_infos = Vec::new();
     for (name, x, y, width, height) in monitors {
-        monitor_manager.add_output(&name, "X11 Display"); 
+        monitor_manager.add_output(&name, "X11 Display").await; 
         let win = backend.create_wallpaper_window(&name, x, y, width, height)?;
         window_to_renderer.insert(win, name.clone());
         
@@ -750,13 +959,15 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
 
     if let Some((_, surface_arc, _, _)) = surface_infos.first() {
         info!("Initializing WGPU context with first surface as compatible...");
+        let wgpu_start = Instant::now();
         let (ctx, surface) = renderer::WgpuContext::with_surface(surface_arc.clone()).await?;
+        let wgpu_duration = wgpu_start.elapsed();
+        metrics.record_wgpu_init(wgpu_duration);
         wgpu_ctx = Some(ctx);
         initial_surface = Some(surface);
     }
 
     if let Some(ctx) = wgpu_ctx.clone() {
-        let mut renderer_futures = Vec::new();
         let first_name = surface_infos.first().map(|(n, _, _, _)| n.clone());
         
         for (name, surface_arc, width, height) in surface_infos {
@@ -773,23 +984,39 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
             };
             
             let metrics_clone = metrics.clone();
-            renderer_futures.push(async move {
-                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf, Some(metrics_clone)).await, width, height)
+            
+            info!("[STARTUP-X11] Initializing renderer for {}", name);
+            let name_for_bg = name.clone();
+            let spawn_handler = tokio::task::spawn_blocking(move || {
+                renderer::Renderer::new(name_for_bg, ctx_clone, surface_arc, init_surf, Some(metrics_clone))
             });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
+                Ok(join_res) => {
+                    match join_res {
+                        Ok(render_res) => {
+                            match render_res {
+                                Ok(mut r) => {
+                                     let _ = r.resize_checked(width as u32, height as u32);
+                                     if let Some(cfg) = monitor_manager.get_output_config(&name) {
+                                         r.apply_config(cfg);
+                                     }
+                                     renderers.insert(name, r);
+                                }
+                                Err(e) => error!("Failed to create renderer for {}: {}", name, e),
+                            }
+                        }
+                        Err(e) => error!("Thread join error for output {}: {}", name, e),
+                    }
+                }
+                Err(_) => error!("TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.", name),
+            }
         }
         
-        let results = futures::future::join_all(renderer_futures).await;
-        for (name, res, width, height) in results {
-            match res {
-                Ok(mut r) => {
-                     let _ = r.resize_checked(width as u32, height as u32);
-                     if let Some(cfg) = monitor_manager.get_output_config(&name) {
-                         r.apply_config(cfg);
-                     }
-                     renderers.insert(name, r);
-                }
-                Err(e) => error!("Failed to create renderer for {}: {}", name, e),
-            }
+        // All renderers created - full initialization complete
+        metrics.record_full_init();
+        if log_level.map(|l| l >= 3).unwrap_or(false) {
+            metrics.log_startup_summary();
         }
     }
 
@@ -833,7 +1060,15 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
 
     let mut next_session_id = 1u64;
     // Initial Load
+    info!("[STARTUP] About to call monitor_manager.tick()");
     let initial_changes = monitor_manager.tick();
+    info!("[STARTUP] Initial changes: {} outputs", initial_changes.len());
+    for (name, (path, content_type)) in &initial_changes {
+        info!("[STARTUP] Change: {} -> {:?} ({:?})", name, path, content_type);
+    }
+    if initial_changes.is_empty() {
+        warn!("[STARTUP] No initial content changes - wallpapers may not load!");
+    }
     let batch_id = rand::random::<u64>();
     for (name, (path, content_type)) in initial_changes {
          switch_wallpaper_content(
@@ -925,9 +1160,17 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
         }
         for (src, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(src.as_str()) {
+                let video_start = std::time::Instant::now();
                 r.upload_frame(&frame);
+                // Record video CPU time (frame processing)
+                let video_duration = video_start.elapsed();
+                metrics.record_video_cpu_time(video_duration);
                 // X11: Render immediately if video
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
+                if !first_frame_recorded_x11 {
+                    metrics.record_first_frame();
+                    first_frame_recorded_x11 = true;
+                }
                 // Check if transition just completed and mark it
                 if r.transition_just_completed {
                     r.transition_just_completed = false; // Clear flag
@@ -976,6 +1219,10 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
         for (name, r) in renderers.iter_mut() {
             if r.needs_redraw || r.transition_active || r.valid_content_type == crate::queue::ContentType::Video {
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
+                if !first_frame_recorded_x11 {
+                    metrics.record_first_frame();
+                    first_frame_recorded_x11 = true;
+                }
                 // Check if transition just completed and mark it
                 if r.transition_just_completed {
                     r.transition_just_completed = false; // Clear flag
@@ -1002,8 +1249,28 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> a
             last_pool_cleanup_x11 = Instant::now();
         }
         
+        // Process directory watcher events (cache invalidation)
+        if let Some(ref mut watcher) = dir_watcher {
+            watcher.process_events().await;
+        }
+        
+        // Flush stats every 5 seconds (batched writes)
+        if last_stats_flush_x11.elapsed().as_secs() >= 5 {
+            let _ = monitor_manager.flush_all_stats();
+            last_stats_flush_x11 = Instant::now();
+        }
+        
         // Log metrics summary every 10 seconds
         if last_metrics_log.elapsed().as_secs() >= 10 {
+            // Record resource counts for leak detection
+            if let Some(ctx) = &wgpu_ctx {
+                let texture_count = ctx.texture_pool.lock().values().map(|v| v.len()).sum();
+                let pipeline_count = ctx.transition_pipelines.lock().len() 
+                    + ctx.blit_pipelines.lock().len() 
+                    + ctx.mipmap_pipelines.lock().len();
+                metrics.record_texture_count(texture_count);
+                metrics.record_pipeline_count(pipeline_count);
+            }
             metrics.log_summary();
             last_metrics_log = Instant::now();
         }

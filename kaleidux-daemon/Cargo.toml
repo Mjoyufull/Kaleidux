@@ -49,3 +49,4 @@ libc = "0.2"
 sysinfo = { version = "0.37.2", features = ["component"] }
 parking_lot = "0.12"
 futures = "0.3"
+notify = { workspace = true }

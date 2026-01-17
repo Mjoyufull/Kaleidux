@@ -6,7 +6,7 @@ use crate::orchestration::{Config, OutputConfig, MonitorBehavior};
 use crate::queue::SmartQueue;
 use crate::cache::FileCache;
 use crate::metrics::PerformanceMetrics;
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, warn};
 use anyhow::Result;
 use kaleidux_common::{KEntry, PlaylistCommand, BlacklistCommand, Response};
 use crate::queue::Playlist;
@@ -24,10 +24,12 @@ pub struct OutputOrchestrator {
 }
 
 impl OutputOrchestrator {
-    pub fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>, metrics: Option<Arc<PerformanceMetrics>>) -> Self {
+    pub async fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>, metrics: Option<Arc<PerformanceMetrics>>) -> Self {
         let queue = if let Some(path) = &config.path {
-            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache, metrics.clone()) {
+            info!("[QUEUE] {}: Initializing queue for path: {:?}", name, path);
+            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache, metrics.clone()).await {
                 Ok(mut q) => {
+                    info!("[QUEUE] {}: Queue initialized successfully", name);
                     if let Some(pl_name) = &config.default_playlist {
                         if let Err(e) = q.set_playlist(Some(pl_name.clone())) {
                             error!("Failed to set default playlist '{}' for {}: {}", pl_name, name, e);
@@ -36,11 +38,12 @@ impl OutputOrchestrator {
                     Some(q)
                 },
                 Err(e) => {
-                    error!("Failed to initialize queue for {}: {}", name, e);
+                    error!("[QUEUE] {}: Failed to initialize queue: {}", name, e);
                     None
                 }
             }
         } else {
+            warn!("[QUEUE] {}: No path configured, queue will be None", name);
             None
         };
 
@@ -60,34 +63,90 @@ impl OutputOrchestrator {
     pub fn tick(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
         let now = Instant::now();
         
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:entry","message":"OutputOrchestrator::tick() called","data":{{"name":"{}","current_path":{:?},"display_start_time":{:?},"next_change":{:?},"queue_is_some":{}}},"timestamp":{}}}"#, 
+                self._name, self.current_path, self.display_start_time, self.next_change, self.queue.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        });
+        // #endregion
+        
         // If content is displaying, check if duration has elapsed based on actual display start time
         if let Some(display_start) = self.display_start_time {
             let elapsed = now.saturating_duration_since(display_start);
             if elapsed >= self.config.duration {
                 debug!("Duration expired for {}: {} elapsed (target: {:?})", 
                     self._name, format!("{:.2}s", elapsed.as_secs_f64()), self.config.duration);
-                return self.pick_next();
+                let result = self.pick_next();
+                // #region agent log
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:duration_expired","message":"Duration expired, pick_next result","data":{{"name":"{}","result":{:?}}},"timestamp":{}}}"#, 
+                        self._name, result.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                });
+                // #endregion
+                return result;
             }
         } else if let Some(next) = self.next_change {
             // Fallback: if display_start_time not set yet, use scheduled time
             // This handles the case where content hasn't loaded yet
             if now >= next {
                 debug!("Timer expired for {}: Switching now (next was {:?})", self._name, next);
-                return self.pick_next();
+                let result = self.pick_next();
+                // #region agent log
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:timer_expired","message":"Timer expired, pick_next result","data":{{"name":"{}","result":{:?}}},"timestamp":{}}}"#, 
+                        self._name, result.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                });
+                // #endregion
+                return result;
             }
         } else if self.current_path.is_none() {
             if self.queue.is_none() {
+                warn!("[TICK] {}: Queue is None, cannot pick content", self._name);
+                // #region agent log
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:queue_none","message":"Queue is None, returning None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
+                        self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                });
+                // #endregion
                 return None;
             }
-            debug!("Initial tick for {}: Picking first content", self._name);
-            return self.pick_next();
+            info!("[TICK] {}: Initial tick - picking first content (queue exists)", self._name);
+            let result = self.pick_next();
+            // #region agent log
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:initial_pick","message":"Initial pick_next result","data":{{"name":"{}","result":{:?},"path":{:?}}},"timestamp":{}}}"#, 
+                    self._name, result.is_some(), result.as_ref().map(|(p,_)| p), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+            });
+            // #endregion
+            return result;
         }
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"monitor.rs:tick:no_action","message":"No action taken, returning None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
+                self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        });
+        // #endregion
         None
     }
 
     pub fn pick_next(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:entry","message":"pick_next() called","data":{{"name":"{}","queue_is_some":{}}},"timestamp":{}}}"#, 
+                self._name, self.queue.is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        });
+        // #endregion
         if let Some(queue) = &mut self.queue {
+            info!("[PICK] {}: Calling queue.pick_next()", self._name);
             if let Some(path) = queue.pick_next() {
+                info!("[PICK] {}: Selected path: {:?}", self._name, path);
                 let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap(); // Already validated in discovery
                 self.current_path = Some(path.clone());
                 // Reset display start time - will be set when content actually starts displaying
@@ -95,8 +154,30 @@ impl OutputOrchestrator {
                 // Set next_change as fallback (in case content never loads)
                 self.next_change = Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
                 debug!("Scheduled next change for {} in {:?} (path: {})", self._name, self.config.duration, path.display());
+                // #region agent log
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:success","message":"pick_next() succeeded","data":{{"name":"{}","path":"{}","content_type":"{:?}"}},"timestamp":{}}}"#, 
+                        self._name, path.display(), content_type, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                });
+                // #endregion
                 return Some((path, content_type));
             }
+            // #region agent log
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:queue_empty","message":"queue.pick_next() returned None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
+                    self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+            });
+            // #endregion
+        } else {
+            // #region agent log
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"monitor.rs:pick_next:no_queue","message":"Queue is None","data":{{"name":"{}"}},"timestamp":{}}}"#, 
+                    self._name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+            });
+            // #endregion
         }
         None
     }
@@ -177,6 +258,10 @@ impl MonitorManager {
         Self::new_with_metrics(config, None)
     }
     
+    pub fn get_cache(&self) -> Arc<FileCache> {
+        self.cache.clone()
+    }
+    
     pub fn new_with_metrics(config: Config, metrics: Option<Arc<PerformanceMetrics>>) -> Result<Self> {
         // Create shared cache instance once for all queues
         let cache = Arc::new(FileCache::new()?);
@@ -207,18 +292,21 @@ impl MonitorManager {
         }
     }
 
-    pub fn add_output(&mut self, name: &str, description: &str) {
+    pub async fn add_output(&mut self, name: &str, description: &str) {
         let output_config = self.config.get_config_for_output(name, description);
+        info!("[ADD_OUTPUT] {}: path={:?}, behavior={:?}", name, output_config.path, self.config.global.monitor_behavior);
         
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
-                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
+                info!("[ADD_OUTPUT] {}: Creating independent queue", name);
+                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
+                info!("[ADD_OUTPUT] {}: Queue created: {}", name, orch.queue.is_some());
                 self.outputs.insert(name.to_string(), orch);
             }
             MonitorBehavior::Synchronized => {
                 if self.shared_queue.is_none() {
                     if let Some(path) = &output_config.path {
-                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()) {
+                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()).await {
                             if let Some(pl_name) = &output_config.default_playlist {
                                 let _ = q.set_playlist(Some(pl_name.clone()));
                             }
@@ -226,7 +314,7 @@ impl MonitorManager {
                         }
                     }
                 }
-                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
+                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
                 orch.queue = None; // Will use shared queue
                 self.outputs.insert(name.to_string(), orch);
             }
@@ -246,7 +334,7 @@ impl MonitorManager {
                     // Initialize group queue if needed
                     if !self.group_queues.contains_key(&gid) {
                         if let Some(path) = &output_config.path {
-                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()) {
+                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()).await {
                                 if let Some(pl_name) = &output_config.default_playlist {
                                     let _ = q.set_playlist(Some(pl_name.clone()));
                                 }
@@ -255,13 +343,13 @@ impl MonitorManager {
                         }
                     }
                     
-                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
+                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
                     orch.queue = None; // Will use group queue
                     self.outputs.insert(name.to_string(), orch);
                 } else {
                     // Output not in any group, treat as independent
                     info!("Output {} not in any group, treating as independent", name);
-                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
+                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
                     self.outputs.insert(name.to_string(), orch);
                 }
             }
@@ -272,10 +360,25 @@ impl MonitorManager {
         let mut changes = HashMap::new();
         let now = Instant::now();
 
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:entry","message":"MonitorManager::tick() called","data":{{"output_count":{},"behavior":"{:?}"}},"timestamp":{}}}"#, 
+                self.outputs.len(), self.config.global.monitor_behavior, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        });
+        // #endregion
+
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for (name, orch) in &mut self.outputs {
                     if let Some(res) = orch.tick() {
+                        // #region agent log
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:change_collected","message":"Change collected from output","data":{{"name":"{}","path":"{}"}},"timestamp":{}}}"#, 
+                                name, res.0.display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+                        });
+                        // #endregion
                         changes.insert(name.clone(), res);
                     }
                 }
@@ -386,6 +489,14 @@ impl MonitorManager {
                 }
             }
         }
+
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/home/chris/projects/code/Kaleidux/.cursor/debug.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"monitor_manager.rs:tick:return","message":"MonitorManager::tick() returning changes","data":{{"change_count":{}}},"timestamp":{}}}"#, 
+                changes.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
+        });
+        // #endregion
 
         changes
     }
@@ -801,6 +912,22 @@ impl MonitorManager {
         for orch in self.outputs.values_mut() {
             if let Some(q) = &mut orch.queue { let _ = f(q); }
         }
+    }
+    
+    /// Flush pending stats updates from all queues (batched write)
+    pub fn flush_all_stats(&mut self) -> Result<()> {
+        if let Some(q) = &mut self.shared_queue { 
+            let _ = q.flush_stats(); 
+        }
+        for q in self.group_queues.values_mut() { 
+            let _ = q.flush_stats(); 
+        }
+        for orch in self.outputs.values_mut() {
+            if let Some(q) = &mut orch.queue { 
+                let _ = q.flush_stats(); 
+            }
+        }
+        Ok(())
     }
 
     fn get_any_queue(&self) -> Option<&SmartQueue> {

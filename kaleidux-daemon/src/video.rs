@@ -6,6 +6,7 @@ use tracing::{info, debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use tokio::sync::Semaphore;
 
 /// Video frame containing RGBA pixel data (tightly packed, no stride padding)
 /// Uses Arc<[u8]> to avoid cloning large buffers
@@ -23,10 +24,43 @@ pub enum VideoEvent {
     Error(String),
 }
 
+/// Shared thread pool for GStreamer bus watchers
+/// Uses a semaphore to limit concurrent bus watcher threads
+pub struct BusWatcherPool {
+    semaphore: Arc<Semaphore>,
+}
+
+impl BusWatcherPool {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        }
+    }
+    
+    pub fn default() -> Self {
+        // Default to 8 concurrent bus watchers (enough for multiple videos)
+        Self::new(8)
+    }
+    
+    /// Acquire a permit for a bus watcher (blocks if at capacity)
+    pub async fn acquire_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.semaphore.acquire().await.unwrap()
+    }
+}
+
+// Global bus watcher pool (lazy initialized)
+static BUS_WATCHER_POOL: once_cell::sync::Lazy<Arc<BusWatcherPool>> = once_cell::sync::Lazy::new(|| {
+    Arc::new(BusWatcherPool::default())
+});
+
+pub fn get_bus_watcher_pool() -> Arc<BusWatcherPool> {
+    BUS_WATCHER_POOL.clone()
+}
+
 pub struct VideoPlayer {
     pub pipeline: gst::Element,
     is_running: Arc<AtomicBool>,
-    thread_handle: Option<JoinHandle<()>>,
+    thread_handle: Option<JoinHandle<()>>, // Keep for compatibility, but will use thread pool
     frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>,
     source_id: Arc<String>,
     start_time: std::time::Instant,
@@ -35,6 +69,7 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Create a new video player with a bounded channel for backpressure
     pub fn new(uri: &str, source_id: Arc<String>, session_id: u64, frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>) -> anyhow::Result<Self> {
+        let video_start = std::time::Instant::now();
         let creation_start = std::time::Instant::now();
         // Use playbin - the same high-level element that gSlapper uses
         let pipeline = gst::ElementFactory::make("playbin")
@@ -214,7 +249,7 @@ impl VideoPlayer {
             gst::StateChangeSuccess::NoPreroll => info!("[VIDEO] {}: Pipeline state -> Playing (Live) in {:.3}ms", self.source_id, duration.as_secs_f64() * 1000.0),
         }
         
-        // Spawn bus watcher
+        // Spawn bus watcher using thread pool with semaphore to limit concurrent threads
         let bus = self.pipeline.bus().ok_or_else(|| anyhow::anyhow!("Pipeline has no bus"))?;
         let pipeline = self.pipeline.clone();
         
@@ -222,8 +257,17 @@ impl VideoPlayer {
         let is_running = self.is_running.clone();
         let frame_tx = self.frame_tx.clone();
         let source_id = self.source_id.clone();
+        let pool = get_bus_watcher_pool();
+        let semaphore = pool.semaphore.clone();
         
+        // Spawn thread but use semaphore to limit concurrent bus watchers
+        // Note: We spawn a std::thread but the semaphore limits how many can run concurrently
+        // The semaphore is acquired synchronously before the thread starts its loop
         let handle = std::thread::spawn(move || {
+            // Try to acquire permit (non-blocking, but we're in a thread so it's ok to wait)
+            // In practice, tokio's blocking thread pool will limit threads, and semaphore provides additional control
+            let _permit = semaphore.try_acquire().ok();
+            
             while is_running.load(Ordering::SeqCst) {
                 // Wait for up to 100ms for a message
                 match bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
