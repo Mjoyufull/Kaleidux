@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::orchestration::{Config, OutputConfig, MonitorBehavior};
 use crate::queue::SmartQueue;
 use crate::cache::FileCache;
+use crate::metrics::PerformanceMetrics;
 use tracing::{info, error, debug};
 use anyhow::Result;
 use kaleidux_common::{KEntry, PlaylistCommand, BlacklistCommand, Response};
@@ -16,14 +17,16 @@ pub struct OutputOrchestrator {
     pub config: OutputConfig,
     pub queue: Option<SmartQueue>,
     pub current_path: Option<PathBuf>,
+    pub next_path: Option<PathBuf>, // Pre-buffered next content path
+    pub next_content_type: Option<crate::queue::ContentType>, // Type of next content
     pub next_change: Option<Instant>,
     pub display_start_time: Option<Instant>, // When content actually started displaying
 }
 
 impl OutputOrchestrator {
-    pub fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>) -> Self {
+    pub fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>, metrics: Option<Arc<PerformanceMetrics>>) -> Self {
         let queue = if let Some(path) = &config.path {
-            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache) {
+            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache, metrics.clone()) {
                 Ok(mut q) => {
                     if let Some(pl_name) = &config.default_playlist {
                         if let Err(e) = q.set_playlist(Some(pl_name.clone())) {
@@ -47,6 +50,8 @@ impl OutputOrchestrator {
             config,
             queue,
             current_path: None,
+            next_path: None,
+            next_content_type: None,
             next_change: None,
             display_start_time: None,
         }
@@ -96,6 +101,41 @@ impl OutputOrchestrator {
         None
     }
     
+    /// Get the next content path without consuming it (for pre-buffering)
+    pub fn peek_next(&self) -> Option<(PathBuf, crate::queue::ContentType)> {
+        if let Some(queue) = &self.queue {
+            // For sequential strategies, we can peek at the next index
+            match queue.strategy {
+                crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
+                    let next_idx = match queue.strategy {
+                        crate::orchestration::SortingStrategy::Ascending => {
+                            (queue.current_index + 1) % queue.pool.len()
+                        }
+                        crate::orchestration::SortingStrategy::Descending => {
+                            if queue.current_index == 0 {
+                                queue.pool.len().saturating_sub(1)
+                            } else {
+                                queue.current_index - 1
+                            }
+                        }
+                        _ => return None,
+                    };
+                    
+                    if next_idx < queue.pool.len() {
+                        let path = queue.pool[next_idx].clone();
+                        if let Some(content_type) = crate::queue::SmartQueue::get_content_type(&path) {
+                            return Some((path, content_type));
+                        }
+                    }
+                }
+                _ => {
+                    // For Random/Loveit, can't predict next
+                }
+            }
+        }
+        None
+    }
+    
     /// Mark that transition has completed and content is now displaying (called when transition progress >= 1.0)
     pub fn mark_transition_completed(&mut self) {
         if self.display_start_time.is_none() && self.current_path.is_some() {
@@ -129,10 +169,15 @@ pub struct MonitorManager {
     shared_display_start_time: Option<Instant>, // For synchronized outputs - shared display start time
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
     cache: Arc<FileCache>, // Shared cache instance for all queues
+    metrics: Option<Arc<PerformanceMetrics>>, // Shared metrics instance
 }
 
 impl MonitorManager {
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_with_metrics(config, None)
+    }
+    
+    pub fn new_with_metrics(config: Config, metrics: Option<Arc<PerformanceMetrics>>) -> Result<Self> {
         // Create shared cache instance once for all queues
         let cache = Arc::new(FileCache::new()?);
         
@@ -145,6 +190,7 @@ impl MonitorManager {
             shared_display_start_time: None,
             group_display_start_times: HashMap::new(),
             cache,
+            metrics,
         })
     }
 
@@ -166,13 +212,13 @@ impl MonitorManager {
         
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
-                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
+                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
                 self.outputs.insert(name.to_string(), orch);
             }
             MonitorBehavior::Synchronized => {
                 if self.shared_queue.is_none() {
                     if let Some(path) = &output_config.path {
-                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone()) {
+                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()) {
                             if let Some(pl_name) = &output_config.default_playlist {
                                 let _ = q.set_playlist(Some(pl_name.clone()));
                             }
@@ -180,7 +226,7 @@ impl MonitorManager {
                         }
                     }
                 }
-                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
+                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
                 orch.queue = None; // Will use shared queue
                 self.outputs.insert(name.to_string(), orch);
             }
@@ -200,7 +246,7 @@ impl MonitorManager {
                     // Initialize group queue if needed
                     if !self.group_queues.contains_key(&gid) {
                         if let Some(path) = &output_config.path {
-                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone()) {
+                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()) {
                                 if let Some(pl_name) = &output_config.default_playlist {
                                     let _ = q.set_playlist(Some(pl_name.clone()));
                                 }
@@ -209,13 +255,13 @@ impl MonitorManager {
                         }
                     }
                     
-                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
+                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
                     orch.queue = None; // Will use group queue
                     self.outputs.insert(name.to_string(), orch);
                 } else {
                     // Output not in any group, treat as independent
                     info!("Output {} not in any group, treating as independent", name);
-                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
+                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone());
                     self.outputs.insert(name.to_string(), orch);
                 }
             }

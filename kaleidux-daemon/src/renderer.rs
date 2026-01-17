@@ -302,7 +302,7 @@ impl WgpuContext {
     }
     
     /// Get a texture from the pool or create a new one
-    pub fn get_texture_from_pool(&self, width: u32, height: u32, usage: wgpu::TextureUsages) -> wgpu::Texture {
+    pub fn get_texture_from_pool(&self, width: u32, height: u32, usage: wgpu::TextureUsages, metrics: Option<&crate::metrics::PerformanceMetrics>) -> wgpu::Texture {
         let mut pool = self.texture_pool.lock();
         let key = (width, height);
         
@@ -313,11 +313,17 @@ impl WgpuContext {
             entries.retain(|e| now.duration_since(e.last_used).as_secs() < 5);
             
             if let Some(entry) = entries.pop() {
+                if let Some(m) = metrics {
+                    m.record_texture_pool_hit();
+                }
                 return entry.texture;
             }
         }
         
         // No texture in pool, create new one
+        if let Some(m) = metrics {
+            m.record_texture_pool_miss();
+        }
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Pooled Texture"),
             size: wgpu::Extent3d {
@@ -412,10 +418,14 @@ pub struct Renderer {
     pub active_video_session_id: u64,
     pub active_batch_id: Option<u64>,
     pub batch_start_time: Option<std::time::Instant>, // Anchor for shared batch transitions
+    
+    // Metrics tracking
+    metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
+    video_first_frame_time: Option<std::time::Instant>, // Track when video session starts
 }
 
 impl Renderer {
-    pub async fn new<W>(name: String, ctx: Arc<WgpuContext>, window: Arc<W>, first_surface: Option<Surface<'static>>) -> anyhow::Result<Self> 
+    pub async fn new<W>(name: String, ctx: Arc<WgpuContext>, window: Arc<W>, first_surface: Option<Surface<'static>>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> anyhow::Result<Self> 
     where 
         W: HasWindowHandle + HasDisplayHandle + Sync + Send + 'static
     {
@@ -507,6 +517,8 @@ impl Renderer {
             active_video_session_id: 0,
             active_batch_id: None,
             batch_start_time: None,
+            metrics,
+            video_first_frame_time: None,
         };
         r.precompile_common_shaders();
         Ok(r)
@@ -840,10 +852,15 @@ impl Renderer {
                         self.transition_active = false;
                         self.transition_just_completed = true;
                         
-                        // Log Audit Report
+                        // Log Audit Report and record metrics
                         if let Some(stats) = self.transition_stats.take() {
                             let duration = stats.start_time.elapsed();
                             let duration_secs = duration.as_secs_f64();
+                            
+                            // Record transition duration in metrics
+                            if let Some(m) = &self.metrics {
+                                m.record_transition(duration);
+                            }
                             let fps = if duration_secs > 0.001 { stats.frame_count as f64 / duration_secs } else { 0.0 };
                             let drift = duration.as_secs_f32() - stats.target_duration;
                             let batch_info = stats.batch_id.map(|b| format!(" (Batch: {:x})", b)).unwrap_or_default();
@@ -1426,6 +1443,11 @@ impl Renderer {
         // reset the transition start time so the transition starts fresh now that we have both textures
         // First frame after a switch is any frame that arrives when current_texture is None
         let is_first_frame_after_switch = self.current_texture.is_none();
+        
+        // Track first frame timing for metrics (only on first frame of new video session)
+        if is_first_frame_after_switch && self.video_first_frame_time.is_none() {
+            self.video_first_frame_time = Some(std::time::Instant::now());
+        }
 
         // REUSE texture if size matches (check before creating new texture)
         let needs_new_texture = self.current_texture_size != Some((frame.width, frame.height));
@@ -1445,7 +1467,8 @@ impl Renderer {
                 self.ctx.get_texture_from_pool(
                     frame.width,
                     frame.height,
-                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    self.metrics.as_deref()
                 )
             }
         } else {
@@ -1453,7 +1476,8 @@ impl Renderer {
             self.ctx.get_texture_from_pool(
                 frame.width,
                 frame.height,
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                self.metrics.as_deref()
             )
         };
 
@@ -1502,6 +1526,15 @@ impl Renderer {
         // but DON'T set transition_start_time - let render() do that on first actual render frame
         // This ensures consistent timing behavior with image transitions
         if is_first_frame_after_switch {
+            // Record video first frame timing
+            if let Some(m) = &self.metrics {
+                if let Some(start_time) = self.video_first_frame_time {
+                    let first_frame_duration = start_time.elapsed();
+                    m.record_video_first_frame(first_frame_duration);
+                    self.video_first_frame_time = None; // Reset for next video session
+                }
+            }
+            
             if self.prev_texture.is_some() {
                 info!("[TRANSITION] {}: First video frame after switch - transition will start on first render frame", self.name);
                 self.transition_start_time = None; // Will be set on first render
@@ -1548,6 +1581,7 @@ impl Renderer {
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None;      // Invalidate
         self.batch_start_time = None;      // Reset
+        self.video_first_frame_time = None; // Reset video timing for new session
         self.needs_redraw = true;
         
         // OPTIMIZATION: Don't reset current_texture_size immediately.

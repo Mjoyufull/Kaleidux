@@ -25,6 +25,7 @@ mod shaders;
 mod scripting;
 mod monitor;
 mod cache;
+mod metrics;
 
 use std::time::Instant;
 use std::path::{Path, PathBuf};
@@ -294,17 +295,24 @@ async fn main() -> anyhow::Result<()> {
     
     if use_x11 {
         info!("Starting X11 Backend...");
-        run_x11_loop(config).await
+        run_x11_loop(config, log_level).await
     } else {
         info!("Starting Wayland Backend...");
-        run_wayland_loop(config).await
+        run_wayland_loop(config, log_level).await
     }
 }
 
-async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
+async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>) -> anyhow::Result<()> {
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
-    let mut monitor_manager = monitor_manager::MonitorManager::new(config)?;
+    let metrics = Arc::new(metrics::PerformanceMetrics::new());
+    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config, Some(metrics.clone()))?;
+    let mut last_metrics_log = Instant::now();
+    
+    // Log metrics immediately for DEBUG (3) and TRACE (4) levels
+    if log_level.map(|l| l >= 3).unwrap_or(false) {
+        metrics.log_summary();
+    }
 
     // Initialize Wayland
     let conn = Connection::connect_to_env()?;
@@ -372,8 +380,9 @@ async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
             let is_first = Some(&name) == first_name.as_ref();
             let init_surf = if is_first { initial_surface.take() } else { None };
             
+            let metrics_clone = metrics.clone();
             renderer_futures.push(async move {
-                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf).await)
+                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf, Some(metrics_clone)).await)
             });
         }
         
@@ -674,12 +683,22 @@ async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
             }
         }
         
+        // Record frame time
+        let frame_time = loop_start.elapsed();
+        metrics.record_frame_time(frame_time);
+        
         // Cleanup texture pool periodically (every 5 seconds)
         if last_pool_cleanup.elapsed().as_secs() >= 5 {
             if let Some(ctx) = &wgpu_ctx {
                 ctx.cleanup_texture_pool();
             }
             last_pool_cleanup = Instant::now();
+        }
+        
+        // Log metrics summary every 30 seconds (or 10 seconds for testing)
+        if last_metrics_log.elapsed().as_secs() >= 10 {
+            metrics.log_summary();
+            last_metrics_log = Instant::now();
         }
         
         // Timing
@@ -693,11 +712,18 @@ async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_x11_loop(config: orchestration::Config) -> anyhow::Result<()> {
+async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>) -> anyhow::Result<()> {
     // Similar to run_wayland_loop but with X11 backend
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
-    let mut monitor_manager = monitor_manager::MonitorManager::new(config)?;
+    let metrics = Arc::new(metrics::PerformanceMetrics::new());
+    let mut monitor_manager = monitor_manager::MonitorManager::new_with_metrics(config, Some(metrics.clone()))?;
+    let mut last_metrics_log = Instant::now();
+    
+    // Log metrics immediately for DEBUG (3) and TRACE (4) levels
+    if log_level.map(|l| l >= 3).unwrap_or(false) {
+        metrics.log_summary();
+    }
 
     let mut backend = x11::X11Backend::new()?;
     // Query RandR for monitors
@@ -746,8 +772,9 @@ async fn run_x11_loop(config: orchestration::Config) -> anyhow::Result<()> {
                 }
             };
             
+            let metrics_clone = metrics.clone();
             renderer_futures.push(async move {
-                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf).await, width, height)
+                (name.clone(), renderer::Renderer::new(name, ctx_clone, surface_arc, init_surf, Some(metrics_clone)).await, width, height)
             });
         }
         
@@ -820,6 +847,7 @@ async fn run_x11_loop(config: orchestration::Config) -> anyhow::Result<()> {
     if let Some(path) = &script_path { let _ = script_manager.load(path); }
     let mut last_script_tick = Instant::now();
     let target_frame_time = std::time::Duration::from_micros(16667);
+    let mut last_pool_cleanup_x11 = Instant::now();
     
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown_flag.clone();
@@ -960,6 +988,24 @@ async fn run_x11_loop(config: orchestration::Config) -> anyhow::Result<()> {
         let needs_flush = renderers.values().any(|r| r.needs_redraw || r.transition_active);
         if needs_flush {
             let _ = backend.conn.flush();
+        }
+
+        // Record frame time
+        let frame_time = loop_start.elapsed();
+        metrics.record_frame_time(frame_time);
+        
+        // Cleanup texture pool periodically (every 5 seconds)
+        if last_pool_cleanup_x11.elapsed().as_secs() >= 5 {
+            if let Some(ctx) = &wgpu_ctx {
+                ctx.cleanup_texture_pool();
+            }
+            last_pool_cleanup_x11 = Instant::now();
+        }
+        
+        // Log metrics summary every 10 seconds
+        if last_metrics_log.elapsed().as_secs() >= 10 {
+            metrics.log_summary();
+            last_metrics_log = Instant::now();
         }
 
         let elapsed = loop_start.elapsed();

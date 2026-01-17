@@ -66,20 +66,21 @@ pub enum ContentType {
 impl SmartQueue {
     pub fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
         let cache = Arc::new(FileCache::new()?);
-        Self::new_with_cache(path, video_ratio, strategy, cache)
+        Self::new_with_cache(path, video_ratio, strategy, cache, None)
     }
     
-    pub fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>) -> Result<Self> {
+    pub fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
         let stats = Self::load_stats_from_cache(&cache)?;
         
         // Run file discovery in blocking task to avoid blocking main thread
         let path_buf = path.to_path_buf();
         let blacklist_clone = stats.blacklist.clone();
         let cache_clone = cache.clone();
+        let metrics_clone = metrics.clone();
         
         // Use tokio::task::spawn_blocking for CPU-intensive work
         let pool = tokio::task::block_in_place(|| {
-            Self::discover_content(&path_buf, &blacklist_clone, cache_clone)
+            Self::discover_content(&path_buf, &blacklist_clone, cache_clone, metrics_clone)
         })?;
         
         let mut pool = pool;
@@ -116,7 +117,7 @@ impl SmartQueue {
         let cache_clone = cache.clone();
         
         let pool = tokio::task::spawn_blocking(move || {
-            Self::discover_content(&path_buf, &blacklist_clone, cache_clone)
+            Self::discover_content(&path_buf, &blacklist_clone, cache_clone, None)
         }).await??;
         
         let mut pool = pool;
@@ -172,9 +173,9 @@ impl SmartQueue {
     fn discover_content(
         path: &Path, 
         blacklist: &std::collections::HashSet<PathBuf>,
-        cache: Arc<FileCache>
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>
     ) -> Result<Vec<PathBuf>> {
-        use std::time::{SystemTime, UNIX_EPOCH};
         let mut files = Vec::new();
         let mut cache_updates = Vec::new();
 
@@ -199,21 +200,34 @@ impl SmartQueue {
                 // Check if file is still valid (mtime matches)
                 if let Ok(valid) = cache.is_file_valid(&p) {
                     if valid {
-                        // Use cached content type
+                        // Cache hit - use cached content type
+                        if let Some(m) = &metrics {
+                            m.record_cache_hit();
+                        }
                         match metadata.content_type {
                             0 => Some(ContentType::Image),
                             1 => Some(ContentType::Video),
                             _ => None,
                         }
                     } else {
-                        // File changed, re-check
+                        // File changed, re-check (cache miss due to invalidation)
+                        if let Some(m) = &metrics {
+                            m.record_cache_miss();
+                        }
                         Self::get_content_type(&p)
                     }
                 } else {
+                    // Error checking validity, re-check
+                    if let Some(m) = &metrics {
+                        m.record_cache_miss();
+                    }
                     Self::get_content_type(&p)
                 }
             } else {
-                // Not in cache, check and cache it
+                // Not in cache, check and cache it (cache miss)
+                if let Some(m) = &metrics {
+                    m.record_cache_miss();
+                }
                 Self::get_content_type(&p)
             };
 
@@ -486,8 +500,8 @@ impl SmartQueue {
                 anyhow::bail!("Playlist '{}' not found", n);
             }
         } else {
-            // Reset to full discovery
-            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist, self.cache.clone())?;
+            // Reset to full discovery (no metrics available in this context)
+            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist, self.cache.clone(), None)?;
         }
         
         self.active_playlist = name;

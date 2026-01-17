@@ -190,10 +190,22 @@ impl VideoPlayer {
         })
     }
 
+    /// Pre-buffer video by setting pipeline to READY state (buffers but doesn't play)
+    pub fn prebuffer(&mut self) -> anyhow::Result<()> {
+        debug!("[VIDEO] {}: Pre-buffering video pipeline", self.source_id);
+        let ret = self.pipeline.set_state(gst::State::Ready)?;
+        match ret {
+            gst::StateChangeSuccess::Success => debug!("[VIDEO] {}: Pipeline state -> Ready (pre-buffered)", self.source_id),
+            gst::StateChangeSuccess::Async => debug!("[VIDEO] {}: Pipeline state -> Ready (Async, pre-buffering)", self.source_id),
+            _ => {}
+        }
+        Ok(())
+    }
+    
     pub fn start(&mut self) -> anyhow::Result<()> {
         info!("[VIDEO] {}: Starting playback for {}", self.source_id, self.pipeline.name());
         
-        // Start pipeline
+        // Start pipeline (or transition from Ready to Playing if pre-buffered)
         let ret = self.pipeline.set_state(gst::State::Playing)?;
         let duration = self.start_time.elapsed();
         match ret {
