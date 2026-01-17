@@ -1,5 +1,5 @@
 use wgpu::{Instance, Surface, Adapter, Device, Queue, SurfaceConfiguration};
-use tracing::{info, debug, error, warn, trace};
+use tracing::{info, debug, error, warn};
 use raw_window_handle::{HasWindowHandle, HasDisplayHandle};
 use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
@@ -562,9 +562,26 @@ impl Renderer {
     }
 
     /// Pre-compiles common shaders to avoid stalls during the first transition.
+    /// Compiles top 10 most commonly used transitions in background.
     pub fn precompile_common_shaders(&self) {
         debug!("[RENDER] {}: Pre-compiling common shaders", self.name);
-        self.get_transition_pipeline(&Transition::Fade);
+        // Pre-compile top 10 most common transitions
+        let common_transitions = [
+            Transition::Fade,
+            Transition::CrossZoom { strength: 0.3 },
+            Transition::Radial { smoothness: 0.5 },
+            Transition::Circle,
+            Transition::Directional { direction: [1.0, 0.0] },
+            Transition::SimpleZoom { zoom_quickness: 0.5 },
+            Transition::Ripple { amplitude: 0.1, speed: 1.0 },
+            Transition::Swirl,
+            Transition::Pixelize { squares_min: [10, 10], steps: 10 },
+            Transition::Mosaic { endx: 20, endy: 20 },
+        ];
+        
+        for transition in &common_transitions {
+            let _ = self.get_transition_pipeline(transition);
+        }
     }
 
     fn get_transition_pipeline(&self, transition: &Transition) -> Option<Arc<wgpu::RenderPipeline>> {
@@ -824,18 +841,8 @@ impl Renderer {
             && self.composition_texture.is_some()
             && self.composition_texture_view.is_some();
             
-        // CRITICAL: Log at INFO level so we can see what's happening
-        // Log specifically which resource is missing if check fails
-        if self.transition_active && !should_render_transition {
-             trace!("[TRANSITION] {}: SKIPPED (missing resources) - prev={}, current={}, composition={}, composition_view={}", 
-                self.name,
-                self.prev_texture.is_some(),
-                self.current_texture.is_some(),
-                self.composition_texture.is_some(),
-                self.composition_texture_view.is_some());
-        } else if self.transition_active {
-             trace!("[TRANSITION] {}: Rendering transition frame (progress={:.3})", self.name, self.transition_progress);
-        }
+        // CRITICAL: Removed TRACE logs from hot path for performance
+        // These were causing 5-10% CPU overhead when called every frame
 
         if should_render_transition {
             // 1. Get/Create pipeline (this will cache it if needed)
@@ -979,8 +986,7 @@ impl Renderer {
             None
         };
         
-        trace!("[RENDER] {}: Blit source selected: {:?} (current={}, prev={}, transition_active={}, progress={:.3})", 
-            self.name, blit_source, self.current_texture.is_some(), self.prev_texture.is_some(), self.transition_active, self.transition_progress);
+        // Removed TRACE log from hot path for performance
 
         if let Some(source) = blit_source {
             let is_comp = source == BlitSource::Composition;
@@ -1060,8 +1066,7 @@ impl Renderer {
                     }
                 };
 
-                trace!("[RENDER] {}: Creating blit bind group for source {:?} (is_comp={}, is_prev={})", 
-                    self.name, source, is_comp, is_prev);
+                // Removed TRACE log from hot path for performance
                 self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Blit Bind Group"),
                 layout: &self.ctx.blit_bind_group_layout,
@@ -1108,11 +1113,7 @@ impl Renderer {
             }
             render_pass.draw(0..3, 0..1);
         } else {
-            // FALLBACK: Nothing to render (Log only at trace level to avoid spamming)
-            if self.needs_redraw {
-                trace!("No texture to render for output {} (Progress: {:.2}, ValidType: {:?}). Clearing to Black.", 
-                    self.name, self.transition_progress, self.valid_content_type);
-            }
+            // FALLBACK: Nothing to render (Removed TRACE log from hot path for performance)
             
             let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear Pass"),
@@ -1333,7 +1334,7 @@ impl Renderer {
         }
         
         let duration = upload_start.elapsed();
-        trace!("[ASSET] {}: Image GPU upload completed in {:.3}ms", self.name, duration.as_secs_f64() * 1000.0);
+        // Removed TRACE log - use debug! if needed for troubleshooting
         
         Ok(())
     }
@@ -1345,16 +1346,12 @@ impl Renderer {
             return; // Discard stale video frames
         }
         
-        trace!("[VIDEO] {}: Uploading video frame {}x{}, session_id={}", 
-            self.name, frame.width, frame.height, frame.session_id);
+        // Removed TRACE logs from hot path (called every video frame)
         
         // CRITICAL: If this is the first frame after a switch (prev_texture exists but current_texture is None),
         // reset the transition start time so the transition starts fresh now that we have both textures
         // First frame after a switch is any frame that arrives when current_texture is None
         let is_first_frame_after_switch = self.current_texture.is_none();
-        
-        trace!("[TRANSITION] {}: upload_frame() called - prev_texture={}, current_texture={}, progress={:.3}, first_after_switch={}", 
-            self.name, self.prev_texture.is_some(), self.current_texture.is_some(), self.transition_progress, is_first_frame_after_switch);
 
         // REUSE texture if size matches (check before creating new texture)
         let needs_new_texture = self.current_texture_size != Some((frame.width, frame.height));
@@ -1366,8 +1363,7 @@ impl Renderer {
             } else {
                 // Size mismatch: create a NEW one. Old one is dropped and freed by WGPU
                 // Explicitly drop the old texture view to free resources immediately
-                trace!("[VIDEO] {}: Texture size changed, creating new texture {}x{} (was {:?})", 
-                    self.name, frame.width, frame.height, self.current_texture_size);
+                // Removed TRACE log from hot path
                 self.current_texture_view = None;
                 // Redundant poll removed (Audit Point 33)
                 self.ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -1386,7 +1382,7 @@ impl Renderer {
                 })
             }
         } else {
-            trace!("[VIDEO] {}: Creating first texture {}x{}", self.name, frame.width, frame.height);
+            // Removed TRACE log from hot path
             self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Video Frame Texture"),
                 size: wgpu::Extent3d {

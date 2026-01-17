@@ -24,6 +24,7 @@ mod monitor_manager;
 mod shaders;
 mod scripting;
 mod monitor;
+mod cache;
 
 use std::time::Instant;
 use std::path::{Path, PathBuf};

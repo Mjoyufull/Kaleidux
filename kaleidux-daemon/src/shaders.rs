@@ -59,8 +59,11 @@ impl ShaderManager {
         // 1. Convert params_mapping from "type var = val;" to "#define var (val)"
         let mut defines = String::new();
         // Regex matches "type name = value" ignoring trailing semicolon
-        // We use lazy static or just compile it here (it's called rarely)
-        let mapping_regex = regex::Regex::new(r"^\s*\w+\s+(\w+)\s*=\s*(.+)$").expect("Failed to compile regex");
+        // Use lazy static to compile once and reuse
+        static MAPPING_REGEX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"^\s*\w+\s+(\w+)\s*=\s*(.+)$").expect("Failed to compile regex")
+        });
+        let mapping_regex = &*MAPPING_REGEX;
         
         for stmt in params_mapping.split(';') {
             let s = stmt.trim();

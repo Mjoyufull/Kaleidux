@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use walkdir::WalkDir;
+use jwalk::WalkDir;
 use rand::Rng;
 use chrono::{DateTime, Utc};
-use anyhow::{Result, Context};
+use anyhow::Result;
+use std::sync::Arc;
+use crate::cache::FileCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoveitData {
@@ -51,6 +54,7 @@ pub struct SmartQueue {
     pub history: Vec<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
+    pub cache: Arc<FileCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,9 +65,20 @@ pub enum ContentType {
 
 impl SmartQueue {
     pub fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
-        let stats = Self::load_stats()?;
-        let mut pool = Self::discover_content(path, &stats.blacklist)?;
+        let cache = Arc::new(FileCache::new()?);
+        let stats = Self::load_stats_from_cache(&cache)?;
         
+        // Run file discovery in blocking task to avoid blocking main thread
+        let path_buf = path.to_path_buf();
+        let blacklist_clone = stats.blacklist.clone();
+        let cache_clone = cache.clone();
+        
+        // Use tokio::task::spawn_blocking for CPU-intensive work
+        let pool = tokio::task::block_in_place(|| {
+            Self::discover_content(&path_buf, &blacklist_clone, cache_clone)
+        })?;
+        
+        let mut pool = pool;
         // Sort the pool initially for sequential strategies
         pool.sort();
 
@@ -82,6 +97,43 @@ impl SmartQueue {
             history: Vec::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
+            cache,
+        })
+    }
+    
+    /// Async version that can be spawned in background
+    pub async fn new_async(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
+        let cache = Arc::new(FileCache::new()?);
+        let stats = Self::load_stats_from_cache(&cache)?;
+        
+        // Run file discovery in blocking task
+        let path_buf = path.to_path_buf();
+        let blacklist_clone = stats.blacklist.clone();
+        let cache_clone = cache.clone();
+        
+        let pool = tokio::task::spawn_blocking(move || {
+            Self::discover_content(&path_buf, &blacklist_clone, cache_clone)
+        }).await??;
+        
+        let mut pool = pool;
+        pool.sort();
+
+        let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
+            pool.len().saturating_sub(1)
+        } else {
+            0
+        };
+
+        Ok(Self {
+            pool,
+            stats,
+            video_ratio,
+            strategy,
+            current_index,
+            history: Vec::new(),
+            root_path: path.to_path_buf(),
+            active_playlist: None,
+            cache,
         })
     }
 
@@ -113,17 +165,84 @@ impl SmartQueue {
         None
     }
 
-    fn discover_content(path: &Path, blacklist: &std::collections::HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    fn discover_content(
+        path: &Path, 
+        blacklist: &std::collections::HashSet<PathBuf>,
+        cache: Arc<FileCache>
+    ) -> Result<Vec<PathBuf>> {
+        use std::time::{SystemTime, UNIX_EPOCH};
         let mut files = Vec::new();
+        let mut cache_updates = Vec::new();
 
-        for entry in WalkDir::new(path).follow_links(true).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let p = entry.path().to_path_buf();
-                if blacklist.contains(&p) { continue; }
-                if Self::get_content_type(&p).is_some() {
-                    files.push(p);
+        // Use jwalk for parallel directory traversal
+        let walk_dir = WalkDir::new(path)
+            .follow_links(true)
+            .parallelism(jwalk::Parallelism::RayonNewPool(0)); // 0 = auto-detect CPU count
+
+        // Collect entries in parallel
+        let entries: Vec<_> = walk_dir
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+
+        for entry in entries {
+            let p = entry.path().to_path_buf();
+            if blacklist.contains(&p) { continue; }
+            
+            // Check cache first
+            let content_type = if let Ok(Some(metadata)) = cache.get_file_metadata(&p) {
+                // Check if file is still valid (mtime matches)
+                if let Ok(valid) = cache.is_file_valid(&p) {
+                    if valid {
+                        // Use cached content type
+                        match metadata.content_type {
+                            0 => Some(ContentType::Image),
+                            1 => Some(ContentType::Video),
+                            _ => None,
+                        }
+                    } else {
+                        // File changed, re-check
+                        Self::get_content_type(&p)
+                    }
+                } else {
+                    Self::get_content_type(&p)
+                }
+            } else {
+                // Not in cache, check and cache it
+                Self::get_content_type(&p)
+            };
+
+            if let Some(ct) = content_type {
+                files.push(p.clone());
+                
+                // Update cache with file metadata
+                if let Ok(metadata) = std::fs::metadata(&p) {
+                    if let Ok(mtime) = metadata.modified()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        .map(|d| d.as_secs())
+                    {
+                        let size = metadata.len();
+                        if let Ok(discovered_at) = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()) {
+                            let file_metadata = crate::cache::FileMetadata {
+                                mtime,
+                                size,
+                                content_type: match ct {
+                                    ContentType::Image => 0,
+                                    ContentType::Video => 1,
+                                },
+                                discovered_at,
+                            };
+                            cache_updates.push((p, file_metadata));
+                        }
+                    }
                 }
             }
+        }
+
+        // Batch update cache
+        for (path, metadata) in cache_updates {
+            let _ = cache.set_file_metadata(&path, &metadata);
         }
 
         if files.is_empty() {
@@ -280,15 +399,18 @@ impl SmartQueue {
     }
 
     fn update_stats(&mut self, path: &PathBuf) {
-        let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
-            count: 0,
-            last_seen: None,
-            love_multiplier: 1.0,
-        });
-        stat.count += 1;
-        stat.last_seen = Some(Utc::now());
-
-        // Limit stats growth (LRU-ish removal)
+        // Update the stat
+        {
+            let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
+                count: 0,
+                last_seen: None,
+                love_multiplier: 1.0,
+            });
+            stat.count += 1;
+            stat.last_seen = Some(Utc::now());
+        }
+        
+        // Limit stats growth (LRU-ish removal) - done after dropping the borrow
         if self.stats.files.len() > 5000 {
             let oldest = self.stats.files.iter()
                 .min_by_key(|(_, s)| s.last_seen.map(|d| d.timestamp()).unwrap_or(0))
@@ -298,39 +420,43 @@ impl SmartQueue {
             }
         }
         
-        let _ = self.save_stats();
+        // Save to redb cache (non-blocking, batched)
+        if let Some(stat) = self.stats.files.get(path) {
+            let _ = self.cache.set_file_stats(path, stat);
+        }
     }
 
-    fn load_stats() -> Result<LoveitData> {
-        let path = Self::stats_path()?;
-        if !path.exists() {
-            return Ok(LoveitData::default());
-        }
-        let content = std::fs::read_to_string(&path)?;
-        match serde_json::from_str(&content) {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::warn!("Failed to parse statistics file {}: {}. Using empty stats.", path.display(), e);
-                Ok(LoveitData::default())
-            }
-        }
+    fn load_stats_from_cache(cache: &FileCache) -> Result<LoveitData> {
+        // Load from redb cache
+        let files = cache.get_all_file_stats()?;
+        let playlists = cache.get_all_playlists()?;
+        let blacklist = cache.get_all_blacklisted()?;
+        
+        Ok(LoveitData {
+            files,
+            playlists,
+            blacklist,
+        })
     }
 
     pub fn save_stats(&self) -> Result<()> {
-        let path = Self::stats_path()?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        // Batch save all stats to redb
+        let updates: Vec<_> = self.stats.files.iter()
+            .map(|(path, stats)| (path.clone(), stats.clone()))
+            .collect();
+        self.cache.batch_set_file_stats(&updates)?;
+        
+        // Save playlists
+        for (name, playlist) in &self.stats.playlists {
+            let _ = self.cache.set_playlist(name, playlist);
         }
-        let content = serde_json::to_string_pretty(&self.stats)?;
-        std::fs::write(&path, content)?;
+        
+        // Save blacklist
+        for path in &self.stats.blacklist {
+            let _ = self.cache.set_blacklisted(path, true);
+        }
+        
         Ok(())
-    }
-
-    fn stats_path() -> Result<PathBuf> {
-        Ok(dirs::state_dir()
-            .context("Failed to get state directory")?
-            .join("kaleidux")
-            .join("loveit.json"))
     }
 
     pub fn love_file(&mut self, path: PathBuf, multiplier: f32) -> Result<()> {
@@ -357,7 +483,7 @@ impl SmartQueue {
             }
         } else {
             // Reset to full discovery
-            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist)?;
+            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist, self.cache.clone())?;
         }
         
         self.active_playlist = name;
