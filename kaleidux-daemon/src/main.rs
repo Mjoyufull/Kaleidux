@@ -467,6 +467,7 @@ async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
     const MAX_CONSECUTIVE_ERRORS: u32 = 3;
     let mut connection_dead = false;
     let mut last_error_time = Instant::now();
+    let mut last_pool_cleanup = Instant::now();
     
     // Initial Load
     let initial_changes = monitor_manager.tick();
@@ -671,6 +672,14 @@ async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
                 r.transition_just_completed = false; // Clear flag
                 monitor_manager.mark_transition_completed(name);
             }
+        }
+        
+        // Cleanup texture pool periodically (every 5 seconds)
+        if last_pool_cleanup.elapsed().as_secs() >= 5 {
+            if let Some(ctx) = &wgpu_ctx {
+                ctx.cleanup_texture_pool();
+            }
+            last_pool_cleanup = Instant::now();
         }
         
         // Timing

@@ -34,6 +34,12 @@ pub enum BackendContext<'a> {
     X11,
 }
 
+// Texture pool entry for LRU cache
+struct TexturePoolEntry {
+    texture: wgpu::Texture,
+    last_used: std::time::Instant,
+}
+
 pub struct WgpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
@@ -45,6 +51,8 @@ pub struct WgpuContext {
     pub blit_bind_group_layout: wgpu::BindGroupLayout,
     pub transition_bind_group_layout: wgpu::BindGroupLayout,
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
+    // Texture pool: (width, height) -> Vec of available textures
+    texture_pool: parking_lot::Mutex<HashMap<(u32, u32), Vec<TexturePoolEntry>>>,
 }
 
 impl WgpuContext {
@@ -187,6 +195,7 @@ impl WgpuContext {
                 blit_bind_group_layout,
                 transition_bind_group_layout,
                 mipmap_bind_group_layout,
+                texture_pool: parking_lot::Mutex::new(HashMap::new()),
             }),
             compatible_surface
         ))
@@ -290,6 +299,68 @@ impl WgpuContext {
         let pipeline_arc = Arc::new(pipeline);
         self.mipmap_pipelines.lock().insert(format, pipeline_arc.clone());
         pipeline_arc
+    }
+    
+    /// Get a texture from the pool or create a new one
+    pub fn get_texture_from_pool(&self, width: u32, height: u32, usage: wgpu::TextureUsages) -> wgpu::Texture {
+        let mut pool = self.texture_pool.lock();
+        let key = (width, height);
+        
+        // Try to find a texture in the pool
+        if let Some(entries) = pool.get_mut(&key) {
+            // Remove stale entries (older than 5 seconds) and find a fresh one
+            let now = std::time::Instant::now();
+            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 5);
+            
+            if let Some(entry) = entries.pop() {
+                return entry.texture;
+            }
+        }
+        
+        // No texture in pool, create new one
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Pooled Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage,
+            view_formats: &[],
+        })
+    }
+    
+    /// Return a texture to the pool for reuse
+    pub fn return_texture_to_pool(&self, texture: wgpu::Texture, width: u32, height: u32) {
+        let mut pool = self.texture_pool.lock();
+        let key = (width, height);
+        
+        // Limit pool size per resolution to prevent unbounded growth
+        let entries = pool.entry(key).or_insert_with(Vec::new);
+        if entries.len() < 3 {
+            entries.push(TexturePoolEntry {
+                texture,
+                last_used: std::time::Instant::now(),
+            });
+        }
+        // If pool is full, texture is dropped (freed by WGPU)
+    }
+    
+    /// Clean up old textures from pool
+    pub fn cleanup_texture_pool(&self) {
+        let mut pool = self.texture_pool.lock();
+        let now = std::time::Instant::now();
+        
+        for entries in pool.values_mut() {
+            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 10);
+        }
+        
+        // Remove empty entries
+        pool.retain(|_, entries| !entries.is_empty());
     }
 }
 
@@ -1202,6 +1273,9 @@ impl Renderer {
         let mip_level_count = ((width.max(height) as f32).log2().floor() as u32) + 1;
 
         // Use Rgba8UnormSrgb for proper color space
+        // Use texture pool for image textures (but note: images need mipmaps, so we can't fully pool them)
+        // For now, create new texture for images since they need mipmaps
+        // Video textures can use the pool since they don't need mipmaps
         let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Image Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -1361,42 +1435,26 @@ impl Renderer {
                 debug!("[VIDEO] {}: Reusing existing texture {}x{}", self.name, frame.width, frame.height);
                 curr
             } else {
-                // Size mismatch: create a NEW one. Old one is dropped and freed by WGPU
-                // Explicitly drop the old texture view to free resources immediately
-                // Removed TRACE log from hot path
+                // Size mismatch: return old texture to pool and get new one from pool
                 self.current_texture_view = None;
-                // Redundant poll removed (Audit Point 33)
-                self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Video Frame Texture"),
-                    size: wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                })
+                let old_size = self.current_texture_size;
+                if let Some((w, h)) = old_size {
+                    self.ctx.return_texture_to_pool(curr, w, h);
+                }
+                // Get texture from pool or create new one
+                self.ctx.get_texture_from_pool(
+                    frame.width,
+                    frame.height,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+                )
             }
         } else {
-            // Removed TRACE log from hot path
-            self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Video Frame Texture"),
-                size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
+            // Get texture from pool or create new one
+            self.ctx.get_texture_from_pool(
+                frame.width,
+                frame.height,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+            )
         };
 
         self.ctx.queue.write_texture(
