@@ -304,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_wayland_loop(config: orchestration::Config) -> anyhow::Result<()> {
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
-    let mut monitor_manager = monitor_manager::MonitorManager::new(config);
+    let mut monitor_manager = monitor_manager::MonitorManager::new(config)?;
 
     // Initialize Wayland
     let conn = Connection::connect_to_env()?;
@@ -688,7 +688,7 @@ async fn run_x11_loop(config: orchestration::Config) -> anyhow::Result<()> {
     // Similar to run_wayland_loop but with X11 backend
     let script_path = config.global.script_path.clone();
     let script_tick_interval = config.global.script_tick_interval;
-    let mut monitor_manager = monitor_manager::MonitorManager::new(config);
+    let mut monitor_manager = monitor_manager::MonitorManager::new(config)?;
 
     let mut backend = x11::X11Backend::new()?;
     // Query RandR for monitors

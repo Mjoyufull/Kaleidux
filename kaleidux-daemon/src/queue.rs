@@ -66,6 +66,10 @@ pub enum ContentType {
 impl SmartQueue {
     pub fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
         let cache = Arc::new(FileCache::new()?);
+        Self::new_with_cache(path, video_ratio, strategy, cache)
+    }
+    
+    pub fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>) -> Result<Self> {
         let stats = Self::load_stats_from_cache(&cache)?;
         
         // Run file discovery in blocking task to avoid blocking main thread

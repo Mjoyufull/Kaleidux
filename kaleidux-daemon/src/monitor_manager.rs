@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
+use std::sync::Arc;
 use crate::orchestration::{Config, OutputConfig, MonitorBehavior};
 use crate::queue::SmartQueue;
+use crate::cache::FileCache;
 use tracing::{info, error, debug};
 use anyhow::Result;
 use kaleidux_common::{KEntry, PlaylistCommand, BlacklistCommand, Response};
@@ -19,9 +21,9 @@ pub struct OutputOrchestrator {
 }
 
 impl OutputOrchestrator {
-    pub fn new(name: String, description: String, config: OutputConfig) -> Self {
+    pub fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>) -> Self {
         let queue = if let Some(path) = &config.path {
-            match SmartQueue::new(path, config.video_ratio, config.sorting.clone()) {
+            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache) {
                 Ok(mut q) => {
                     if let Some(pl_name) = &config.default_playlist {
                         if let Err(e) = q.set_playlist(Some(pl_name.clone())) {
@@ -126,11 +128,15 @@ pub struct MonitorManager {
     output_groups: HashMap<String, usize>,    // output_name -> group_id
     shared_display_start_time: Option<Instant>, // For synchronized outputs - shared display start time
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
+    cache: Arc<FileCache>, // Shared cache instance for all queues
 }
 
 impl MonitorManager {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub fn new(config: Config) -> Result<Self> {
+        // Create shared cache instance once for all queues
+        let cache = Arc::new(FileCache::new()?);
+        
+        Ok(Self {
             config,
             outputs: HashMap::new(),
             shared_queue: None,
@@ -138,7 +144,8 @@ impl MonitorManager {
             output_groups: HashMap::new(),
             shared_display_start_time: None,
             group_display_start_times: HashMap::new(),
-        }
+            cache,
+        })
     }
 
     pub fn update_config(&mut self, config: Config) {
@@ -159,13 +166,13 @@ impl MonitorManager {
         
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
-                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config);
+                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
                 self.outputs.insert(name.to_string(), orch);
             }
             MonitorBehavior::Synchronized => {
                 if self.shared_queue.is_none() {
                     if let Some(path) = &output_config.path {
-                        if let Ok(mut q) = SmartQueue::new(path, output_config.video_ratio, output_config.sorting.clone()) {
+                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone()) {
                             if let Some(pl_name) = &output_config.default_playlist {
                                 let _ = q.set_playlist(Some(pl_name.clone()));
                             }
@@ -173,7 +180,7 @@ impl MonitorManager {
                         }
                     }
                 }
-                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config);
+                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
                 orch.queue = None; // Will use shared queue
                 self.outputs.insert(name.to_string(), orch);
             }
@@ -193,7 +200,7 @@ impl MonitorManager {
                     // Initialize group queue if needed
                     if !self.group_queues.contains_key(&gid) {
                         if let Some(path) = &output_config.path {
-                            if let Ok(mut q) = SmartQueue::new(path, output_config.video_ratio, output_config.sorting.clone()) {
+                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone()) {
                                 if let Some(pl_name) = &output_config.default_playlist {
                                     let _ = q.set_playlist(Some(pl_name.clone()));
                                 }
@@ -202,13 +209,13 @@ impl MonitorManager {
                         }
                     }
                     
-                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config);
+                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
                     orch.queue = None; // Will use group queue
                     self.outputs.insert(name.to_string(), orch);
                 } else {
                     // Output not in any group, treat as independent
                     info!("Output {} not in any group, treating as independent", name);
-                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config);
+                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone());
                     self.outputs.insert(name.to_string(), orch);
                 }
             }
