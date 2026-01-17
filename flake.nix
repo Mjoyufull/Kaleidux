@@ -36,6 +36,7 @@
           cmake
           python3
           llvmPackages.libclang.lib
+          makeWrapper
         ];
 
         kaleidux = naersk-lib.buildPackage {
