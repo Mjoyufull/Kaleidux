@@ -123,7 +123,7 @@ impl WgpuContext {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None, // Removing this often fixes "Queue Family" issues on Nvidia Wayland
+                compatible_surface: Some(&compatible_surface), // Restore this - required for presentation support
                 force_fallback_adapter: false,
             })
             .await
