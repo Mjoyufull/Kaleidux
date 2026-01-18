@@ -1054,10 +1054,9 @@ impl Renderer {
             };
             self.ctx.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-            // USE CACHED BIND GROUP
-            if self.transition_bind_group.is_none() {
-                self.update_transition_bind_group();
-            }
+            // Always update bind group to ensure it matches current texture views
+            // (Optimization removed to guarantee correctness if views change)
+            self.update_transition_bind_group();
 
             if let Some(bind_group) = &self.transition_bind_group {
                 let composition_view = match self.composition_texture_view.as_ref() {
@@ -1775,11 +1774,8 @@ impl Renderer {
             }
         };
         
-        // If bind group already exists, assume it's valid (texture views are checked by caller)
-        // This avoids unnecessary recreation when render() is called multiple times with same textures
-        if self.transition_bind_group.is_some() {
-            return;
-        }
+        // Always recreate bind group to ensure it matches current texture views
+        // This prevents stale bind groups if invalidation logic elsewhere is missed
 
         self.transition_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Transition Bind Group (Cached)"),
