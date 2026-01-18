@@ -89,6 +89,7 @@ impl PipelineLRU {
         self.pipelines.len()
     }
     
+    #[allow(dead_code)]
     pub fn contains_key(&self, key: &str) -> bool {
         self.pipelines.contains_key(key)
     }
@@ -737,6 +738,7 @@ impl Renderer {
 
     /// Pre-compiles common shaders to avoid stalls during the first transition.
     /// Compiles top 10 most commonly used transitions in background.
+    #[allow(dead_code)]
     pub fn precompile_common_shaders(&self) {
         debug!("[RENDER] {}: Pre-compiling common shaders", self.name);
         // Pre-compile top 10 most common transitions
@@ -1389,6 +1391,7 @@ impl Renderer {
         self.valid_content_type = content_type;
     }
 
+    #[allow(dead_code)]
     pub fn upload_image_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let _load_start = std::time::Instant::now();
         let img = image::open(path)?;
@@ -1725,6 +1728,7 @@ impl Renderer {
     /// 
     /// This explicitly drops all texture resources and forces WGPU to reclaim
     /// GPU memory immediately. Useful for cleanup and preventing memory leaks.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         // Explicitly drop textures to free GPU memory
         self.current_texture = None;
@@ -1747,6 +1751,7 @@ impl Renderer {
         self.ctx.device.poll(wgpu::Maintain::Poll);
     }
 
+    #[allow(dead_code)]
     pub fn recreate_surface(&mut self, surface: wgpu::Surface<'static>) {
         self.surface = surface;
         self.configured = false;

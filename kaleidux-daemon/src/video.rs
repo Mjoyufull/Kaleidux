@@ -41,11 +41,6 @@ impl BusWatcherPool {
         // Default to 8 concurrent bus watchers (enough for multiple videos)
         Self::new(8)
     }
-    
-    /// Acquire a permit for a bus watcher (blocks if at capacity)
-    pub async fn acquire_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.semaphore.acquire().await.unwrap()
-    }
 }
 
 // Global bus watcher pool (lazy initialized)
@@ -265,16 +260,21 @@ impl VideoPlayer {
         // The semaphore is acquired synchronously before the thread starts its loop
         let handle = std::thread::spawn(move || {
             // Acquire permit - block until available to ensure proper resource control
-            // Using blocking acquire in a thread is safe and ensures threads wait when pool is at capacity
-            let permit = match semaphore.try_acquire() {
-                Ok(p) => p,
+            // Using runtime block_on in a thread ensures threads wait when pool is at capacity
+            let rt = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
                 Err(_) => {
-                    // If try_acquire fails, log and return - thread won't run without permit
-                    tracing::warn!("[VIDEO] Bus watcher pool at capacity, skipping bus watcher for {}", source_id);
+                    tracing::error!("[VIDEO] No tokio runtime available for {}", source_id);
                     return;
                 }
             };
-            let _permit = permit; // Hold permit for thread lifetime
+            let _permit = match rt.block_on(semaphore.acquire_owned()) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::error!("[VIDEO] Semaphore closed unexpectedly for {}", source_id);
+                    return;
+                }
+            };
             
             while is_running.load(Ordering::SeqCst) {
                 // Wait for up to 100ms for a message

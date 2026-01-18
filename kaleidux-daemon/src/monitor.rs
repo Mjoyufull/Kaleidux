@@ -13,6 +13,7 @@ pub struct SystemMonitor {
 }
 
 impl SystemMonitor {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::new_with_metrics(None)
     }

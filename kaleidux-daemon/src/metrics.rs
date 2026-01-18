@@ -193,7 +193,9 @@ impl PerformanceMetrics {
     }
     
     pub fn get_peak_memory(&self) -> Option<f64> {
-        self.memory_samples.lock().iter().map(|(_, mb)| *mb).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        self.memory_samples.lock().iter()
+            .filter_map(|(_, mb)| if mb.is_finite() { Some(*mb) } else { None })
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
     
     pub fn record_startup_start(&self) {
@@ -209,12 +211,6 @@ impl PerformanceMetrics {
     pub fn record_wgpu_init(&self, duration: Duration) {
         let mut metrics = self.startup_metrics.lock();
         metrics.wgpu_init_duration = Some(duration);
-    }
-    
-    pub fn record_file_discovery(&self, duration: Duration) {
-        let mut metrics = self.startup_metrics.lock();
-        metrics.file_discovery_duration = Some(duration);
-        // Note: Component CPU time is recorded separately at the call site to avoid double-counting
     }
     
     /// Record CPU time spent in renderer operations
@@ -270,6 +266,7 @@ impl PerformanceMetrics {
     }
     
     /// Get average CPU time per renderer operation (in ms)
+    #[allow(dead_code)]
     pub fn get_avg_renderer_cpu_time_ms(&self) -> f64 {
         let ops = self.renderer_ops.load(Ordering::Relaxed);
         if ops == 0 {
@@ -280,6 +277,7 @@ impl PerformanceMetrics {
     }
     
     /// Get average CPU time per video operation (in ms)
+    #[allow(dead_code)]
     pub fn get_avg_video_cpu_time_ms(&self) -> f64 {
         let ops = self.video_ops.load(Ordering::Relaxed);
         if ops == 0 {
@@ -462,7 +460,10 @@ impl PerformanceMetrics {
         if times.is_empty() {
             return 0.0;
         }
-        let mut sorted: Vec<f64> = times.iter().copied().collect();
+        let mut sorted: Vec<f64> = times.iter().filter(|t| t.is_finite()).copied().collect();
+        if sorted.is_empty() {
+            return 0.0;
+        }
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = (sorted.len() as f64 * percentile) as usize;
         sorted.get(idx.min(sorted.len() - 1)).copied().unwrap_or(0.0)

@@ -36,7 +36,7 @@ struct LoadedImage {
     data: Option<Vec<u8>>,
     width: u32,
     height: u32,
-    path: PathBuf,
+    _path: PathBuf,
 }
 
 enum VideoPlayerResult {
@@ -108,7 +108,7 @@ fn switch_wallpaper_content(
                             data: Some(rgba.into_raw()),
                             width,
                             height,
-                            path: path_clone,
+                            _path: path_clone,
                         });
                         if send_result.is_err() {
                             debug!("[ASSET] {}: Failed to send decoded image (channel closed)", name_clone);
@@ -122,7 +122,7 @@ fn switch_wallpaper_content(
                             data: None,
                             width: 0,
                             height: 0,
-                            path: path_clone,
+                            _path: path_clone,
                         });
                     }
                 }
@@ -813,6 +813,11 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         if last_stats_flush.elapsed().as_secs() >= 5 {
             let _ = monitor_manager.flush_all_stats();
             last_stats_flush = Instant::now();
+        }
+        
+        // Process directory watcher events (cache invalidation)
+        if let Some(ref mut watcher) = dir_watcher {
+            watcher.process_events().await;
         }
         
         // Log metrics summary every 30 seconds (or 10 seconds for testing)

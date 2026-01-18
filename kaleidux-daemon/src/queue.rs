@@ -65,11 +65,6 @@ pub enum ContentType {
 }
 
 impl SmartQueue {
-    pub async fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
-        let cache = Arc::new(FileCache::new()?);
-        Self::new_with_cache(path, video_ratio, strategy, cache, None).await
-    }
-    
     pub async fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
         tracing::info!("[QUEUE] new_with_cache called for path: {:?}", path);
         let stats = Self::load_stats_from_cache(&cache)?;
@@ -90,43 +85,6 @@ impl SmartQueue {
         
         let mut pool = pool;
         // Sort the pool initially for sequential strategies
-        pool.sort();
-
-        let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
-            pool.len().saturating_sub(1)
-        } else {
-            0
-        };
-
-        Ok(Self {
-            pool,
-            stats,
-            video_ratio,
-            strategy,
-            current_index,
-            history: Vec::new(),
-            root_path: path.to_path_buf(),
-            active_playlist: None,
-            cache,
-            pending_stats_updates: HashMap::new(),
-        })
-    }
-    
-    /// Async version that can be spawned in background
-    pub async fn new_async(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
-        let cache = Arc::new(FileCache::new()?);
-        let stats = Self::load_stats_from_cache(&cache)?;
-        
-        // Run file discovery in blocking task
-        let path_buf = path.to_path_buf();
-        let blacklist_clone = stats.blacklist.clone();
-        let cache_clone = cache.clone();
-        
-        let pool = tokio::task::spawn_blocking(move || {
-            Self::discover_content(&path_buf, &blacklist_clone, cache_clone, None)
-        }).await??;
-        
-        let mut pool = pool;
         pool.sort();
 
         let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
@@ -322,6 +280,39 @@ impl SmartQueue {
         }
 
         picked
+    }
+
+    /// Get the next content path without consuming it (for pre-buffering)
+    pub fn peek_next(&self) -> Option<(PathBuf, ContentType)> {
+        // For sequential strategies, we can peek at the next index
+        match self.strategy {
+            crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
+                let next_idx = match self.strategy {
+                    crate::orchestration::SortingStrategy::Ascending => {
+                        (self.current_index + 1) % self.pool.len()
+                    }
+                    crate::orchestration::SortingStrategy::Descending => {
+                        if self.current_index == 0 {
+                            self.pool.len().saturating_sub(1)
+                        } else {
+                            self.current_index - 1
+                        }
+                    }
+                    _ => return None,
+                };
+                
+                if next_idx < self.pool.len() {
+                    let path = self.pool[next_idx].clone();
+                    if let Some(content_type) = Self::get_content_type(&path) {
+                        return Some((path, content_type));
+                    }
+                }
+            }
+            _ => {
+                // For Random/Loveit, can't predict next easily without pre-rolling
+            }
+        }
+        None
     }
 
     #[inline]

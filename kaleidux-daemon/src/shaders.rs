@@ -121,6 +121,7 @@ impl ShaderManager {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn get_shader(transition: &Transition) -> anyhow::Result<String> {
         match transition {
             Transition::Custom { shader, params } => {
@@ -139,6 +140,7 @@ impl ShaderManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn load_external_glsl_async(name: &str) -> anyhow::Result<String> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Failed to get config directory"))?
@@ -154,6 +156,7 @@ impl ShaderManager {
         anyhow::bail!("Shader not found in ~/.config/kaleidux/shaders/: {}", name)
     }
     
+    #[allow(dead_code)]
     pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
         // Use block_in_place to call async version from sync context
         tokio::task::block_in_place(|| -> anyhow::Result<String> {

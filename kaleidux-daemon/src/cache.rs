@@ -89,6 +89,7 @@ impl FileCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_file_stats(&self, path: &Path) -> Result<Option<crate::queue::FileStats>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
@@ -103,6 +104,7 @@ impl FileCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_file_stats(&self, path: &Path, stats: &crate::queue::FileStats) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -146,6 +148,7 @@ impl FileCache {
         Ok(stats)
     }
 
+    #[allow(dead_code)]
     pub fn get_playlist(&self, name: &str) -> Result<Option<crate::queue::Playlist>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
@@ -184,6 +187,7 @@ impl FileCache {
         Ok(playlists)
     }
 
+    #[allow(dead_code)]
     pub fn delete_playlist(&self, name: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -194,6 +198,7 @@ impl FileCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn is_blacklisted(&self, path: &Path) -> Result<bool> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(BLACKLIST_TABLE)?;
@@ -233,23 +238,19 @@ impl FileCache {
         Ok(blacklist)
     }
 
+    #[allow(dead_code)]
     pub fn clear_file_cache(&self) -> Result<()> {
-        // Clear cache by removing all entries
-        // Collect all keys first in a separate read transaction to avoid deadlock
-        let keys: Vec<Vec<u8>> = {
-            let read_txn = self.db.begin_read()?;
-            let read_table = read_txn.open_table(FILE_CACHE_TABLE)?;
-            read_table.iter()?
-                .filter_map(|item| {
-                    item.ok().map(|(key, _)| key.value().to_vec())
-                })
-                .collect()
-        };
-        
-        // Now remove all keys in a write transaction
+        // Clear cache atomically using a single write transaction
+        // This avoids race conditions where entries added between read and write would be missed
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
+            // Collect keys within write transaction to ensure atomicity
+            let keys: Vec<Vec<u8>> = table.iter()?
+                .filter_map(|item| {
+                    item.ok().map(|(key, _)| key.value().to_vec())
+                })
+                .collect();
             for key in keys {
                 table.remove(key.as_slice())?;
             }

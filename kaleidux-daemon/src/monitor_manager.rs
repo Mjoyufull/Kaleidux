@@ -13,11 +13,14 @@ use crate::queue::Playlist;
 
 pub struct OutputOrchestrator {
     pub _name: String,
+    #[allow(dead_code)]
     pub description: String,
     pub config: OutputConfig,
     pub queue: Option<SmartQueue>,
     pub current_path: Option<PathBuf>,
+    #[allow(dead_code)]
     pub next_path: Option<PathBuf>, // Pre-buffered next content path
+    #[allow(dead_code)]
     pub next_content_type: Option<crate::queue::ContentType>, // Type of next content
     pub next_change: Option<Instant>,
     pub display_start_time: Option<Instant>, // When content actually started displaying
@@ -101,9 +104,20 @@ impl OutputOrchestrator {
                 let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap(); // Already validated in discovery
                 self.current_path = Some(path.clone());
                 // Reset display start time - will be set when content actually starts displaying
+                // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
                 // Set next_change as fallback (in case content never loads)
                 self.next_change = Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
+                
+                // Pre-buffer next content
+                if let Some((next_p, next_t)) = self.peek_next() {
+                     self.next_path = Some(next_p);
+                     self.next_content_type = Some(next_t);
+                } else {
+                     self.next_path = None;
+                     self.next_content_type = None;
+                }
+                
                 debug!("Scheduled next change for {} in {:?} (path: {})", self._name, self.config.duration, path.display());
                 return Some((path, content_type));
             }
@@ -115,34 +129,7 @@ impl OutputOrchestrator {
     /// Get the next content path without consuming it (for pre-buffering)
     pub fn peek_next(&self) -> Option<(PathBuf, crate::queue::ContentType)> {
         if let Some(queue) = &self.queue {
-            // For sequential strategies, we can peek at the next index
-            match queue.strategy {
-                crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
-                    let next_idx = match queue.strategy {
-                        crate::orchestration::SortingStrategy::Ascending => {
-                            (queue.current_index + 1) % queue.pool.len()
-                        }
-                        crate::orchestration::SortingStrategy::Descending => {
-                            if queue.current_index == 0 {
-                                queue.pool.len().saturating_sub(1)
-                            } else {
-                                queue.current_index - 1
-                            }
-                        }
-                        _ => return None,
-                    };
-                    
-                    if next_idx < queue.pool.len() {
-                        let path = queue.pool[next_idx].clone();
-                        if let Some(content_type) = crate::queue::SmartQueue::get_content_type(&path) {
-                            return Some((path, content_type));
-                        }
-                    }
-                }
-                _ => {
-                    // For Random/Loveit, can't predict next
-                }
-            }
+            return queue.peek_next();
         }
         None
     }
@@ -184,6 +171,7 @@ pub struct MonitorManager {
 }
 
 impl MonitorManager {
+    #[allow(dead_code)]
     pub fn new(config: Config) -> Result<Self> {
         Self::new_with_metrics(config, None)
     }
@@ -209,6 +197,7 @@ impl MonitorManager {
         })
     }
 
+    #[allow(dead_code)]
     pub fn update_config(&mut self, config: Config) {
         self.config = config;
         
@@ -327,12 +316,22 @@ impl MonitorManager {
                     if let Some(queue) = &mut self.shared_queue {
                         if let Some(path) = queue.pick_next() {
                             let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                            
+                            // Pre-buffer next content
+                            let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                                (Some(np), Some(nt))
+                            } else { (None, None) };
+                            
                             // Reset shared display start time for next cycle
                             self.shared_display_start_time = None;
                             for (name, orch) in &mut self.outputs {
                                 orch.current_path = Some(path.clone());
                                 orch.display_start_time = None;
                                 orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
+                                
+                                orch.next_path = next_p.clone();
+                                orch.next_content_type = next_t.clone();
+
                                 changes.insert(name.clone(), (path.clone(), content_type));
                             }
                         }
@@ -380,6 +379,12 @@ impl MonitorManager {
                         if let Some(queue) = self.group_queues.get_mut(&gid) {
                             if let Some(path) = queue.pick_next() {
                                 let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                                
+                                // Pre-buffer next content
+                                let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                                    (Some(np), Some(nt))
+                                } else { (None, None) };
+                                
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
                                 for name in &output_names {
@@ -387,6 +392,10 @@ impl MonitorManager {
                                         orch.current_path = Some(path.clone());
                                         orch.display_start_time = None;
                                         orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
+                                        
+                                        orch.next_path = next_p.clone();
+                                        orch.next_content_type = next_t.clone();
+
                                         changes.insert(name.clone(), (path.clone(), content_type));
                                     }
                                 }
@@ -433,12 +442,22 @@ impl MonitorManager {
                     if let Some(path) = queue.pick_next() {
                         let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
                         let now = Instant::now();
+                        
+                        // Pre-buffer next content
+                        let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                            (Some(np), Some(nt))
+                        } else { (None, None) };
+                        
                         // Reset shared display start time for next cycle
                         self.shared_display_start_time = None;
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
                             orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
+                            
+                            orch.next_path = next_p.clone();
+                            orch.next_content_type = next_t.clone();
+
                             changes.insert(name.clone(), (path.clone(), content_type));
                         }
                     }
@@ -451,6 +470,12 @@ impl MonitorManager {
                         if let Some(queue) = self.group_queues.get_mut(&gid) {
                             if let Some(path) = queue.pick_next() {
                                 let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                                
+                                // Pre-buffer next content
+                                let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                                    (Some(np), Some(nt))
+                                } else { (None, None) };
+                                
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
                                 for (name, orch_gid) in &self.output_groups {
@@ -459,6 +484,10 @@ impl MonitorManager {
                                             orch.current_path = Some(path.clone());
                                             orch.display_start_time = None;
                                             orch.next_change = Some(Instant::now() + orch.config.duration + std::time::Duration::from_secs(5));
+                                            
+                                            orch.next_path = next_p.clone();
+                                            orch.next_content_type = next_t.clone();
+
                                             changes.insert(name.clone(), (path.clone(), content_type));
                                         }
                                     }
