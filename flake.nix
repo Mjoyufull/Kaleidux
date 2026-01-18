@@ -55,9 +55,9 @@
           # Post-install hook to wrap binaries with runtime path
           postInstall = ''
             wrapProgram $out/bin/kaleidux-daemon \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}"
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib"
             wrapProgram $out/bin/kldctl \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}"
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib"
             
             mkdir -p $out/share/man/man1
             cp man/kaleidux-daemon.1 $out/share/man/man1/
