@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use kaleidux_common::{Request, Response};
+use kaleidux_common::{Request, Response, Transition};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -90,6 +90,16 @@ fn switch_wallpaper_content(
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time; 
         r.set_content_type(content_type);
+
+        // Resolve Random transition if configured for this output
+        if let Some(orchestrator) = monitor_manager.outputs.get(name) {
+            if matches!(orchestrator.config.transition, Transition::Random) {
+                let picked = Transition::pick_random();
+                debug!("[TRANSITION] {}: Resolved Random transition to: {}", name, picked.name());
+                r.active_transition = picked;
+            }
+        }
+
         r.switch_content();
 
         if content_type == crate::queue::ContentType::Image {
@@ -282,13 +292,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 2. Load Configuration
-    let config = match orchestration::Config::load().await {
+    let mut config = match orchestration::Config::load().await {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load configuration: {}. Using defaults.", e);
             orchestration::Config::default()
         }
     };
+
+    if args.demo {
+        info!("Demo mode enabled! Overriding configuration to use current directory...");
+        let current_dir = std::env::current_dir()?;
+        config.any.path = Some(current_dir);
+        config.any.duration = Some(std::time::Duration::from_secs(10));
+        config.global.video_ratio = Some(100); // 100% video for the demo file
+        config.any.transition_time = Some(1500); // Nice 1.5s transitions
+        config.any.transition = Some(Transition::Random); // Cycle through transitions
+    }
 
     // 3. Initialize GStreamer
     let gstreamer_start = Instant::now();
