@@ -57,6 +57,10 @@
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}"
             wrapProgram $out/bin/kldctl \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}"
+            
+            mkdir -p $out/share/man/man1
+            cp man/kaleidux-daemon.1 $out/share/man/man1/
+            cp man/kldctl.1 $out/share/man/man1/
           '';
 
           meta = with pkgs.lib; {
