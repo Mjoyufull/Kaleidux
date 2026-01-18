@@ -1,12 +1,16 @@
 <div align="center">
+<h3>Kaleidux</h3>
+<i>(dynamic desktop kaleidoscope)</i>
+<br><br>
 
-### Kaleidux
-_(dynamic desktop kaleidoscope)_
+[![License](https://img.shields.io/badge/license-AGPL--3.0-red.svg?style=flat-square)](https://github.com/Mjoyufull/Kaleidux/blob/main/LICENSE)
+![written in Rust](https://img.shields.io/badge/language-rust-orange.svg?style=flat-square)
+![platform](https://img.shields.io/badge/platform-linux-blue.svg?style=flat-square)
 
-[![License](https://img.shields.io/badge/license-AGPL--3.0-red.svg?style=flat-square)](https://github.com/Mjoyufull/Kaleidux/blob/main/LICENSE) ![written in Rust](https://img.shields.io/badge/language-rust-orange.svg?style=flat-square) ![platform](https://img.shields.io/badge/platform-linux-blue.svg?style=flat-square)
-
-High-performance, hardware-accelerated wallpaper daemon for Linux.
+<br>
+High-performance, hardware-accelerated wallpaper daemon for Linux.<br>
 Supports Wayland & X11 with 50+ smooth GLSL transitions.
+</div>
 
 ## Table of Contents
 
