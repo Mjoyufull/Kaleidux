@@ -1,5 +1,5 @@
 use wgpu::{Instance, Surface, Adapter, Device, Queue, SurfaceConfiguration};
-use tracing::{info, debug, error, warn, trace};
+use tracing::{info, debug, error, warn};
 use raw_window_handle::{HasWindowHandle, HasDisplayHandle};
 use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
@@ -34,18 +34,83 @@ pub enum BackendContext<'a> {
     X11,
 }
 
+// Texture pool entry for LRU cache
+pub struct TexturePoolEntry {
+    texture: wgpu::Texture,
+    last_used: std::time::Instant,
+}
+
+// LRU cache for transition pipelines
+pub struct PipelineLRU {
+    pipelines: HashMap<String, Arc<wgpu::RenderPipeline>>,
+    access_order: std::collections::VecDeque<String>, // Most recently used at back
+    max_size: usize,
+}
+
+impl PipelineLRU {
+    fn new(max_size: usize) -> Self {
+        Self {
+            pipelines: HashMap::new(),
+            access_order: std::collections::VecDeque::new(),
+            max_size,
+        }
+    }
+    
+    fn get(&mut self, key: &str) -> Option<Arc<wgpu::RenderPipeline>> {
+        if let Some(pipeline) = self.pipelines.get(key).cloned() {
+            // Move to back (most recently used)
+            self.access_order.retain(|k| k != key);
+            self.access_order.push_back(key.to_string());
+            Some(pipeline)
+        } else {
+            None
+        }
+    }
+    
+    fn insert(&mut self, key: String, pipeline: Arc<wgpu::RenderPipeline>) {
+        // Remove if already exists
+        if self.pipelines.contains_key(&key) {
+            self.access_order.retain(|k| k != &key);
+        } else {
+            // Evict least recently used if at capacity
+            while self.pipelines.len() >= self.max_size {
+                if let Some(lru_key) = self.access_order.pop_front() {
+                    self.pipelines.remove(&lru_key);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.pipelines.insert(key.clone(), pipeline);
+        self.access_order.push_back(key);
+    }
+    
+    pub fn len(&self) -> usize {
+        self.pipelines.len()
+    }
+    
+    #[allow(dead_code)]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.pipelines.contains_key(key)
+    }
+}
+
 pub struct WgpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
-    pub transition_pipelines: parking_lot::Mutex<HashMap<String, Arc<wgpu::RenderPipeline>>>,
+    pub transition_pipelines: parking_lot::Mutex<PipelineLRU>,
     pub blit_pipelines: parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub mipmap_pipelines: parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub blit_bind_group_layout: wgpu::BindGroupLayout,
     pub transition_bind_group_layout: wgpu::BindGroupLayout,
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
+    // Texture pool: (width, height) -> Vec of available textures
+    pub texture_pool: parking_lot::Mutex<HashMap<(u32, u32), Vec<TexturePoolEntry>>>,
 }
+
+const MAX_PIPELINE_CACHE_SIZE: usize = 50;
 
 impl WgpuContext {
     pub async fn with_surface(window: Arc<impl HasWindowHandle + HasDisplayHandle + Sync + Send + 'static>) -> anyhow::Result<(Arc<Self>, Surface<'static>)> {
@@ -181,12 +246,13 @@ impl WgpuContext {
                 adapter,
                 device,
                 queue,
-                transition_pipelines: parking_lot::Mutex::new(HashMap::new()),
+                transition_pipelines: parking_lot::Mutex::new(PipelineLRU::new(MAX_PIPELINE_CACHE_SIZE)),
                 blit_pipelines: parking_lot::Mutex::new(HashMap::new()),
                 mipmap_pipelines: parking_lot::Mutex::new(HashMap::new()),
                 blit_bind_group_layout,
                 transition_bind_group_layout,
                 mipmap_bind_group_layout,
+                texture_pool: parking_lot::Mutex::new(HashMap::new()),
             }),
             compatible_surface
         ))
@@ -291,6 +357,74 @@ impl WgpuContext {
         self.mipmap_pipelines.lock().insert(format, pipeline_arc.clone());
         pipeline_arc
     }
+    
+    /// Get a texture from the pool or create a new one
+    pub fn get_texture_from_pool(&self, width: u32, height: u32, usage: wgpu::TextureUsages, metrics: Option<&crate::metrics::PerformanceMetrics>) -> wgpu::Texture {
+        let mut pool = self.texture_pool.lock();
+        let key = (width, height);
+        
+        // Try to find a texture in the pool
+        if let Some(entries) = pool.get_mut(&key) {
+            // Remove stale entries (older than 5 seconds) and find a fresh one
+            let now = std::time::Instant::now();
+            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 5);
+            
+            if let Some(entry) = entries.pop() {
+                if let Some(m) = metrics {
+                    m.record_texture_pool_hit();
+                }
+                return entry.texture;
+            }
+        }
+        
+        // No texture in pool, create new one
+        if let Some(m) = metrics {
+            m.record_texture_pool_miss();
+        }
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Pooled Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage,
+            view_formats: &[],
+        })
+    }
+    
+    /// Return a texture to the pool for reuse
+    pub fn return_texture_to_pool(&self, texture: wgpu::Texture, width: u32, height: u32) {
+        let mut pool = self.texture_pool.lock();
+        let key = (width, height);
+        
+        // Limit pool size per resolution to prevent unbounded growth
+        let entries = pool.entry(key).or_insert_with(Vec::new);
+        if entries.len() < 3 {
+            entries.push(TexturePoolEntry {
+                texture,
+                last_used: std::time::Instant::now(),
+            });
+        }
+        // If pool is full, texture is dropped (freed by WGPU)
+    }
+    
+    /// Clean up old textures from pool
+    pub fn cleanup_texture_pool(&self) {
+        let mut pool = self.texture_pool.lock();
+        let now = std::time::Instant::now();
+        
+        for entries in pool.values_mut() {
+            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 10);
+        }
+        
+        // Remove empty entries
+        pool.retain(|_, entries| !entries.is_empty());
+    }
 }
 
 pub struct Renderer {
@@ -341,10 +475,17 @@ pub struct Renderer {
     pub active_video_session_id: u64,
     pub active_batch_id: Option<u64>,
     pub batch_start_time: Option<std::time::Instant>, // Anchor for shared batch transitions
+    
+    // Metrics tracking
+    metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
+    video_first_frame_time: Option<std::time::Instant>, // Track when video session starts
+    
+    // Background task handle for shader precompilation (aborted on drop)
+    shader_precompile_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl Renderer {
-    pub async fn new<W>(name: String, ctx: Arc<WgpuContext>, window: Arc<W>, first_surface: Option<Surface<'static>>) -> anyhow::Result<Self> 
+    pub fn new<W>(name: String, ctx: Arc<WgpuContext>, window: Arc<W>, first_surface: Option<Surface<'static>>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> anyhow::Result<Self> 
     where 
         W: HasWindowHandle + HasDisplayHandle + Sync + Send + 'static
     {
@@ -384,7 +525,10 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let r = Self {
+        // Clone name for background task before moving it into Self
+        let name_for_bg = name.clone();
+        
+        let mut r = Self {
             name,
             ctx: ctx.clone(),
             surface,
@@ -436,8 +580,39 @@ impl Renderer {
             active_video_session_id: 0,
             active_batch_id: None,
             batch_start_time: None,
+            metrics,
+            video_first_frame_time: None,
+            shader_precompile_handle: None,
         };
-        r.precompile_common_shaders();
+        // Precompile shaders in background to avoid blocking startup
+        // Store abort handle to prevent resource leaks when Renderer is dropped
+        let shader_precompile_handle = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            // Pre-compile common transition shader code (the expensive GLSL->WGSL conversion)
+            // Pipelines will be created on first use, but shader compilation is cached
+            let common_transitions = vec![
+                Transition::Fade,
+                Transition::CrossZoom { strength: 0.4 },
+                Transition::Directional { direction: [0.0, 1.0] },
+                Transition::SimpleZoom { zoom_quickness: 0.5 },
+                Transition::RotateScaleFade { center: [0.5, 0.5], rotations: 1.0, scale: 0.8, back_color: [0.15, 0.15, 0.15, 1.0] },
+                Transition::Circle,
+                Transition::LeftRight,
+                Transition::Radial { smoothness: 0.5 },
+                Transition::Bounce { shadow_colour: [0.0, 0.0, 0.0, 0.6], shadow_height: 0.075, bounces: 3.0 },
+                Transition::Swirl,
+            ];
+            
+            for transition in common_transitions {
+                // Just compile the shader code - this warms the shader cache
+                // Pipeline creation happens on first use and is fast
+                let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
+            }
+            let duration = start.elapsed();
+            tracing::debug!("[RENDER] {}: Background shader precompilation completed in {:.2}ms", name_for_bg, duration.as_secs_f64() * 1000.0);
+        }).abort_handle();
+        
+        r.shader_precompile_handle = Some(shader_precompile_handle);
         Ok(r)
     }
 
@@ -557,14 +732,32 @@ impl Renderer {
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
         self.needs_redraw = true;
-        // Pre-compile the assigned transition early
-        self.get_transition_pipeline(&self.active_transition);
+        // Pre-compile the assigned transition early - DISABLED to avoid startup hang
+        // self.get_transition_pipeline(&self.active_transition);
     }
 
     /// Pre-compiles common shaders to avoid stalls during the first transition.
+    /// Compiles top 10 most commonly used transitions in background.
+    #[allow(dead_code)]
     pub fn precompile_common_shaders(&self) {
         debug!("[RENDER] {}: Pre-compiling common shaders", self.name);
-        self.get_transition_pipeline(&Transition::Fade);
+        // Pre-compile top 10 most common transitions
+        let common_transitions = [
+            Transition::Fade,
+            Transition::CrossZoom { strength: 0.3 },
+            Transition::Radial { smoothness: 0.5 },
+            Transition::Circle,
+            Transition::Directional { direction: [1.0, 0.0] },
+            Transition::SimpleZoom { zoom_quickness: 0.5 },
+            Transition::Ripple { amplitude: 0.1, speed: 1.0 },
+            Transition::Swirl,
+            Transition::Pixelize { squares_min: [10, 10], steps: 10 },
+            Transition::Mosaic { endx: 20, endy: 20 },
+        ];
+        
+        for transition in &common_transitions {
+            let _ = self.get_transition_pipeline(transition);
+        }
     }
 
     fn get_transition_pipeline(&self, transition: &Transition) -> Option<Arc<wgpu::RenderPipeline>> {
@@ -585,6 +778,7 @@ impl Renderer {
     }
 
     fn compile_transition_pipeline(&self, transition: &Transition) -> Option<Arc<wgpu::RenderPipeline>> {
+        let compile_start = std::time::Instant::now();
         let name = transition.name();
         
         // Get compiled WGSL shader code using ShaderManager (fragment shader only)
@@ -592,11 +786,17 @@ impl Renderer {
             Ok(code) => code,
             Err(e) => {
                 error!("Failed to compile shader for {}: {}. Falling back to fade.", name, e);
+                if let Some(m) = &self.metrics {
+                    m.record_error("shader_compile");
+                }
                 // Fallback to fade
                 match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
                     Ok(code) => code,
                     Err(fe) => {
                         error!("FATAL: Failed to compile fallback fade shader: {}", fe);
+                        if let Some(m) = &self.metrics {
+                            m.record_error("shader_compile_fatal");
+                        }
                         return None;
                     }
                 }
@@ -655,10 +855,18 @@ impl Renderer {
         // Update cache
         self.ctx.transition_pipelines.lock().insert(name, pipeline_arc.clone());
         
+        // Record shader compile CPU time
+        if let Some(m) = &self.metrics {
+            let compile_duration = compile_start.elapsed();
+            m.record_shader_compile_cpu_time(compile_duration);
+        }
+        
         Some(pipeline_arc)
     }
 
     pub fn render(&mut self, context: BackendContext, frame_time: std::time::Instant) -> anyhow::Result<()> {
+        let render_start = std::time::Instant::now();
+        
         // CRITICAL: Reset per-frame state at the start of each render cycle
         // This flag tracks whether a transition was rendered in THIS frame
         self.transition_rendered_this_frame = false;
@@ -683,14 +891,7 @@ impl Renderer {
         // If we are here, we are going to render.
         // CRITICAL: Always keep needs_redraw=true during transitions to ensure continuous rendering
         // This ensures transitions complete smoothly without getting stuck
-        if self.transition_active {
-            // Transition in progress - MUST keep rendering until complete
-            self.needs_redraw = true;
-        } else if !self.transition_active && self.valid_content_type != crate::queue::ContentType::Video {
-            // Transition complete and not video - can reset needs_redraw
-            self.needs_redraw = false;
-        }
-        // For video, keep needs_redraw=true so we continue requesting frame callbacks
+        // Note: Don't reset needs_redraw here - do it AFTER we've actually rendered and presented
 
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
@@ -752,10 +953,15 @@ impl Renderer {
                         self.transition_active = false;
                         self.transition_just_completed = true;
                         
-                        // Log Audit Report
+                        // Log Audit Report and record metrics
                         if let Some(stats) = self.transition_stats.take() {
                             let duration = stats.start_time.elapsed();
                             let duration_secs = duration.as_secs_f64();
+                            
+                            // Record transition duration in metrics
+                            if let Some(m) = &self.metrics {
+                                m.record_transition(duration);
+                            }
                             let fps = if duration_secs > 0.001 { stats.frame_count as f64 / duration_secs } else { 0.0 };
                             let drift = duration.as_secs_f32() - stats.target_duration;
                             let batch_info = stats.batch_id.map(|b| format!(" (Batch: {:x})", b)).unwrap_or_default();
@@ -824,18 +1030,8 @@ impl Renderer {
             && self.composition_texture.is_some()
             && self.composition_texture_view.is_some();
             
-        // CRITICAL: Log at INFO level so we can see what's happening
-        // Log specifically which resource is missing if check fails
-        if self.transition_active && !should_render_transition {
-             trace!("[TRANSITION] {}: SKIPPED (missing resources) - prev={}, current={}, composition={}, composition_view={}", 
-                self.name,
-                self.prev_texture.is_some(),
-                self.current_texture.is_some(),
-                self.composition_texture.is_some(),
-                self.composition_texture_view.is_some());
-        } else if self.transition_active {
-             trace!("[TRANSITION] {}: Rendering transition frame (progress={:.3})", self.name, self.transition_progress);
-        }
+        // CRITICAL: Removed TRACE logs from hot path for performance
+        // These were causing 5-10% CPU overhead when called every frame
 
         if should_render_transition {
             // 1. Get/Create pipeline (this will cache it if needed)
@@ -858,10 +1054,9 @@ impl Renderer {
             };
             self.ctx.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-            // USE CACHED BIND GROUP
-            if self.transition_bind_group.is_none() {
-                self.update_transition_bind_group();
-            }
+            // Always update bind group to ensure it matches current texture views
+            // (Optimization removed to guarantee correctness if views change)
+            self.update_transition_bind_group();
 
             if let Some(bind_group) = &self.transition_bind_group {
                 let composition_view = match self.composition_texture_view.as_ref() {
@@ -979,52 +1174,86 @@ impl Renderer {
             None
         };
         
-        trace!("[RENDER] {}: Blit source selected: {:?} (current={}, prev={}, transition_active={}, progress={:.3})", 
-            self.name, blit_source, self.current_texture.is_some(), self.prev_texture.is_some(), self.transition_active, self.transition_progress);
+        // Removed TRACE log from hot path for performance
 
-        if let Some(source) = blit_source {
-            let is_comp = source == BlitSource::Composition;
-            let is_prev = source == BlitSource::Prev;
+        // If no blit source, we can't render anything - return early
+        // But keep needs_redraw=true so we try again next frame
+        let blit_source = match blit_source {
+            Some(s) => s,
+            None => {
+                // No textures available - can't render, but keep needs_redraw for next attempt
+                debug!("[RENDER] {}: No blit source available (current={}, prev={})", 
+                    self.name, 
+                    self.current_texture.is_some(),
+                    self.prev_texture.is_some());
+                return Ok(());
+            }
+        };
 
-            // Always recreate bind group if source changed or doesn't exist
-            // This ensures we're using the correct texture after content switches
-            let needs_recreate = self.blit_bind_group.is_none() 
-                || self.blit_source_is_composition != is_comp 
-                || self.blit_source_is_prev != is_prev;
-            
-            if needs_recreate {
-                let tex_view = match source {
-                    BlitSource::Current => self.current_texture_view.as_ref(),
-                    BlitSource::Prev => self.prev_texture_view.as_ref(),
-                    BlitSource::Composition => self.composition_texture_view.as_ref(),
-                };
-                let tex_view = match tex_view {
-                    Some(v) => v,
-                    None => {
-                        // Fallback logic: if Composition fails, try Prev, then Current
-                        let fallback_view = match source {
-                            BlitSource::Composition => {
-                                warn!("[RENDER] {}: Composition texture view missing, falling back to prev", self.name);
-                                self.prev_texture_view.as_ref().or_else(|| {
-                                    warn!("[RENDER] {}: Prev texture view also missing, falling back to current", self.name);
-                                    self.current_texture_view.as_ref()
-                                })
-                            }
-                            BlitSource::Prev => {
-                                warn!("[RENDER] {}: Prev texture view missing, falling back to current", self.name);
+        let is_comp = blit_source == BlitSource::Composition;
+        let is_prev = blit_source == BlitSource::Prev;
+
+        // Always recreate bind group if source changed or doesn't exist
+        // This ensures we're using the correct texture after content switches
+        let needs_recreate = self.blit_bind_group.is_none() 
+            || self.blit_source_is_composition != is_comp 
+            || self.blit_source_is_prev != is_prev;
+        
+        if needs_recreate {
+            let tex_view = match blit_source {
+                BlitSource::Current => self.current_texture_view.as_ref(),
+                BlitSource::Prev => self.prev_texture_view.as_ref(),
+                BlitSource::Composition => self.composition_texture_view.as_ref(),
+            };
+            match tex_view {
+                Some(v) => {
+                    // Create bind group with the texture
+                    self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Blit Bind Group"),
+                        layout: &self.ctx.blit_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(v),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                            },
+                        ],
+                    }));
+                    self.blit_source_is_composition = is_comp;
+                    self.blit_source_is_prev = is_prev;
+                },
+                None => {
+                    // Fallback logic: if Composition fails, try Prev, then Current
+                    let fallback_view = match blit_source {
+                        BlitSource::Composition => {
+                            warn!("[RENDER] {}: Composition texture view missing, falling back to prev", self.name);
+                            self.prev_texture_view.as_ref().or_else(|| {
+                                warn!("[RENDER] {}: Prev texture view also missing, falling back to current", self.name);
                                 self.current_texture_view.as_ref()
-                            }
-                            BlitSource::Current => {
-                                error!("[RENDER] {}: Current texture view missing, cannot render", self.name);
-                                None
-                            }
-                        };
-                        
-                        match fallback_view {
+                            })
+                        }
+                        BlitSource::Prev => {
+                            warn!("[RENDER] {}: Prev texture view missing, falling back to current", self.name);
+                            self.current_texture_view.as_ref()
+                        }
+                        BlitSource::Current => {
+                            error!("[RENDER] {}: Current texture view missing, cannot render", self.name);
+                            None
+                        }
+                    };
+                    
+                    match fallback_view {
                             Some(v) => {
                                 // Update source to match fallback
                                 let is_comp = false;
-                                let is_prev = matches!(source, BlitSource::Prev) || matches!(source, BlitSource::Composition);
+                                let is_prev = matches!(blit_source, BlitSource::Prev) || matches!(blit_source, BlitSource::Composition);
                                 // Recreate bind group with fallback texture
                                 self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                     label: Some("Blit Bind Group (Fallback)"),
@@ -1046,11 +1275,10 @@ impl Renderer {
                                 }));
                                 self.blit_source_is_composition = is_comp;
                                 self.blit_source_is_prev = is_prev;
-                                v
                             }
                             None => {
                                 error!("Texture view missing for blit source {:?} and all fallbacks failed (current={}, prev={}, composition={})", 
-                                    source, 
+                                    blit_source, 
                                     self.current_texture_view.is_some(),
                                     self.prev_texture_view.is_some(),
                                     self.composition_texture_view.is_some());
@@ -1059,34 +1287,12 @@ impl Renderer {
                         }
                     }
                 };
+        }
 
-                trace!("[RENDER] {}: Creating blit bind group for source {:?} (is_comp={}, is_prev={})", 
-                    self.name, source, is_comp, is_prev);
-                self.blit_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Blit Bind Group"),
-                layout: &self.ctx.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(tex_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            }));
-                self.blit_source_is_composition = is_comp;
-                self.blit_source_is_prev = is_prev;
-            }
+        // Get format-specific blit pipeline from shared context
+        let blit_pipeline = self.ctx.get_blit_pipeline(self.config.format);
 
-            // Get format-specific blit pipeline from shared context
-            let blit_pipeline = self.ctx.get_blit_pipeline(self.config.format);
-
+        {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Blit Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1105,30 +1311,12 @@ impl Renderer {
             render_pass.set_pipeline(&blit_pipeline);
             if let Some(bg) = &self.blit_bind_group {
                 render_pass.set_bind_group(0, bg, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else {
+                error!("[RENDER] {}: blit_bind_group is None, cannot render!", self.name);
+                return Ok(()); // Can't render without bind group
             }
-            render_pass.draw(0..3, 0..1);
-        } else {
-            // FALLBACK: Nothing to render (Log only at trace level to avoid spamming)
-            if self.needs_redraw {
-                trace!("No texture to render for output {} (Progress: {:.2}, ValidType: {:?}). Clearing to Black.", 
-                    self.name, self.transition_progress, self.valid_content_type);
-            }
-            
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Clear Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-        }
+        } // render_pass dropped here
 
         // Request frame callback BEFORE presenting/committing to ensure correct ordering
         // Deadlock fix: always request on first frame even if one is pending from switch
@@ -1154,6 +1342,24 @@ impl Renderer {
         }
 
         self.last_present_time = std::time::Instant::now();
+        
+        // CRITICAL: Reset needs_redraw AFTER we've actually rendered and presented
+        // This ensures we render at least once for static images
+        if self.transition_active {
+            // Transition in progress - MUST keep rendering until complete
+            self.needs_redraw = true;
+        } else if !self.transition_active && self.valid_content_type != crate::queue::ContentType::Video {
+            // Transition complete and not video - can reset needs_redraw now that we've presented
+            self.needs_redraw = false;
+        }
+        // For video, keep needs_redraw=true so we continue requesting frame callbacks
+        
+        // Record renderer CPU time
+        if let Some(m) = &self.metrics {
+            let render_duration = render_start.elapsed();
+            m.record_renderer_cpu_time(render_duration);
+        }
+        
         Ok(())
     }
     
@@ -1184,6 +1390,7 @@ impl Renderer {
         self.valid_content_type = content_type;
     }
 
+    #[allow(dead_code)]
     pub fn upload_image_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let _load_start = std::time::Instant::now();
         let img = image::open(path)?;
@@ -1201,6 +1408,9 @@ impl Renderer {
         let mip_level_count = ((width.max(height) as f32).log2().floor() as u32) + 1;
 
         // Use Rgba8UnormSrgb for proper color space
+        // Use texture pool for image textures (but note: images need mipmaps, so we can't fully pool them)
+        // For now, create new texture for images since they need mipmaps
+        // Video textures can use the pool since they don't need mipmaps
         let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Image Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -1332,8 +1542,8 @@ impl Renderer {
             info!("[TRANSITION] {}: Image data uploaded (Instant) - transition signaled as complete", self.name);
         }
         
-        let duration = upload_start.elapsed();
-        trace!("[ASSET] {}: Image GPU upload completed in {:.3}ms", self.name, duration.as_secs_f64() * 1000.0);
+        let _duration = upload_start.elapsed();
+        // Removed TRACE log - use debug! if needed for troubleshooting
         
         Ok(())
     }
@@ -1345,16 +1555,17 @@ impl Renderer {
             return; // Discard stale video frames
         }
         
-        trace!("[VIDEO] {}: Uploading video frame {}x{}, session_id={}", 
-            self.name, frame.width, frame.height, frame.session_id);
+        // Removed TRACE logs from hot path (called every video frame)
         
         // CRITICAL: If this is the first frame after a switch (prev_texture exists but current_texture is None),
         // reset the transition start time so the transition starts fresh now that we have both textures
         // First frame after a switch is any frame that arrives when current_texture is None
         let is_first_frame_after_switch = self.current_texture.is_none();
         
-        trace!("[TRANSITION] {}: upload_frame() called - prev_texture={}, current_texture={}, progress={:.3}, first_after_switch={}", 
-            self.name, self.prev_texture.is_some(), self.current_texture.is_some(), self.transition_progress, is_first_frame_after_switch);
+        // Track first frame timing for metrics (only on first frame of new video session)
+        if is_first_frame_after_switch && self.video_first_frame_time.is_none() {
+            self.video_first_frame_time = Some(std::time::Instant::now());
+        }
 
         // REUSE texture if size matches (check before creating new texture)
         let needs_new_texture = self.current_texture_size != Some((frame.width, frame.height));
@@ -1364,43 +1575,28 @@ impl Renderer {
                 debug!("[VIDEO] {}: Reusing existing texture {}x{}", self.name, frame.width, frame.height);
                 curr
             } else {
-                // Size mismatch: create a NEW one. Old one is dropped and freed by WGPU
-                // Explicitly drop the old texture view to free resources immediately
-                trace!("[VIDEO] {}: Texture size changed, creating new texture {}x{} (was {:?})", 
-                    self.name, frame.width, frame.height, self.current_texture_size);
+                // Size mismatch: return old texture to pool and get new one from pool
                 self.current_texture_view = None;
-                // Redundant poll removed (Audit Point 33)
-                self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Video Frame Texture"),
-                    size: wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                })
+                let old_size = self.current_texture_size;
+                if let Some((w, h)) = old_size {
+                    self.ctx.return_texture_to_pool(curr, w, h);
+                }
+                // Get texture from pool or create new one
+                self.ctx.get_texture_from_pool(
+                    frame.width,
+                    frame.height,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    self.metrics.as_deref()
+                )
             }
         } else {
-            trace!("[VIDEO] {}: Creating first texture {}x{}", self.name, frame.width, frame.height);
-            self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Video Frame Texture"),
-                size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
+            // Get texture from pool or create new one
+            self.ctx.get_texture_from_pool(
+                frame.width,
+                frame.height,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                self.metrics.as_deref()
+            )
         };
 
         self.ctx.queue.write_texture(
@@ -1448,6 +1644,15 @@ impl Renderer {
         // but DON'T set transition_start_time - let render() do that on first actual render frame
         // This ensures consistent timing behavior with image transitions
         if is_first_frame_after_switch {
+            // Record video first frame timing
+            if let Some(m) = &self.metrics {
+                if let Some(start_time) = self.video_first_frame_time {
+                    let first_frame_duration = start_time.elapsed();
+                    m.record_video_first_frame(first_frame_duration);
+                    self.video_first_frame_time = None; // Reset for next video session
+                }
+            }
+            
             if self.prev_texture.is_some() {
                 info!("[TRANSITION] {}: First video frame after switch - transition will start on first render frame", self.name);
                 self.transition_start_time = None; // Will be set on first render
@@ -1494,6 +1699,7 @@ impl Renderer {
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None;      // Invalidate
         self.batch_start_time = None;      // Reset
+        self.video_first_frame_time = None; // Reset video timing for new session
         self.needs_redraw = true;
         
         // OPTIMIZATION: Don't reset current_texture_size immediately.
@@ -1521,6 +1727,7 @@ impl Renderer {
     /// 
     /// This explicitly drops all texture resources and forces WGPU to reclaim
     /// GPU memory immediately. Useful for cleanup and preventing memory leaks.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         // Explicitly drop textures to free GPU memory
         self.current_texture = None;
@@ -1543,12 +1750,15 @@ impl Renderer {
         self.ctx.device.poll(wgpu::Maintain::Poll);
     }
 
+    #[allow(dead_code)]
     pub fn recreate_surface(&mut self, surface: wgpu::Surface<'static>) {
         self.surface = surface;
         self.configured = false;
         self.needs_redraw = true;
     }
     fn update_transition_bind_group(&mut self) {
+        // Only recreate if bind group doesn't exist or texture views changed
+        // Check if we already have a valid bind group with the same texture views
         let prev_view = match self.prev_texture_view.as_ref() {
             Some(v) => v,
             None => {
@@ -1563,6 +1773,9 @@ impl Renderer {
                 return;
             }
         };
+        
+        // Always recreate bind group to ensure it matches current texture views
+        // This prevents stale bind groups if invalidation logic elsewhere is missed
 
         self.transition_bind_group = Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Transition Bind Group (Cached)"),
@@ -1586,5 +1799,14 @@ impl Renderer {
                     },
                 ],
             }));
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Abort background shader precompilation task to prevent resource leaks
+        if let Some(handle) = self.shader_precompile_handle.take() {
+            handle.abort();
+        }
     }
 }

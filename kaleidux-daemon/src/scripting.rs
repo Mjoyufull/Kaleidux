@@ -44,8 +44,8 @@ impl ScriptManager {
         }
     }
 
-    pub fn load(&mut self, path: &PathBuf) -> anyhow::Result<()> {
-        let content = std::fs::read_to_string(path)?;
+    pub async fn load(&mut self, path: &PathBuf) -> anyhow::Result<()> {
+        let content = tokio::fs::read_to_string(path).await?;
         let ast = self.engine.compile(content)?;
         self.ast = Some(ast);
         info!("Rhai script loaded from {:?}", path);

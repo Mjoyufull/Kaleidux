@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -349,6 +350,34 @@ impl Default for Transition {
 }
 
 impl Transition {
+    pub fn pick_random() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let variants = [
+            "angular", "bookflip", "bounce", "bowtiehorizontal", "bowtievertical",
+            "bowtiewithparameter", "burn", "butterflywavescrawler", "cannabisleaf", "circle",
+            "circlecrop", "circleopen", "colorphase", "coord-from-in", "crazyparametricfun",
+            "colourdistance", "crosshatch", "crosswarp", "crosszoom", "cube", "directional",
+            "directionaleasing", "directionalscaled", "directionalwarp", "directionalwipe",
+            "displacement", "dissolve", "doom", "doorway", "dreamy", "dreamyzoom", "edge",
+            "fade", "fadecolor", "fadegrayscale", "filmburn", "flyeye", "glitchdisplace",
+            "glitchmemories", "gridflip", "heart", "hexagonalize", "horizontalclose",
+            "horizontalopen", "invertedpagecurl", "kaleidoscope", "leftright", "linearblur",
+            "luma", "luminancemelt", "morph", "mosaic", "mosaic_transition", "multiplyblend",
+            "overexposure", "perlin", "pinwheel", "pixelize", "polarfunction", "polkadotscurtain",
+            "powerkaleido", "radial", "randomnoisex", "randomsquares", "rectangle",
+            "rectanglecrop", "ripple", "rolls", "rotate", "rotatescalefade",
+            "rotatescalevanish", "scale_in", "simplezoom", "simplezoomout", "slides",
+            "squareswire", "squeeze", "staticfade", "static_wipe", "stereoviewer",
+            "swap", "swirl", "tangentmotionblur", "topbottom", "tvstatic",
+            "undulatingburnout", "verticalclose", "verticalopen", "waterdrop", "wind",
+            "windowblinds", "windowslice", "wipedown", "wipeleft", "wiperight", "wipeup",
+            "x-axis-translation", "zoomincircles", "zoomleftwipe", "zoomrightwipe",
+        ];
+        let name = variants[rng.gen_range(0..variants.len())];
+        Self::from_name(name)
+    }
+
     pub fn from_name(name: &str) -> Self {
         match name.to_lowercase().as_str() {
             "angular" => Transition::Angular { starting_angle: 0.0 },

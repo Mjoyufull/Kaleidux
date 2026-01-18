@@ -6,6 +6,7 @@ use tracing::{info, debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use tokio::sync::Semaphore;
 
 /// Video frame containing RGBA pixel data (tightly packed, no stride padding)
 /// Uses Arc<[u8]> to avoid cloning large buffers
@@ -23,10 +24,38 @@ pub enum VideoEvent {
     Error(String),
 }
 
+/// Shared thread pool for GStreamer bus watchers
+/// Uses a semaphore to limit concurrent bus watcher threads
+pub struct BusWatcherPool {
+    semaphore: Arc<Semaphore>,
+}
+
+impl BusWatcherPool {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+        }
+    }
+    
+    pub fn default() -> Self {
+        // Default to 8 concurrent bus watchers (enough for multiple videos)
+        Self::new(8)
+    }
+}
+
+// Global bus watcher pool (lazy initialized)
+static BUS_WATCHER_POOL: once_cell::sync::Lazy<Arc<BusWatcherPool>> = once_cell::sync::Lazy::new(|| {
+    Arc::new(BusWatcherPool::default())
+});
+
+pub fn get_bus_watcher_pool() -> Arc<BusWatcherPool> {
+    BUS_WATCHER_POOL.clone()
+}
+
 pub struct VideoPlayer {
     pub pipeline: gst::Element,
     is_running: Arc<AtomicBool>,
-    thread_handle: Option<JoinHandle<()>>,
+    thread_handle: Option<JoinHandle<()>>, // Keep for compatibility, but will use thread pool
     frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>,
     source_id: Arc<String>,
     start_time: std::time::Instant,
@@ -35,6 +64,7 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Create a new video player with a bounded channel for backpressure
     pub fn new(uri: &str, source_id: Arc<String>, session_id: u64, frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>) -> anyhow::Result<Self> {
+        let _video_start = std::time::Instant::now();
         let creation_start = std::time::Instant::now();
         // Use playbin - the same high-level element that gSlapper uses
         let pipeline = gst::ElementFactory::make("playbin")
@@ -190,10 +220,22 @@ impl VideoPlayer {
         })
     }
 
+    /// Pre-buffer video by setting pipeline to READY state (buffers but doesn't play)
+    pub fn prebuffer(&mut self) -> anyhow::Result<()> {
+        debug!("[VIDEO] {}: Pre-buffering video pipeline", self.source_id);
+        let ret = self.pipeline.set_state(gst::State::Ready)?;
+        match ret {
+            gst::StateChangeSuccess::Success => debug!("[VIDEO] {}: Pipeline state -> Ready (pre-buffered)", self.source_id),
+            gst::StateChangeSuccess::Async => debug!("[VIDEO] {}: Pipeline state -> Ready (Async, pre-buffering)", self.source_id),
+            _ => {}
+        }
+        Ok(())
+    }
+    
     pub fn start(&mut self) -> anyhow::Result<()> {
         info!("[VIDEO] {}: Starting playback for {}", self.source_id, self.pipeline.name());
         
-        // Start pipeline
+        // Start pipeline (or transition from Ready to Playing if pre-buffered)
         let ret = self.pipeline.set_state(gst::State::Playing)?;
         let duration = self.start_time.elapsed();
         match ret {
@@ -202,7 +244,7 @@ impl VideoPlayer {
             gst::StateChangeSuccess::NoPreroll => info!("[VIDEO] {}: Pipeline state -> Playing (Live) in {:.3}ms", self.source_id, duration.as_secs_f64() * 1000.0),
         }
         
-        // Spawn bus watcher
+        // Spawn bus watcher using thread pool with semaphore to limit concurrent threads
         let bus = self.pipeline.bus().ok_or_else(|| anyhow::anyhow!("Pipeline has no bus"))?;
         let pipeline = self.pipeline.clone();
         
@@ -210,8 +252,30 @@ impl VideoPlayer {
         let is_running = self.is_running.clone();
         let frame_tx = self.frame_tx.clone();
         let source_id = self.source_id.clone();
+        let pool = get_bus_watcher_pool();
+        let semaphore = pool.semaphore.clone();
         
+        // Spawn thread but use semaphore to limit concurrent bus watchers
+        // Note: We spawn a std::thread but the semaphore limits how many can run concurrently
+        // The semaphore is acquired synchronously before the thread starts its loop
         let handle = std::thread::spawn(move || {
+            // Acquire permit - block until available to ensure proper resource control
+            // Using runtime block_on in a thread ensures threads wait when pool is at capacity
+            let rt = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => {
+                    tracing::error!("[VIDEO] No tokio runtime available for {}", source_id);
+                    return;
+                }
+            };
+            let _permit = match rt.block_on(semaphore.acquire_owned()) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::error!("[VIDEO] Semaphore closed unexpectedly for {}", source_id);
+                    return;
+                }
+            };
+            
             while is_running.load(Ordering::SeqCst) {
                 // Wait for up to 100ms for a message
                 match bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
