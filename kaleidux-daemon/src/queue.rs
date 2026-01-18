@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use walkdir::WalkDir;
+use jwalk::WalkDir;
 use rand::Rng;
 use chrono::{DateTime, Utc};
-use anyhow::{Result, Context};
+use anyhow::Result;
+use std::sync::Arc;
+use crate::cache::FileCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoveitData {
@@ -51,6 +54,8 @@ pub struct SmartQueue {
     pub history: Vec<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
+    pub cache: Arc<FileCache>,
+    pending_stats_updates: HashMap<PathBuf, FileStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,10 +65,25 @@ pub enum ContentType {
 }
 
 impl SmartQueue {
-    pub fn new(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy) -> Result<Self> {
-        let stats = Self::load_stats()?;
-        let mut pool = Self::discover_content(path, &stats.blacklist)?;
+    pub async fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
+        tracing::info!("[QUEUE] new_with_cache called for path: {:?}", path);
+        let stats = Self::load_stats_from_cache(&cache)?;
+        tracing::info!("[QUEUE] Loaded stats, blacklist size: {}", stats.blacklist.len());
         
+        // Run file discovery in background task to avoid blocking startup
+        let path_buf = path.to_path_buf();
+        let blacklist_clone = stats.blacklist.clone();
+        let cache_clone = cache.clone();
+        let metrics_clone = metrics.clone();
+        
+        tracing::info!("[QUEUE] Starting file discovery for: {:?}", path_buf);
+        // Use spawn_blocking to run on thread pool (truly async, non-blocking)
+        let pool = tokio::task::spawn_blocking(move || {
+            Self::discover_content(&path_buf, &blacklist_clone, cache_clone, metrics_clone)
+        }).await??;
+        tracing::info!("[QUEUE] File discovery completed, found {} files", pool.len());
+        
+        let mut pool = pool;
         // Sort the pool initially for sequential strategies
         pool.sort();
 
@@ -82,6 +102,8 @@ impl SmartQueue {
             history: Vec::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
+            cache,
+            pending_stats_updates: HashMap::new(),
         })
     }
 
@@ -113,21 +135,123 @@ impl SmartQueue {
         None
     }
 
-    fn discover_content(path: &Path, blacklist: &std::collections::HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    fn discover_content(
+        path: &Path, 
+        blacklist: &std::collections::HashSet<PathBuf>,
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>
+    ) -> Result<Vec<PathBuf>> {
+        let discovery_start = std::time::Instant::now();
         let mut files = Vec::new();
+        let mut cache_updates = Vec::new();
 
-        for entry in WalkDir::new(path).follow_links(true).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let p = entry.path().to_path_buf();
-                if blacklist.contains(&p) { continue; }
-                if Self::get_content_type(&p).is_some() {
-                    files.push(p);
+        // Use jwalk for parallel directory traversal
+        let walk_dir = WalkDir::new(path)
+            .follow_links(true)
+            .parallelism(jwalk::Parallelism::RayonNewPool(0)); // 0 = auto-detect CPU count, optimal thread usage
+
+        // Collect entries in parallel
+        let entries: Vec<_> = walk_dir
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+
+        for entry in entries {
+            let p = entry.path().to_path_buf();
+            if blacklist.contains(&p) { continue; }
+            
+            // Check cache first
+            let content_type = if let Ok(Some(metadata)) = cache.get_file_metadata(&p) {
+                // Check if file is still valid (mtime matches)
+                if let Ok(valid) = cache.is_file_valid(&p) {
+                    if valid {
+                        // Cache hit - use cached content type
+                        if let Some(m) = &metrics {
+                            m.record_cache_hit();
+                        }
+                        match metadata.content_type {
+                            0 => Some(ContentType::Image),
+                            1 => Some(ContentType::Video),
+                            _ => None,
+                        }
+                    } else {
+                        // File changed, re-check (cache miss due to invalidation)
+                        if let Some(m) = &metrics {
+                            m.record_cache_miss();
+                        }
+                        Self::get_content_type(&p)
+                    }
+                } else {
+                    // Error checking validity, re-check
+                    if let Some(m) = &metrics {
+                        m.record_cache_miss();
+                    }
+                    Self::get_content_type(&p)
+                }
+            } else {
+                // Not in cache, check and cache it (cache miss)
+                if let Some(m) = &metrics {
+                    m.record_cache_miss();
+                }
+                Self::get_content_type(&p)
+            };
+
+            if let Some(ct) = content_type {
+                files.push(p.clone());
+                
+                // Update cache with file metadata
+                match std::fs::metadata(&p) {
+                    Ok(metadata) => {
+                        match metadata.modified()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                            .map(|d| d.as_secs())
+                        {
+                            Ok(mtime) => {
+                                let size = metadata.len();
+                                match SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()) {
+                                    Ok(discovered_at) => {
+                                        let file_metadata = crate::cache::FileMetadata {
+                                            mtime,
+                                            size,
+                                            content_type: match ct {
+                                                ContentType::Image => 0,
+                                                ContentType::Video => 1,
+                                            },
+                                            discovered_at,
+                                        };
+                                        cache_updates.push((p, file_metadata));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[QUEUE] Failed to get current time for cache update: {} (path: {:?})", e, p);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[QUEUE] Failed to extract mtime for cache update: {} (path: {:?})", e, p);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[QUEUE] Failed to get metadata for cache update: {} (path: {:?})", e, p);
+                    }
                 }
             }
         }
 
+        // Batch update cache
+        for (path, metadata) in cache_updates {
+            let _ = cache.set_file_metadata(&path, &metadata);
+        }
+
         if files.is_empty() {
             anyhow::bail!("No supported images or videos found in {:?}", path);
+        }
+
+        // Record file discovery CPU time
+        if let Some(m) = &metrics {
+            let discovery_duration = discovery_start.elapsed();
+            m.record_file_discovery_cpu_time(discovery_duration);
         }
 
         Ok(files)
@@ -156,6 +280,39 @@ impl SmartQueue {
         }
 
         picked
+    }
+
+    /// Get the next content path without consuming it (for pre-buffering)
+    pub fn peek_next(&self) -> Option<(PathBuf, ContentType)> {
+        // For sequential strategies, we can peek at the next index
+        match self.strategy {
+            crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
+                let next_idx = match self.strategy {
+                    crate::orchestration::SortingStrategy::Ascending => {
+                        (self.current_index + 1) % self.pool.len()
+                    }
+                    crate::orchestration::SortingStrategy::Descending => {
+                        if self.current_index == 0 {
+                            self.pool.len().saturating_sub(1)
+                        } else {
+                            self.current_index - 1
+                        }
+                    }
+                    _ => return None,
+                };
+                
+                if next_idx < self.pool.len() {
+                    let path = self.pool[next_idx].clone();
+                    if let Some(content_type) = Self::get_content_type(&path) {
+                        return Some((path, content_type));
+                    }
+                }
+            }
+            _ => {
+                // For Random/Loveit, can't predict next easily without pre-rolling
+            }
+        }
+        None
     }
 
     #[inline]
@@ -280,6 +437,7 @@ impl SmartQueue {
     }
 
     fn update_stats(&mut self, path: &PathBuf) {
+        // Update the stat in memory
         let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
             count: 0,
             last_seen: None,
@@ -287,7 +445,10 @@ impl SmartQueue {
         });
         stat.count += 1;
         stat.last_seen = Some(Utc::now());
-
+        
+        // Add to pending updates for batched write
+        self.pending_stats_updates.insert(path.clone(), stat.clone());
+        
         // Limit stats growth (LRU-ish removal)
         if self.stats.files.len() > 5000 {
             let oldest = self.stats.files.iter()
@@ -295,42 +456,53 @@ impl SmartQueue {
                 .map(|(p, _)| p.clone());
             if let Some(p) = oldest {
                 self.stats.files.remove(&p);
+                self.pending_stats_updates.remove(&p);
             }
+        }
+    }
+    
+    /// Flush pending stats updates to cache in a batch
+    pub fn flush_stats(&mut self) -> Result<()> {
+        if self.pending_stats_updates.is_empty() {
+            return Ok(());
         }
         
-        let _ = self.save_stats();
-    }
-
-    fn load_stats() -> Result<LoveitData> {
-        let path = Self::stats_path()?;
-        if !path.exists() {
-            return Ok(LoveitData::default());
-        }
-        let content = std::fs::read_to_string(&path)?;
-        match serde_json::from_str(&content) {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::warn!("Failed to parse statistics file {}: {}. Using empty stats.", path.display(), e);
-                Ok(LoveitData::default())
-            }
-        }
-    }
-
-    pub fn save_stats(&self) -> Result<()> {
-        let path = Self::stats_path()?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let content = serde_json::to_string_pretty(&self.stats)?;
-        std::fs::write(&path, content)?;
+        let updates: Vec<_> = self.pending_stats_updates.drain()
+            .map(|(path, stats)| (path, stats))
+            .collect();
+        
+        self.cache.batch_set_file_stats(&updates)?;
         Ok(())
     }
 
-    fn stats_path() -> Result<PathBuf> {
-        Ok(dirs::state_dir()
-            .context("Failed to get state directory")?
-            .join("kaleidux")
-            .join("loveit.json"))
+    fn load_stats_from_cache(cache: &FileCache) -> Result<LoveitData> {
+        // Load from redb cache
+        let files = cache.get_all_file_stats()?;
+        let playlists = cache.get_all_playlists()?;
+        let blacklist = cache.get_all_blacklisted()?;
+        
+        Ok(LoveitData {
+            files,
+            playlists,
+            blacklist,
+        })
+    }
+
+    pub fn save_stats(&mut self) -> Result<()> {
+        // Flush any pending stats updates first
+        self.flush_stats()?;
+        
+        // Save playlists
+        for (name, playlist) in &self.stats.playlists {
+            let _ = self.cache.set_playlist(name, playlist);
+        }
+        
+        // Save blacklist
+        for path in &self.stats.blacklist {
+            let _ = self.cache.set_blacklisted(path, true);
+        }
+        
+        Ok(())
     }
 
     pub fn love_file(&mut self, path: PathBuf, multiplier: f32) -> Result<()> {
@@ -356,8 +528,8 @@ impl SmartQueue {
                 anyhow::bail!("Playlist '{}' not found", n);
             }
         } else {
-            // Reset to full discovery
-            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist)?;
+            // Reset to full discovery (no metrics available in this context)
+            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist, self.cache.clone(), None)?;
         }
         
         self.active_playlist = name;

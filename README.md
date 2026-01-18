@@ -1,11 +1,46 @@
-# Kaleidux
+<div align="center">
 
-**Kaleidux** is a high-performance, dynamic wallpaper daemon for Linux, supporting both **Wayland** (via Layer-Shell) and **X11**. It transforms your desktop with smooth, hardware-accelerated transitions between images and videos.
+### Kaleidux
+_(dynamic desktop kaleidoscope)_
 
-Version: `0.0.1-kneecap`
+[![License](https://img.shields.io/badge/license-AGPL--3.0-red.svg?style=flat-square)](https://github.com/Mjoyufull/Kaleidux/blob/main/LICENSE) ![written in Rust](https://img.shields.io/badge/language-rust-orange.svg?style=flat-square) ![platform](https://img.shields.io/badge/platform-linux-blue.svg?style=flat-square)
 
-![License](https://img.shields.io/badge/license-AGPL--3.0-red)
-![Language](https://img.shields.io/badge/language-Rust-orange)
+High-performance, hardware-accelerated wallpaper daemon for Linux.
+Supports Wayland & X11 with 50+ smooth GLSL transitions.
+
+## Table of Contents
+
+- [Quickstart](#quickstart)
+- [Features](#features)
+- [Installation](#installation)
+- [Usage Breakdown](#usage-breakdown)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+**More Info:** [Detailed Usage & Advanced Config](./USAGE.MD)
+
+## Quickstart
+
+Get up and running in 30 seconds:
+
+```bash
+# Install with Nix (recommended)
+nix run github:Mjoyufull/Kaleidux
+
+# Or build from source
+git clone https://github.com/Mjoyufull/Kaleidux && cd Kaleidux
+cargo build --release
+sudo cp target/release/kaleidux-daemon /usr/local/bin/
+sudo cp target/release/kldctl /usr/local/bin/
+
+# Start the daemon
+kaleidux-daemon &
+
+# Skip to next wallpaper
+kldctl next
+```
 
 ## Features
 
@@ -18,62 +53,120 @@ Version: `0.0.1-kneecap`
 - **Rhai Scripting**: Automate your wallpaper logic with Rust-like scripts.
 - **IPC Control**: Control the daemon via `kldctl` (next, prev, pause, status, etc.).
 
-## Quick Start
+## Installation
 
-### Installation (Nix)
+### Option 1: Nix Flake (Recommended)
 
-If you have Flakes enabled:
+- Build and run with Nix flakes:
+
+  ```bash
+  nix run github:Mjoyufull/Kaleidux
+  ```
+
+- Add to your `flake.nix` inputs:
+  ```nix
+  {
+    inputs.kaleidux.url = "github:Mjoyufull/Kaleidux";
+  }
+  ```
+
+### Option 2: Build from Source
+
+**Build Requirements:**
+
+- Rust 1.89+ **stable**
+- GStreamer 1.20+ with dev plugins
+- Wayland and/or X11 development headers
+
+**Arch Linux Setup:**
 
 ```bash
-nix run github:Mjoyufull/Kaleidux
-```
-
-### Installation (Source)
-
-Ensure you have the required GStreamer and graphics dependencies installed:
-
-```bash
-# Arch Linux
 sudo pacman -S gstreamer gst-plugins-base gst-plugins-good \
                gst-plugins-bad gst-libav wayland libx11 \
                vulkan-devel pkgconf cmake
 ```
 
-Build with Cargo:
+**Build:**
 
 ```bash
+git clone https://github.com/Mjoyufull/Kaleidux && cd Kaleidux
 cargo build --release
 ```
 
-### Usage
+## Usage Breakdown
 
-1. **Start the daemon**:
+### Daemon (`kaleidux-daemon`)
 
-   ```bash
-   ./target/release/kaleidux-daemon
-   ```
+The core background service handling rendering and display interop.
 
-2. **Control with `kldctl`**:
+```bash
+Usage: kaleidux-daemon [OPTIONS]
 
-   ```bash
-   kldctl next    # Skip to next wallpaper
-   kldctl status  # Show what's playing
-   kldctl query   # List connected monitors
-   ```
+Options:
+      --demo       Run in demo mode (rotating built-in shaders)
+      --log <PATH> Specify log file path
+  -h, --help       Show help
+```
 
-3. **Configure**:
-   The default config is at `~/.config/kaleidux/config.toml`. See [USAGE.MD](./USAGE.MD) for details.
+### Controller (`kldctl`)
 
-## Components
+Swiss Army knife for interacting with the running daemon.
 
-- **kaleidux-daemon**: The core background service handling rendering and Wayland/X11 interop.
-- **kldctl**: Command-line utility to interact with the running daemon.
-- **kaleidux-common**: Shared types and IPC protocol logic.
+```text
+kldctl
+├── next [n]      Skip to the next wallpaper
+├── prev [p]      Go back to the previous wallpaper
+├── query [q]     List connected outputs and current state
+├── love <PATH>   Increase selection frequency for a file
+├── unlove <PATH> Reset frequency for a file
+├── lovelist [ll] List all "loved" wallpapers
+├── pause         Pause video playback
+├── resume        Resume video playback
+├── reload        Reload configuration from disk
+├── kill          Stop the daemon gracefully
+├── playlist      Manage content playlists
+├── blacklist     Manage excluded files
+└── history       Show recently played wallpapers
+```
 
-## Documentation
+### Quick Usage Examples
 
-- [Advanced Usage & Configuration (USAGE.MD)](./USAGE.MD)
-- [Example Configuration (config.example.toml)](./config.example.toml)
+```bash
+# Love the current wallpaper on a specific monitor
+kldctl love ~/wallpapers/nature.jpg
+
+# List status of all monitors
+kldctl query
+
+# Sync all monitors to the next wallpaper
+kldctl next --all
+```
+
+## Configuration
+
+Default location: `~/.config/kaleidux/config.toml`
+
+```toml
+[global]
+monitor-behavior = "independent"
+sorting = "loveit"
+video-ratio = 50
+
+[any]
+transition = { type = "cube", duration = 1000 }
+```
+
+See [USAGE.MD](./USAGE.MD) for full configuration reference.
+
+## Troubleshooting
+
+- **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
+- **High CPU**: Video frames currently use a CPU-RGBA roundtrip. Zero-copy is planned.
+- **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_STANDARDS.md) for guidelines.
 
 ## License
 

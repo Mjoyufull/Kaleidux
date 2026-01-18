@@ -1,0 +1,65 @@
+.TH KLDCTL 1 "JANUARY 2026" "0.0.1-kneecap" "Kaleidux Manual"
+.SH NAME
+kldctl \- Control utility for the Kaleidux wallpaper daemon
+.SH SYNOPSIS
+.B kldctl
+[\fIOPTIONS\fR] \fICOMMAND\fR [\fIARGS\fR]
+.SH DESCRIPTION
+.B kldctl
+is the primary interface for interacting with a running
+.B kaleidux-daemon
+instance. It uses a Unix domain socket to send commands for wallpaper switching, playlist management, and status queries.
+.SH OPTIONS
+.TP
+.B \-s, \-\-socket \fI<SOCKET>\fR
+Path to the daemon's Unix socket. Defaults to \fIXDG_RUNTIME_DIR/kaleidux.sock\fR or \fI/tmp/kaleidux-{USER}.sock\fR.
+.TP
+.B \-v, \-\-version
+Show version information.
+.TP
+.B \-h, \-\-help
+Print help information.
+.SH COMMANDS
+.TP
+.B status \fR(alias: \fBst\fR)
+Display the current status of the daemon, including active wallpapers and playback state.
+.TP
+.B next \fR(alias: \fBn\fR)
+Force the daemon to skip to the next wallpaper in the queue.
+.TP
+.B prev \fR(alias: \fBp\fR)
+Switch back to the previously displayed wallpaper if history is available.
+.TP
+.B love \fI<PATH>\fR [\fI-m MULTIPLIER\fR]
+Mark the specified file as "loved", increasing its selection frequency in the "loveit" sorting strategy.
+.TP
+.B unlove \fI<PATH>\fR
+Remove the love status from a file, resetting its selection weight.
+.TP
+.B lovelist \fR(alias: \fBll\fR)
+List all files currently in the love list.
+.TP
+.B pause
+Pause video wallpaper playback.
+.TP
+.B resume
+Resume paused video playback.
+.TP
+.B query \fR(alias: \fBq\fR)
+Query connected outputs and their current content state.
+.TP
+.B reload
+Request the daemon to reload its configuration file from disk.
+.TP
+.B kill
+Instruct the daemon to shut down gracefully.
+.TP
+.B playlist \fI<SUBCOMMAND>\fR
+Manage content playlists. Subcommands include: \fBcreate\fR, \fBadd\fR, \fBremove\fR, \fBload\fR, \fBlist\fR, \fBdelete\fR.
+.TP
+.B blacklist \fI<SUBCOMMAND>\fR
+Manage the blacklist of files to exclude from rotation. Subcommands include: \fBadd\fR, \fBremove\fR, \fBlist\fR.
+.SH SEE ALSO
+.BR kaleidux-daemon (1)
+.SH AUTHOR
+Mjoyufull <https://github.com/Mjoyufull/Kaleidux>

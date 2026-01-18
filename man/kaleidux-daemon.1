@@ -1,0 +1,33 @@
+.TH KALEIDUX-DAEMON 1 "JANUARY 2026" "0.0.1-kneecap" "Kaleidux Manual"
+.SH NAME
+kaleidux-daemon \- High-performance hardware-accelerated wallpaper daemon
+.SH SYNOPSIS
+.B kaleidux-daemon
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B kaleidux-daemon
+is a sophisticated wallpaper daemon for Wayland and X11 that specializes in smooth, hardware-accelerated transitions. It provides seamless blending between high-resolution images and videos using WGPU and GStreamer.
+.SH OPTIONS
+.TP
+.B \-v, \-\-version
+Show version information.
+.TP
+.B \-\-demo
+Start the daemon in demo mode, cycling through built-in transitions and sample content.
+.TP
+.B \-\-log \fI<LOG>\fR
+Set the logging verbosity (e.g., debug, info, warn) or specify a log file destination.
+.TP
+.B \-h, \-\-help
+Print help information.
+.SH FILES
+.TP
+.I ~/.config/kaleidux/config.toml
+The main configuration file where monitors, content paths, and transitions are defined.
+.TP
+.I ~/.config/kaleidux/logs/
+Directory containing daemon logs if file logging is enabled.
+.SH SEE ALSO
+.BR kldctl (1)
+.SH AUTHOR
+Mjoyufull <https://github.com/Mjoyufull/Kaleidux>

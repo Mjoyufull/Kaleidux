@@ -90,7 +90,8 @@ print("Automated tick at " + now.format("%H:%M"));
 
 ## Transitions Reference
 
-Kaleidux includes over 50 transitions. Most can be used with a simple name string, or a table to configure parameters.
+Kaleidux includes over 50 transitions. Most can be used with a simple name string, or a table to configure parameters,
+see the [transition examples](./transitions_example.toml).
 
 **Example parametric transition:**
 
@@ -105,12 +106,4 @@ transition = { type = "cube", persp = 0.7, unzoom = 0.3, reflection = 0.4, float
 - `smoothness`: How "hard" the transition edge is.
 - `direction`: For wipe/directional effects (e.g. `[1.0, 0.0]`).
 
-## Troubleshooting
-
-### Long Startup
-
-If the daemon takes ~15 seconds to start, this is usually WGPU waiting for the GPU driver to initialize on Wayland. This is a known driver/WGPU interaction on some systems.
-
-### Video High CPU Usage
-
-Currently, video frames are copied through the CPU (RGBA Round-Trip). This ensures compatibility across all GPUs but can be taxing for 4K video. We are researching Zero-Copy paths for future updates.
+ts

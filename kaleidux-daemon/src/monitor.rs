@@ -9,10 +9,16 @@ pub struct SystemMonitor {
     sys: System,
     has_nvidia: bool,
     amd_gpu_path: Option<String>,
+    metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
 }
 
 impl SystemMonitor {
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::new_with_metrics(None)
+    }
+    
+    pub fn new_with_metrics(metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
         
@@ -29,7 +35,7 @@ impl SystemMonitor {
             }
         }
 
-        Self { sys, has_nvidia, amd_gpu_path }
+        Self { sys, has_nvidia, amd_gpu_path, metrics }
     }
 
     fn get_gpu_stats(&self) -> (Option<f32>, Option<f32>, Option<f32>) {
@@ -104,10 +110,21 @@ impl SystemMonitor {
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
                     proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // KB to MB
+                    // Record memory usage in metrics
+                    if let Some(m) = &self.metrics {
+                        m.record_memory_usage(proc_mem as f64);
+                    }
                 }
             }
 
             let (gpu_load, vram_used, vram_total) = self.get_gpu_stats();
+            
+            // Record GPU utilization in metrics
+            if let Some(gl) = gpu_load {
+                if let Some(m) = &self.metrics {
+                    m.record_gpu_utilization(gl as f64);
+                }
+            }
             
             let mut log_msg = format!(
                 "[MONITOR] App: {:.1}% CPU, {:.1}MB | Sys: {:.1}% CPU, {:.2}GB / {:.2}GB",
