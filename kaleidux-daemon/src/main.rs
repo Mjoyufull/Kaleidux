@@ -11,8 +11,8 @@ use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use kaleidux_common::{Request, Response, Transition};
 
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// Global allocator removed (using system allocator)
+
 
 mod video;
 mod renderer;
