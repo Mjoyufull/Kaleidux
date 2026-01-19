@@ -44,7 +44,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb", "randr
 image = "0.25"
 rhai = { workspace = true }
 bytemuck = { version = "1.24.0", features = ["derive"] }
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads_runtime_support"] }
 
 libc = "0.2"
 sysinfo = { version = "0.37.2", features = ["component"] }
