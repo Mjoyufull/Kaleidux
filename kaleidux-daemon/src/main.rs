@@ -705,9 +705,7 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         
         // Handle Commands
         while let Ok((req, resp)) = cmd_rx.try_recv() {
-        while let Ok((req, resp)) = cmd_rx.try_recv() {
              let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag).await;
-             let _ = resp.send(response);
              let _ = resp.send(response);
         }
         
@@ -1128,9 +1126,7 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         
         // Commands
         while let Ok((req, resp)) = cmd_rx.try_recv() {
-        while let Ok((req, resp)) = cmd_rx.try_recv() {
              let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag).await;
-             let _ = resp.send(response);
              let _ = resp.send(response);
         }
         
