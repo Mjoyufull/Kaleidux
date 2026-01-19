@@ -57,12 +57,16 @@
           PKG_CONFIG_PATH = "${pkgs.gst_all_1.gstreamer.dev}/lib/pkgconfig:${pkgs.gst_all_1.gst-plugins-base.dev}/lib/pkgconfig";
 
           # Post-install hook to wrap binaries with runtime path
+          # Use --suffix to append Nix libraries AFTER system default paths
+          # This allows system graphics drivers (NVIDIA, etc.) to be found first
+          # System libraries in /usr/lib, /lib are checked before Nix store paths
           postInstall = ''
             wrapProgram $out/bin/kaleidux-daemon \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib" \
-              --prefix PATH : "${pkgs.mesa.drivers}/bin"
+              --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}" \
+              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib"
             wrapProgram $out/bin/kldctl \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib"
+              --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}" \
+              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib"
             
             mkdir -p $out/share/man/man1
             cp man/kaleidux-daemon.1 $out/share/man/man1/
