@@ -29,6 +29,7 @@ Supports Wayland & X11 with 50+ smooth GLSL transitions.
 **More Info:** [Detailed Usage & Advanced Config](./USAGE.MD)
 
 ## Quickstart
+<img width="1920" height="1080" alt="Screenshot_20260118-203253" src="https://github.com/user-attachments/assets/2487daf1-5dbc-4a57-a7fe-d5d8f7148a77" />
 
 Get up and running in 30 seconds:
 
