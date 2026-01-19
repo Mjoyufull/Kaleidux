@@ -11,8 +11,9 @@ use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use kaleidux_common::{Request, Response, Transition};
 
-// Global allocator removed (using system allocator)
-
+// Use jemalloc for better memory fragmentation handling in long-running processes
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod video;
 mod renderer;
