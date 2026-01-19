@@ -189,10 +189,7 @@ fn create_and_start_video_player(
         ) {
             Ok(mut vp) => {
                 vp.set_volume(vol);
-                // Pre-buffer video to reduce first frame latency
-                if let Err(e) = vp.prebuffer() {
-                    debug!("[VIDEO] {}: Pre-buffering failed (non-fatal): {}", name_str, e);
-                }
+
                 if vp.start().is_ok() {
                     if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp)) {
                          error!("Failed to send video player back: {}", e);
