@@ -100,12 +100,12 @@
           postInstall = ''
             wrapProgram $out/bin/kaleidux-daemon \
               --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeWrapDeps}" \
-              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib" \
+              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib:/usr/lib" \
               --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${gstPluginPath}" \
               --suffix XDG_DATA_DIRS : "/usr/share"
             wrapProgram $out/bin/kldctl \
               --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeWrapDeps}" \
-              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib"
+              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib:/usr/lib"
             
             mkdir -p $out/share/man/man1
             cp man/kaleidux-daemon.1 $out/share/man/man1/
