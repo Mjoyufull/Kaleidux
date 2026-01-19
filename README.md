@@ -1,5 +1,5 @@
 <div align="center">
-![Logo](./assets/fsel.png)
+![Logo](./assets/kaleidux.png)
 <i>(dynamic desktop kaleidoscope)</i>
 <br><br>
 
