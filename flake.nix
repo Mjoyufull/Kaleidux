@@ -16,8 +16,12 @@
         
         runtimeDeps = with pkgs; [
           wayland
+          wayland-protocols
           egl-wayland
           vulkan-loader
+          mesa
+          libGL
+          libglvnd
           libxkbcommon
           xorg.libX11
           xorg.libXcursor
@@ -29,7 +33,6 @@
           gst_all_1.gst-plugins-bad
           gst_all_1.gst-plugins-ugly
           gst_all_1.gst-libav
-          libglvnd
         ];
 
         buildDeps = with pkgs; [
@@ -38,6 +41,7 @@
           python3
           llvmPackages.libclang.lib
           makeWrapper
+          vulkan-headers
         ];
 
         kaleidux = naersk-lib.buildPackage {
@@ -55,7 +59,8 @@
           # Post-install hook to wrap binaries with runtime path
           postInstall = ''
             wrapProgram $out/bin/kaleidux-daemon \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib"
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib" \
+              --prefix PATH : "${pkgs.mesa.drivers}/bin"
             wrapProgram $out/bin/kldctl \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeDeps}:/run/opengl-driver/lib:/run/opengl-driver-32/lib"
             
