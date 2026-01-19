@@ -29,6 +29,7 @@
           xorg.libXcursor
           xorg.libXrandr
           xorg.libXi
+          xorg.libxcb
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
@@ -51,6 +52,7 @@
           xorg.libXcursor
           xorg.libXrandr
           xorg.libXi
+          xorg.libxcb
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
@@ -58,6 +60,15 @@
           gst_all_1.gst-plugins-ugly
           gst_all_1.gst-libav
         ];
+
+        gstPluginPath = pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (with pkgs.gst_all_1; [
+          gstreamer
+          gst-plugins-base
+          gst-plugins-good
+          gst-plugins-bad
+          gst-plugins-ugly
+          gst-libav
+        ]);
 
         buildDeps = with pkgs; [
           pkg-config
@@ -89,7 +100,8 @@
           postInstall = ''
             wrapProgram $out/bin/kaleidux-daemon \
               --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeWrapDeps}" \
-              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib"
+              --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib" \
+              --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${gstPluginPath}"
             wrapProgram $out/bin/kldctl \
               --suffix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeWrapDeps}" \
               --suffix LD_LIBRARY_PATH : "/run/opengl-driver/lib:/run/opengl-driver-32/lib"
