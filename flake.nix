@@ -43,7 +43,7 @@
           wayland
           wayland-protocols
           egl-wayland
-          # vulkan-loader excluded - use system's loader on non-NixOS
+          vulkan-loader
           mesa
           libGL
           libglvnd
