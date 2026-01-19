@@ -705,7 +705,9 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         
         // Handle Commands
         while let Ok((req, resp)) = cmd_rx.try_recv() {
-             let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag);
+        while let Ok((req, resp)) = cmd_rx.try_recv() {
+             let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag).await;
+             let _ = resp.send(response);
              let _ = resp.send(response);
         }
         
@@ -1126,7 +1128,9 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         
         // Commands
         while let Ok((req, resp)) = cmd_rx.try_recv() {
-             let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag);
+        while let Ok((req, resp)) = cmd_rx.try_recv() {
+             let response = handle_command(req, &mut monitor_manager, &mut renderers, &mut video_players, &frame_tx, &image_tx, &player_tx, &mut next_session_id, loop_start, &shutdown_flag).await;
+             let _ = resp.send(response);
              let _ = resp.send(response);
         }
         
@@ -1265,7 +1269,7 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
     Ok(())
 }
 
-fn handle_command(
+async fn handle_command(
     req: Request,
     monitor_manager: &mut monitor_manager::MonitorManager,
     renderers: &mut HashMap<String, renderer::Renderer>,
@@ -1317,6 +1321,26 @@ fn handle_command(
              monitor_manager.unlove_file(path).map(|_| Response::Ok).unwrap_or_else(|e| Response::Error(e.to_string()))
         }
         Request::History { output } => Response::History(monitor_manager.get_history(output)),
+        Request::Reload => {
+            info!("Reloading configuration...");
+             match orchestration::Config::load().await {
+                Ok(new_config) => {
+                    monitor_manager.update_config(new_config);
+                    // Refresh renderers with new config
+                    for (name, r) in renderers.iter_mut() {
+                        if let Some(cfg) = monitor_manager.get_output_config(name) {
+                            r.apply_config(cfg);
+                        }
+                    }
+                    info!("Configuration reloaded successfully");
+                    Response::Ok
+                }
+                Err(e) => {
+                    error!("Failed to reload config: {}", e);
+                    Response::Error(format!("Failed to reload config: {}", e))
+                }
+            }
+        }
         _ => Response::Ok
     }
 }
