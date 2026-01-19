@@ -1,9 +1,6 @@
 <div align="center">
-
 ![Kaleidux Logo](./assets/kaleidux.png)
-
 <i>(dynamic desktop kaleidoscope)</i>
-
 <br><br>
 
 [![License](https://img.shields.io/badge/license-AGPL--3.0-red.svg?style=flat-square)](https://github.com/Mjoyufull/Kaleidux/blob/main/LICENSE)
