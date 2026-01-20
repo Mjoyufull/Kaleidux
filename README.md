@@ -62,8 +62,15 @@ kldctl next
 - **IPC Control**: Control the daemon via `kldctl` (next, prev, pause, status, etc.).
 
 ## Installation
+### Option 1: Aur (Recommended)
+- Installing from the Arch User Repository
+```
+$ yay -S kaleidux-git
+# or
+$ paru -S kaleidux-git
+```
 
-### Option 1: Nix Flake (Recommended)
+### Option 2: Nix Flake
 
 - Build and run with Nix flakes:
 
@@ -78,7 +85,7 @@ kldctl next
   }
   ```
 
-### Option 2: Build from Source
+### Option 3: Build from Source
 
 **Build Requirements:**
 
@@ -175,6 +182,16 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_STANDARDS.md) for guidelines.
+
+## Credits
+
+- [gSlapper](https://github.com/Nomadcxx/gSlapper)
+- [wpaperd](https://github.com/danyspin97/wpaperd)
+- [mpvpaper](https://github.com/GhostNaN/mpvpaper)
+- [GStreamer](https://gstreamer.freedesktop.org/)
+- [Clapper](https://github.com/Rafostar/clapper)
+- [swww](https://github.com/Horus645/swww)
+
 
 ## License
 
