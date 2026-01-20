@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Instant;
-use std::sync::Arc;
-use crate::orchestration::{Config, OutputConfig, MonitorBehavior};
-use crate::queue::SmartQueue;
 use crate::cache::FileCache;
 use crate::metrics::PerformanceMetrics;
-use tracing::{info, error, debug, warn};
-use anyhow::Result;
-use kaleidux_common::{KEntry, PlaylistCommand, BlacklistCommand, Response};
+use crate::orchestration::{Config, MonitorBehavior, OutputConfig};
 use crate::queue::Playlist;
+use crate::queue::SmartQueue;
+use anyhow::Result;
+use kaleidux_common::{BlacklistCommand, KEntry, PlaylistCommand, Response};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, error, info, warn};
 
 pub struct OutputOrchestrator {
     pub _name: String,
@@ -27,19 +27,36 @@ pub struct OutputOrchestrator {
 }
 
 impl OutputOrchestrator {
-    pub async fn new(name: String, description: String, config: OutputConfig, cache: Arc<FileCache>, metrics: Option<Arc<PerformanceMetrics>>) -> Self {
+    pub async fn new(
+        name: String,
+        description: String,
+        config: OutputConfig,
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<PerformanceMetrics>>,
+    ) -> Self {
         let queue = if let Some(path) = &config.path {
             info!("[QUEUE] {}: Initializing queue for path: {:?}", name, path);
-            match SmartQueue::new_with_cache(path, config.video_ratio, config.sorting.clone(), cache, metrics.clone()).await {
+            match SmartQueue::new_with_cache(
+                path,
+                config.video_ratio,
+                config.sorting,
+                cache,
+                metrics.clone(),
+            )
+            .await
+            {
                 Ok(mut q) => {
                     info!("[QUEUE] {}: Queue initialized successfully", name);
                     if let Some(pl_name) = &config.default_playlist {
                         if let Err(e) = q.set_playlist(Some(pl_name.clone())) {
-                            error!("Failed to set default playlist '{}' for {}: {}", pl_name, name, e);
+                            error!(
+                                "Failed to set default playlist '{}' for {}: {}",
+                                pl_name, name, e
+                            );
                         }
                     }
                     Some(q)
-                },
+                }
                 Err(e) => {
                     error!("[QUEUE] {}: Failed to initialize queue: {}", name, e);
                     None
@@ -65,14 +82,17 @@ impl OutputOrchestrator {
 
     pub fn tick(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
         let now = Instant::now();
-        
-        
+
         // If content is displaying, check if duration has elapsed based on actual display start time
         if let Some(display_start) = self.display_start_time {
             let elapsed = now.saturating_duration_since(display_start);
             if elapsed >= self.config.duration {
-                debug!("Duration expired for {}: {} elapsed (target: {:?})", 
-                    self._name, format!("{:.2}s", elapsed.as_secs_f64()), self.config.duration);
+                debug!(
+                    "Duration expired for {}: {} elapsed (target: {:?})",
+                    self._name,
+                    format!("{:.2}s", elapsed.as_secs_f64()),
+                    self.config.duration
+                );
                 let result = self.pick_next();
                 return result;
             }
@@ -80,7 +100,10 @@ impl OutputOrchestrator {
             // Fallback: if display_start_time not set yet, use scheduled time
             // This handles the case where content hasn't loaded yet
             if now >= next {
-                debug!("Timer expired for {}: Switching now (next was {:?})", self._name, next);
+                debug!(
+                    "Timer expired for {}: Switching now (next was {:?})",
+                    self._name, next
+                );
                 let result = self.pick_next();
                 return result;
             }
@@ -89,7 +112,10 @@ impl OutputOrchestrator {
                 warn!("[TICK] {}: Queue is None, cannot pick content", self._name);
                 return None;
             }
-            info!("[TICK] {}: Initial tick - picking first content (queue exists)", self._name);
+            info!(
+                "[TICK] {}: Initial tick - picking first content (queue exists)",
+                self._name
+            );
             let result = self.pick_next();
             return result;
         }
@@ -107,25 +133,30 @@ impl OutputOrchestrator {
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
                 // Set next_change as fallback (in case content never loads)
-                self.next_change = Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
-                
+                self.next_change =
+                    Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
+
                 // Pre-buffer next content
                 if let Some((next_p, next_t)) = self.peek_next() {
-                     self.next_path = Some(next_p);
-                     self.next_content_type = Some(next_t);
+                    self.next_path = Some(next_p);
+                    self.next_content_type = Some(next_t);
                 } else {
-                     self.next_path = None;
-                     self.next_content_type = None;
+                    self.next_path = None;
+                    self.next_content_type = None;
                 }
-                
-                debug!("Scheduled next change for {} in {:?} (path: {})", self._name, self.config.duration, path.display());
+
+                debug!(
+                    "Scheduled next change for {} in {:?} (path: {})",
+                    self._name,
+                    self.config.duration,
+                    path.display()
+                );
                 return Some((path, content_type));
             }
-        } else {
         }
         None
     }
-    
+
     /// Get the next content path without consuming it (for pre-buffering)
     pub fn peek_next(&self) -> Option<(PathBuf, crate::queue::ContentType)> {
         if let Some(queue) = &self.queue {
@@ -133,7 +164,7 @@ impl OutputOrchestrator {
         }
         None
     }
-    
+
     /// Mark that transition has completed and content is now displaying (called when transition progress >= 1.0)
     pub fn mark_transition_completed(&mut self) {
         if self.display_start_time.is_none() && self.current_path.is_some() {
@@ -150,7 +181,8 @@ impl OutputOrchestrator {
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
                 // Set next_change as fallback (in case content never loads)
-                self.next_change = Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
+                self.next_change =
+                    Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
                 return Some((path, content_type));
             }
         }
@@ -166,8 +198,8 @@ pub struct MonitorManager {
     output_groups: HashMap<String, usize>,    // output_name -> group_id
     shared_display_start_time: Option<Instant>, // For synchronized outputs - shared display start time
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
-    cache: Arc<FileCache>, // Shared cache instance for all queues
-    metrics: Option<Arc<PerformanceMetrics>>, // Shared metrics instance
+    cache: Arc<FileCache>,                              // Shared cache instance for all queues
+    metrics: Option<Arc<PerformanceMetrics>>,           // Shared metrics instance
 }
 
 impl MonitorManager {
@@ -175,15 +207,18 @@ impl MonitorManager {
     pub fn new(config: Config) -> Result<Self> {
         Self::new_with_metrics(config, None)
     }
-    
+
     pub fn get_cache(&self) -> Arc<FileCache> {
         self.cache.clone()
     }
-    
-    pub fn new_with_metrics(config: Config, metrics: Option<Arc<PerformanceMetrics>>) -> Result<Self> {
+
+    pub fn new_with_metrics(
+        config: Config,
+        metrics: Option<Arc<PerformanceMetrics>>,
+    ) -> Result<Self> {
         // Create shared cache instance once for all queues
         let cache = Arc::new(FileCache::new()?);
-        
+
         Ok(Self {
             config,
             outputs: HashMap::new(),
@@ -200,32 +235,54 @@ impl MonitorManager {
     #[allow(dead_code)]
     pub fn update_config(&mut self, config: Config) {
         self.config = config;
-        
+
         // Refresh all output configurations
         for (name, orch) in &mut self.outputs {
             // Re-match config for this output using its stored description
-            let output_config = self.config.get_config_for_output(name, &orch.description); 
+            let output_config = self.config.get_config_for_output(name, &orch.description);
             orch.config = output_config;
-            
+
             // TODO: Full queue refresh if path changes.
         }
     }
 
     pub async fn add_output(&mut self, name: &str, description: &str) {
         let output_config = self.config.get_config_for_output(name, description);
-        info!("[ADD_OUTPUT] {}: path={:?}, behavior={:?}", name, output_config.path, self.config.global.monitor_behavior);
-        
+        info!(
+            "[ADD_OUTPUT] {}: path={:?}, behavior={:?}",
+            name, output_config.path, self.config.global.monitor_behavior
+        );
+
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 info!("[ADD_OUTPUT] {}: Creating independent queue", name);
-                let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
-                info!("[ADD_OUTPUT] {}: Queue created: {}", name, orch.queue.is_some());
+                let orch = OutputOrchestrator::new(
+                    name.to_string(),
+                    description.to_string(),
+                    output_config,
+                    self.cache.clone(),
+                    self.metrics.clone(),
+                )
+                .await;
+                info!(
+                    "[ADD_OUTPUT] {}: Queue created: {}",
+                    name,
+                    orch.queue.is_some()
+                );
                 self.outputs.insert(name.to_string(), orch);
             }
             MonitorBehavior::Synchronized => {
                 if self.shared_queue.is_none() {
                     if let Some(path) = &output_config.path {
-                        if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()).await {
+                        if let Ok(mut q) = SmartQueue::new_with_cache(
+                            path,
+                            output_config.video_ratio,
+                            output_config.sorting,
+                            self.cache.clone(),
+                            self.metrics.clone(),
+                        )
+                        .await
+                        {
                             if let Some(pl_name) = &output_config.default_playlist {
                                 let _ = q.set_playlist(Some(pl_name.clone()));
                             }
@@ -233,7 +290,14 @@ impl MonitorManager {
                         }
                     }
                 }
-                let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
+                let mut orch = OutputOrchestrator::new(
+                    name.to_string(),
+                    description.to_string(),
+                    output_config,
+                    self.cache.clone(),
+                    self.metrics.clone(),
+                )
+                .await;
                 orch.queue = None; // Will use shared queue
                 self.outputs.insert(name.to_string(), orch);
             }
@@ -249,11 +313,19 @@ impl MonitorManager {
 
                 if let Some(gid) = group_id {
                     self.output_groups.insert(name.to_string(), gid);
-                    
+
                     // Initialize group queue if needed
                     if !self.group_queues.contains_key(&gid) {
                         if let Some(path) = &output_config.path {
-                            if let Ok(mut q) = SmartQueue::new_with_cache(path, output_config.video_ratio, output_config.sorting.clone(), self.cache.clone(), self.metrics.clone()).await {
+                            if let Ok(mut q) = SmartQueue::new_with_cache(
+                                path,
+                                output_config.video_ratio,
+                                output_config.sorting,
+                                self.cache.clone(),
+                                self.metrics.clone(),
+                            )
+                            .await
+                            {
                                 if let Some(pl_name) = &output_config.default_playlist {
                                     let _ = q.set_playlist(Some(pl_name.clone()));
                                 }
@@ -261,14 +333,28 @@ impl MonitorManager {
                             }
                         }
                     }
-                    
-                    let mut orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
+
+                    let mut orch = OutputOrchestrator::new(
+                        name.to_string(),
+                        description.to_string(),
+                        output_config,
+                        self.cache.clone(),
+                        self.metrics.clone(),
+                    )
+                    .await;
                     orch.queue = None; // Will use group queue
                     self.outputs.insert(name.to_string(), orch);
                 } else {
                     // Output not in any group, treat as independent
                     info!("Output {} not in any group, treating as independent", name);
-                    let orch = OutputOrchestrator::new(name.to_string(), description.to_string(), output_config, self.cache.clone(), self.metrics.clone()).await;
+                    let orch = OutputOrchestrator::new(
+                        name.to_string(),
+                        description.to_string(),
+                        output_config,
+                        self.cache.clone(),
+                        self.metrics.clone(),
+                    )
+                    .await;
                     self.outputs.insert(name.to_string(), orch);
                 }
             }
@@ -278,7 +364,6 @@ impl MonitorManager {
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
         let now = Instant::now();
-
 
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
@@ -306,7 +391,9 @@ impl MonitorManager {
                             should_change = true;
                         }
                     } else if let Some(next) = first_orch.next_change {
-                        if now >= next { should_change = true; }
+                        if now >= next {
+                            should_change = true;
+                        }
                     } else if first_orch.current_path.is_none() {
                         should_change = true;
                     }
@@ -315,22 +402,27 @@ impl MonitorManager {
                 if should_change {
                     if let Some(queue) = &mut self.shared_queue {
                         if let Some(path) = queue.pick_next() {
-                            let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
-                            
+                            let content_type =
+                                crate::queue::SmartQueue::get_content_type(&path).unwrap();
+
                             // Pre-buffer next content
                             let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
                                 (Some(np), Some(nt))
-                            } else { (None, None) };
-                            
+                            } else {
+                                (None, None)
+                            };
+
                             // Reset shared display start time for next cycle
                             self.shared_display_start_time = None;
                             for (name, orch) in &mut self.outputs {
                                 orch.current_path = Some(path.clone());
                                 orch.display_start_time = None;
-                                orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
-                                
+                                orch.next_change = Some(
+                                    now + orch.config.duration + std::time::Duration::from_secs(5),
+                                );
+
                                 orch.next_path = next_p.clone();
-                                orch.next_content_type = next_t.clone();
+                                orch.next_content_type = next_t;
 
                                 changes.insert(name.clone(), (path.clone(), content_type));
                             }
@@ -341,11 +433,11 @@ impl MonitorManager {
             MonitorBehavior::Grouped(_) => {
                 // Check each group independently
                 let mut groups_to_tick: HashMap<usize, Vec<String>> = HashMap::new();
-                
+
                 for (name, gid) in &self.output_groups {
                     groups_to_tick.entry(*gid).or_default().push(name.clone());
                 }
-                
+
                 for (gid, output_names) in groups_to_tick {
                     // Check if any output in this group needs a change
                     let mut should_change = false;
@@ -368,33 +460,41 @@ impl MonitorManager {
                                     should_change = true;
                                 }
                             } else if let Some(next) = orch.next_change {
-                                if now >= next { should_change = true; }
+                                if now >= next {
+                                    should_change = true;
+                                }
                             } else if orch.current_path.is_none() {
                                 should_change = true;
                             }
                         }
                     }
-                    
+
                     if should_change {
                         if let Some(queue) = self.group_queues.get_mut(&gid) {
                             if let Some(path) = queue.pick_next() {
-                                let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
-                                
+                                let content_type =
+                                    crate::queue::SmartQueue::get_content_type(&path).unwrap();
+
                                 // Pre-buffer next content
                                 let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
                                     (Some(np), Some(nt))
-                                } else { (None, None) };
-                                
+                                } else {
+                                    (None, None)
+                                };
+
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
                                 for name in &output_names {
                                     if let Some(orch) = self.outputs.get_mut(name) {
                                         orch.current_path = Some(path.clone());
                                         orch.display_start_time = None;
-                                        orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
-                                        
+                                        orch.next_change = Some(
+                                            now + orch.config.duration
+                                                + std::time::Duration::from_secs(5),
+                                        );
+
                                         orch.next_path = next_p.clone();
-                                        orch.next_content_type = next_t.clone();
+                                        orch.next_content_type = next_t;
 
                                         changes.insert(name.clone(), (path.clone(), content_type));
                                     }
@@ -403,7 +503,7 @@ impl MonitorManager {
                         }
                     }
                 }
-                
+
                 // Also tick independent outputs (not in any group)
                 for (name, orch) in &mut self.outputs {
                     if !self.output_groups.contains_key(name) {
@@ -415,11 +515,13 @@ impl MonitorManager {
             }
         }
 
-
         changes
     }
 
-    pub fn handle_next(&mut self, output_name: Option<String>) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
+    pub fn handle_next(
+        &mut self,
+        output_name: Option<String>,
+    ) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
@@ -440,23 +542,28 @@ impl MonitorManager {
             MonitorBehavior::Synchronized => {
                 if let Some(queue) = &mut self.shared_queue {
                     if let Some(path) = queue.pick_next() {
-                        let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                        let content_type =
+                            crate::queue::SmartQueue::get_content_type(&path).unwrap();
                         let now = Instant::now();
-                        
+
                         // Pre-buffer next content
                         let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
                             (Some(np), Some(nt))
-                        } else { (None, None) };
-                        
+                        } else {
+                            (None, None)
+                        };
+
                         // Reset shared display start time for next cycle
                         self.shared_display_start_time = None;
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
-                            orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
-                            
+                            orch.next_change = Some(
+                                now + orch.config.duration + std::time::Duration::from_secs(5),
+                            );
+
                             orch.next_path = next_p.clone();
-                            orch.next_content_type = next_t.clone();
+                            orch.next_content_type = next_t;
 
                             changes.insert(name.clone(), (path.clone(), content_type));
                         }
@@ -469,13 +576,16 @@ impl MonitorManager {
                     if let Some(gid) = self.output_groups.get(&target_name).copied() {
                         if let Some(queue) = self.group_queues.get_mut(&gid) {
                             if let Some(path) = queue.pick_next() {
-                                let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
-                                
+                                let content_type =
+                                    crate::queue::SmartQueue::get_content_type(&path).unwrap();
+
                                 // Pre-buffer next content
                                 let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
                                     (Some(np), Some(nt))
-                                } else { (None, None) };
-                                
+                                } else {
+                                    (None, None)
+                                };
+
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
                                 for (name, orch_gid) in &self.output_groups {
@@ -483,12 +593,17 @@ impl MonitorManager {
                                         if let Some(orch) = self.outputs.get_mut(name) {
                                             orch.current_path = Some(path.clone());
                                             orch.display_start_time = None;
-                                            orch.next_change = Some(Instant::now() + orch.config.duration + std::time::Duration::from_secs(5));
-                                            
-                                            orch.next_path = next_p.clone();
-                                            orch.next_content_type = next_t.clone();
+                                            orch.next_change = Some(
+                                                Instant::now()
+                                                    + orch.config.duration
+                                                    + std::time::Duration::from_secs(5),
+                                            );
 
-                                            changes.insert(name.clone(), (path.clone(), content_type));
+                                            orch.next_path = next_p.clone();
+                                            orch.next_content_type = next_t;
+
+                                            changes
+                                                .insert(name.clone(), (path.clone(), content_type));
                                         }
                                     }
                                 }
@@ -505,11 +620,12 @@ impl MonitorManager {
                 } else {
                     // No target specified, advance all groups and independents
                     let mut advanced_groups = std::collections::HashSet::new();
-                    for (_name, gid) in &self.output_groups {
+                    for gid in self.output_groups.values() {
                         if !advanced_groups.contains(gid) {
                             if let Some(queue) = self.group_queues.get_mut(gid) {
                                 if let Some(path) = queue.pick_next() {
-                                    let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                                    let content_type =
+                                        crate::queue::SmartQueue::get_content_type(&path).unwrap();
                                     // Reset group display start time for next cycle
                                     self.group_display_start_times.remove(gid);
                                     for (n, og) in &self.output_groups {
@@ -517,8 +633,15 @@ impl MonitorManager {
                                             if let Some(orch) = self.outputs.get_mut(n) {
                                                 orch.current_path = Some(path.clone());
                                                 orch.display_start_time = None;
-                                            orch.next_change = Some(Instant::now() + orch.config.duration + std::time::Duration::from_secs(5));
-                                                changes.insert(n.clone(), (path.clone(), content_type));
+                                                orch.next_change = Some(
+                                                    Instant::now()
+                                                        + orch.config.duration
+                                                        + std::time::Duration::from_secs(5),
+                                                );
+                                                changes.insert(
+                                                    n.clone(),
+                                                    (path.clone(), content_type),
+                                                );
                                             }
                                         }
                                     }
@@ -541,7 +664,10 @@ impl MonitorManager {
         changes
     }
 
-    pub fn handle_prev(&mut self, output_name: Option<String>) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
+    pub fn handle_prev(
+        &mut self,
+        output_name: Option<String>,
+    ) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
@@ -562,14 +688,17 @@ impl MonitorManager {
             MonitorBehavior::Synchronized => {
                 if let Some(queue) = &mut self.shared_queue {
                     if let Some(path) = queue.pick_prev() {
-                        let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                        let content_type =
+                            crate::queue::SmartQueue::get_content_type(&path).unwrap();
                         let now = Instant::now();
                         // Reset shared display start time for next cycle
                         self.shared_display_start_time = None;
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
-                            orch.next_change = Some(now + orch.config.duration + std::time::Duration::from_secs(5));
+                            orch.next_change = Some(
+                                now + orch.config.duration + std::time::Duration::from_secs(5),
+                            );
                             changes.insert(name.clone(), (path.clone(), content_type));
                         }
                     }
@@ -580,7 +709,8 @@ impl MonitorManager {
                     if let Some(gid) = self.output_groups.get(&target_name).copied() {
                         if let Some(queue) = self.group_queues.get_mut(&gid) {
                             if let Some(path) = queue.pick_prev() {
-                                let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                                let content_type =
+                                    crate::queue::SmartQueue::get_content_type(&path).unwrap();
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
                                 for (name, og) in &self.output_groups {
@@ -588,27 +718,31 @@ impl MonitorManager {
                                         if let Some(orch) = self.outputs.get_mut(name) {
                                             orch.current_path = Some(path.clone());
                                             orch.display_start_time = None;
-                                            orch.next_change = Some(Instant::now() + orch.config.duration + std::time::Duration::from_secs(5));
-                                            changes.insert(name.clone(), (path.clone(), content_type));
+                                            orch.next_change = Some(
+                                                Instant::now()
+                                                    + orch.config.duration
+                                                    + std::time::Duration::from_secs(5),
+                                            );
+                                            changes
+                                                .insert(name.clone(), (path.clone(), content_type));
                                         }
                                     }
                                 }
                             }
                         }
-                    } else {
-                        if let Some(orch) = self.outputs.get_mut(&target_name) {
-                            if let Some(res) = orch.pick_prev() {
-                                changes.insert(target_name, res);
-                            }
+                    } else if let Some(orch) = self.outputs.get_mut(&target_name) {
+                        if let Some(res) = orch.pick_prev() {
+                            changes.insert(target_name, res);
                         }
                     }
                 } else {
                     let mut prev_groups = std::collections::HashSet::new();
-                    for (_name, gid) in &self.output_groups {
+                    for gid in self.output_groups.values() {
                         if !prev_groups.contains(gid) {
                             if let Some(queue) = self.group_queues.get_mut(gid) {
                                 if let Some(path) = queue.pick_prev() {
-                                    let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                                    let content_type =
+                                        crate::queue::SmartQueue::get_content_type(&path).unwrap();
                                     // Reset group display start time for next cycle
                                     self.group_display_start_times.remove(gid);
                                     for (n, og) in &self.output_groups {
@@ -616,8 +750,15 @@ impl MonitorManager {
                                             if let Some(orch) = self.outputs.get_mut(n) {
                                                 orch.current_path = Some(path.clone());
                                                 orch.display_start_time = None;
-                                            orch.next_change = Some(Instant::now() + orch.config.duration + std::time::Duration::from_secs(5));
-                                                changes.insert(n.clone(), (path.clone(), content_type));
+                                                orch.next_change = Some(
+                                                    Instant::now()
+                                                        + orch.config.duration
+                                                        + std::time::Duration::from_secs(5),
+                                                );
+                                                changes.insert(
+                                                    n.clone(),
+                                                    (path.clone(), content_type),
+                                                );
                                             }
                                         }
                                     }
@@ -665,14 +806,20 @@ impl MonitorManager {
         if let Some(queue) = &self.shared_queue {
             for (path, stats) in &queue.stats.files {
                 if stats.love_multiplier > 1.0 {
-                    list.insert(path.to_string_lossy().to_string(), (stats.love_multiplier, stats.count));
+                    list.insert(
+                        path.to_string_lossy().to_string(),
+                        (stats.love_multiplier, stats.count),
+                    );
                 }
             }
         }
         for queue in self.group_queues.values() {
             for (path, stats) in &queue.stats.files {
                 if stats.love_multiplier > 1.0 {
-                    list.insert(path.to_string_lossy().to_string(), (stats.love_multiplier, stats.count));
+                    list.insert(
+                        path.to_string_lossy().to_string(),
+                        (stats.love_multiplier, stats.count),
+                    );
                 }
             }
         }
@@ -680,27 +827,34 @@ impl MonitorManager {
             if let Some(queue) = &orch.queue {
                 for (path, stats) in &queue.stats.files {
                     if stats.love_multiplier > 1.0 {
-                        list.insert(path.to_string_lossy().to_string(), (stats.love_multiplier, stats.count));
+                        list.insert(
+                            path.to_string_lossy().to_string(),
+                            (stats.love_multiplier, stats.count),
+                        );
                     }
                 }
             }
         }
-        list.into_iter().map(|(path, (multiplier, count))| {
-            KEntry { path, multiplier, count }
-        }).collect()
+        list.into_iter()
+            .map(|(path, (multiplier, count))| KEntry {
+                path,
+                multiplier,
+                count,
+            })
+            .collect()
     }
 
     pub fn get_output_config(&self, name: &str) -> Option<&OutputConfig> {
         self.outputs.get(name).map(|o| &o.config)
     }
-    
+
     /// Mark that transition has completed for an output (called when transition progress >= 1.0)
     /// For synchronized mode, uses shared display start time (first output to complete)
     /// For grouped mode, uses group display start time (first output in group to complete)
     /// For independent mode, each output has its own display start time
     pub fn mark_transition_completed(&mut self, name: &str) {
         let now = Instant::now();
-        
+
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Synchronized => {
                 // For synchronized mode, use shared display start time
@@ -788,13 +942,13 @@ impl MonitorManager {
             PlaylistCommand::Load { name } => {
                 let mut error = None;
                 self.apply_to_all_queues(|q| {
-                     if let Err(e) = q.set_playlist(name.clone()) {
-                         error = Some(e.to_string());
-                         let _ = q.save_stats(); // Save active playlist state? SmartQueue doesn't persist active_playlist yet
-                         Err(e)
-                     } else {
-                         q.save_stats()
-                     }
+                    if let Err(e) = q.set_playlist(name.clone()) {
+                        error = Some(e.to_string());
+                        let _ = q.save_stats(); // Save active playlist state? SmartQueue doesn't persist active_playlist yet
+                        Err(e)
+                    } else {
+                        q.save_stats()
+                    }
                 });
                 if let Some(e) = error {
                     Response::Error(e)
@@ -818,21 +972,20 @@ impl MonitorManager {
         match cmd {
             BlacklistCommand::Add { path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| {
-                    q.blacklist_file(path_buf.clone())
-                });
+                self.apply_to_all_queues(|q| q.blacklist_file(path_buf.clone()));
                 Response::Ok
             }
             BlacklistCommand::Remove { path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| {
-                    q.unblacklist_file(path_buf.clone())
-                });
+                self.apply_to_all_queues(|q| q.unblacklist_file(path_buf.clone()));
                 Response::Ok
             }
             BlacklistCommand::List => {
                 if let Some(q) = self.get_any_queue() {
-                    let paths: Vec<String> = q.stats.blacklist.iter()
+                    let paths: Vec<String> = q
+                        .stats
+                        .blacklist
+                        .iter()
                         .map(|p| p.to_string_lossy().to_string())
                         .collect();
                     Response::Blacklist(paths)
@@ -843,36 +996,50 @@ impl MonitorManager {
         }
     }
 
-    fn apply_to_all_queues<F>(&mut self, mut f: F) 
-    where F: FnMut(&mut SmartQueue) -> Result<()> {
-        if let Some(q) = &mut self.shared_queue { let _ = f(q); }
-        for q in self.group_queues.values_mut() { let _ = f(q); }
+    fn apply_to_all_queues<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut SmartQueue) -> Result<()>,
+    {
+        if let Some(q) = &mut self.shared_queue {
+            let _ = f(q);
+        }
+        for q in self.group_queues.values_mut() {
+            let _ = f(q);
+        }
         for orch in self.outputs.values_mut() {
-            if let Some(q) = &mut orch.queue { let _ = f(q); }
+            if let Some(q) = &mut orch.queue {
+                let _ = f(q);
+            }
         }
     }
-    
+
     /// Flush pending stats updates from all queues (batched write)
     pub fn flush_all_stats(&mut self) -> Result<()> {
-        if let Some(q) = &mut self.shared_queue { 
-            let _ = q.flush_stats(); 
+        if let Some(q) = &mut self.shared_queue {
+            let _ = q.flush_stats();
         }
-        for q in self.group_queues.values_mut() { 
-            let _ = q.flush_stats(); 
+        for q in self.group_queues.values_mut() {
+            let _ = q.flush_stats();
         }
         for orch in self.outputs.values_mut() {
-            if let Some(q) = &mut orch.queue { 
-                let _ = q.flush_stats(); 
+            if let Some(q) = &mut orch.queue {
+                let _ = q.flush_stats();
             }
         }
         Ok(())
     }
 
     fn get_any_queue(&self) -> Option<&SmartQueue> {
-        if let Some(q) = &self.shared_queue { return Some(q); }
-        if let Some(q) = self.group_queues.values().next() { return Some(q); }
+        if let Some(q) = &self.shared_queue {
+            return Some(q);
+        }
+        if let Some(q) = self.group_queues.values().next() {
+            return Some(q);
+        }
         for orch in self.outputs.values() {
-            if let Some(q) = &orch.queue { return Some(q); }
+            if let Some(q) = &orch.queue {
+                return Some(q);
+            }
         }
         None
     }
@@ -880,35 +1047,38 @@ impl MonitorManager {
     pub fn get_history(&self, output_name: Option<String>) -> Vec<String> {
         let history = Vec::new();
         let to_strings = |paths: &[PathBuf]| -> Vec<String> {
-            paths.iter().map(|p| p.to_string_lossy().to_string()).collect()
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect()
         };
 
         if let Some(name) = output_name {
             // Specific output requested
-             if let Some(gid) = self.output_groups.get(&name) {
-                  if let Some(q) = self.group_queues.get(gid) {
-                      return to_strings(&q.history);
-                  }
-             }
-             if let Some(orch) = self.outputs.get(&name) {
-                 if let Some(q) = &orch.queue {
-                      return to_strings(&q.history);
-                 }
-                 // If orch exists but no queue (synchronized?), check shared
-                 if self.shared_queue.is_some() {
-                      if let Some(q) = &self.shared_queue {
-                          return to_strings(&q.history);
-                      }
-                 }
-             }
+            if let Some(gid) = self.output_groups.get(&name) {
+                if let Some(q) = self.group_queues.get(gid) {
+                    return to_strings(&q.history);
+                }
+            }
+            if let Some(orch) = self.outputs.get(&name) {
+                if let Some(q) = &orch.queue {
+                    return to_strings(&q.history);
+                }
+                // If orch exists but no queue (synchronized?), check shared
+                if self.shared_queue.is_some() {
+                    if let Some(q) = &self.shared_queue {
+                        return to_strings(&q.history);
+                    }
+                }
+            }
         } else {
             // General request
             if let Some(q) = &self.shared_queue {
-                 return to_strings(&q.history);
+                return to_strings(&q.history);
             }
             // Try to find a group queue
             if let Some(q) = self.group_queues.values().next() {
-                 return to_strings(&q.history);
+                return to_strings(&q.history);
             }
             // Try to find any independent queue
             for orch in self.outputs.values() {

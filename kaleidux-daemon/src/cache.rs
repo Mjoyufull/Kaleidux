@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
-use anyhow::{Result, Context};
-use serde::{Serialize, Deserialize};
+use anyhow::{Context, Result};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use redb::{Database, ReadableTable, TableDefinition};
-use notify::{Watcher, RecommendedWatcher, RecursiveMode, Event, EventKind};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
 
 // Table definitions for redb
@@ -17,7 +17,7 @@ const BLACKLIST_TABLE: TableDefinition<&[u8], bool> = TableDefinition::new("blac
 pub struct FileMetadata {
     pub mtime: u64, // Unix timestamp
     pub size: u64,
-    pub content_type: u8, // 0 = Image, 1 = Video
+    pub content_type: u8,   // 0 = Image, 1 = Video
     pub discovered_at: u64, // Unix timestamp
 }
 
@@ -31,10 +31,10 @@ impl FileCache {
             .context("Failed to get cache directory")?
             .join("kaleidux");
         std::fs::create_dir_all(&cache_dir)?;
-        
+
         let db_path = cache_dir.join("cache.redb");
         let db = Database::create(&db_path)?;
-        
+
         // Initialize tables
         let write_txn = db.begin_write()?;
         {
@@ -44,14 +44,14 @@ impl FileCache {
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
         }
         write_txn.commit()?;
-        
+
         Ok(Self { db })
     }
 
     pub fn get_file_metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_CACHE_TABLE)?;
-        
+
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
         if let Some(data) = table.get(path_bytes)? {
@@ -77,11 +77,8 @@ impl FileCache {
 
     pub fn is_file_valid(&self, path: &Path) -> Result<bool> {
         let metadata = std::fs::metadata(path)?;
-        let mtime = metadata
-            .modified()?
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+        let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+
         if let Some(cached) = self.get_file_metadata(path)? {
             Ok(cached.mtime == mtime)
         } else {
@@ -93,7 +90,7 @@ impl FileCache {
     pub fn get_file_stats(&self, path: &Path) -> Result<Option<crate::queue::FileStats>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
-        
+
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
         if let Some(data) = table.get(path_bytes)? {
@@ -118,7 +115,10 @@ impl FileCache {
         Ok(())
     }
 
-    pub fn batch_set_file_stats(&self, updates: &[(PathBuf, crate::queue::FileStats)]) -> Result<()> {
+    pub fn batch_set_file_stats(
+        &self,
+        updates: &[(PathBuf, crate::queue::FileStats)],
+    ) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
@@ -133,18 +133,20 @@ impl FileCache {
         Ok(())
     }
 
-    pub fn get_all_file_stats(&self) -> Result<std::collections::HashMap<PathBuf, crate::queue::FileStats>> {
+    pub fn get_all_file_stats(
+        &self,
+    ) -> Result<std::collections::HashMap<PathBuf, crate::queue::FileStats>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
         let mut stats = std::collections::HashMap::new();
-        
+
         for item in table.iter()? {
             let (key, value) = item?;
             let path = PathBuf::from(String::from_utf8_lossy(key.value()).to_string());
             let file_stats: crate::queue::FileStats = bincode::deserialize(value.value())?;
             stats.insert(path, file_stats);
         }
-        
+
         Ok(stats)
     }
 
@@ -152,7 +154,7 @@ impl FileCache {
     pub fn get_playlist(&self, name: &str) -> Result<Option<crate::queue::Playlist>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
-        
+
         if let Some(data) = table.get(name)? {
             let playlist: crate::queue::Playlist = bincode::deserialize(data.value())?;
             Ok(Some(playlist))
@@ -172,18 +174,20 @@ impl FileCache {
         Ok(())
     }
 
-    pub fn get_all_playlists(&self) -> Result<std::collections::HashMap<String, crate::queue::Playlist>> {
+    pub fn get_all_playlists(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::queue::Playlist>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
         let mut playlists = std::collections::HashMap::new();
-        
+
         for item in table.iter()? {
             let (key, value) = item?;
             let name = key.value().to_string();
             let playlist: crate::queue::Playlist = bincode::deserialize(value.value())?;
             playlists.insert(name, playlist);
         }
-        
+
         Ok(playlists)
     }
 
@@ -202,7 +206,7 @@ impl FileCache {
     pub fn is_blacklisted(&self, path: &Path) -> Result<bool> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(BLACKLIST_TABLE)?;
-        
+
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
         Ok(table.get(path_bytes)?.is_some())
@@ -228,13 +232,13 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(BLACKLIST_TABLE)?;
         let mut blacklist = std::collections::HashSet::new();
-        
+
         for item in table.iter()? {
             let (key, _) = item?;
             let path = PathBuf::from(String::from_utf8_lossy(key.value()).to_string());
             blacklist.insert(path);
         }
-        
+
         Ok(blacklist)
     }
 
@@ -246,10 +250,9 @@ impl FileCache {
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
             // Collect keys within write transaction to ensure atomicity
-            let keys: Vec<Vec<u8>> = table.iter()?
-                .filter_map(|item| {
-                    item.ok().map(|(key, _)| key.value().to_vec())
-                })
+            let keys: Vec<Vec<u8>> = table
+                .iter()?
+                .filter_map(|item| item.ok().map(|(key, _)| key.value().to_vec()))
                 .collect();
             for key in keys {
                 table.remove(key.as_slice())?;
@@ -258,7 +261,7 @@ impl FileCache {
         write_txn.commit()?;
         Ok(())
     }
-    
+
     /// Invalidate cache entry for a specific file
     pub fn invalidate_file(&self, path: &Path) -> Result<()> {
         let write_txn = self.db.begin_write()?;
@@ -284,11 +287,11 @@ pub struct DirectoryWatcher {
 impl DirectoryWatcher {
     pub fn new(cache: Arc<FileCache>) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
-        
+
         let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             let _ = event_tx.blocking_send(res);
         })?;
-        
+
         Ok(Self {
             watcher,
             event_rx,
@@ -296,7 +299,7 @@ impl DirectoryWatcher {
             watched_dirs: Vec::new(),
         })
     }
-    
+
     /// Watch a directory for changes
     pub fn watch(&mut self, path: &Path) -> Result<()> {
         if path.exists() && path.is_dir() {
@@ -306,7 +309,7 @@ impl DirectoryWatcher {
         }
         Ok(())
     }
-    
+
     /// Process file system events and invalidate cache entries
     pub async fn process_events(&mut self) {
         while let Ok(Ok(event)) = self.event_rx.try_recv() {
@@ -316,9 +319,16 @@ impl DirectoryWatcher {
                         if path.is_file() {
                             // Invalidate cache entry for this file
                             if let Err(e) = self.cache.invalidate_file(&path) {
-                                tracing::warn!("[CACHE] Failed to invalidate cache for {}: {}", path.display(), e);
+                                tracing::warn!(
+                                    "[CACHE] Failed to invalidate cache for {}: {}",
+                                    path.display(),
+                                    e
+                                );
                             } else {
-                                tracing::debug!("[CACHE] Invalidated cache for: {}", path.display());
+                                tracing::debug!(
+                                    "[CACHE] Invalidated cache for: {}",
+                                    path.display()
+                                );
                             }
                         } else if path.is_dir() {
                             // Directory changed - mark all files in this directory as dirty

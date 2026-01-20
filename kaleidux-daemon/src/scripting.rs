@@ -1,8 +1,8 @@
+use kaleidux_common::{Request, Response};
 use rhai::{Engine, Scope, AST};
 use std::path::PathBuf;
-use tracing::{info, error};
 use tokio::sync::{mpsc, oneshot};
-use kaleidux_common::{Request, Response};
+use tracing::{error, info};
 
 pub struct ScriptManager {
     engine: Engine,
@@ -49,7 +49,7 @@ impl ScriptManager {
         let ast = self.engine.compile(content)?;
         self.ast = Some(ast);
         info!("Rhai script loaded from {:?}", path);
-        
+
         // Run initial setup if it exists
         if let Some(ast) = &self.ast {
             if let Err(e) = self.engine.call_fn::<()>(&mut self.scope, ast, "init", ()) {
@@ -58,13 +58,16 @@ impl ScriptManager {
                 }
             }
         }
-        
+
         Ok(())
     }
 
     pub fn tick(&mut self) {
         if let Some(ast) = &self.ast {
-            if let Err(e) = self.engine.call_fn::<()>(&mut self.scope, ast, "on_tick", ()) {
+            if let Err(e) = self
+                .engine
+                .call_fn::<()>(&mut self.scope, ast, "on_tick", ())
+            {
                 if !e.to_string().contains("not found") {
                     error!("Rhai tick error: {}", e);
                 }

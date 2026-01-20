@@ -1,31 +1,21 @@
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
+use crate::cache::FileCache;
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use jwalk::WalkDir;
 use rand::Rng;
-use chrono::{DateTime, Utc};
-use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use crate::cache::FileCache;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoveitData {
     pub files: HashMap<PathBuf, FileStats>,
     #[serde(default)]
     pub playlists: HashMap<String, Playlist>,
     #[serde(default)]
     pub blacklist: std::collections::HashSet<PathBuf>,
-}
-
-impl Default for LoveitData {
-    fn default() -> Self {
-        Self {
-            files: HashMap::new(),
-            playlists: HashMap::new(),
-            blacklist: std::collections::HashSet::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +26,9 @@ pub struct Playlist {
     pub enabled: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileStats {
@@ -65,24 +57,37 @@ pub enum ContentType {
 }
 
 impl SmartQueue {
-    pub async fn new_with_cache(path: &Path, video_ratio: u8, strategy: crate::orchestration::SortingStrategy, cache: Arc<FileCache>, metrics: Option<Arc<crate::metrics::PerformanceMetrics>>) -> Result<Self> {
+    pub async fn new_with_cache(
+        path: &Path,
+        video_ratio: u8,
+        strategy: crate::orchestration::SortingStrategy,
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
+    ) -> Result<Self> {
         tracing::info!("[QUEUE] new_with_cache called for path: {:?}", path);
         let stats = Self::load_stats_from_cache(&cache)?;
-        tracing::info!("[QUEUE] Loaded stats, blacklist size: {}", stats.blacklist.len());
-        
+        tracing::info!(
+            "[QUEUE] Loaded stats, blacklist size: {}",
+            stats.blacklist.len()
+        );
+
         // Run file discovery in background task to avoid blocking startup
         let path_buf = path.to_path_buf();
         let blacklist_clone = stats.blacklist.clone();
         let cache_clone = cache.clone();
         let metrics_clone = metrics.clone();
-        
+
         tracing::info!("[QUEUE] Starting file discovery for: {:?}", path_buf);
         // Use spawn_blocking to run on thread pool (truly async, non-blocking)
         let pool = tokio::task::spawn_blocking(move || {
             Self::discover_content(&path_buf, &blacklist_clone, cache_clone, metrics_clone)
-        }).await??;
-        tracing::info!("[QUEUE] File discovery completed, found {} files", pool.len());
-        
+        })
+        .await??;
+        tracing::info!(
+            "[QUEUE] File discovery completed, found {} files",
+            pool.len()
+        );
+
         let mut pool = pool;
         // Sort the pool initially for sequential strategies
         pool.sort();
@@ -120,26 +125,38 @@ impl SmartQueue {
         }
 
         // JPEG: FF D8 FF
-        if buffer[0..3] == [0xFF, 0xD8, 0xFF] { return Some(ContentType::Image); }
+        if buffer[0..3] == [0xFF, 0xD8, 0xFF] {
+            return Some(ContentType::Image);
+        }
         // PNG: 89 50 4E 47
-        if buffer[0..4] == [0x89, 0x50, 0x4E, 0x47] { return Some(ContentType::Image); }
+        if buffer[0..4] == [0x89, 0x50, 0x4E, 0x47] {
+            return Some(ContentType::Image);
+        }
         // GIF: GIF8
-        if buffer[0..4] == *b"GIF8" { return Some(ContentType::Image); }
+        if buffer[0..4] == *b"GIF8" {
+            return Some(ContentType::Image);
+        }
         // WebP: RIFF .... WEBP
-        if &buffer[0..4] == b"RIFF" && &buffer[8..12] == b"WEBP" { return Some(ContentType::Image); }
+        if &buffer[0..4] == b"RIFF" && &buffer[8..12] == b"WEBP" {
+            return Some(ContentType::Image);
+        }
         // EBML (MKV/WebM): 1A 45 DF A3
-        if buffer[0..4] == [0x1A, 0x45, 0xDF, 0xA3] { return Some(ContentType::Video); }
+        if buffer[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+            return Some(ContentType::Video);
+        }
         // MP4: ....ftyp
-        if &buffer[4..8] == b"ftyp" { return Some(ContentType::Video); }
+        if &buffer[4..8] == b"ftyp" {
+            return Some(ContentType::Video);
+        }
 
         None
     }
 
     fn discover_content(
-        path: &Path, 
+        path: &Path,
         blacklist: &std::collections::HashSet<PathBuf>,
         cache: Arc<FileCache>,
-        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>
+        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
     ) -> Result<Vec<PathBuf>> {
         let discovery_start = std::time::Instant::now();
         let mut files = Vec::new();
@@ -159,8 +176,10 @@ impl SmartQueue {
 
         for entry in entries {
             let p = entry.path().to_path_buf();
-            if blacklist.contains(&p) { continue; }
-            
+            if blacklist.contains(&p) {
+                continue;
+            }
+
             // Check cache first
             let content_type = if let Ok(Some(metadata)) = cache.get_file_metadata(&p) {
                 // Check if file is still valid (mtime matches)
@@ -199,17 +218,23 @@ impl SmartQueue {
 
             if let Some(ct) = content_type {
                 files.push(p.clone());
-                
+
                 // Update cache with file metadata
                 match std::fs::metadata(&p) {
                     Ok(metadata) => {
-                        match metadata.modified()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        match metadata
+                            .modified()
+                            .and_then(|t| {
+                                t.duration_since(UNIX_EPOCH).map_err(std::io::Error::other)
+                            })
                             .map(|d| d.as_secs())
                         {
                             Ok(mtime) => {
                                 let size = metadata.len();
-                                match SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()) {
+                                match SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                {
                                     Ok(discovered_at) => {
                                         let file_metadata = crate::cache::FileMetadata {
                                             mtime,
@@ -233,7 +258,11 @@ impl SmartQueue {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("[QUEUE] Failed to get metadata for cache update: {} (path: {:?})", e, p);
+                        tracing::warn!(
+                            "[QUEUE] Failed to get metadata for cache update: {} (path: {:?})",
+                            e,
+                            p
+                        );
                     }
                 }
             }
@@ -259,7 +288,9 @@ impl SmartQueue {
 
     #[inline]
     pub fn pick_next(&mut self) -> Option<PathBuf> {
-        if self.pool.is_empty() { return None; }
+        if self.pool.is_empty() {
+            return None;
+        }
 
         let picked = match self.strategy {
             crate::orchestration::SortingStrategy::Loveit => self.pick_loveit(),
@@ -286,7 +317,8 @@ impl SmartQueue {
     pub fn peek_next(&self) -> Option<(PathBuf, ContentType)> {
         // For sequential strategies, we can peek at the next index
         match self.strategy {
-            crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
+            crate::orchestration::SortingStrategy::Ascending
+            | crate::orchestration::SortingStrategy::Descending => {
                 let next_idx = match self.strategy {
                     crate::orchestration::SortingStrategy::Ascending => {
                         (self.current_index + 1) % self.pool.len()
@@ -300,7 +332,7 @@ impl SmartQueue {
                     }
                     _ => return None,
                 };
-                
+
                 if next_idx < self.pool.len() {
                     let path = self.pool[next_idx].clone();
                     if let Some(content_type) = Self::get_content_type(&path) {
@@ -317,13 +349,19 @@ impl SmartQueue {
 
     #[inline]
     pub fn pick_prev(&mut self) -> Option<PathBuf> {
-        if self.pool.is_empty() { return None; }
+        if self.pool.is_empty() {
+            return None;
+        }
 
         let picked = match self.strategy {
-            crate::orchestration::SortingStrategy::Ascending | crate::orchestration::SortingStrategy::Descending => {
-                let descending = matches!(self.strategy, crate::orchestration::SortingStrategy::Descending);
+            crate::orchestration::SortingStrategy::Ascending
+            | crate::orchestration::SortingStrategy::Descending => {
+                let descending = matches!(
+                    self.strategy,
+                    crate::orchestration::SortingStrategy::Descending
+                );
                 self.pick_sequential(!descending) // Reversed
-            },
+            }
             _ => {
                 // For non-sequential, use history
                 if self.history.len() > 1 {
@@ -345,28 +383,34 @@ impl SmartQueue {
     fn pick_random(&mut self) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
         let is_video_cycle = rng.gen_range(0..100) < self.video_ratio;
-        
-        let sub_pool: Vec<&PathBuf> = self.pool.iter().filter(|p| {
-            let is_video = matches!(Self::get_content_type(p), Some(ContentType::Video));
-            is_video == is_video_cycle
-        }).collect();
+
+        let sub_pool: Vec<&PathBuf> = self
+            .pool
+            .iter()
+            .filter(|p| {
+                let is_video = matches!(Self::get_content_type(p), Some(ContentType::Video));
+                is_video == is_video_cycle
+            })
+            .collect();
 
         let active_pool = if sub_pool.is_empty() {
             self.pool.iter().collect::<Vec<_>>()
         } else {
             sub_pool
         };
-        
+
         let idx = rng.gen_range(0..active_pool.len());
         Some(active_pool[idx].clone())
     }
 
     fn pick_sequential(&mut self, descending: bool) -> Option<PathBuf> {
-        if self.pool.is_empty() { return None; }
-        
+        if self.pool.is_empty() {
+            return None;
+        }
+
         let pool_len = self.pool.len();
         let picked = self.pool[self.current_index].clone();
-        
+
         if descending {
             if self.current_index == 0 {
                 self.current_index = pool_len - 1;
@@ -382,15 +426,19 @@ impl SmartQueue {
 
     fn pick_loveit(&mut self) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
-        
+
         // 1. Filter by video_ratio probability
         let is_video_cycle = rng.gen_range(0..100) < self.video_ratio;
-        
-        let sub_pool: Vec<&PathBuf> = self.pool.iter().filter(|p| {
-            let content_type = Self::get_content_type(p);
-            let is_video = matches!(content_type, Some(ContentType::Video));
-            is_video == is_video_cycle
-        }).collect();
+
+        let sub_pool: Vec<&PathBuf> = self
+            .pool
+            .iter()
+            .filter(|p| {
+                let content_type = Self::get_content_type(p);
+                let is_video = matches!(content_type, Some(ContentType::Video));
+                is_video == is_video_cycle
+            })
+            .collect();
 
         // Fallback if sub_pool is empty
         let active_pool = if sub_pool.is_empty() {
@@ -405,20 +453,24 @@ impl SmartQueue {
 
         for path in &active_pool {
             let stat = self.stats.files.get(*path).cloned().unwrap_or_default();
-            
+
             // Score = LoveMultiplier / (1 + Count) * RecencyFactor
             let count_score = 100.0 / (stat.count as f32 + 1.0);
-            
+
             let recency_factor = if let Some(last) = stat.last_seen {
                 let hours_since = (now - last).num_hours() as f32;
                 // Favor items not seen in a long time
-                (hours_since / 24.0).min(10.0).max(1.0)
+                (hours_since / 24.0).clamp(1.0, 10.0)
             } else {
                 10.0 // Never seen is high priority
             };
 
-            let love_weight = if stat.love_multiplier > 0.0 { stat.love_multiplier } else { 1.0 };
-            
+            let love_weight = if stat.love_multiplier > 0.0 {
+                stat.love_multiplier
+            } else {
+                1.0
+            };
+
             let weight = count_score * recency_factor * love_weight;
             weights.push(weight);
         }
@@ -436,22 +488,30 @@ impl SmartQueue {
         Some(active_pool[0].clone())
     }
 
-    fn update_stats(&mut self, path: &PathBuf) {
+    fn update_stats(&mut self, path: &Path) {
         // Update the stat in memory
-        let stat = self.stats.files.entry(path.clone()).or_insert_with(|| FileStats {
-            count: 0,
-            last_seen: None,
-            love_multiplier: 1.0,
-        });
+        let stat = self
+            .stats
+            .files
+            .entry(path.to_path_buf())
+            .or_insert_with(|| FileStats {
+                count: 0,
+                last_seen: None,
+                love_multiplier: 1.0,
+            });
         stat.count += 1;
         stat.last_seen = Some(Utc::now());
-        
+
         // Add to pending updates for batched write
-        self.pending_stats_updates.insert(path.clone(), stat.clone());
-        
+        self.pending_stats_updates
+            .insert(path.to_path_buf(), stat.clone());
+
         // Limit stats growth (LRU-ish removal)
         if self.stats.files.len() > 5000 {
-            let oldest = self.stats.files.iter()
+            let oldest = self
+                .stats
+                .files
+                .iter()
                 .min_by_key(|(_, s)| s.last_seen.map(|d| d.timestamp()).unwrap_or(0))
                 .map(|(p, _)| p.clone());
             if let Some(p) = oldest {
@@ -460,17 +520,15 @@ impl SmartQueue {
             }
         }
     }
-    
+
     /// Flush pending stats updates to cache in a batch
     pub fn flush_stats(&mut self) -> Result<()> {
         if self.pending_stats_updates.is_empty() {
             return Ok(());
         }
-        
-        let updates: Vec<_> = self.pending_stats_updates.drain()
-            .map(|(path, stats)| (path, stats))
-            .collect();
-        
+
+        let updates: Vec<_> = self.pending_stats_updates.drain().collect();
+
         self.cache.batch_set_file_stats(&updates)?;
         Ok(())
     }
@@ -480,7 +538,7 @@ impl SmartQueue {
         let files = cache.get_all_file_stats()?;
         let playlists = cache.get_all_playlists()?;
         let blacklist = cache.get_all_blacklisted()?;
-        
+
         Ok(LoveitData {
             files,
             playlists,
@@ -491,17 +549,17 @@ impl SmartQueue {
     pub fn save_stats(&mut self) -> Result<()> {
         // Flush any pending stats updates first
         self.flush_stats()?;
-        
+
         // Save playlists
         for (name, playlist) in &self.stats.playlists {
             let _ = self.cache.set_playlist(name, playlist);
         }
-        
+
         // Save blacklist
         for path in &self.stats.blacklist {
             let _ = self.cache.set_blacklisted(path, true);
         }
-        
+
         Ok(())
     }
 
@@ -518,7 +576,9 @@ impl SmartQueue {
                     anyhow::bail!("Playlist '{}' is disabled", n);
                 }
                 // Filter playlist paths against blacklist
-                self.pool = playlist.paths.iter()
+                self.pool = playlist
+                    .paths
+                    .iter()
                     .filter(|p| !self.stats.blacklist.contains(*p))
                     .cloned()
                     .collect();
@@ -529,9 +589,14 @@ impl SmartQueue {
             }
         } else {
             // Reset to full discovery (no metrics available in this context)
-            self.pool = Self::discover_content(&self.root_path, &self.stats.blacklist, self.cache.clone(), None)?;
+            self.pool = Self::discover_content(
+                &self.root_path,
+                &self.stats.blacklist,
+                self.cache.clone(),
+                None,
+            )?;
         }
-        
+
         self.active_playlist = name;
         self.pool.sort(); // Always sort generic pool
         self.current_index = 0; // Reset index

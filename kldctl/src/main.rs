@@ -1,8 +1,15 @@
-#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_imports,
+    unused_assignments,
+    unused_attributes
+)]
 use clap::{Parser, Subcommand};
 use kaleidux_common::{Request, Response};
-use tokio::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 #[derive(Parser)]
 #[command(
@@ -42,7 +49,7 @@ struct Cli {
     /// Daemon socket path (defaults to XDG_RUNTIME_DIR/kaleidux.sock or /tmp/kaleidux-{USER}.sock)
     #[arg(short, long, global = true)]
     socket: Option<String>,
-    
+
     /// Show version information
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     version: Option<bool>,
@@ -71,7 +78,7 @@ enum Commands {
     },
 
     /// Mark a file as "loved" - increases its selection frequency
-    /// 
+    ///
     /// Loved files appear more often based on their multiplier.
     /// A multiplier of 2.0 means 2x more likely to be picked.
     Love {
@@ -122,7 +129,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
-
 
     /// Manage playlists
     Playlist {
@@ -175,29 +181,29 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Handle local commands first (don't need daemon connection)
-    match &cli.command {
-        Commands::CheckConfig => {
-            // Validate configuration without connecting to daemon
-            let config_path = dirs::config_dir()
-                .map(|p| p.join("kaleidux").join("config.toml"))
-                .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
-            
-            if !config_path.exists() {
-                println!("✓ No config file found at {:?} (using defaults)", config_path);
-                return Ok(());
-            }
-            
-            let content = std::fs::read_to_string(&config_path)?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(_) => println!("✓ Configuration valid: {:?}", config_path),
-                Err(e) => {
-                    eprintln!("✗ Configuration error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+    if let Commands::CheckConfig = &cli.command {
+        // Validate configuration without connecting to daemon
+        let config_path = dirs::config_dir()
+            .map(|p| p.join("kaleidux").join("config.toml"))
+            .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
+
+        if !config_path.exists() {
+            println!(
+                "✓ No config file found at {:?} (using defaults)",
+                config_path
+            );
             return Ok(());
         }
-        _ => {}
+
+        let content = std::fs::read_to_string(&config_path)?;
+        match toml::from_str::<toml::Value>(&content) {
+            Ok(_) => println!("✓ Configuration valid: {:?}", config_path),
+            Err(e) => {
+                eprintln!("✗ Configuration error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
     }
 
     let request = match cli.command {
@@ -217,16 +223,26 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::CheckConfig => unreachable!(),
         Commands::Playlist { command } => Request::Playlist(match command {
-            PlaylistSubcommand::Create { name } => kaleidux_common::PlaylistCommand::Create { name },
-            PlaylistSubcommand::Delete { name } => kaleidux_common::PlaylistCommand::Delete { name },
-            PlaylistSubcommand::Add { name, path } => kaleidux_common::PlaylistCommand::Add { name, path },
-            PlaylistSubcommand::Remove { name, path } => kaleidux_common::PlaylistCommand::Remove { name, path },
+            PlaylistSubcommand::Create { name } => {
+                kaleidux_common::PlaylistCommand::Create { name }
+            }
+            PlaylistSubcommand::Delete { name } => {
+                kaleidux_common::PlaylistCommand::Delete { name }
+            }
+            PlaylistSubcommand::Add { name, path } => {
+                kaleidux_common::PlaylistCommand::Add { name, path }
+            }
+            PlaylistSubcommand::Remove { name, path } => {
+                kaleidux_common::PlaylistCommand::Remove { name, path }
+            }
             PlaylistSubcommand::Load { name } => kaleidux_common::PlaylistCommand::Load { name },
             PlaylistSubcommand::List => kaleidux_common::PlaylistCommand::List,
         }),
         Commands::Blacklist { command } => Request::Blacklist(match command {
             BlacklistSubcommand::Add { path } => kaleidux_common::BlacklistCommand::Add { path },
-            BlacklistSubcommand::Remove { path } => kaleidux_common::BlacklistCommand::Remove { path },
+            BlacklistSubcommand::Remove { path } => {
+                kaleidux_common::BlacklistCommand::Remove { path }
+            }
             BlacklistSubcommand::List => kaleidux_common::BlacklistCommand::List,
         }),
         Commands::History { output } => Request::History { output },
@@ -241,18 +257,18 @@ async fn main() -> anyhow::Result<()> {
                 format!("/tmp/kaleidux-{}.sock", uid)
             })
     });
-    
+
     // Connect to daemon
     match UnixStream::connect(&socket_path).await {
         Ok(mut stream) => {
             let req_json = serde_json::to_string(&request)?;
             stream.write_all(req_json.as_bytes()).await?;
             stream.write_all(b"\n").await?;
-            
+
             // Read response
             let mut response = String::new();
             stream.read_to_string(&mut response).await?;
-            
+
             if !response.is_empty() {
                 // Try to parse as Response to pretty print if it's a list
                 if let Ok(resp) = serde_json::from_str::<Response>(&response) {
@@ -261,17 +277,26 @@ async fn main() -> anyhow::Result<()> {
                             println!("{:<50} | {:<5} | {:<5}", "Path", "Loveit", "Uses");
                             println!("{}", "-".repeat(66));
                             for entry in entries {
-                                println!("{:<50} | {:<5.1} | {:<5}", 
-                                    entry.path, entry.multiplier, entry.count);
+                                println!(
+                                    "{:<50} | {:<5.1} | {:<5}",
+                                    entry.path, entry.multiplier, entry.count
+                                );
                             }
                         }
                         Response::OutputInfo(outputs) => {
-                            println!("{:<10} | {:<10} | {:<30}", "Output", "Size", "Current Wallpaper");
+                            println!(
+                                "{:<10} | {:<10} | {:<30}",
+                                "Output", "Size", "Current Wallpaper"
+                            );
                             println!("{}", "-".repeat(56));
                             for out in outputs {
-                                println!("{:<10} | {}x{} | {:<30}", 
-                                    out.name, out.width, out.height, 
-                                    out.current_wallpaper.unwrap_or_else(|| "none".to_string()));
+                                println!(
+                                    "{:<10} | {}x{} | {:<30}",
+                                    out.name,
+                                    out.width,
+                                    out.height,
+                                    out.current_wallpaper.unwrap_or_else(|| "none".to_string())
+                                );
                             }
                         }
                         Response::Error(e) => eprintln!("Error: {}", e),
@@ -286,7 +311,6 @@ async fn main() -> anyhow::Result<()> {
                             println!("Blacklisted Files:");
                             for path in paths {
                                 println!(" - {}", path);
-
                             }
                         }
                         Response::History(paths) => {

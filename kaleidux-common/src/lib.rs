@@ -1,4 +1,11 @@
-#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_attributes)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_imports,
+    unused_assignments,
+    unused_attributes
+)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,22 +22,13 @@ pub enum Request {
     #[serde(rename = "query_outputs")]
     QueryOutputs,
     #[serde(rename = "next")]
-    Next {
-        output: Option<String>,
-    },
+    Next { output: Option<String> },
     #[serde(rename = "prev")]
-    Prev {
-        output: Option<String>,
-    },
+    Prev { output: Option<String> },
     #[serde(rename = "love")]
-    Love {
-        path: String,
-        multiplier: f32,
-    },
+    Love { path: String, multiplier: f32 },
     #[serde(rename = "unlove")]
-    Unlove {
-        path: String,
-    },
+    Unlove { path: String },
     #[serde(rename = "loveitlist")]
     LoveitList,
     #[serde(rename = "pause")]
@@ -42,9 +40,7 @@ pub enum Request {
     #[serde(rename = "reload")]
     Reload,
     #[serde(rename = "clear")]
-    Clear {
-        output: Option<String>,
-    },
+    Clear { output: Option<String> },
     #[serde(rename = "kill")]
     Kill,
     #[serde(rename = "playlist")]
@@ -83,249 +79,412 @@ pub enum BlacklistCommand {
     List,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum Transition {
-    Angular { #[serde(default = "df_0")] starting_angle: f32 },
+    Angular {
+        #[serde(default = "df_0")]
+        starting_angle: f32,
+    },
     BookFlip,
-    Bounce { 
-        #[serde(default = "df_black_alpha")] shadow_colour: [f32; 4], 
-        #[serde(default = "df_0_075")] shadow_height: f32, 
-        #[serde(default = "df_3")] bounces: f32 
+    Bounce {
+        #[serde(default = "df_black_alpha")]
+        shadow_colour: [f32; 4],
+        #[serde(default = "df_0_075")]
+        shadow_height: f32,
+        #[serde(default = "df_3")]
+        bounces: f32,
     },
     BowTieHorizontal,
     BowTieVertical,
-    BowTieWithParameter { 
-        #[serde(default = "df_0_5")] adjust: f32, 
-        #[serde(default = "df_false")] reverse: bool 
+    BowTieWithParameter {
+        #[serde(default = "df_0_5")]
+        adjust: f32,
+        #[serde(default = "df_false")]
+        reverse: bool,
     },
     Burn,
-    ButterflyWaveScrawler { 
-        #[serde(default = "df_1")] amplitude: f32, 
-        #[serde(default = "df_30")] waves: f32, 
-        #[serde(default = "df_0_3")] color_separation: f32 
+    ButterflyWaveScrawler {
+        #[serde(default = "df_1")]
+        amplitude: f32,
+        #[serde(default = "df_30")]
+        waves: f32,
+        #[serde(default = "df_0_3")]
+        color_separation: f32,
     },
     CannabisLeaf,
     Circle,
-    CircleCrop { #[serde(default = "df_black_rgba")] bgcolor: [f32; 4] },
-    CircleOpen { 
-        #[serde(default = "df_0_3")] smoothness: f32, 
-        #[serde(default = "df_true")] opening: bool 
+    CircleCrop {
+        #[serde(default = "df_black_rgba")]
+        bgcolor: [f32; 4],
+    },
+    CircleOpen {
+        #[serde(default = "df_0_3")]
+        smoothness: f32,
+        #[serde(default = "df_true")]
+        opening: bool,
     },
     ColorPhase,
     CoordFromIn,
-    CrazyParametricFun { 
-        #[serde(default = "df_4")] a: f32, 
-        #[serde(default = "df_1")] b: f32, 
-        #[serde(default = "df_120")] amplitude: f32, 
-        #[serde(default = "df_0_1")] smoothness: f32 
+    CrazyParametricFun {
+        #[serde(default = "df_4")]
+        a: f32,
+        #[serde(default = "df_1")]
+        b: f32,
+        #[serde(default = "df_120")]
+        amplitude: f32,
+        #[serde(default = "df_0_1")]
+        smoothness: f32,
     },
-    ColourDistance { #[serde(default = "df_5")] power: f32 },
+    ColourDistance {
+        #[serde(default = "df_5")]
+        power: f32,
+    },
     CrossHatch,
     CrossWarp,
-    CrossZoom { #[serde(default = "df_0_4")] strength: f32 },
-    Cube { 
-        #[serde(default = "df_0_7")] persp: f32, 
-        #[serde(default = "df_0_3")] unzoom: f32, 
-        #[serde(default = "df_0_4")] reflection: f32, 
-        #[serde(default = "df_3")] floating: f32 
+    CrossZoom {
+        #[serde(default = "df_0_4")]
+        strength: f32,
     },
-    Directional { #[serde(default = "df_y_up")] direction: [f32; 2] },
-    DirectionalEasing { #[serde(default = "df_y_up")] direction: [f32; 2] },
-    DirectionalScaled { 
-        #[serde(default = "df_y_up")] direction: [f32; 2], 
-        #[serde(default = "df_0_7")] scale: f32 
+    Cube {
+        #[serde(default = "df_0_7")]
+        persp: f32,
+        #[serde(default = "df_0_3")]
+        unzoom: f32,
+        #[serde(default = "df_0_4")]
+        reflection: f32,
+        #[serde(default = "df_3")]
+        floating: f32,
     },
-    DirectionalWarp { #[serde(default = "df_y_up")] direction: [f32; 2] },
+    Directional {
+        #[serde(default = "df_y_up")]
+        direction: [f32; 2],
+    },
+    DirectionalEasing {
+        #[serde(default = "df_y_up")]
+        direction: [f32; 2],
+    },
+    DirectionalScaled {
+        #[serde(default = "df_y_up")]
+        direction: [f32; 2],
+        #[serde(default = "df_0_7")]
+        scale: f32,
+    },
+    DirectionalWarp {
+        #[serde(default = "df_y_up")]
+        direction: [f32; 2],
+    },
     #[serde(alias = "wipe")]
-    DirectionalWipe { 
+    DirectionalWipe {
         #[serde(default = "default_wipe_direction")]
-        direction: [f32; 2], 
+        direction: [f32; 2],
         #[serde(default = "default_wipe_smoothness")]
-        smoothness: f32 
+        smoothness: f32,
     },
     Displacement,
-    Dissolve { 
-        #[serde(default = "df_0_1")] line_width: f32, 
-        #[serde(default = "df_red")] spread_clr: [f32; 3], 
-        #[serde(default = "df_yellow")] hot_clr: [f32; 3], 
-        #[serde(default = "df_5")] pow: f32, 
-        #[serde(default = "df_1")] intensity: f32 
+    Dissolve {
+        #[serde(default = "df_0_1")]
+        line_width: f32,
+        #[serde(default = "df_red")]
+        spread_clr: [f32; 3],
+        #[serde(default = "df_yellow")]
+        hot_clr: [f32; 3],
+        #[serde(default = "df_5")]
+        pow: f32,
+        #[serde(default = "df_1")]
+        intensity: f32,
     },
-    Doom { 
-        #[serde(default = "df_30_i")] bars: i32, 
-        #[serde(default = "df_2")] amplitude: f32, 
-        #[serde(default = "df_0_1")] noise: f32, 
-        #[serde(default = "df_0_5")] frequency: f32, 
-        #[serde(default = "df_0_5")] drip_scale: f32 
+    Doom {
+        #[serde(default = "df_30_i")]
+        bars: i32,
+        #[serde(default = "df_2")]
+        amplitude: f32,
+        #[serde(default = "df_0_1")]
+        noise: f32,
+        #[serde(default = "df_0_5")]
+        frequency: f32,
+        #[serde(default = "df_0_5")]
+        drip_scale: f32,
     },
-    Doorway { 
-        #[serde(default = "df_0_4")] reflection: f32, 
-        #[serde(default = "df_0_4")] perspective: f32, 
-        #[serde(default = "df_3")] depth: f32 
+    Doorway {
+        #[serde(default = "df_0_4")]
+        reflection: f32,
+        #[serde(default = "df_0_4")]
+        perspective: f32,
+        #[serde(default = "df_3")]
+        depth: f32,
     },
     Dreamy,
-    DreamyZoom { 
-        #[serde(default = "df_6")] rotation: f32, 
-        #[serde(default = "df_1_2")] scale: f32 
+    DreamyZoom {
+        #[serde(default = "df_6")]
+        rotation: f32,
+        #[serde(default = "df_1_2")]
+        scale: f32,
     },
-    Edge { 
-        #[serde(default = "df_tiny")] thickness: f32, 
-        #[serde(default = "df_8")] brightness: f32 
+    Edge {
+        #[serde(default = "df_tiny")]
+        thickness: f32,
+        #[serde(default = "df_8")]
+        brightness: f32,
     },
+    #[default]
     Fade,
-    FadeColor { 
-        #[serde(default = "df_black_rgb")] color: [f32; 3], 
-        #[serde(default = "df_0_4")] color_phase: f32 
+    FadeColor {
+        #[serde(default = "df_black_rgb")]
+        color: [f32; 3],
+        #[serde(default = "df_0_4")]
+        color_phase: f32,
     },
-    FadeGrayscale { #[serde(default = "df_0_3")] intensity: f32 },
-    FilmBurn { #[serde(default = "df_2_31")] seed: f32 },
-    FlyEye { 
-        #[serde(default = "df_0_04")] size: f32, 
-        #[serde(default = "df_0_5")] zoom: f32, 
-        #[serde(default = "df_0_3")] color_separation: f32 
+    FadeGrayscale {
+        #[serde(default = "df_0_3")]
+        intensity: f32,
+    },
+    FilmBurn {
+        #[serde(default = "df_2_31")]
+        seed: f32,
+    },
+    FlyEye {
+        #[serde(default = "df_0_04")]
+        size: f32,
+        #[serde(default = "df_0_5")]
+        zoom: f32,
+        #[serde(default = "df_0_3")]
+        color_separation: f32,
     },
     GlitchDisplace,
     GlitchMemories,
-    GridFlip { 
-        #[serde(default = "df_4_4")] size: [i32; 2], 
-        #[serde(default = "df_0_1")] pause: f32, 
-        #[serde(default = "df_0_05")] divider_width: f32, 
-        #[serde(default = "df_black_rgba")] bgcolor: [f32; 4], 
-        #[serde(default = "df_0_1")] randomness: f32 
+    GridFlip {
+        #[serde(default = "df_4_4")]
+        size: [i32; 2],
+        #[serde(default = "df_0_1")]
+        pause: f32,
+        #[serde(default = "df_0_05")]
+        divider_width: f32,
+        #[serde(default = "df_black_rgba")]
+        bgcolor: [f32; 4],
+        #[serde(default = "df_0_1")]
+        randomness: f32,
     },
     Heart,
-    Hexagonalize { 
-        #[serde(default = "df_50_i")] steps: i32, 
-        #[serde(default = "df_20")] horizontal_hexagons: f32 
+    Hexagonalize {
+        #[serde(default = "df_50_i")]
+        steps: i32,
+        #[serde(default = "df_20")]
+        horizontal_hexagons: f32,
     },
     HorizontalClose,
     HorizontalOpen,
     InvertedPageCurl,
-    Kaleidoscope { 
-        #[serde(default = "df_0_5")] speed: f32, 
-        #[serde(default = "df_1")] angle: f32, 
-        #[serde(default = "df_0_3")] power: f32 
+    Kaleidoscope {
+        #[serde(default = "df_0_5")]
+        speed: f32,
+        #[serde(default = "df_1")]
+        angle: f32,
+        #[serde(default = "df_0_3")]
+        power: f32,
     },
     LeftRight,
-    LinearBlur { #[serde(default = "df_0_1")] intensity: f32 },
+    LinearBlur {
+        #[serde(default = "df_0_1")]
+        intensity: f32,
+    },
     Luma,
-    LuminanceMelt { 
-        #[serde(default = "df_true")] direction: bool, 
-        #[serde(rename = "luma_threshold", default = "df_0_05")] luma_threshold: f32 
+    LuminanceMelt {
+        #[serde(default = "df_true")]
+        direction: bool,
+        #[serde(rename = "luma_threshold", default = "df_0_05")]
+        luma_threshold: f32,
     },
-    Morph { #[serde(default = "df_0_1")] strength: f32 },
-    Mosaic { 
-        #[serde(default = "df_2_i")] endx: i32, 
-        #[serde(default = "df_neg_1_i")] endy: i32 
+    Morph {
+        #[serde(default = "df_0_1")]
+        strength: f32,
     },
-    MosaicTransition { #[serde(default = "df_10")] mosaic_num: f32 },
+    Mosaic {
+        #[serde(default = "df_2_i")]
+        endx: i32,
+        #[serde(default = "df_neg_1_i")]
+        endy: i32,
+    },
+    MosaicTransition {
+        #[serde(default = "df_10")]
+        mosaic_num: f32,
+    },
     MultiplyBlend,
     Overexposure,
-    Perlin { 
-        #[serde(default = "df_4")] scale: f32, 
-        #[serde(default = "df_0_01")] smoothness: f32, 
-        #[serde(default = "df_12")] seed: f32 
+    Perlin {
+        #[serde(default = "df_4")]
+        scale: f32,
+        #[serde(default = "df_0_01")]
+        smoothness: f32,
+        #[serde(default = "df_12")]
+        seed: f32,
     },
-    Pinwheel { #[serde(default = "df_2")] speed: f32 },
-    Pixelize { 
-        #[serde(default = "df_20_20")] squares_min: [i32; 2], 
-        #[serde(default = "df_50_i")] steps: i32 
+    Pinwheel {
+        #[serde(default = "df_2")]
+        speed: f32,
     },
-    PolarFunction { #[serde(default = "df_5_i")] segments: i32 },
-    PolkaDotsCurtain { 
-        #[serde(default = "df_20")] dots: f32, 
-        #[serde(default = "df_origin")] center: [f32; 2] 
+    Pixelize {
+        #[serde(default = "df_20_20")]
+        squares_min: [i32; 2],
+        #[serde(default = "df_50_i")]
+        steps: i32,
     },
-    PowerKaleido { 
-        #[serde(default = "df_2")] scale: f32, 
-        #[serde(default = "df_1_5")] radius: f32, 
-        #[serde(default = "df_0")] angle: f32 
+    PolarFunction {
+        #[serde(default = "df_5_i")]
+        segments: i32,
     },
-    Radial { 
+    PolkaDotsCurtain {
+        #[serde(default = "df_20")]
+        dots: f32,
+        #[serde(default = "df_origin")]
+        center: [f32; 2],
+    },
+    PowerKaleido {
+        #[serde(default = "df_2")]
+        scale: f32,
+        #[serde(default = "df_1_5")]
+        radius: f32,
+        #[serde(default = "df_0")]
+        angle: f32,
+    },
+    Radial {
         #[serde(default = "default_radial_smoothness")]
-        smoothness: f32 
+        smoothness: f32,
     },
     RandomNoiseX,
-    RandomSquares { 
-        #[serde(default = "df_10_10")] size: [i32; 2], 
-        #[serde(default = "df_0_5")] smoothness: f32 
+    RandomSquares {
+        #[serde(default = "df_10_10")]
+        size: [i32; 2],
+        #[serde(default = "df_0_5")]
+        smoothness: f32,
     },
-    Rectangle { #[serde(default = "df_black_rgba")] bgcolor: [f32; 4] },
-    RectangleCrop { #[serde(default = "df_black_rgba")] bgcolor: [f32; 4] },
-    Ripple { 
-        #[serde(default = "df_100")] amplitude: f32, 
-        #[serde(default = "df_50_f")] speed: f32 
+    Rectangle {
+        #[serde(default = "df_black_rgba")]
+        bgcolor: [f32; 4],
     },
-    Rolls { 
-        #[serde(rename = "rolls_type", default = "df_0_i")] rolls_type: i32, 
-        #[serde(rename = "rot_down", default = "df_false")] rot_down: bool 
+    RectangleCrop {
+        #[serde(default = "df_black_rgba")]
+        bgcolor: [f32; 4],
+    },
+    Ripple {
+        #[serde(default = "df_100")]
+        amplitude: f32,
+        #[serde(default = "df_50_f")]
+        speed: f32,
+    },
+    Rolls {
+        #[serde(rename = "rolls_type", default = "df_0_i")]
+        rolls_type: i32,
+        #[serde(rename = "rot_down", default = "df_false")]
+        rot_down: bool,
     },
     Rotate,
-    RotateScaleFade { 
-        #[serde(default = "df_center")] center: [f32; 2], 
-        #[serde(default = "df_1")] rotations: f32, 
-        #[serde(default = "df_8_f")] scale: f32, 
-        #[serde(rename = "back_color", default = "df_dark_grey")] back_color: [f32; 4] 
+    RotateScaleFade {
+        #[serde(default = "df_center")]
+        center: [f32; 2],
+        #[serde(default = "df_1")]
+        rotations: f32,
+        #[serde(default = "df_8_f")]
+        scale: f32,
+        #[serde(rename = "back_color", default = "df_dark_grey")]
+        back_color: [f32; 4],
     },
-    RotateScaleVanish { 
-        #[serde(rename = "fade_in_second", default = "df_true")] fade_in_second: bool, 
-        #[serde(rename = "reverse_effect", default = "df_false")] reverse_effect: bool, 
-        #[serde(rename = "reverse_rotation", default = "df_false")] reverse_rotation: bool 
+    RotateScaleVanish {
+        #[serde(rename = "fade_in_second", default = "df_true")]
+        fade_in_second: bool,
+        #[serde(rename = "reverse_effect", default = "df_false")]
+        reverse_effect: bool,
+        #[serde(rename = "reverse_rotation", default = "df_false")]
+        reverse_rotation: bool,
     },
     ScaleIn,
-    SimpleZoom { #[serde(default = "df_0_8")] zoom_quickness: f32 },
-    SimpleZoomOut { 
-        #[serde(default = "df_0_8")] zoom_quickness: f32, 
-        #[serde(default = "df_true")] fade_edge: bool 
+    SimpleZoom {
+        #[serde(default = "df_0_8")]
+        zoom_quickness: f32,
     },
-    Slides { 
-        #[serde(rename = "slides_type", default = "df_0_i")] slides_type: i32, 
-        #[serde(rename = "slides_in", default = "df_false")] slides_in: bool 
+    SimpleZoomOut {
+        #[serde(default = "df_0_8")]
+        zoom_quickness: f32,
+        #[serde(default = "df_true")]
+        fade_edge: bool,
     },
-    SquaresWire { 
-        #[serde(default = "df_10_10")] squares: [i32; 2], 
-        #[serde(default = "df_x_up")] direction: [f32; 2], 
-        #[serde(default = "df_1_6")] smoothness: f32 
+    Slides {
+        #[serde(rename = "slides_type", default = "df_0_i")]
+        slides_type: i32,
+        #[serde(rename = "slides_in", default = "df_false")]
+        slides_in: bool,
     },
-    Squeeze { #[serde(default = "df_0_1")] color_separation: f32 },
-    StaticFade { 
-        #[serde(default = "df_200")] n_noise_pixels: f32, 
-        #[serde(default = "df_0_8")] static_luminosity: f32 
+    SquaresWire {
+        #[serde(default = "df_10_10")]
+        squares: [i32; 2],
+        #[serde(default = "df_x_up")]
+        direction: [f32; 2],
+        #[serde(default = "df_1_6")]
+        smoothness: f32,
     },
-    StaticWipe { 
-        #[serde(default = "df_true")] up_to_down: bool, 
-        #[serde(default = "df_0_5")] max_static_span: f32 
+    Squeeze {
+        #[serde(default = "df_0_1")]
+        color_separation: f32,
     },
-    StereoViewer { 
-        #[serde(default = "df_0_8")] zoom: f32, 
-        #[serde(default = "df_0_22")] corner_radius: f32 
+    StaticFade {
+        #[serde(default = "df_200")]
+        n_noise_pixels: f32,
+        #[serde(default = "df_0_8")]
+        static_luminosity: f32,
     },
-    Swap { 
-        #[serde(default = "df_0_4")] reflection: f32, 
-        #[serde(default = "df_0_2")] perspective: f32, 
-        #[serde(default = "df_3")] depth: f32 
+    StaticWipe {
+        #[serde(default = "df_true")]
+        up_to_down: bool,
+        #[serde(default = "df_0_5")]
+        max_static_span: f32,
+    },
+    StereoViewer {
+        #[serde(default = "df_0_8")]
+        zoom: f32,
+        #[serde(default = "df_0_22")]
+        corner_radius: f32,
+    },
+    Swap {
+        #[serde(default = "df_0_4")]
+        reflection: f32,
+        #[serde(default = "df_0_2")]
+        perspective: f32,
+        #[serde(default = "df_3")]
+        depth: f32,
     },
     Swirl,
     TangentMotionBlur,
     TopBottom,
-    TvStatic { #[serde(default = "df_0_05")] offset: f32 },
-    UndulatingBurnOut { 
-        #[serde(default = "df_0_03")] smoothness: f32, 
-        #[serde(default = "df_center")] center: [f32; 2], 
-        #[serde(default = "df_black_rgb")] color: [f32; 3] 
+    TvStatic {
+        #[serde(default = "df_0_05")]
+        offset: f32,
+    },
+    UndulatingBurnOut {
+        #[serde(default = "df_0_03")]
+        smoothness: f32,
+        #[serde(default = "df_center")]
+        center: [f32; 2],
+        #[serde(default = "df_black_rgb")]
+        color: [f32; 3],
     },
     VerticalClose,
     VerticalOpen,
-    WaterDrop { 
-        #[serde(default = "df_30")] amplitude: f32, 
-        #[serde(default = "df_30")] speed: f32 
+    WaterDrop {
+        #[serde(default = "df_30")]
+        amplitude: f32,
+        #[serde(default = "df_30")]
+        speed: f32,
     },
-    Wind { #[serde(default = "df_0_05")] size: f32 },
+    Wind {
+        #[serde(default = "df_0_05")]
+        size: f32,
+    },
     WindowBlinds,
-    WindowSlice { 
-        #[serde(default = "df_10")] count: f32, 
-        #[serde(default = "df_0_5")] smoothness: f32 
+    WindowSlice {
+        #[serde(default = "df_10")]
+        count: f32,
+        #[serde(default = "df_0_5")]
+        smoothness: f32,
     },
     WipeDown,
     WipeLeft,
@@ -333,20 +492,20 @@ pub enum Transition {
     WipeUp,
     XAxisTranslation,
     ZoomInCircles,
-    ZoomLeftWipe { #[serde(default = "df_0_8")] zoom_quickness: f32 },
-    ZoomRightWipe { #[serde(default = "df_0_8")] zoom_quickness: f32 },
-    Random,
-    Custom { 
-        shader: String, 
-        #[serde(default)]
-        params: HashMap<String, f32> 
+    ZoomLeftWipe {
+        #[serde(default = "df_0_8")]
+        zoom_quickness: f32,
     },
-}
-
-impl Default for Transition {
-    fn default() -> Self {
-        Transition::Fade
-    }
+    ZoomRightWipe {
+        #[serde(default = "df_0_8")]
+        zoom_quickness: f32,
+    },
+    Random,
+    Custom {
+        shader: String,
+        #[serde(default)]
+        params: HashMap<String, f32>,
+    },
 }
 
 impl Transition {
@@ -354,25 +513,106 @@ impl Transition {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let variants = [
-            "angular", "bookflip", "bounce", "bowtiehorizontal", "bowtievertical",
-            "bowtiewithparameter", "burn", "butterflywavescrawler", "cannabisleaf", "circle",
-            "circlecrop", "circleopen", "colorphase", "coord-from-in", "crazyparametricfun",
-            "colourdistance", "crosshatch", "crosswarp", "crosszoom", "cube", "directional",
-            "directionaleasing", "directionalscaled", "directionalwarp", "directionalwipe",
-            "displacement", "dissolve", "doom", "doorway", "dreamy", "dreamyzoom", "edge",
-            "fade", "fadecolor", "fadegrayscale", "filmburn", "flyeye", "glitchdisplace",
-            "glitchmemories", "gridflip", "heart", "hexagonalize", "horizontalclose",
-            "horizontalopen", "invertedpagecurl", "kaleidoscope", "leftright", "linearblur",
-            "luma", "luminancemelt", "morph", "mosaic", "mosaic_transition", "multiplyblend",
-            "overexposure", "perlin", "pinwheel", "pixelize", "polarfunction", "polkadotscurtain",
-            "powerkaleido", "radial", "randomnoisex", "randomsquares", "rectangle",
-            "rectanglecrop", "ripple", "rolls", "rotate", "rotatescalefade",
-            "rotatescalevanish", "scale_in", "simplezoom", "simplezoomout", "slides",
-            "squareswire", "squeeze", "staticfade", "static_wipe", "stereoviewer",
-            "swap", "swirl", "tangentmotionblur", "topbottom", "tvstatic",
-            "undulatingburnout", "verticalclose", "verticalopen", "waterdrop", "wind",
-            "windowblinds", "windowslice", "wipedown", "wipeleft", "wiperight", "wipeup",
-            "x-axis-translation", "zoomincircles", "zoomleftwipe", "zoomrightwipe",
+            "angular",
+            "bookflip",
+            "bounce",
+            "bowtiehorizontal",
+            "bowtievertical",
+            "bowtiewithparameter",
+            "burn",
+            "butterflywavescrawler",
+            "cannabisleaf",
+            "circle",
+            "circlecrop",
+            "circleopen",
+            "colorphase",
+            "coord-from-in",
+            "crazyparametricfun",
+            "colourdistance",
+            "crosshatch",
+            "crosswarp",
+            "crosszoom",
+            "cube",
+            "directional",
+            "directionaleasing",
+            "directionalscaled",
+            "directionalwarp",
+            "directionalwipe",
+            "displacement",
+            "dissolve",
+            "doom",
+            "doorway",
+            "dreamy",
+            "dreamyzoom",
+            "edge",
+            "fade",
+            "fadecolor",
+            "fadegrayscale",
+            "filmburn",
+            "flyeye",
+            "glitchdisplace",
+            "glitchmemories",
+            "gridflip",
+            "heart",
+            "hexagonalize",
+            "horizontalclose",
+            "horizontalopen",
+            "invertedpagecurl",
+            "kaleidoscope",
+            "leftright",
+            "linearblur",
+            "luma",
+            "luminancemelt",
+            "morph",
+            "mosaic",
+            "mosaic_transition",
+            "multiplyblend",
+            "overexposure",
+            "perlin",
+            "pinwheel",
+            "pixelize",
+            "polarfunction",
+            "polkadotscurtain",
+            "powerkaleido",
+            "radial",
+            "randomnoisex",
+            "randomsquares",
+            "rectangle",
+            "rectanglecrop",
+            "ripple",
+            "rolls",
+            "rotate",
+            "rotatescalefade",
+            "rotatescalevanish",
+            "scale_in",
+            "simplezoom",
+            "simplezoomout",
+            "slides",
+            "squareswire",
+            "squeeze",
+            "staticfade",
+            "static_wipe",
+            "stereoviewer",
+            "swap",
+            "swirl",
+            "tangentmotionblur",
+            "topbottom",
+            "tvstatic",
+            "undulatingburnout",
+            "verticalclose",
+            "verticalopen",
+            "waterdrop",
+            "wind",
+            "windowblinds",
+            "windowslice",
+            "wipedown",
+            "wipeleft",
+            "wiperight",
+            "wipeup",
+            "x-axis-translation",
+            "zoomincircles",
+            "zoomleftwipe",
+            "zoomrightwipe",
         ];
         let name = variants[rng.gen_range(0..variants.len())];
         Self::from_name(name)
@@ -380,105 +620,267 @@ impl Transition {
 
     pub fn from_name(name: &str) -> Self {
         match name.to_lowercase().as_str() {
-            "angular" => Transition::Angular { starting_angle: 0.0 },
+            "angular" => Transition::Angular {
+                starting_angle: 0.0,
+            },
             "bookflip" => Transition::BookFlip,
-            "bounce" => Transition::Bounce { shadow_colour: [0.0, 0.0, 0.0, 0.6], shadow_height: 0.075, bounces: 3.0 },
+            "bounce" => Transition::Bounce {
+                shadow_colour: [0.0, 0.0, 0.0, 0.6],
+                shadow_height: 0.075,
+                bounces: 3.0,
+            },
             "bowtiehorizontal" => Transition::BowTieHorizontal,
             "bowtievertical" => Transition::BowTieVertical,
-            "bowtiewithparameter" => Transition::BowTieWithParameter { adjust: 0.5, reverse: false },
+            "bowtiewithparameter" => Transition::BowTieWithParameter {
+                adjust: 0.5,
+                reverse: false,
+            },
             "burn" => Transition::Burn,
-            "butterflywavescrawler" => Transition::ButterflyWaveScrawler { amplitude: 1.0, waves: 30.0, color_separation: 0.3 },
+            "butterflywavescrawler" => Transition::ButterflyWaveScrawler {
+                amplitude: 1.0,
+                waves: 30.0,
+                color_separation: 0.3,
+            },
             "circle" => Transition::Circle,
-            "circlecrop" => Transition::CircleCrop { bgcolor: [0.0, 0.0, 0.0, 1.0] },
-            "circleopen" => Transition::CircleOpen { smoothness: 0.3, opening: true },
+            "circlecrop" => Transition::CircleCrop {
+                bgcolor: [0.0, 0.0, 0.0, 1.0],
+            },
+            "circleopen" => Transition::CircleOpen {
+                smoothness: 0.3,
+                opening: true,
+            },
             "colorphase" => Transition::ColorPhase,
             "coord-from-in" => Transition::CoordFromIn,
-            "crazyparametricfun" => Transition::CrazyParametricFun { a: 4.0, b: 1.0, amplitude: 120.0, smoothness: 0.1 },
+            "crazyparametricfun" => Transition::CrazyParametricFun {
+                a: 4.0,
+                b: 1.0,
+                amplitude: 120.0,
+                smoothness: 0.1,
+            },
             "colourdistance" => Transition::ColourDistance { power: 5.0 },
             "crosshatch" => Transition::CrossHatch,
             "crosswarp" => Transition::CrossWarp,
             "crosszoom" => Transition::CrossZoom { strength: 0.4 },
-            "cube" => Transition::Cube { persp: 0.7, unzoom: 0.3, reflection: 0.4, floating: 3.0 },
-            "directional" => Transition::Directional { direction: [0.0, 1.0] },
-            "directionaleasing" => Transition::DirectionalEasing { direction: [0.0, 1.0] },
-            "directionalscaled" => Transition::DirectionalScaled { direction: [0.0, 1.0], scale: 0.7 },
-            "directionalwarp" => Transition::DirectionalWarp { direction: [1.0, 0.0] },
-            "directionalwipe" | "wipe" => Transition::DirectionalWipe { direction: [1.0, -1.0], smoothness: 0.5 },
+            "cube" => Transition::Cube {
+                persp: 0.7,
+                unzoom: 0.3,
+                reflection: 0.4,
+                floating: 3.0,
+            },
+            "directional" => Transition::Directional {
+                direction: [0.0, 1.0],
+            },
+            "directionaleasing" => Transition::DirectionalEasing {
+                direction: [0.0, 1.0],
+            },
+            "directionalscaled" => Transition::DirectionalScaled {
+                direction: [0.0, 1.0],
+                scale: 0.7,
+            },
+            "directionalwarp" => Transition::DirectionalWarp {
+                direction: [1.0, 0.0],
+            },
+            "directionalwipe" | "wipe" => Transition::DirectionalWipe {
+                direction: [1.0, -1.0],
+                smoothness: 0.5,
+            },
             "displacement" => Transition::Displacement,
-            "dissolve" => Transition::Dissolve { line_width: 0.1, spread_clr: [1.0, 0.0, 0.0], hot_clr: [0.9, 0.9, 0.2], pow: 5.0, intensity: 1.0 },
-            "doom" => Transition::Doom { bars: 30, amplitude: 2.0, noise: 0.1, frequency: 0.5, drip_scale: 0.5 },
-            "doorway" => Transition::Doorway { reflection: 0.4, perspective: 0.4, depth: 3.0 },
+            "dissolve" => Transition::Dissolve {
+                line_width: 0.1,
+                spread_clr: [1.0, 0.0, 0.0],
+                hot_clr: [0.9, 0.9, 0.2],
+                pow: 5.0,
+                intensity: 1.0,
+            },
+            "doom" => Transition::Doom {
+                bars: 30,
+                amplitude: 2.0,
+                noise: 0.1,
+                frequency: 0.5,
+                drip_scale: 0.5,
+            },
+            "doorway" => Transition::Doorway {
+                reflection: 0.4,
+                perspective: 0.4,
+                depth: 3.0,
+            },
             "dreamy" => Transition::Dreamy,
-            "dreamyzoom" => Transition::DreamyZoom { rotation: 6.0, scale: 1.2 },
-            "edge" => Transition::Edge { thickness: 0.001, brightness: 8.0 },
+            "dreamyzoom" => Transition::DreamyZoom {
+                rotation: 6.0,
+                scale: 1.2,
+            },
+            "edge" => Transition::Edge {
+                thickness: 0.001,
+                brightness: 8.0,
+            },
             "fade" => Transition::Fade,
-            "fadecolor" => Transition::FadeColor { color: [0.0, 0.0, 0.0], color_phase: 0.4 },
+            "fadecolor" => Transition::FadeColor {
+                color: [0.0, 0.0, 0.0],
+                color_phase: 0.4,
+            },
             "fadegrayscale" => Transition::FadeGrayscale { intensity: 0.3 },
             "filmburn" => Transition::FilmBurn { seed: 2.31 },
-            "flyeye" => Transition::FlyEye { size: 0.04, zoom: 0.5, color_separation: 0.3 },
+            "flyeye" => Transition::FlyEye {
+                size: 0.04,
+                zoom: 0.5,
+                color_separation: 0.3,
+            },
             "glitchdisplace" => Transition::GlitchDisplace,
             "glitchmemories" => Transition::GlitchMemories,
-            "gridflip" => Transition::GridFlip { size: [4, 4], pause: 0.1, divider_width: 0.05, bgcolor: [0.0, 0.0, 0.0, 1.0], randomness: 0.1 },
+            "gridflip" => Transition::GridFlip {
+                size: [4, 4],
+                pause: 0.1,
+                divider_width: 0.05,
+                bgcolor: [0.0, 0.0, 0.0, 1.0],
+                randomness: 0.1,
+            },
             "heart" => Transition::Heart,
-            "hexagonalize" => Transition::Hexagonalize { steps: 50, horizontal_hexagons: 20.0 },
+            "hexagonalize" => Transition::Hexagonalize {
+                steps: 50,
+                horizontal_hexagons: 20.0,
+            },
             "horizontalclose" => Transition::HorizontalClose,
             "horizontalopen" => Transition::HorizontalOpen,
             "invertedpagecurl" => Transition::InvertedPageCurl,
-            "kaleidoscope" => Transition::Kaleidoscope { speed: 0.5, angle: 1.0, power: 0.3 },
+            "kaleidoscope" => Transition::Kaleidoscope {
+                speed: 0.5,
+                angle: 1.0,
+                power: 0.3,
+            },
             "leftright" => Transition::LeftRight,
             "linearblur" => Transition::LinearBlur { intensity: 0.1 },
             "luma" => Transition::Luma,
-            "luminancemelt" => Transition::LuminanceMelt { direction: true, luma_threshold: 0.05 },
+            "luminancemelt" => Transition::LuminanceMelt {
+                direction: true,
+                luma_threshold: 0.05,
+            },
             "morph" => Transition::Morph { strength: 0.1 },
             "mosaic" => Transition::Mosaic { endx: 2, endy: -1 },
             "mosaic_transition" => Transition::MosaicTransition { mosaic_num: 10.0 },
             "multiplyblend" => Transition::MultiplyBlend,
             "overexposure" => Transition::Overexposure,
-            "perlin" => Transition::Perlin { scale: 4.0, smoothness: 0.01, seed: 12.0 },
+            "perlin" => Transition::Perlin {
+                scale: 4.0,
+                smoothness: 0.01,
+                seed: 12.0,
+            },
             "pinwheel" => Transition::Pinwheel { speed: 2.0 },
-            "pixelize" => Transition::Pixelize { squares_min: [20, 20], steps: 50 },
+            "pixelize" => Transition::Pixelize {
+                squares_min: [20, 20],
+                steps: 50,
+            },
             "polarfunction" => Transition::PolarFunction { segments: 5 },
-            "polkadotscurtain" => Transition::PolkaDotsCurtain { dots: 20.0, center: [0.0, 0.0] },
-            "powerkaleido" => Transition::PowerKaleido { scale: 2.0, radius: 1.5, angle: 0.0 },
+            "polkadotscurtain" => Transition::PolkaDotsCurtain {
+                dots: 20.0,
+                center: [0.0, 0.0],
+            },
+            "powerkaleido" => Transition::PowerKaleido {
+                scale: 2.0,
+                radius: 1.5,
+                angle: 0.0,
+            },
             "radial" => Transition::Radial { smoothness: 1.0 },
             "randomnoisex" => Transition::RandomNoiseX,
-            "randomsquares" => Transition::RandomSquares { size: [10, 10], smoothness: 0.5 },
-            "rectangle" => Transition::Rectangle { bgcolor: [0.0, 0.0, 0.0, 1.0] },
-            "rectanglecrop" => Transition::RectangleCrop { bgcolor: [0.0, 0.0, 0.0, 1.0] },
-            "ripple" => Transition::Ripple { amplitude: 100.0, speed: 50.0 },
-            "rolls" => Transition::Rolls { rolls_type: 0, rot_down: false },
+            "randomsquares" => Transition::RandomSquares {
+                size: [10, 10],
+                smoothness: 0.5,
+            },
+            "rectangle" => Transition::Rectangle {
+                bgcolor: [0.0, 0.0, 0.0, 1.0],
+            },
+            "rectanglecrop" => Transition::RectangleCrop {
+                bgcolor: [0.0, 0.0, 0.0, 1.0],
+            },
+            "ripple" => Transition::Ripple {
+                amplitude: 100.0,
+                speed: 50.0,
+            },
+            "rolls" => Transition::Rolls {
+                rolls_type: 0,
+                rot_down: false,
+            },
             "rotate" => Transition::Rotate,
-            "rotatescalefade" => Transition::RotateScaleFade { center: [0.5, 0.5], rotations: 1.0, scale: 8.0, back_color: [0.15, 0.15, 0.15, 1.0] },
-            "rotatescalevanish" => Transition::RotateScaleVanish { fade_in_second: true, reverse_effect: false, reverse_rotation: false },
+            "rotatescalefade" => Transition::RotateScaleFade {
+                center: [0.5, 0.5],
+                rotations: 1.0,
+                scale: 8.0,
+                back_color: [0.15, 0.15, 0.15, 1.0],
+            },
+            "rotatescalevanish" => Transition::RotateScaleVanish {
+                fade_in_second: true,
+                reverse_effect: false,
+                reverse_rotation: false,
+            },
             "scale_in" => Transition::ScaleIn,
-            "simplezoom" => Transition::SimpleZoom { zoom_quickness: 0.8 },
-            "simplezoomout" => Transition::SimpleZoomOut { zoom_quickness: 0.8, fade_edge: true },
-            "slides" => Transition::Slides { slides_type: 0, slides_in: false },
-            "squareswire" => Transition::SquaresWire { squares: [10, 10], direction: [1.0, -0.5], smoothness: 1.6 },
-            "squeeze" => Transition::Squeeze { color_separation: 0.1 },
-            "staticfade" => Transition::StaticFade { n_noise_pixels: 200.0, static_luminosity: 0.8 },
-            "static_wipe" => Transition::StaticWipe { up_to_down: true, max_static_span: 0.5 },
-            "stereoviewer" => Transition::StereoViewer { zoom: 0.88, corner_radius: 0.22 },
-            "swap" => Transition::Swap { reflection: 0.4, perspective: 0.2, depth: 3.0 },
+            "simplezoom" => Transition::SimpleZoom {
+                zoom_quickness: 0.8,
+            },
+            "simplezoomout" => Transition::SimpleZoomOut {
+                zoom_quickness: 0.8,
+                fade_edge: true,
+            },
+            "slides" => Transition::Slides {
+                slides_type: 0,
+                slides_in: false,
+            },
+            "squareswire" => Transition::SquaresWire {
+                squares: [10, 10],
+                direction: [1.0, -0.5],
+                smoothness: 1.6,
+            },
+            "squeeze" => Transition::Squeeze {
+                color_separation: 0.1,
+            },
+            "staticfade" => Transition::StaticFade {
+                n_noise_pixels: 200.0,
+                static_luminosity: 0.8,
+            },
+            "static_wipe" => Transition::StaticWipe {
+                up_to_down: true,
+                max_static_span: 0.5,
+            },
+            "stereoviewer" => Transition::StereoViewer {
+                zoom: 0.88,
+                corner_radius: 0.22,
+            },
+            "swap" => Transition::Swap {
+                reflection: 0.4,
+                perspective: 0.2,
+                depth: 3.0,
+            },
             "swirl" => Transition::Swirl,
             "tangentmotionblur" => Transition::TangentMotionBlur,
             "topbottom" => Transition::TopBottom,
             "tvstatic" => Transition::TvStatic { offset: 0.05 },
-            "undulatingburnout" => Transition::UndulatingBurnOut { smoothness: 0.03, center: [0.5, 0.5], color: [0.0, 0.0, 0.0] },
+            "undulatingburnout" => Transition::UndulatingBurnOut {
+                smoothness: 0.03,
+                center: [0.5, 0.5],
+                color: [0.0, 0.0, 0.0],
+            },
             "verticalclose" => Transition::VerticalClose,
             "verticalopen" => Transition::VerticalOpen,
-            "waterdrop" => Transition::WaterDrop { amplitude: 30.0, speed: 30.0 },
+            "waterdrop" => Transition::WaterDrop {
+                amplitude: 30.0,
+                speed: 30.0,
+            },
             "wind" => Transition::Wind { size: 0.05 },
             "windowblinds" => Transition::WindowBlinds,
-            "windowslice" => Transition::WindowSlice { count: 10.0, smoothness: 0.5 },
+            "windowslice" => Transition::WindowSlice {
+                count: 10.0,
+                smoothness: 0.5,
+            },
             "wipedown" => Transition::WipeDown,
             "wipeleft" => Transition::WipeLeft,
             "wiperight" => Transition::WipeRight,
             "wipeup" => Transition::WipeUp,
             "x-axis-translation" => Transition::XAxisTranslation,
             "zoomincircles" => Transition::ZoomInCircles,
-            "zoomleftwipe" => Transition::ZoomLeftWipe { zoom_quickness: 0.8 },
-            "zoomrightwipe" => Transition::ZoomRightWipe { zoom_quickness: 0.8 },
+            "zoomleftwipe" => Transition::ZoomLeftWipe {
+                zoom_quickness: 0.8,
+            },
+            "zoomrightwipe" => Transition::ZoomRightWipe {
+                zoom_quickness: 0.8,
+            },
             "random" => Transition::Random,
             _ => Transition::Fade,
         }
@@ -594,153 +996,406 @@ impl Transition {
     pub fn to_params(&self) -> [f32; 28] {
         let mut p = [0.0; 28];
         match self {
-            Transition::BookFlip | Transition::Burn | Transition::CannabisLeaf | Transition::Circle | Transition::ColorPhase | Transition::CoordFromIn | Transition::CrossHatch | Transition::CrossWarp | Transition::Displacement | Transition::Dreamy | Transition::Fade | Transition::GlitchDisplace | Transition::GlitchMemories | Transition::Heart | Transition::HorizontalClose | Transition::HorizontalOpen | Transition::InvertedPageCurl | Transition::LeftRight | Transition::Luma | Transition::MultiplyBlend | Transition::Overexposure | Transition::RandomNoiseX | Transition::Rotate | Transition::ScaleIn | Transition::Swirl | Transition::TangentMotionBlur | Transition::TopBottom | Transition::VerticalClose | Transition::VerticalOpen | Transition::WipeDown | Transition::WipeLeft | Transition::WipeRight | Transition::WipeUp | Transition::WindowBlinds | Transition::XAxisTranslation | Transition::ZoomInCircles | Transition::Random => {}
-            Transition::Angular { starting_angle } => { p[0] = *starting_angle; }
+            Transition::BookFlip
+            | Transition::Burn
+            | Transition::CannabisLeaf
+            | Transition::Circle
+            | Transition::ColorPhase
+            | Transition::CoordFromIn
+            | Transition::CrossHatch
+            | Transition::CrossWarp
+            | Transition::Displacement
+            | Transition::Dreamy
+            | Transition::Fade
+            | Transition::GlitchDisplace
+            | Transition::GlitchMemories
+            | Transition::Heart
+            | Transition::HorizontalClose
+            | Transition::HorizontalOpen
+            | Transition::InvertedPageCurl
+            | Transition::LeftRight
+            | Transition::Luma
+            | Transition::MultiplyBlend
+            | Transition::Overexposure
+            | Transition::RandomNoiseX
+            | Transition::Rotate
+            | Transition::ScaleIn
+            | Transition::Swirl
+            | Transition::TangentMotionBlur
+            | Transition::TopBottom
+            | Transition::VerticalClose
+            | Transition::VerticalOpen
+            | Transition::WipeDown
+            | Transition::WipeLeft
+            | Transition::WipeRight
+            | Transition::WipeUp
+            | Transition::WindowBlinds
+            | Transition::XAxisTranslation
+            | Transition::ZoomInCircles
+            | Transition::Random => {}
+            Transition::Angular { starting_angle } => {
+                p[0] = *starting_angle;
+            }
             Transition::BowTieWithParameter { adjust, reverse } => {
-                p[0] = *adjust; p[1] = if *reverse { 1.0 } else { 0.0 };
+                p[0] = *adjust;
+                p[1] = if *reverse { 1.0 } else { 0.0 };
             }
             Transition::BowTieHorizontal | Transition::BowTieVertical => {}
-            Transition::Bounce { shadow_colour, shadow_height, bounces } => {
+            Transition::Bounce {
+                shadow_colour,
+                shadow_height,
+                bounces,
+            } => {
                 p[0..4].copy_from_slice(shadow_colour);
                 p[4] = *shadow_height;
                 p[5] = *bounces;
             }
-            Transition::ButterflyWaveScrawler { amplitude, waves, color_separation } => {
-                p[0] = *amplitude; p[1] = *waves; p[2] = *color_separation;
+            Transition::ButterflyWaveScrawler {
+                amplitude,
+                waves,
+                color_separation,
+            } => {
+                p[0] = *amplitude;
+                p[1] = *waves;
+                p[2] = *color_separation;
             }
-            Transition::CircleCrop { bgcolor } => { p[0..4].copy_from_slice(bgcolor); }
-            Transition::CircleOpen { smoothness, opening } => {
+            Transition::CircleCrop { bgcolor } => {
+                p[0..4].copy_from_slice(bgcolor);
+            }
+            Transition::CircleOpen {
+                smoothness,
+                opening,
+            } => {
                 p[0] = *smoothness;
                 p[1] = if *opening { 1.0 } else { 0.0 };
             }
-            Transition::CrazyParametricFun { a, b, amplitude, smoothness } => {
-                p[0] = *a; p[1] = *b; p[2] = *amplitude; p[3] = *smoothness;
+            Transition::CrazyParametricFun {
+                a,
+                b,
+                amplitude,
+                smoothness,
+            } => {
+                p[0] = *a;
+                p[1] = *b;
+                p[2] = *amplitude;
+                p[3] = *smoothness;
             }
-            Transition::ColourDistance { power } => { p[0] = *power; }
-            Transition::CrossZoom { strength } => { p[0] = *strength; }
-            Transition::Cube { persp, unzoom, reflection, floating } => {
-                p[0] = *persp; p[1] = *unzoom; p[2] = *reflection; p[3] = *floating;
+            Transition::ColourDistance { power } => {
+                p[0] = *power;
             }
-            Transition::Directional { direction } => { p[0..2].copy_from_slice(direction); }
-            Transition::DirectionalEasing { direction } => { p[0..2].copy_from_slice(direction); }
+            Transition::CrossZoom { strength } => {
+                p[0] = *strength;
+            }
+            Transition::Cube {
+                persp,
+                unzoom,
+                reflection,
+                floating,
+            } => {
+                p[0] = *persp;
+                p[1] = *unzoom;
+                p[2] = *reflection;
+                p[3] = *floating;
+            }
+            Transition::Directional { direction } => {
+                p[0..2].copy_from_slice(direction);
+            }
+            Transition::DirectionalEasing { direction } => {
+                p[0..2].copy_from_slice(direction);
+            }
             Transition::DirectionalScaled { direction, scale } => {
-                p[0..2].copy_from_slice(direction); p[2] = *scale;
+                p[0..2].copy_from_slice(direction);
+                p[2] = *scale;
             }
-            Transition::DirectionalWarp { direction } => { p[0..2].copy_from_slice(direction); }
-            Transition::DirectionalWipe { direction, smoothness } => {
-                p[0..2].copy_from_slice(direction); p[2] = *smoothness;
+            Transition::DirectionalWarp { direction } => {
+                p[0..2].copy_from_slice(direction);
             }
-            Transition::Dissolve { line_width, spread_clr, hot_clr, pow, intensity } => {
+            Transition::DirectionalWipe {
+                direction,
+                smoothness,
+            } => {
+                p[0..2].copy_from_slice(direction);
+                p[2] = *smoothness;
+            }
+            Transition::Dissolve {
+                line_width,
+                spread_clr,
+                hot_clr,
+                pow,
+                intensity,
+            } => {
                 p[0] = *line_width;
                 p[1..4].copy_from_slice(spread_clr);
                 p[4..7].copy_from_slice(hot_clr);
                 p[7] = *pow;
                 p[8] = *intensity;
             }
-            Transition::Doom { bars, amplitude, noise, frequency, drip_scale } => {
-                p[0] = *bars as f32; p[1] = *amplitude; p[2] = *noise; p[3] = *frequency; p[4] = *drip_scale;
+            Transition::Doom {
+                bars,
+                amplitude,
+                noise,
+                frequency,
+                drip_scale,
+            } => {
+                p[0] = *bars as f32;
+                p[1] = *amplitude;
+                p[2] = *noise;
+                p[3] = *frequency;
+                p[4] = *drip_scale;
             }
-            Transition::Doorway { reflection, perspective, depth } => {
-                p[0] = *reflection; p[1] = *perspective; p[2] = *depth;
+            Transition::Doorway {
+                reflection,
+                perspective,
+                depth,
+            } => {
+                p[0] = *reflection;
+                p[1] = *perspective;
+                p[2] = *depth;
             }
-            Transition::DreamyZoom { rotation, scale } => { p[0] = *rotation; p[1] = *scale; }
-            Transition::Edge { thickness, brightness } => { p[0] = *thickness; p[1] = *brightness; }
+            Transition::DreamyZoom { rotation, scale } => {
+                p[0] = *rotation;
+                p[1] = *scale;
+            }
+            Transition::Edge {
+                thickness,
+                brightness,
+            } => {
+                p[0] = *thickness;
+                p[1] = *brightness;
+            }
             Transition::FadeColor { color, color_phase } => {
-                p[0..3].copy_from_slice(color); p[3] = *color_phase;
+                p[0..3].copy_from_slice(color);
+                p[3] = *color_phase;
             }
-            Transition::FadeGrayscale { intensity } => { p[0] = *intensity; }
-            Transition::FlyEye { size, zoom, color_separation } => {
-                p[0] = *size; p[1] = *zoom; p[2] = *color_separation;
+            Transition::FadeGrayscale { intensity } => {
+                p[0] = *intensity;
             }
-            Transition::GridFlip { size, pause, divider_width, bgcolor, randomness } => {
-                p[0] = size[0] as f32; p[1] = size[1] as f32;
-                p[2] = *pause; p[3] = *divider_width;
-                p[4..8].copy_from_slice(bgcolor); p[8] = *randomness;
+            Transition::FlyEye {
+                size,
+                zoom,
+                color_separation,
+            } => {
+                p[0] = *size;
+                p[1] = *zoom;
+                p[2] = *color_separation;
             }
-            Transition::Hexagonalize { steps, horizontal_hexagons } => {
-                p[0] = *steps as f32; p[1] = *horizontal_hexagons;
+            Transition::GridFlip {
+                size,
+                pause,
+                divider_width,
+                bgcolor,
+                randomness,
+            } => {
+                p[0] = size[0] as f32;
+                p[1] = size[1] as f32;
+                p[2] = *pause;
+                p[3] = *divider_width;
+                p[4..8].copy_from_slice(bgcolor);
+                p[8] = *randomness;
             }
-            Transition::Kaleidoscope { speed, angle, power } => {
-                p[0] = *speed; p[1] = *angle; p[2] = *power;
+            Transition::Hexagonalize {
+                steps,
+                horizontal_hexagons,
+            } => {
+                p[0] = *steps as f32;
+                p[1] = *horizontal_hexagons;
             }
-            Transition::LinearBlur { intensity } => { p[0] = *intensity; }
-            Transition::LuminanceMelt { direction, luma_threshold } => {
-                p[0] = if *direction { 1.0 } else { 0.0 }; p[1] = *luma_threshold;
+            Transition::Kaleidoscope {
+                speed,
+                angle,
+                power,
+            } => {
+                p[0] = *speed;
+                p[1] = *angle;
+                p[2] = *power;
             }
-            Transition::Morph { strength } => { p[0] = *strength; }
-            Transition::Mosaic { endx, endy } => { p[0] = *endx as f32; p[1] = *endy as f32; }
-            Transition::MosaicTransition { mosaic_num } => { p[0] = *mosaic_num; }
-            Transition::Perlin { scale, smoothness, seed } => {
-                p[0] = *scale; p[1] = *smoothness; p[2] = *seed;
+            Transition::LinearBlur { intensity } => {
+                p[0] = *intensity;
             }
-            Transition::Pinwheel { speed } => { p[0] = *speed; }
+            Transition::LuminanceMelt {
+                direction,
+                luma_threshold,
+            } => {
+                p[0] = if *direction { 1.0 } else { 0.0 };
+                p[1] = *luma_threshold;
+            }
+            Transition::Morph { strength } => {
+                p[0] = *strength;
+            }
+            Transition::Mosaic { endx, endy } => {
+                p[0] = *endx as f32;
+                p[1] = *endy as f32;
+            }
+            Transition::MosaicTransition { mosaic_num } => {
+                p[0] = *mosaic_num;
+            }
+            Transition::Perlin {
+                scale,
+                smoothness,
+                seed,
+            } => {
+                p[0] = *scale;
+                p[1] = *smoothness;
+                p[2] = *seed;
+            }
+            Transition::Pinwheel { speed } => {
+                p[0] = *speed;
+            }
             Transition::Pixelize { squares_min, steps } => {
-                p[0] = squares_min[0] as f32; p[1] = squares_min[1] as f32; p[2] = *steps as f32;
+                p[0] = squares_min[0] as f32;
+                p[1] = squares_min[1] as f32;
+                p[2] = *steps as f32;
             }
-            Transition::PolarFunction { segments } => { p[0] = *segments as f32; }
+            Transition::PolarFunction { segments } => {
+                p[0] = *segments as f32;
+            }
             Transition::PolkaDotsCurtain { dots, center } => {
-                p[0] = *dots; p[1..3].copy_from_slice(center);
+                p[0] = *dots;
+                p[1..3].copy_from_slice(center);
             }
-            Transition::PowerKaleido { scale, radius, angle } => {
-                p[0] = *scale; p[1] = *radius; p[2] = *angle;
+            Transition::PowerKaleido {
+                scale,
+                radius,
+                angle,
+            } => {
+                p[0] = *scale;
+                p[1] = *radius;
+                p[2] = *angle;
             }
-            Transition::Radial { smoothness } => { p[0] = *smoothness; }
+            Transition::Radial { smoothness } => {
+                p[0] = *smoothness;
+            }
             Transition::RandomSquares { size, smoothness } => {
-                p[0] = size[0] as f32; p[1] = size[1] as f32; p[2] = *smoothness;
+                p[0] = size[0] as f32;
+                p[1] = size[1] as f32;
+                p[2] = *smoothness;
             }
-            Transition::Rectangle { bgcolor } => { p[0..4].copy_from_slice(bgcolor); }
-            Transition::RectangleCrop { bgcolor } => { p[0..4].copy_from_slice(bgcolor); }
-            Transition::Ripple { amplitude, speed } => { p[0] = *amplitude; p[1] = *speed; }
-            Transition::Rolls { rolls_type, rot_down } => {
-                p[0] = *rolls_type as f32; p[1] = if *rot_down { 1.0 } else { 0.0 };
+            Transition::Rectangle { bgcolor } => {
+                p[0..4].copy_from_slice(bgcolor);
             }
-            Transition::RotateScaleFade { center, rotations, scale, back_color } => {
-                p[0..2].copy_from_slice(center); p[2] = *rotations; p[3] = *scale;
+            Transition::RectangleCrop { bgcolor } => {
+                p[0..4].copy_from_slice(bgcolor);
+            }
+            Transition::Ripple { amplitude, speed } => {
+                p[0] = *amplitude;
+                p[1] = *speed;
+            }
+            Transition::Rolls {
+                rolls_type,
+                rot_down,
+            } => {
+                p[0] = *rolls_type as f32;
+                p[1] = if *rot_down { 1.0 } else { 0.0 };
+            }
+            Transition::RotateScaleFade {
+                center,
+                rotations,
+                scale,
+                back_color,
+            } => {
+                p[0..2].copy_from_slice(center);
+                p[2] = *rotations;
+                p[3] = *scale;
                 p[4..8].copy_from_slice(back_color);
             }
-            Transition::RotateScaleVanish { fade_in_second, reverse_effect, reverse_rotation } => {
+            Transition::RotateScaleVanish {
+                fade_in_second,
+                reverse_effect,
+                reverse_rotation,
+            } => {
                 p[0] = if *fade_in_second { 1.0 } else { 0.0 };
                 p[1] = if *reverse_effect { 1.0 } else { 0.0 };
                 p[2] = if *reverse_rotation { 1.0 } else { 0.0 };
             }
-            Transition::SimpleZoom { zoom_quickness } => { p[0] = *zoom_quickness; }
-            Transition::SimpleZoomOut { zoom_quickness, fade_edge } => {
-                p[0] = *zoom_quickness; p[1] = if *fade_edge { 1.0 } else { 0.0 };
+            Transition::SimpleZoom { zoom_quickness } => {
+                p[0] = *zoom_quickness;
             }
-            Transition::Slides { slides_type, slides_in } => {
-                p[0] = *slides_type as f32; p[1] = if *slides_in { 1.0 } else { 0.0 };
+            Transition::SimpleZoomOut {
+                zoom_quickness,
+                fade_edge,
+            } => {
+                p[0] = *zoom_quickness;
+                p[1] = if *fade_edge { 1.0 } else { 0.0 };
             }
-            Transition::SquaresWire { squares, direction, smoothness } => {
-                p[0] = squares[0] as f32; p[1] = squares[1] as f32;
-                p[2] = direction[0]; p[3] = direction[1];
+            Transition::Slides {
+                slides_type,
+                slides_in,
+            } => {
+                p[0] = *slides_type as f32;
+                p[1] = if *slides_in { 1.0 } else { 0.0 };
+            }
+            Transition::SquaresWire {
+                squares,
+                direction,
+                smoothness,
+            } => {
+                p[0] = squares[0] as f32;
+                p[1] = squares[1] as f32;
+                p[2] = direction[0];
+                p[3] = direction[1];
                 p[4] = *smoothness;
             }
-            Transition::Squeeze { color_separation } => { p[0] = *color_separation; }
-            Transition::StaticFade { n_noise_pixels, static_luminosity } => {
-                p[0] = *n_noise_pixels; p[1] = *static_luminosity;
+            Transition::Squeeze { color_separation } => {
+                p[0] = *color_separation;
             }
-            Transition::StaticWipe { up_to_down, max_static_span } => {
-                p[0] = if *up_to_down { 1.0 } else { 0.0 }; p[1] = *max_static_span;
+            Transition::StaticFade {
+                n_noise_pixels,
+                static_luminosity,
+            } => {
+                p[0] = *n_noise_pixels;
+                p[1] = *static_luminosity;
             }
-            Transition::StereoViewer { zoom, corner_radius } => {
-                p[0] = *zoom; p[1] = *corner_radius;
+            Transition::StaticWipe {
+                up_to_down,
+                max_static_span,
+            } => {
+                p[0] = if *up_to_down { 1.0 } else { 0.0 };
+                p[1] = *max_static_span;
             }
-            Transition::Swap { reflection, perspective, depth } => {
-                p[0] = *reflection; p[1] = *perspective; p[2] = *depth;
+            Transition::StereoViewer {
+                zoom,
+                corner_radius,
+            } => {
+                p[0] = *zoom;
+                p[1] = *corner_radius;
             }
-            Transition::TvStatic { offset } => { p[0] = *offset; }
-            Transition::UndulatingBurnOut { smoothness, center, color } => {
-                p[0] = *smoothness; p[1..3].copy_from_slice(center); p[3..6].copy_from_slice(color);
+            Transition::Swap {
+                reflection,
+                perspective,
+                depth,
+            } => {
+                p[0] = *reflection;
+                p[1] = *perspective;
+                p[2] = *depth;
             }
-            Transition::WaterDrop { amplitude, speed } => { p[0] = *amplitude; p[1] = *speed; }
-            Transition::Wind { size } => { p[0] = *size; }
+            Transition::TvStatic { offset } => {
+                p[0] = *offset;
+            }
+            Transition::UndulatingBurnOut {
+                smoothness,
+                center,
+                color,
+            } => {
+                p[0] = *smoothness;
+                p[1..3].copy_from_slice(center);
+                p[3..6].copy_from_slice(color);
+            }
+            Transition::WaterDrop { amplitude, speed } => {
+                p[0] = *amplitude;
+                p[1] = *speed;
+            }
+            Transition::Wind { size } => {
+                p[0] = *size;
+            }
             Transition::Custom { .. } => {
                 // Named parameters handled via #define in daemon for Custom
             }
             Transition::WindowSlice { count, smoothness } => {
-                p[0] = *count; p[1] = *smoothness;
+                p[0] = *count;
+                p[1] = *smoothness;
             }
-            Transition::ZoomLeftWipe { zoom_quickness } | Transition::ZoomRightWipe { zoom_quickness } => {
+            Transition::ZoomLeftWipe { zoom_quickness }
+            | Transition::ZoomRightWipe { zoom_quickness } => {
                 p[0] = *zoom_quickness;
             }
             _ => {}
@@ -780,60 +1435,174 @@ fn default_radial_smoothness() -> f32 {
     1.0
 }
 
-fn df_0() -> f32 { 0.0 }
-fn df_0_075() -> f32 { 0.075 }
-fn df_3() -> f32 { 3.0 }
-fn df_1() -> f32 { 1.0 }
-fn df_30() -> f32 { 30.0 }
-fn df_0_3() -> f32 { 0.3 }
-fn df_black_rgba() -> [f32; 4] { [0.0, 0.0, 0.0, 1.0] }
-fn df_black_alpha() -> [f32; 4] { [0.0, 0.0, 0.0, 0.6] }
-fn df_true() -> bool { true }
-fn df_5() -> f32 { 5.0 }
-fn df_0_4() -> f32 { 0.4 }
-fn df_0_7() -> f32 { 0.7 }
-fn df_y_up() -> [f32; 2] { [0.0, 1.0] }
-fn df_0_1() -> f32 { 0.1 }
-fn df_red() -> [f32; 3] { [1.0, 0.0, 0.0] }
-fn df_yellow() -> [f32; 3] { [0.9, 0.9, 0.2] }
-fn df_2() -> f32 { 2.0 }
-fn df_6() -> f32 { 6.0 }
-fn df_1_2() -> f32 { 1.2 }
-fn df_tiny() -> f32 { 0.001 }
-fn df_8() -> f32 { 8.0 }
-fn df_black_rgb() -> [f32; 3] { [0.0, 0.0, 0.0] }
-fn df_2_31() -> f32 { 2.31 }
-fn df_0_04() -> f32 { 0.04 }
-fn df_0_5() -> f32 { 0.5 }
-fn df_4_4() -> [i32; 2] { [4, 4] }
-fn df_0_05() -> f32 { 0.05 }
-fn df_50_i() -> i32 { 50 }
-fn df_20() -> f32 { 20.0 }
-fn df_0_05_f() -> f32 { 0.05 }
-fn df_2_i() -> i32 { 2 }
-fn df_neg_1_i() -> i32 { -1 }
-fn df_4() -> f32 { 4.0 }
-fn df_0_01() -> f32 { 0.01 }
-fn df_12() -> f32 { 12.0 }
-fn df_20_20() -> [i32; 2] { [20, 20] }
-fn df_5_i() -> i32 { 5 }
-fn df_center() -> [f32; 2] { [0.5, 0.5] }
-fn df_origin() -> [f32; 2] { [0.0, 0.0] }
-fn df_1_5() -> f32 { 1.5 }
-fn df_10_10() -> [i32; 2] { [10, 10] }
-fn df_100() -> f32 { 100.0 }
-fn df_50_f() -> f32 { 50.0 }
-fn df_0_i() -> i32 { 0 }
-fn df_false() -> bool { false }
-fn df_8_f() -> f32 { 8.0 }
-fn df_dark_grey() -> [f32; 4] { [0.15, 0.15, 0.15, 1.0] }
-fn df_0_8() -> f32 { 0.8 }
-fn df_200() -> f32 { 200.0 }
-fn df_0_2() -> f32 { 0.2 }
-fn df_0_22() -> f32 { 0.22 }
-fn df_30_i() -> i32 { 30 }
-fn df_10() -> f32 { 10.0 }
-fn df_x_up() -> [f32; 2] { [1.0, 0.0] }
-fn df_120() -> f32 { 120.0 }
-fn df_1_6() -> f32 { 1.6 }
-fn df_0_03() -> f32 { 0.03 }
+fn df_0() -> f32 {
+    0.0
+}
+fn df_0_075() -> f32 {
+    0.075
+}
+fn df_3() -> f32 {
+    3.0
+}
+fn df_1() -> f32 {
+    1.0
+}
+fn df_30() -> f32 {
+    30.0
+}
+fn df_0_3() -> f32 {
+    0.3
+}
+fn df_black_rgba() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+fn df_black_alpha() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 0.6]
+}
+fn df_true() -> bool {
+    true
+}
+fn df_5() -> f32 {
+    5.0
+}
+fn df_0_4() -> f32 {
+    0.4
+}
+fn df_0_7() -> f32 {
+    0.7
+}
+fn df_y_up() -> [f32; 2] {
+    [0.0, 1.0]
+}
+fn df_0_1() -> f32 {
+    0.1
+}
+fn df_red() -> [f32; 3] {
+    [1.0, 0.0, 0.0]
+}
+fn df_yellow() -> [f32; 3] {
+    [0.9, 0.9, 0.2]
+}
+fn df_2() -> f32 {
+    2.0
+}
+fn df_6() -> f32 {
+    6.0
+}
+fn df_1_2() -> f32 {
+    1.2
+}
+fn df_tiny() -> f32 {
+    0.001
+}
+fn df_8() -> f32 {
+    8.0
+}
+fn df_black_rgb() -> [f32; 3] {
+    [0.0, 0.0, 0.0]
+}
+fn df_2_31() -> f32 {
+    2.31
+}
+fn df_0_04() -> f32 {
+    0.04
+}
+fn df_0_5() -> f32 {
+    0.5
+}
+fn df_4_4() -> [i32; 2] {
+    [4, 4]
+}
+fn df_0_05() -> f32 {
+    0.05
+}
+fn df_50_i() -> i32 {
+    50
+}
+fn df_20() -> f32 {
+    20.0
+}
+fn df_0_05_f() -> f32 {
+    0.05
+}
+fn df_2_i() -> i32 {
+    2
+}
+fn df_neg_1_i() -> i32 {
+    -1
+}
+fn df_4() -> f32 {
+    4.0
+}
+fn df_0_01() -> f32 {
+    0.01
+}
+fn df_12() -> f32 {
+    12.0
+}
+fn df_20_20() -> [i32; 2] {
+    [20, 20]
+}
+fn df_5_i() -> i32 {
+    5
+}
+fn df_center() -> [f32; 2] {
+    [0.5, 0.5]
+}
+fn df_origin() -> [f32; 2] {
+    [0.0, 0.0]
+}
+fn df_1_5() -> f32 {
+    1.5
+}
+fn df_10_10() -> [i32; 2] {
+    [10, 10]
+}
+fn df_100() -> f32 {
+    100.0
+}
+fn df_50_f() -> f32 {
+    50.0
+}
+fn df_0_i() -> i32 {
+    0
+}
+fn df_false() -> bool {
+    false
+}
+fn df_8_f() -> f32 {
+    8.0
+}
+fn df_dark_grey() -> [f32; 4] {
+    [0.15, 0.15, 0.15, 1.0]
+}
+fn df_0_8() -> f32 {
+    0.8
+}
+fn df_200() -> f32 {
+    200.0
+}
+fn df_0_2() -> f32 {
+    0.2
+}
+fn df_0_22() -> f32 {
+    0.22
+}
+fn df_30_i() -> i32 {
+    30
+}
+fn df_10() -> f32 {
+    10.0
+}
+fn df_x_up() -> [f32; 2] {
+    [1.0, 0.0]
+}
+fn df_120() -> f32 {
+    120.0
+}
+fn df_1_6() -> f32 {
+    1.6
+}
+fn df_0_03() -> f32 {
+    0.03
+}
