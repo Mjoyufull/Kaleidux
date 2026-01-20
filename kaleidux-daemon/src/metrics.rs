@@ -28,6 +28,10 @@ pub struct PerformanceMetrics {
     pub texture_count_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, count)
     pub pipeline_count_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, count)
     
+    // Channel buffer tracking for memory leak detection
+    pub frame_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, frames in channel)
+    pub image_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, images in channel)
+    
     // Uptime tracking
     start_time: std::time::Instant,
     
@@ -87,6 +91,8 @@ impl PerformanceMetrics {
             cache_misses: Arc::new(AtomicU64::new(0)),
             texture_count_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             pipeline_count_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            frame_channel_size_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_channel_size_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             start_time: std::time::Instant::now(),
             startup_metrics: Arc::new(parking_lot::Mutex::new(StartupMetrics {
                 startup_start: Some(std::time::Instant::now()),
@@ -492,6 +498,22 @@ impl PerformanceMetrics {
     pub fn record_pipeline_count(&self, count: usize) {
         let mut samples = self.pipeline_count_samples.lock();
         samples.push_back((std::time::Instant::now(), count));
+        if samples.len() > 100 {
+            samples.pop_front();
+        }
+    }
+    
+    pub fn record_frame_channel_size(&self, size: usize) {
+        let mut samples = self.frame_channel_size_samples.lock();
+        samples.push_back((std::time::Instant::now(), size));
+        if samples.len() > 100 {
+            samples.pop_front();
+        }
+    }
+    
+    pub fn record_image_channel_size(&self, size: usize) {
+        let mut samples = self.image_channel_size_samples.lock();
+        samples.push_back((std::time::Instant::now(), size));
         if samples.len() > 100 {
             samples.pop_front();
         }

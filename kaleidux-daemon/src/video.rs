@@ -8,14 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use tokio::sync::Semaphore;
 
-/// Video frame containing RGBA pixel data (tightly packed, no stride padding)
-/// Uses Arc<[u8]> to avoid cloning large buffers
+/// Video frame containing RGBA pixel data
+/// Uses gst::Buffer to avoid copying data
 #[derive(Clone)]
 pub struct VideoFrame {
-    /// RGBA pixel data (tightly packed: width * height * 4 bytes)
-    pub data: Arc<[u8]>,
+    pub buffer: gst::Buffer,
     pub width: u32,
     pub height: u32,
+    pub stride: u32,
     pub session_id: u64,
 }
 
@@ -88,6 +88,9 @@ impl VideoPlayer {
         info!("Setting video URI: {}", full_uri);
         pipeline.set_property("uri", &full_uri);
         
+        // Note: Removed buffer-size property setting - it expects gint (i32) not u64
+        // and may not be necessary for preventing memory leaks
+        
         // Default flags (video+audio+text+softvolume) are usually fine.
         // Explicitly setting them to 3 (video+audio) requires the GstPlayFlags type.
         // pipeline.set_property("flags", 3u32);
@@ -106,8 +109,10 @@ impl VideoPlayer {
 
         appsink.set_caps(Some(&caps));
         appsink.set_sync(true); // Sync to clock
-        appsink.set_drop(true); // Drop frames if late
-        appsink.set_max_buffers(1); // Match gSlapper: 1 buffer to minimize latency
+        appsink.set_drop(true); // Drop frames if late - CRITICAL for preventing buffer accumulation
+        appsink.set_max_buffers(1); // Match gSlapper: 1 buffer to minimize latency and memory
+        // CRITICAL: Enable emit-signals to get callbacks, but ensure we handle them quickly
+        // The new_sample callback will be called for each frame
 
         // Keep source_id for closure
         let cb_source_id = source_id.clone();
@@ -129,69 +134,60 @@ impl VideoPlayer {
                     }
                     
                     let session_id = session_id;
-                    let sample = match sink.pull_sample() {
-                        Ok(s) => s,
-                        Err(_) => return Err(gst::FlowError::Error),
-                    };
                     
-                    let buffer = match sample.buffer() {
-                        Some(b) => b,
-                        None => return Err(gst::FlowError::Error),
-                    };
-                    
-                    let caps = match sample.caps() {
-                        Some(c) => c,
-                        None => return Err(gst::FlowError::Error),
-                    };
-                    
-                    let video_info = match gst_video::VideoInfo::from_caps(caps) {
-                        Ok(vi) => vi,
-                        Err(_) => return Err(gst::FlowError::Error),
-                    };
+                    // CRITICAL: Pull sample and extract buffer in explicit scope
+                    // This ensures sample is dropped immediately after buffer extraction
+                    let (buffer, width, height, stride) = {
+                        let sample = match sink.pull_sample() {
+                            Ok(s) => s,
+                            Err(_) => return Err(gst::FlowError::Error),
+                        };
+                        
+                        let buffer = match sample.buffer() {
+                            Some(b) => b.to_owned(),
+                            None => return Err(gst::FlowError::Error),
+                        };
+                        
+                        let caps = match sample.caps() {
+                            Some(c) => c,
+                            None => return Err(gst::FlowError::Error),
+                        };
+                        
+                        let video_info = match gst_video::VideoInfo::from_caps(caps) {
+                            Ok(vi) => vi,
+                            Err(_) => return Err(gst::FlowError::Error),
+                        };
 
-                    // Map buffer to read pixel data
-                    let map = match buffer.map_readable() {
-                        Ok(m) => m,
-                        Err(_) => return Err(gst::FlowError::Error),
-                    };
-
-                    let width = video_info.width() as u32;
-                    let height = video_info.height() as u32;
-                    let stride = video_info.stride()[0] as usize;
-                    let expected_stride = width as usize * 4;
-
-                    let data = if stride != expected_stride {
-                        let src = map.as_slice();
-                        let mut dst = Vec::with_capacity(expected_stride * height as usize);
-                        for row in 0..height as usize {
-                            let row_start = row * stride;
-                            let row_end = row_start + expected_stride;
-                            if row_end <= src.len() {
-                                dst.extend_from_slice(&src[row_start..row_end]);
-                            }
-                        }
-                        Arc::from(dst)
-                    } else {
-                        Arc::from(map.as_slice())
+                        let width = video_info.width() as u32;
+                        let height = video_info.height() as u32;
+                        let stride = video_info.stride()[0] as u32;
+                        
+                        // sample is dropped here, releasing GStreamer sample resources
+                        (buffer, width, height, stride)
                     };
 
                     let frame = VideoFrame {
-                        data,
+                        buffer,
                         width,
                         height,
+                        stride,
                         session_id,
                     };
 
-                    // Send frame - log if channel is full (frames being dropped)
+                    // Send frame - if channel is full, drop frame immediately to release gst::Buffer
                     match frame_tx_clone.try_send((source_id.clone(), VideoEvent::Frame(frame))) {
                         Ok(()) => {
                             // Frame sent successfully
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!("[VIDEO] Frame channel full for {}, frame dropped!", source_id);
+                            // CRITICAL: Channel full - drop frame immediately to release gst::Buffer
+                            // This prevents buffer accumulation in GStreamer's internal pool
+                            tracing::warn!("[VIDEO] Frame channel full for {}, dropping frame and releasing buffer", source_id);
+                            // frame is dropped here, releasing the gst::Buffer
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             tracing::warn!("[VIDEO] Frame channel closed for {}, stopping", source_id);
+                            // frame is dropped here
                             return Err(gst::FlowError::Eos);
                         }
                     }
@@ -258,16 +254,21 @@ impl VideoPlayer {
         // Spawn thread but use semaphore to limit concurrent bus watchers
         // Note: We spawn a std::thread but the semaphore limits how many can run concurrently
         // The semaphore is acquired synchronously before the thread starts its loop
+        // Capture runtime handle from caller context (must be called from within a Tokio runtime/task)
+        let rt = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::error!("[VIDEO] No tokio runtime available for start() caller of {}", self.source_id);
+                return Err(anyhow::anyhow!("No tokio runtime available"));
+            }
+        };
+
+        // Spawn thread but use semaphore to limit concurrent bus watchers
+        // Note: We spawn a std::thread but the semaphore limits how many can run concurrently
+        // The semaphore is acquired synchronously before the thread starts its loop
         let handle = std::thread::spawn(move || {
             // Acquire permit - block until available to ensure proper resource control
             // Using runtime block_on in a thread ensures threads wait when pool is at capacity
-            let rt = match tokio::runtime::Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => {
-                    tracing::error!("[VIDEO] No tokio runtime available for {}", source_id);
-                    return;
-                }
-            };
             let _permit = match rt.block_on(semaphore.acquire_owned()) {
                 Ok(p) => p,
                 Err(_) => {

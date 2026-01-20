@@ -111,6 +111,7 @@ pub struct WgpuContext {
 }
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
+const MAX_TEXTURE_POOL_SIZE: usize = 50; // Global limit on total textures in pool
 
 impl WgpuContext {
     pub async fn with_surface(window: Arc<impl HasWindowHandle + HasDisplayHandle + Sync + Send + 'static>) -> anyhow::Result<(Arc<Self>, Surface<'static>)> {
@@ -402,6 +403,15 @@ impl WgpuContext {
         let mut pool = self.texture_pool.lock();
         let key = (width, height);
         
+        // Calculate total textures in pool
+        let total_textures: usize = pool.values().map(|v| v.len()).sum();
+        
+        // Check global limit first
+        if total_textures >= MAX_TEXTURE_POOL_SIZE {
+            // Pool is at global limit, drop this texture
+            return;
+        }
+        
         // Limit pool size per resolution to prevent unbounded growth
         let entries = pool.entry(key).or_insert_with(Vec::new);
         if entries.len() < 3 {
@@ -410,7 +420,7 @@ impl WgpuContext {
                 last_used: std::time::Instant::now(),
             });
         }
-        // If pool is full, texture is dropped (freed by WGPU)
+        // If pool is full for this resolution, texture is dropped (freed by WGPU)
     }
     
     /// Clean up old textures from pool
@@ -418,12 +428,30 @@ impl WgpuContext {
         let mut pool = self.texture_pool.lock();
         let now = std::time::Instant::now();
         
-        for entries in pool.values_mut() {
-            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 10);
+        // 1. Collect all valid (non-expired) textures
+        let mut all_entries: Vec<((u32, u32), TexturePoolEntry)> = Vec::new();
+        let old_pool = std::mem::take(&mut *pool);
+        for (key, entries) in old_pool {
+            for entry in entries {
+                if now.duration_since(entry.last_used).as_secs() < 10 {
+                    all_entries.push((key, entry));
+                }
+            }
         }
         
-        // Remove empty entries
-        pool.retain(|_, entries| !entries.is_empty());
+        // 2. If over global limit, sort and truncate
+        if all_entries.len() > MAX_TEXTURE_POOL_SIZE {
+            // Sort oldest first (smallest Instant)
+            all_entries.sort_by_key(|(_, entry)| entry.last_used);
+            // Drop oldest items
+            let keep_start = all_entries.len() - MAX_TEXTURE_POOL_SIZE;
+            all_entries.drain(0..keep_start);
+        }
+        
+        // 3. Re-populate pool
+        for (key, entry) in all_entries {
+            pool.entry(key).or_default().push(entry);
+        }
     }
 }
 
@@ -1599,28 +1627,126 @@ impl Renderer {
             )
         };
 
-        self.ctx.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture, 
-                mip_level: 0, 
-                origin: wgpu::Origin3d::ZERO, 
-                aspect: wgpu::TextureAspect::All,
-            },
-            &frame.data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * frame.width), 
-                rows_per_image: Some(frame.height),
-            },
-            wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Map buffer to access pixel data
+        // CRITICAL: Use explicit scope to ensure map is dropped immediately after use
+        // This prevents GStreamer buffer memory leaks
+        let src_stride = frame.stride;
+        let width = frame.width;
+        let height = frame.height;
+        let expected_stride = width * 4;
+
+        // Check if source stride is 256-byte aligned (required for bytes_per_row)
+        if src_stride % 256 == 0 {
+             // Direct upload possible - map buffer in explicit scope
+             {
+                 let map = match frame.buffer.map_readable() {
+                     Ok(m) => m,
+                     Err(e) => {
+                         error!("Failed to map video buffer: {}", e);
+                         return;
+                     }
+                 };
+                 
+                 let src_data = map.as_slice();
+                 
+                 self.ctx.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &texture, 
+                        mip_level: 0, 
+                        origin: wgpu::Origin3d::ZERO, 
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    src_data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(src_stride), 
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width: width,
+                        height: height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                 // map is dropped here, unmapping the GStreamer buffer
+             }
+        } else {
+            // Unaligned stride - must repack to tight packing (or aligned packing)
+            // But wait, if tight packing (width*4) is ALSO not 256 aligned, we still need padding?
+             // wgpu::Queue::write_texture documentation says bytes_per_row must be multiple of 256.
+             // If width=1920, width*4=7680 (aligned).
+             // If width=1366, width*4=5464 (NOT aligned).
+             
+             // We'll repack to a 256-byte aligned stride to be safe and efficient
+             let align_mask = 255;
+             let aligned_stride = (expected_stride + align_mask) & !align_mask;
+             
+             // Map buffer and copy to temp buffer in explicit scope
+             let temp_buf = {
+                 let map = match frame.buffer.map_readable() {
+                     Ok(m) => m,
+                     Err(e) => {
+                         error!("Failed to map video buffer: {}", e);
+                         return;
+                     }
+                 };
+                 
+                 let src_data = map.as_slice();
+                 
+                 // Allocate temp buffer
+                 let mut temp_buf = Vec::with_capacity((aligned_stride * height) as usize);
+                 
+                 // Copy row by row
+                 for row in 0..height {
+                     let src_start = (row * src_stride) as usize;
+                     let src_end = src_start + expected_stride as usize; // width * 4
+                     
+                     // Append row data
+                     if src_end <= src_data.len() {
+                        temp_buf.extend_from_slice(&src_data[src_start..src_end]);
+                     } else {
+                         // Should not happen if buffer is valid
+                         break; 
+                     }
+                     
+                     // Add padding
+                     let padding = aligned_stride - expected_stride;
+                     if padding > 0 {
+                         temp_buf.extend(std::iter::repeat(0).take(padding as usize));
+                     }
+                 }
+                 
+                 // map is dropped here, unmapping the GStreamer buffer
+                 temp_buf
+             };
+             
+             self.ctx.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture, 
+                    mip_level: 0, 
+                    origin: wgpu::Origin3d::ZERO, 
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &temp_buf,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_stride),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width: width,
+                    height: height,
+                    depth_or_array_layers: 1,
+                },
+            );
+             // temp_buf is dropped here
+        }
 
         // Only recreate texture view and invalidate bind groups if size changed (optimization)
         if needs_new_texture || self.current_texture_view.is_none() {
+            // Explicitly drop old texture view before creating new one to free WGPU resources
+            drop(self.current_texture_view.take());
+            
             self.current_texture_view = Some(texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("Video Texture View"),
                 format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
@@ -1675,6 +1801,8 @@ impl Renderer {
         
         // Explicitly poll device to ensure old textures are freed promptly
         // This helps prevent GPU memory accumulation during rapid video frame updates
+        // Note: Using Poll (non-blocking) to avoid stalling the main loop
+        // WGPU will free resources when they're no longer referenced
         self.ctx.device.poll(wgpu::Maintain::Poll);
     }
 

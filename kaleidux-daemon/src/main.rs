@@ -9,11 +9,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use kaleidux_common::{Request, Response, Transition};
 
 // Use jemalloc for better memory fragmentation handling in long-running processes
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Global semaphore to limit concurrent image decode tasks (prevents memory spikes)
+// Limit to 2 concurrent decodes since each can be 35-40MB
+static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> = once_cell::sync::Lazy::new(|| {
+    Arc::new(Semaphore::new(2))
+});
 
 mod video;
 mod renderer;
@@ -87,6 +94,8 @@ fn switch_wallpaper_content(
         }
     }
     
+    // CRITICAL: Ensure renderer exists before switching content
+    // This prevents race conditions where content is switched before renderer is ready
     if let Some(r) = renderers.get_mut(name) {
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time; 
@@ -107,36 +116,64 @@ fn switch_wallpaper_content(
             let name_clone = name.to_string();
             let path_clone = path.to_path_buf();
             let tx = image_tx.clone();
+            let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
             
             debug!("[ASSET] {}: Offloading image decode: {}", name, path.display());
-            tokio::task::spawn_blocking(move || {
-                match image::open(&path_clone) {
-                    Ok(img) => {
-                        let rgba = img.to_rgba8();
-                        let (width, height) = rgba.dimensions();
-                        let send_result = tx.send(LoadedImage {
-                            name: name_clone.clone(),
-                            data: Some(rgba.into_raw()),
-                            width,
-                            height,
-                            _path: path_clone,
-                        });
-                        if send_result.is_err() {
-                            debug!("[ASSET] {}: Failed to send decoded image (channel closed)", name_clone);
+            tokio::spawn(async move {
+                // Acquire permit before decoding to limit concurrent tasks
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!("[ASSET] {}: Semaphore closed, skipping image decode", name_clone);
+                        return;
+                    }
+                };
+                
+                // Decode image in blocking task
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    match image::open(&path_clone) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let (width, height) = rgba.dimensions();
+                            let image_data = rgba.into_raw();
+                            Ok((name_clone.clone(), image_data, width, height, path_clone))
+                        }
+                        Err(e) => {
+                            error!("Failed to decode image {}: {}", path_clone.display(), e);
+                            Err((name_clone, path_clone))
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to decode image {}: {}", path_clone.display(), e);
-                        // Note: metrics not available in this closure context
+                }).await;
+                
+                // Send decoded image (or error) to channel
+                match decode_result {
+                    Ok(Ok((name, image_data, width, height, path))) => {
+                        // Use send for unbounded channel - won't block and allows all monitors to load simultaneously
+                        if let Err(e) = tx.send(LoadedImage {
+                            name: name.clone(),
+                            data: Some(image_data),
+                            width,
+                            height,
+                            _path: path,
+                        }) {
+                            debug!("[ASSET] {}: Failed to send decoded image (channel closed): {}", name, e);
+                        }
+                    }
+                    Ok(Err((name, path))) => {
+                        // Send error case - unbounded channel won't block
                         let _ = tx.send(LoadedImage {
-                            name: name_clone,
+                            name,
                             data: None,
                             width: 0,
                             height: 0,
-                            _path: path_clone,
+                            _path: path,
                         });
                     }
+                    Err(e) => {
+                        error!("Image decode task panicked: {}", e);
+                    }
                 }
+                // _permit is dropped here, releasing the semaphore
             });
         }
     }
@@ -189,7 +226,10 @@ fn create_and_start_video_player(
         ) {
             Ok(mut vp) => {
                 vp.set_volume(vol);
-
+                // Pre-buffer video to reduce first frame latency
+                if let Err(e) = vp.prebuffer() {
+                    debug!("[VIDEO] {}: Pre-buffering failed (non-fatal): {}", name_str, e);
+                }
                 if vp.start().is_ok() {
                     if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp)) {
                          error!("Failed to send video player back: {}", e);
@@ -381,9 +421,11 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
     let mut wgpu_ctx: Option<Arc<renderer::WgpuContext>> = None;
     let mut initial_surface: Option<wgpu::Surface<'static>> = None;
 
-    // Frame channel buffer: 60 frames = ~1 second at 60fps
-    // This prevents frame drops when renderer is temporarily slow
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(60);
+    // Frame channel buffer: 30 frames = ~1s buffer at 30fps
+    // Reasonable buffer to prevent stuttering while maintaining backpressure
+    // Each frame can be 30-40MB, so 30 frames = ~900-1200MB max in channel
+    // This is acceptable for smooth playback across multiple monitors
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(30);
     let mut renderers = HashMap::new();
     let outputs: Vec<_> = backend.output_state.outputs().collect();
     
@@ -496,6 +538,9 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
     let mut video_players: HashMap<String, video::VideoPlayer> = HashMap::new();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
+    // Image channel: unbounded to support many monitors simultaneously
+    // Each image can be 35-40MB, but with proper processing this shouldn't accumulate
+    // Unbounded allows all monitors to load images without blocking
     let (image_tx, mut image_rx) = tokio::sync::mpsc::unbounded_channel::<LoadedImage>();
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
     let script_cmd_tx = cmd_tx.clone();
@@ -707,16 +752,36 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         }
         
         // Handle Frames
+        // CRITICAL: Process ALL frames in channel, not just latest per source
+        // This prevents frame accumulation and memory leaks
+        // Keep only the latest frame per source for upload (discard older ones)
         let mut latest_frames: HashMap<Arc<String>, video::VideoFrame> = HashMap::new();
+        let mut frames_received = 0;
+        let mut frames_discarded = 0;
         while let Ok((source_id, event)) = frame_rx.try_recv() {
+            frames_received += 1;
             match event {
-                video::VideoEvent::Frame(frame) => { latest_frames.insert(source_id, frame); }
+                video::VideoEvent::Frame(frame) => {
+                    // If we already have a frame for this source, drop the old one
+                    // This ensures we only keep the latest frame per source
+                    if latest_frames.insert(source_id.clone(), frame).is_some() {
+                        frames_discarded += 1;
+                    }
+                }
                 video::VideoEvent::Error(msg) => {
                     error!("Video error {}: {}", source_id, msg);
                     metrics.record_error("video_decode");
                 }
             }
         }
+        // Track frame channel usage for memory leak detection
+        if frames_received > 0 {
+            metrics.record_frame_channel_size(frames_received);
+            if frames_discarded > 0 {
+                debug!("[VIDEO] Discarded {} older frames (keeping latest per source)", frames_discarded);
+            }
+        }
+        // Process all frames (one per source, the latest)
         for (source_id, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(source_id.as_str()) {
                 let _video_start = std::time::Instant::now();
@@ -724,6 +789,9 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
                 // Record video CPU time (frame processing)
                 let video_duration = _video_start.elapsed();
                 metrics.record_video_cpu_time(video_duration);
+                // CRITICAL: Explicitly drop frame after processing to release gst::Buffer
+                drop(frame);
+                
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == source_id.as_str()) {
                         // Deadlock fix: if this is the first frame of a transition (progress == 0),
@@ -739,11 +807,16 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
                         }
                     }
                 }
+            } else {
+                // Renderer doesn't exist - drop frame immediately
+                drop(frame);
             }
         }
         
         // Handle Images
+        let mut images_received = 0;
         while let Ok(msg) = image_rx.try_recv() {
+            images_received += 1;
             debug!("[IMAGE] Received image for {}: data={}, size={}x{}", msg.name, msg.data.is_some(), msg.width, msg.height);
              if let Some(r) = renderers.get_mut(&msg.name) {
                      if let Some(data) = msg.data {
@@ -762,7 +835,15 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
                  } else {
                      r.abort_transition();
                  }
+             } else {
+                 // CRITICAL: Renderer doesn't exist - drop image data immediately to prevent memory leak
+                 warn!("[IMAGE] {}: Renderer not found, dropping image data to prevent memory leak", msg.name);
+                 // msg.data is dropped here, freeing the Vec<u8>
              }
+        }
+        // Track image channel usage for memory leak detection
+        if images_received > 0 {
+            metrics.record_image_channel_size(images_received);
         }
         
         // Async Video Players
@@ -770,9 +851,14 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
             match res {
                 VideoPlayerResult::Success(name, session_id, mut player) => {
                     if renderers.get(&name).map(|r| r.active_video_session_id) == Some(session_id) {
-                        video_players.insert(name, player);
+                        if let Some(mut old) = video_players.insert(name, player) {
+                            tokio::spawn(async move { let _ = old.stop(); });
+                        }
                     } else {
-                        let _ = player.stop(); // Stale
+                        // Stale player - stop in background to avoid blocking main loop
+                        tokio::spawn(async move {
+                            let _ = player.stop();
+                        });
                     }
                 }
                 VideoPlayerResult::Failure(name, session_id) => {
@@ -819,10 +905,11 @@ async fn run_wayland_loop(config: orchestration::Config, log_level: Option<u8>, 
         let frame_time = loop_start.elapsed();
         metrics.record_frame_time(frame_time);
         
-        // Cleanup texture pool periodically (every 5 seconds)
-        if last_pool_cleanup.elapsed().as_secs() >= 5 {
+        // Cleanup texture pool periodically (every 3 seconds for more aggressive cleanup)
+        if last_pool_cleanup.elapsed().as_secs() >= 3 {
             if let Some(ctx) = &wgpu_ctx {
                 ctx.cleanup_texture_pool();
+                // Removed blocking poll(Wait) to prevent UI freezes/deadlocks
             }
             last_pool_cleanup = Instant::now();
         }
@@ -995,10 +1082,15 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
     }
 
     let mut video_players: HashMap<String, video::VideoPlayer> = HashMap::new();
-    // Frame channel buffer: 60 frames = ~1 second at 60fps
-    // This prevents frame drops when renderer is temporarily slow
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(60);
+    // Frame channel buffer: 30 frames = ~1s buffer at 30fps
+    // Reasonable buffer to prevent stuttering while maintaining backpressure
+    // Each frame can be 30-40MB, so 30 frames = ~900-1200MB max in channel
+    // This is acceptable for smooth playback across multiple monitors
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(30);
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
+    // Image channel: unbounded to support many monitors simultaneously
+    // Each image can be 35-40MB, but with proper processing this shouldn't accumulate
+    // Unbounded allows all monitors to load images without blocking
     let (image_tx, mut image_rx) = tokio::sync::mpsc::unbounded_channel::<LoadedImage>();
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
     
@@ -1128,13 +1220,29 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         }
         
         // Frames / Images / Video Players
-        let latest_frames = {
+        // CRITICAL: Process ALL frames in channel, not just latest per source
+        let (latest_frames, frames_received, frames_discarded_x11) = {
             let mut frames = HashMap::new();
+            let mut count = 0;
+            let mut discarded = 0;
             while let Ok((src, evt)) = frame_rx.try_recv() {
-                if let video::VideoEvent::Frame(f) = evt { frames.insert(src, f); }
+                count += 1;
+                if let video::VideoEvent::Frame(f) = evt {
+                    // If we already have a frame for this source, drop the old one
+                    if frames.insert(src.clone(), f).is_some() {
+                        discarded += 1;
+                    }
+                }
             }
-            frames
+            (frames, count, discarded)
         };
+        // Track frame channel usage for memory leak detection
+        if frames_received > 0 {
+            metrics.record_frame_channel_size(frames_received);
+            if frames_discarded_x11 > 0 {
+                debug!("[VIDEO] Discarded {} older frames (keeping latest per source)", frames_discarded_x11);
+            }
+        }
         for (src, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(src.as_str()) {
                 let _video_start = std::time::Instant::now();
@@ -1142,6 +1250,9 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
                 // Record video CPU time (frame processing)
                 let video_duration = _video_start.elapsed();
                 metrics.record_video_cpu_time(video_duration);
+                // CRITICAL: Explicitly drop frame after processing to release gst::Buffer
+                drop(frame);
+                
                 // X11: Render immediately if video
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
                 if !first_frame_recorded_x11 {
@@ -1153,9 +1264,14 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
                     r.transition_just_completed = false; // Clear flag
                     monitor_manager.mark_transition_completed(src.as_str());
                 }
+            } else {
+                // Renderer doesn't exist - drop frame immediately
+                drop(frame);
             }
         }
+        let mut images_received_x11 = 0;
         while let Ok(msg) = image_rx.try_recv() {
+            images_received_x11 += 1;
             if let Some(r) = renderers.get_mut(&msg.name) {
                  if let Some(data) = msg.data {
                      let _ = r.upload_image_data(data, msg.width, msg.height);
@@ -1168,18 +1284,26 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
                  } else {
                      r.abort_transition();
                  }
+            } else {
+                // CRITICAL: Renderer doesn't exist - drop image data immediately to prevent memory leak
+                warn!("[IMAGE] {}: Renderer not found, dropping image data to prevent memory leak", msg.name);
+                // msg.data is dropped here, freeing the Vec<u8>
             }
+        }
+        // Track image channel usage for memory leak detection
+        if images_received_x11 > 0 {
+            metrics.record_image_channel_size(images_received_x11);
         }
         while let Ok(msg) = player_rx.try_recv() {
              match msg {
                  VideoPlayerResult::Success(name, session_id, mut p) => {
                      if renderers.get(&name).map(|r| r.active_video_session_id) == Some(session_id) {
-                         if let Some(existing) = video_players.insert(name, p) {
-                             let mut old = existing;
-                             let _ = old.stop();
+                         if let Some(mut existing) = video_players.insert(name, p) {
+                             tokio::spawn(async move { let _ = existing.stop(); });
                          }
                      } else {
-                         let _ = p.stop(); // Stale
+                          // Stale - stop in background
+                          tokio::spawn(async move { let _ = p.stop(); });
                      }
                  }
                  VideoPlayerResult::Failure(name, session_id) => {
@@ -1218,8 +1342,8 @@ async fn run_x11_loop(config: orchestration::Config, log_level: Option<u8>, gstr
         let frame_time = loop_start.elapsed();
         metrics.record_frame_time(frame_time);
         
-        // Cleanup texture pool periodically (every 5 seconds)
-        if last_pool_cleanup_x11.elapsed().as_secs() >= 5 {
+        // Cleanup texture pool periodically (every 3 seconds for more aggressive cleanup)
+        if last_pool_cleanup_x11.elapsed().as_secs() >= 3 {
             if let Some(ctx) = &wgpu_ctx {
                 ctx.cleanup_texture_pool();
             }
