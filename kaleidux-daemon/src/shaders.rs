@@ -55,68 +55,98 @@ vec4 getToColor(vec2 uv) {
 pub struct ShaderManager;
 
 impl ShaderManager {
-    pub fn compile_glsl(name: &str, user_code: &str, params_mapping: &str) -> anyhow::Result<String> {
+    pub fn compile_glsl(
+        name: &str,
+        user_code: &str,
+        params_mapping: &str,
+    ) -> anyhow::Result<String> {
         // 1. Convert params_mapping from "type var = val;" to "#define var (val)"
         let mut defines = String::new();
         // Regex matches "type name = value" ignoring trailing semicolon
         // Use lazy static to compile once and reuse
-        static MAPPING_REGEX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-            regex::Regex::new(r"^\s*\w+\s+(\w+)\s*=\s*(.+)$").expect("Failed to compile regex")
-        });
+        static MAPPING_REGEX: once_cell::sync::Lazy<regex::Regex> =
+            once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r"^\s*\w+\s+(\w+)\s*=\s*(.+)$").expect("Failed to compile regex")
+            });
         let mapping_regex = &*MAPPING_REGEX;
-        
+
         for stmt in params_mapping.split(';') {
             let s = stmt.trim();
-            if s.is_empty() { continue; }
+            if s.is_empty() {
+                continue;
+            }
             if let Some(caps) = mapping_regex.captures(s) {
                 let var_name = &caps[1];
                 let val = &caps[2];
-                // Check if value ends with semicolon (regex greedy match might capture it if not careful, 
+                // Check if value ends with semicolon (regex greedy match might capture it if not careful,
                 // but split(';') removes the delimiter. If implicit semicolon was in the regex match, it might be an issue.
                 // Our input strings in get_builtin_shader don't have nested semicolons usually.
                 defines.push_str(&format!("#define {} ({})\n", var_name, val));
             } else {
-               // Fallback: just include it? If it's a statement not matching, it might be valid code?
-               // But usually our mappings are strictly "type name = val".
-               // If we fail to macro-ize it, we inject it as is.
-               defines.push_str(s);
-               defines.push_str(";\n"); 
+                // Fallback: just include it? If it's a statement not matching, it might be valid code?
+                // But usually our mappings are strictly "type name = val".
+                // If we fail to macro-ize it, we inject it as is.
+                defines.push_str(s);
+                defines.push_str(";\n");
             }
         }
 
         // 2. Strip "uniform type name;" from user_code because Naga requires bindings for uniforms.
         // We replace them with comments.
         // Manual line-based processing is more robust than regex for this specific case, avoiding potential multiline/regex engine quirks.
-        let stripped_user_code = user_code.lines().map(|line| {
-            let ops = line.trim_start();
-            if ops.starts_with("uniform ") {
-                format!("// {}", line)
-            } else {
-                line.to_string()
-            }
-        }).collect::<Vec<_>>().join("\n");
+        let stripped_user_code = user_code
+            .lines()
+            .map(|line| {
+                let ops = line.trim_start();
+                if ops.starts_with("uniform ") {
+                    format!("// {}", line)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        let full_glsl = format!("{}\n{}\n{}\nvoid main() {{ o_color = transition(v_uv); }}", GLSL_PRELUDE, defines, stripped_user_code);
-        
+        let full_glsl = format!(
+            "{}\n{}\n{}\nvoid main() {{ o_color = transition(v_uv); }}",
+            GLSL_PRELUDE, defines, stripped_user_code
+        );
+
         // Log the generated shader for debugging purposes
         tracing::debug!("Compiling GLSL shader '{}'", name);
 
         let mut parser = naga::front::glsl::Frontend::default();
-        let module = parser.parse(&naga::front::glsl::Options {
-            stage: naga::ShaderStage::Fragment,
-            defines: naga::FastHashMap::default(),
-        }, &full_glsl).map_err(|e| {
-            tracing::error!("GLSL Parse Error in {}: {:?}\nSource:\n{}", name, e, full_glsl);
-            anyhow::anyhow!("GLSL Parse Error in {}: {:?}", name, e)
-        })?;
+        let module = parser
+            .parse(
+                &naga::front::glsl::Options {
+                    stage: naga::ShaderStage::Fragment,
+                    defines: naga::FastHashMap::default(),
+                },
+                &full_glsl,
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    "GLSL Parse Error in {}: {:?}\nSource:\n{}",
+                    name,
+                    e,
+                    full_glsl
+                );
+                anyhow::anyhow!("GLSL Parse Error in {}: {:?}", name, e)
+            })?;
 
-        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module)
-            .map_err(|e| anyhow::anyhow!("Shader Validation Error in {}: {:?}", name, e))?;
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .map_err(|e| anyhow::anyhow!("Shader Validation Error in {}: {:?}", name, e))?;
 
         let mut out = String::new();
-        let mut writer = naga::back::wgsl::Writer::new(&mut out, naga::back::wgsl::WriterFlags::empty());
-        writer.write(&module, &info).map_err(|e| anyhow::anyhow!("WGSL Generation Error in {}: {:?}", name, e))?;
+        let mut writer =
+            naga::back::wgsl::Writer::new(&mut out, naga::back::wgsl::WriterFlags::empty());
+        writer
+            .write(&module, &info)
+            .map_err(|e| anyhow::anyhow!("WGSL Generation Error in {}: {:?}", name, e))?;
 
         Ok(out)
     }
@@ -146,16 +176,18 @@ impl ShaderManager {
             .ok_or_else(|| anyhow::anyhow!("Failed to get config directory"))?
             .join("kaleidux")
             .join("shaders");
-        
+
         // Try .glsl then .wgsl (though compile_glsl expects glsl)
         let path = config_dir.join(format!("{}.glsl", name));
         if tokio::fs::metadata(&path).await.is_ok() {
-            return tokio::fs::read_to_string(path).await.map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e));
+            return tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e));
         }
-        
+
         anyhow::bail!("Shader not found in ~/.config/kaleidux/shaders/: {}", name)
     }
-    
+
     #[allow(dead_code)]
     pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
         // Use block_in_place to call async version from sync context
@@ -172,9 +204,13 @@ impl ShaderManager {
                 .join("shaders");
             let path = config_dir.join(format!("{}.glsl", name));
             if path.exists() {
-                std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e))
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read shader: {}", e))
             } else {
-                Err(anyhow::anyhow!("Shader not found in ~/.config/kaleidux/shaders/: {}", name))
+                Err(anyhow::anyhow!(
+                    "Shader not found in ~/.config/kaleidux/shaders/: {}",
+                    name
+                ))
             }
         })
     }
@@ -183,7 +219,7 @@ impl ShaderManager {
         let name = transition.name();
         let glsl = Self::get_builtin_glsl(&name)
             .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?;
-        
+
         // Note: We use getFromParams(i) which handles the aligned vec4 array access
         // We must map Rust struct fields to the EXACT uniform names used in the GLSL shaders.
         let mapping = match transition {
@@ -196,7 +232,7 @@ impl ShaderManager {
             // Most gl-transitions use camelCase. I'll define BOTH to be safe if that works? No, redefinition error.
             // Let's stick to what we had unless proven wrong (User didn't complain about Butterfly). Use original:
             // "float amplitude = getFromParams(0); float waves = getFromParams(1); float color_separation = getFromParams(2);"
-            
+
             Transition::Circle => "vec2 center = vec2(0.5, 0.5); vec3 backColor = vec3(0.1, 0.1, 0.1);",
             Transition::CircleCrop { .. } => "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));",
             Transition::CircleOpen { .. } => "float smoothness = getFromParams(0); bool opening = getFromParams(1) > 0.5;",
@@ -215,9 +251,9 @@ impl ShaderManager {
             Transition::DirectionalWipe { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);",
             Transition::Displacement => "float strength = 0.5; #define displacementMap t_next", // Mock displacementMap with t_next
             Transition::Dissolve { .. } => "float uLineWidth = getFromParams(0); vec3 uSpreadClr = vec3(getFromParams(1), getFromParams(2), getFromParams(3)); vec3 uHotClr = vec3(getFromParams(4), getFromParams(5), getFromParams(6)); float uPow = getFromParams(7); float uIntensity = getFromParams(8);",
-            Transition::Doom { .. } => "int bars = int(getFromParams(0)); float amplitude = getFromParams(1); float noise = getFromParams(2); float frequency = getFromParams(3); float dripScale = getFromParams(4);", // grep didn't show dripScale name but camelCase is safer guess. 
+            Transition::Doom { .. } => "int bars = int(getFromParams(0)); float amplitude = getFromParams(1); float noise = getFromParams(2); float frequency = getFromParams(3); float dripScale = getFromParams(4);", // grep didn't show dripScale name but camelCase is safer guess.
             // Wait, previous code used `drip_scale`. I'll trust previous code unless I see error.
-            
+
             Transition::Doorway { .. } => "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);",
             Transition::DreamyZoom { .. } => "float rotation = getFromParams(0); float scale = getFromParams(1);",
             Transition::Edge { .. } => "float thickness = getFromParams(0); float brightness = getFromParams(1);",
@@ -277,29 +313,39 @@ impl ShaderManager {
             "Bounce" => Some(include_str!("shaders/transitions/Bounce.glsl")),
             "BowTieHorizontal" => Some(include_str!("shaders/transitions/BowTieHorizontal.glsl")),
             "BowTieVertical" => Some(include_str!("shaders/transitions/BowTieVertical.glsl")),
-            "BowTieWithParameter" => Some(include_str!("shaders/transitions/BowTieWithParameter.glsl")),
+            "BowTieWithParameter" => {
+                Some(include_str!("shaders/transitions/BowTieWithParameter.glsl"))
+            }
             "burn" => Some(include_str!("shaders/transitions/burn.glsl")),
-            "ButterflyWaveScrawler" => Some(include_str!("shaders/transitions/ButterflyWaveScrawler.glsl")),
+            "ButterflyWaveScrawler" => Some(include_str!(
+                "shaders/transitions/ButterflyWaveScrawler.glsl"
+            )),
             "cannabisleaf" => Some(include_str!("shaders/transitions/cannabisleaf.glsl")),
             "circle" => Some(include_str!("shaders/transitions/circle.glsl")),
             "CircleCrop" => Some(include_str!("shaders/transitions/CircleCrop.glsl")),
             "circleopen" => Some(include_str!("shaders/transitions/circleopen.glsl")),
             "colorphase" => Some(include_str!("shaders/transitions/colorphase.glsl")),
             "coord-from-in" => Some(include_str!("shaders/transitions/coord-from-in.glsl")),
-            "CrazyParametricFun" => Some(include_str!("shaders/transitions/CrazyParametricFun.glsl")),
+            "CrazyParametricFun" => {
+                Some(include_str!("shaders/transitions/CrazyParametricFun.glsl"))
+            }
             "ColourDistance" => Some(include_str!("shaders/transitions/ColourDistance.glsl")),
             "crosshatch" => Some(include_str!("shaders/transitions/crosshatch.glsl")),
             "crosswarp" => Some(include_str!("shaders/transitions/crosswarp.glsl")),
             "CrossZoom" => Some(include_str!("shaders/transitions/CrossZoom.glsl")),
             "cube" => Some(include_str!("shaders/transitions/cube.glsl")),
             "Directional" => Some(include_str!("shaders/transitions/Directional.glsl")),
-            "directional-easing" => Some(include_str!("shaders/transitions/directional-easing.glsl")),
+            "directional-easing" => {
+                Some(include_str!("shaders/transitions/directional-easing.glsl"))
+            }
             "DirectionalScaled" => Some(include_str!("shaders/transitions/DirectionalScaled.glsl")),
             "directionalwarp" => Some(include_str!("shaders/transitions/directionalwarp.glsl")),
             "directionalwipe" => Some(include_str!("shaders/transitions/directionalwipe.glsl")),
             "displacement" => Some(include_str!("shaders/transitions/displacement.glsl")),
             "dissolve" => Some(include_str!("shaders/transitions/dissolve.glsl")),
-            "DoomScreenTransition" => Some(include_str!("shaders/transitions/DoomScreenTransition.glsl")),
+            "DoomScreenTransition" => Some(include_str!(
+                "shaders/transitions/DoomScreenTransition.glsl"
+            )),
             "doorway" => Some(include_str!("shaders/transitions/doorway.glsl")),
             "Dreamy" => Some(include_str!("shaders/transitions/Dreamy.glsl")),
             "DreamyZoom" => Some(include_str!("shaders/transitions/DreamyZoom.glsl")),
@@ -368,7 +414,9 @@ impl ShaderManager {
             "wipeLeft" => Some(include_str!("shaders/transitions/wipeLeft.glsl")),
             "wipeRight" => Some(include_str!("shaders/transitions/wipeRight.glsl")),
             "wipeUp" => Some(include_str!("shaders/transitions/wipeUp.glsl")),
-            "x_axis_translation" => Some(include_str!("shaders/transitions/x_axis_translation.glsl")),
+            "x_axis_translation" => {
+                Some(include_str!("shaders/transitions/x_axis_translation.glsl"))
+            }
             "ZoomInCircles" => Some(include_str!("shaders/transitions/ZoomInCircles.glsl")),
             "ZoomLeftWipe" => Some(include_str!("shaders/transitions/ZoomLeftWipe.glsl")),
             "ZoomRigthWipe" => Some(include_str!("shaders/transitions/ZoomRigthWipe.glsl")),

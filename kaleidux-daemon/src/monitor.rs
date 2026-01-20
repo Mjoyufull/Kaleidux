@@ -1,9 +1,9 @@
-use sysinfo::{System, ProcessRefreshKind, ProcessesToUpdate};
-use tracing::{info, debug, warn};
-use std::time::Duration;
-use tokio::time::interval;
 use std::fs;
 use std::process::Command;
+use std::time::Duration;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+use tokio::time::interval;
+use tracing::{debug, info, warn};
 
 pub struct SystemMonitor {
     sys: System,
@@ -17,14 +17,16 @@ impl SystemMonitor {
     pub fn new() -> Self {
         Self::new_with_metrics(None)
     }
-    
-    pub fn new_with_metrics(metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>) -> Self {
+
+    pub fn new_with_metrics(
+        metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
+    ) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
-        
+
         // Detect GPU type
         let has_nvidia = fs::metadata("/proc/driver/nvidia/gpus").is_ok();
-        
+
         let mut amd_gpu_path = None;
         // Check for common AMD/Intel paths
         for i in 0..3 {
@@ -35,7 +37,12 @@ impl SystemMonitor {
             }
         }
 
-        Self { sys, has_nvidia, amd_gpu_path, metrics }
+        Self {
+            sys,
+            has_nvidia,
+            amd_gpu_path,
+            metrics,
+        }
     }
 
     fn get_gpu_stats(&self) -> (Option<f32>, Option<f32>, Option<f32>) {
@@ -46,9 +53,12 @@ impl SystemMonitor {
         if self.has_nvidia {
             // Try nvidia-smi
             let output = Command::new("nvidia-smi")
-                .args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+                .args([
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ])
                 .output();
-            
+
             if let Ok(out) = output {
                 let s = String::from_utf8_lossy(&out.stdout);
                 let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
@@ -64,10 +74,18 @@ impl SystemMonitor {
                 gpu_usage = content.trim().parse::<f32>().ok();
             }
             if let Ok(content) = fs::read_to_string(format!("{}/mem_info_vram_used", base_path)) {
-                vram_used = content.trim().parse::<f32>().map(|b| b / 1024.0 / 1024.0 / 1024.0).ok(); // Bytes to GB
+                vram_used = content
+                    .trim()
+                    .parse::<f32>()
+                    .map(|b| b / 1024.0 / 1024.0 / 1024.0)
+                    .ok(); // Bytes to GB
             }
             if let Ok(content) = fs::read_to_string(format!("{}/mem_info_vram_total", base_path)) {
-                vram_total = content.trim().parse::<f32>().map(|b| b / 1024.0 / 1024.0 / 1024.0).ok();
+                vram_total = content
+                    .trim()
+                    .parse::<f32>()
+                    .map(|b| b / 1024.0 / 1024.0 / 1024.0)
+                    .ok();
             }
         }
 
@@ -76,7 +94,7 @@ impl SystemMonitor {
 
     pub async fn run(mut self) {
         let mut interval = interval(Duration::from_secs(10));
-        
+
         info!("[MONITOR] Starting resource monitoring...");
         if self.has_nvidia {
             info!("[MONITOR] NVIDIA GPU detected.");
@@ -88,29 +106,29 @@ impl SystemMonitor {
 
         loop {
             interval.tick().await;
-            
+
             self.sys.refresh_cpu_all();
             self.sys.refresh_memory();
 
             let load = self.sys.global_cpu_usage();
             let total_mem = self.sys.total_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
             let used_mem = self.sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
-            
+
             // Get process-specific info
             let pid = sysinfo::get_current_pid().ok();
             let mut proc_cpu = 0.0;
             let mut proc_mem = 0.0;
-            
+
             if let Some(p) = pid {
                 self.sys.refresh_processes_specifics(
                     ProcessesToUpdate::Some(&[p]),
                     false,
-                    ProcessRefreshKind::nothing().with_cpu().with_memory()
+                    ProcessRefreshKind::nothing().with_cpu().with_memory(),
                 );
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
                     proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // KB to MB
-                    // Record memory usage in metrics
+                                                                          // Record memory usage in metrics
                     if let Some(m) = &self.metrics {
                         m.record_memory_usage(proc_mem as f64);
                     }
@@ -118,14 +136,14 @@ impl SystemMonitor {
             }
 
             let (gpu_load, vram_used, vram_total) = self.get_gpu_stats();
-            
+
             // Record GPU utilization in metrics
             if let Some(gl) = gpu_load {
                 if let Some(m) = &self.metrics {
                     m.record_gpu_utilization(gl as f64);
                 }
             }
-            
+
             let mut log_msg = format!(
                 "[MONITOR] App: {:.1}% CPU, {:.1}MB | Sys: {:.1}% CPU, {:.2}GB / {:.2}GB",
                 proc_cpu, proc_mem, load, used_mem, total_mem
@@ -137,7 +155,7 @@ impl SystemMonitor {
             if let (Some(vu), Some(vt)) = (vram_used, vram_total) {
                 log_msg.push_str(&format!(" | VRAM: {:.2}GB / {:.2}GB", vu, vt));
             }
-            
+
             info!("{}", log_msg);
 
             // Log individual core spikes if high
