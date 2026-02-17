@@ -112,6 +112,38 @@ impl SmartQueue {
         })
     }
 
+    /// Create a queue from a pre-discovered file list (avoids re-scanning the directory)
+    pub fn new_from_pool(
+        path: &Path,
+        pool: Vec<PathBuf>,
+        video_ratio: u8,
+        strategy: crate::orchestration::SortingStrategy,
+        cache: Arc<FileCache>,
+    ) -> Result<Self> {
+        let stats = Self::load_stats_from_cache(&cache)?;
+        let mut pool = pool;
+        pool.sort();
+
+        let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
+            pool.len().saturating_sub(1)
+        } else {
+            0
+        };
+
+        Ok(Self {
+            pool,
+            stats,
+            video_ratio,
+            strategy,
+            current_index,
+            history: Vec::new(),
+            root_path: path.to_path_buf(),
+            active_playlist: None,
+            cache,
+            pending_stats_updates: HashMap::new(),
+        })
+    }
+
     #[inline]
     pub fn get_content_type(path: &Path) -> Option<ContentType> {
         use std::io::Read;

@@ -200,6 +200,10 @@ pub struct MonitorManager {
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
     cache: Arc<FileCache>,                              // Shared cache instance for all queues
     metrics: Option<Arc<PerformanceMetrics>>,           // Shared metrics instance
+    paused: bool,                                       // Global pause state for wallpaper cycling
+    // In-memory cache of discovered file lists per directory path.
+    // Avoids re-scanning the same directory when multiple outputs share the same path.
+    discovered_files_cache: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl MonitorManager {
@@ -229,6 +233,8 @@ impl MonitorManager {
             group_display_start_times: HashMap::new(),
             cache,
             metrics,
+            paused: false,
+            discovered_files_cache: HashMap::new(),
         })
     }
 
@@ -256,14 +262,67 @@ impl MonitorManager {
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 info!("[ADD_OUTPUT] {}: Creating independent queue", name);
-                let orch = OutputOrchestrator::new(
-                    name.to_string(),
-                    description.to_string(),
-                    output_config,
-                    self.cache.clone(),
-                    self.metrics.clone(),
-                )
-                .await;
+                // Check if we already discovered files for this path (avoids re-scanning)
+                let cached_path = output_config.path.clone();
+                let orch = if let Some(path) = &cached_path {
+                    if let Some(cached_files) = self.discovered_files_cache.get(path) {
+                        info!(
+                            "[ADD_OUTPUT] {}: Reusing cached file list ({} files) for {:?}",
+                            name,
+                            cached_files.len(),
+                            path
+                        );
+                        let queue = SmartQueue::new_from_pool(
+                            path,
+                            cached_files.clone(),
+                            output_config.video_ratio,
+                            output_config.sorting,
+                            self.cache.clone(),
+                        )
+                        .ok()
+                        .map(|mut q| {
+                            if let Some(pl_name) = &output_config.default_playlist {
+                                let _ = q.set_playlist(Some(pl_name.clone()));
+                            }
+                            q
+                        });
+                        OutputOrchestrator {
+                            _name: name.to_string(),
+                            description: description.to_string(),
+                            config: output_config,
+                            queue,
+                            current_path: None,
+                            next_path: None,
+                            next_content_type: None,
+                            next_change: None,
+                            display_start_time: None,
+                        }
+                    } else {
+                        let orch = OutputOrchestrator::new(
+                            name.to_string(),
+                            description.to_string(),
+                            output_config,
+                            self.cache.clone(),
+                            self.metrics.clone(),
+                        )
+                        .await;
+                        // Cache the discovered file list for subsequent outputs with the same path
+                        if let Some(q) = &orch.queue {
+                            self.discovered_files_cache
+                                .insert(path.clone(), q.pool.clone());
+                        }
+                        orch
+                    }
+                } else {
+                    OutputOrchestrator::new(
+                        name.to_string(),
+                        description.to_string(),
+                        output_config,
+                        self.cache.clone(),
+                        self.metrics.clone(),
+                    )
+                    .await
+                };
                 info!(
                     "[ADD_OUTPUT] {}: Queue created: {}",
                     name,
@@ -361,8 +420,31 @@ impl MonitorManager {
         }
     }
 
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        if paused {
+            info!("[MONITOR_MANAGER] Wallpaper cycling paused");
+        } else {
+            // When resuming, reset timers so content doesn't immediately switch
+            let now = Instant::now();
+            for orch in self.outputs.values_mut() {
+                orch.display_start_time = Some(now);
+                orch.next_change = Some(now + orch.config.duration);
+            }
+            self.shared_display_start_time = Some(now);
+            for start in self.group_display_start_times.values_mut() {
+                *start = now;
+            }
+            info!("[MONITOR_MANAGER] Wallpaper cycling resumed (timers reset)");
+        }
+    }
+
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
+        // Don't cycle wallpapers when paused
+        if self.paused {
+            return changes;
+        }
         let now = Instant::now();
 
         match &self.config.global.monitor_behavior {

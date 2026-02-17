@@ -12,6 +12,7 @@ const FILE_CACHE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fi
 const FILE_STATS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_stats");
 const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlists");
 const BLACKLIST_TABLE: TableDefinition<&[u8], bool> = TableDefinition::new("blacklist");
+const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("history");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -42,6 +43,7 @@ impl FileCache {
             let _ = write_txn.open_table(FILE_STATS_TABLE)?;
             let _ = write_txn.open_table(PLAYLISTS_TABLE)?;
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
+            let _ = write_txn.open_table(HISTORY_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -240,6 +242,32 @@ impl FileCache {
         }
 
         Ok(blacklist)
+    }
+
+    pub fn set_history(&self, output_name: &str, history: &[PathBuf]) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(HISTORY_TABLE)?;
+            let paths: Vec<String> = history
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let data = bincode::serialize(&paths)?;
+            table.insert(output_name, data.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_history(&self, output_name: &str) -> Result<Vec<PathBuf>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(HISTORY_TABLE)?;
+        if let Some(data) = table.get(output_name)? {
+            let paths: Vec<String> = bincode::deserialize(data.value())?;
+            Ok(paths.into_iter().map(PathBuf::from).collect())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     #[allow(dead_code)]

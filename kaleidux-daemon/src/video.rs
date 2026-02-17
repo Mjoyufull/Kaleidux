@@ -92,12 +92,10 @@ impl VideoPlayer {
         info!("Setting video URI: {}", full_uri);
         pipeline.set_property("uri", &full_uri);
 
-        // Note: Removed buffer-size property setting - it expects gint (i32) not u64
-        // and may not be necessary for preventing memory leaks
-
-        // Default flags (video+audio+text+softvolume) are usually fine.
-        // Explicitly setting them to 3 (video+audio) requires the GstPlayFlags type.
-        // pipeline.set_property("flags", 3u32);
+        // Set playbin flags to only video+audio (disable text/subtitles/soft-volume/buffering).
+        // This avoids creating unnecessary subtitle/text overlay elements at startup.
+        // Must use set_property_from_str since the flags property expects GstPlayFlags, not u32.
+        pipeline.set_property_from_str("flags", "video+audio");
 
         // Create appsink for video frames - configure like gSlapper does
         let appsink = gst::ElementFactory::make("appsink")
@@ -431,6 +429,16 @@ impl VideoPlayer {
 
     pub fn set_volume(&mut self, volume: f64) {
         self.pipeline.set_property("volume", volume);
+    }
+
+    pub fn pause(&self) -> anyhow::Result<()> {
+        self.pipeline.set_state(gst::State::Paused)?;
+        Ok(())
+    }
+
+    pub fn resume(&self) -> anyhow::Result<()> {
+        self.pipeline.set_state(gst::State::Playing)?;
+        Ok(())
     }
 }
 

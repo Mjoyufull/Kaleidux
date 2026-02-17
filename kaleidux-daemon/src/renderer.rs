@@ -461,7 +461,7 @@ impl WgpuContext {
     }
 
     /// Clean up old textures from pool
-    pub fn cleanup_texture_pool(&self) {
+    pub fn cleanup_texture_pool(&self, metrics: Option<&crate::metrics::PerformanceMetrics>) {
         let mut pool = self.texture_pool.lock();
         let now = std::time::Instant::now();
 
@@ -488,6 +488,12 @@ impl WgpuContext {
         // 3. Re-populate pool
         for (key, entry) in all_entries {
             pool.entry(key).or_default().push(entry);
+        }
+
+        // 4. Record pool size for leak detection
+        let pool_size: usize = pool.values().map(|v| v.len()).sum();
+        if let Some(m) = metrics {
+            m.record_texture_pool_size(pool_size);
         }
     }
 }
@@ -547,6 +553,12 @@ pub struct Renderer {
 
     // Background task handle for shader precompilation (aborted on drop)
     shader_precompile_handle: Option<tokio::task::AbortHandle>,
+
+    // Reusable buffer for stride conversion to avoid per-frame allocations
+    stride_temp_buffer: Vec<u8>,
+
+    // Track prev_texture size for returning to pool
+    prev_texture_size: Option<(u32, u32)>,
 }
 
 impl Renderer {
@@ -610,10 +622,7 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
 
-        // Clone name for background task before moving it into Self
-        let name_for_bg = name.clone();
-
-        let mut r = Self {
+        let r = Self {
             name,
             ctx: ctx.clone(),
             surface,
@@ -668,54 +677,12 @@ impl Renderer {
             metrics,
             video_first_frame_time: None,
             shader_precompile_handle: None,
+            stride_temp_buffer: Vec::new(),
+            prev_texture_size: None,
         };
-        // Precompile shaders in background to avoid blocking startup
-        // Store abort handle to prevent resource leaks when Renderer is dropped
-        let shader_precompile_handle = tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            // Pre-compile common transition shader code (the expensive GLSL->WGSL conversion)
-            // Pipelines will be created on first use, but shader compilation is cached
-            let common_transitions = vec![
-                Transition::Fade,
-                Transition::CrossZoom { strength: 0.4 },
-                Transition::Directional {
-                    direction: [0.0, 1.0],
-                },
-                Transition::SimpleZoom {
-                    zoom_quickness: 0.5,
-                },
-                Transition::RotateScaleFade {
-                    center: [0.5, 0.5],
-                    rotations: 1.0,
-                    scale: 0.8,
-                    back_color: [0.15, 0.15, 0.15, 1.0],
-                },
-                Transition::Circle,
-                Transition::LeftRight,
-                Transition::Radial { smoothness: 0.5 },
-                Transition::Bounce {
-                    shadow_colour: [0.0, 0.0, 0.0, 0.6],
-                    shadow_height: 0.075,
-                    bounces: 3.0,
-                },
-                Transition::Swirl,
-            ];
-
-            for transition in common_transitions {
-                // Just compile the shader code - this warms the shader cache
-                // Pipeline creation happens on first use and is fast
-                let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
-            }
-            let duration = start.elapsed();
-            tracing::debug!(
-                "[RENDER] {}: Background shader precompilation completed in {:.2}ms",
-                name_for_bg,
-                duration.as_secs_f64() * 1000.0
-            );
-        })
-        .abort_handle();
-
-        r.shader_precompile_handle = Some(shader_precompile_handle);
+        // Shader precompilation is deferred to apply_config() which knows
+        // the actual configured transition. No need to precompile 10 hardcoded
+        // transitions when the user's config specifies exactly what they want.
         Ok(r)
     }
 
@@ -820,6 +787,11 @@ impl Renderer {
                 );
             }
 
+            // CRITICAL: Explicitly drop old composition texture before creating new one
+            // This prevents memory leaks when surface is resized or texture is recreated
+            drop(self.composition_texture.take());
+            drop(self.composition_texture_view.take());
+
             let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Composition Texture"),
                 size: wgpu::Extent3d {
@@ -851,8 +823,32 @@ impl Renderer {
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
         self.needs_redraw = true;
-        // Pre-compile the assigned transition early - DISABLED to avoid startup hang
-        // self.get_transition_pipeline(&self.active_transition);
+
+        // Pre-compile only the configured transition in background (+ Fade as fallback).
+        // This replaces the old approach of blindly precompiling 10 hardcoded transitions.
+        if let Some(handle) = self.shader_precompile_handle.take() {
+            handle.abort();
+        }
+        let transition = config.transition.clone();
+        let name_for_bg = self.name.clone();
+        let shader_precompile_handle = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            // Always precompile Fade (used as fallback on errors)
+            let _ = crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade);
+            // Precompile the user's configured transition (skip if it IS Fade or Random)
+            if !matches!(transition, Transition::Fade | Transition::Random) {
+                let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
+            }
+            let duration = start.elapsed();
+            tracing::debug!(
+                "[RENDER] {}: Background shader precompilation completed in {:.2}ms ({})",
+                name_for_bg,
+                duration.as_secs_f64() * 1000.0,
+                transition.name()
+            );
+        })
+        .abort_handle();
+        self.shader_precompile_handle = Some(shader_precompile_handle);
     }
 
     /// Pre-compiles common shaders to avoid stalls during the first transition.
@@ -1290,22 +1286,27 @@ impl Renderer {
                 // Don't set transition_rendered_this_frame - transition didn't actually render
             }
 
-            // CLEANUP: Drop prev_texture only when transition is TRULY finished
+            // CLEANUP: Return prev_texture to pool when transition is TRULY finished
             if self.transition_progress >= 1.0
                 && self.current_texture.is_some()
                 && self.prev_texture.is_some()
             {
                 debug!(
-                    "[TRANSITION] {}: Transition completed, cleaning up prev_texture",
+                    "[TRANSITION] {}: Transition completed, returning prev_texture to pool",
                     self.name
                 );
-                self.prev_texture = None;
+                // Return prev_texture to pool for reuse (instead of just dropping)
+                if let Some(prev_tex) = self.prev_texture.take() {
+                    if let Some((w, h)) = self.prev_texture_size.take() {
+                        self.ctx.return_texture_to_pool(prev_tex, w, h);
+                    }
+                    // If size unknown, texture is still dropped here (freed by WGPU)
+                }
                 self.prev_texture_view = None;
                 self.transition_bind_group = None;
                 self.blit_bind_group = None;
                 self.transition_start_time = None;
                 self.transition_active = false;
-                // Removed redundant poll (Audit Point 33)
             }
         }
 
@@ -1544,15 +1545,17 @@ impl Renderer {
         } // render_pass dropped here
 
         // Request frame callback BEFORE presenting/committing to ensure correct ordering
-        // Deadlock fix: always request on first frame even if one is pending from switch
-        if !self.frame_callback_pending || self.transition_progress == 0.0 {
-            match context {
-                BackendContext::Wayland { surface, qh } => {
-                    self.request_frame_callback(surface, qh);
-                }
-                BackendContext::X11 => {
-                    // X11 doesn't use Wayland frame callbacks
-                }
+        // CRITICAL FIX: Always force a fresh callback request when rendering.
+        // If we are rendering, we are committing a new frame, so we need a callback for the NEXT one.
+        // We reset pending=false to bypass the check in request_frame_callback and ensure we don't
+        // get stuck thinking a stale (lost) callback is still pending.
+        self.frame_callback_pending = false;
+        match context {
+            BackendContext::Wayland { surface, qh } => {
+                self.request_frame_callback(surface, qh);
+            }
+            BackendContext::X11 => {
+                // X11 doesn't use Wayland frame callbacks
             }
         }
 
@@ -1624,6 +1627,33 @@ impl Renderer {
         self.valid_content_type = content_type;
     }
 
+    /// Check if current_texture exists (used for throttling logic)
+    pub fn has_current_texture(&self) -> bool {
+        self.current_texture.is_some()
+    }
+
+    /// Check if any renderable content exists (current or previous texture)
+    pub fn has_any_content(&self) -> bool {
+        self.current_texture.is_some() || self.prev_texture.is_some()
+    }
+
+    /// Get the duration that the frame callback has been pending, if any
+    /// Returns None if no callback is pending or if timing info is unavailable
+    pub fn frame_callback_pending_duration(&self) -> Option<std::time::Duration> {
+        if self.frame_callback_pending {
+            self.last_frame_request.map(|t| t.elapsed())
+        } else {
+            None
+        }
+    }
+
+    /// Check if frame callback has been pending for too long (indicating we're stuck)
+    /// This is used to prevent memory leaks by throttling frame uploads when stuck
+    pub fn frame_callback_pending_too_long(&self, threshold_ms: u64) -> bool {
+        self.frame_callback_pending_duration()
+            .map_or(false, |d| d.as_millis() > threshold_ms as u128)
+    }
+
     #[allow(dead_code)]
     pub fn upload_image_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let _load_start = std::time::Instant::now();
@@ -1642,6 +1672,12 @@ impl Renderer {
         height: u32,
     ) -> anyhow::Result<()> {
         let upload_start = std::time::Instant::now();
+
+        // CRITICAL: Explicitly drop old image texture before creating new one
+        // This prevents memory leaks when switching images rapidly
+        // Image textures can't be pooled (they need mipmaps), so we must drop them
+        drop(self.current_texture.take());
+        drop(self.current_texture_view.take());
 
         // Calculate mip levels
         let mip_level_count = ((width.max(height) as f32).log2().floor() as u32) + 1;
@@ -1918,9 +1954,18 @@ impl Renderer {
             // We'll repack to a 256-byte aligned stride to be safe and efficient
             let align_mask = 255;
             let aligned_stride = (expected_stride + align_mask) & !align_mask;
+            let required_size = (aligned_stride * height) as usize;
 
-            // Map buffer and copy to temp buffer in explicit scope
-            let temp_buf = {
+            // OPTIMIZATION: Reuse temp buffer to avoid per-frame allocations (was ~5MB/frame)
+            // Clear and resize to required capacity
+            self.stride_temp_buffer.clear();
+            if self.stride_temp_buffer.capacity() < required_size {
+                self.stride_temp_buffer
+                    .reserve(required_size - self.stride_temp_buffer.capacity());
+            }
+
+            // Map buffer and copy in explicit scope
+            {
                 let map = match frame.buffer.map_readable() {
                     Ok(m) => m,
                     Err(e) => {
@@ -1931,9 +1976,6 @@ impl Renderer {
 
                 let src_data = map.as_slice();
 
-                // Allocate temp buffer
-                let mut temp_buf = Vec::with_capacity((aligned_stride * height) as usize);
-
                 // Copy row by row
                 for row in 0..height {
                     let src_start = (row * src_stride) as usize;
@@ -1941,7 +1983,8 @@ impl Renderer {
 
                     // Append row data
                     if src_end <= src_data.len() {
-                        temp_buf.extend_from_slice(&src_data[src_start..src_end]);
+                        self.stride_temp_buffer
+                            .extend_from_slice(&src_data[src_start..src_end]);
                     } else {
                         // Should not happen if buffer is valid
                         break;
@@ -1950,13 +1993,13 @@ impl Renderer {
                     // Add padding
                     let padding = aligned_stride - expected_stride;
                     if padding > 0 {
-                        temp_buf.extend(std::iter::repeat_n(0, padding as usize));
+                        self.stride_temp_buffer
+                            .extend(std::iter::repeat_n(0, padding as usize));
                     }
                 }
 
                 // map is dropped here, unmapping the GStreamer buffer
-                temp_buf
-            };
+            }
 
             self.ctx.queue.write_texture(
                 wgpu::ImageCopyTexture {
@@ -1965,7 +2008,7 @@ impl Renderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &temp_buf,
+                &self.stride_temp_buffer,
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(aligned_stride),
@@ -1977,7 +2020,7 @@ impl Renderer {
                     depth_or_array_layers: 1,
                 },
             );
-            // temp_buf is dropped here
+            // stride_temp_buffer is NOT dropped - it's reused next frame
         }
 
         // Only recreate texture view and invalidate bind groups if size changed (optimization)
@@ -2049,10 +2092,26 @@ impl Renderer {
         // This ensures transitions work even when switching from empty state
         let had_current = self.current_texture.is_some();
 
+        // CRITICAL: If prev_texture already exists (from previous switch that didn't complete),
+        // return it to pool before setting new one. This prevents accumulation when switching rapidly.
+        if let Some(old_prev) = self.prev_texture.take() {
+            if let Some((w, h)) = self.prev_texture_size.take() {
+                debug!(
+                    "[TRANSITION] {}: Replacing incomplete prev_texture, returning old one to pool",
+                    self.name
+                );
+                self.ctx.return_texture_to_pool(old_prev, w, h);
+            }
+            // Drop view as well
+            drop(self.prev_texture_view.take());
+        }
+
         if let Some(curr) = self.current_texture.take() {
             self.prev_texture_view = self.current_texture_view.take();
             self.prev_texture = Some(curr);
             self.prev_aspect = self.current_aspect;
+            // Track prev_texture size for returning to pool later
+            self.prev_texture_size = self.current_texture_size;
         }
 
         // Always reset transition state when switching content
