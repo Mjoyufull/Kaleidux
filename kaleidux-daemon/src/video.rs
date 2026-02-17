@@ -1,21 +1,121 @@
 use gst::prelude::*;
 use gstreamer as gst;
+use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
-/// Video frame containing RGBA pixel data
-/// Uses gst::Buffer to avoid copying data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoMode {
+    Auto,
+    ForceDmaBuf,
+    ForceCuda,
+    ForceNv12,
+    ForceRgba,
+}
+
+static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_video_mode(mode: VideoMode) {
+    let val = match mode {
+        VideoMode::Auto => 0,
+        VideoMode::ForceDmaBuf => 1,
+        VideoMode::ForceNv12 => 2,
+        VideoMode::ForceRgba => 3,
+        VideoMode::ForceCuda => 4,
+    };
+    VIDEO_MODE.store(val, Ordering::SeqCst);
+    info!("[VIDEO] Video mode set to {:?}", mode);
+}
+
+pub fn get_video_mode() -> VideoMode {
+    match VIDEO_MODE.load(Ordering::SeqCst) {
+        1 => VideoMode::ForceDmaBuf,
+        2 => VideoMode::ForceNv12,
+        3 => VideoMode::ForceRgba,
+        4 => VideoMode::ForceCuda,
+        _ => VideoMode::Auto,
+    }
+}
+
+/// Configure GStreamer decoder element ranks based on detected GPU vendor.
+/// On NVIDIA: boost nvcodec decoders above VA-API so GStreamer picks native
+/// NVDEC (which can export DMA-BUF via cudadownload) instead of the VA-API
+/// shim (nvidia-vaapi-driver, which cannot export DMA-BUF).
+pub fn configure_hw_decoders() {
+    let has_nvidia = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok();
+
+    if has_nvidia {
+        let nvcodec_decoders = [
+            "nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec",
+        ];
+        let mut boosted = Vec::new();
+        for name in &nvcodec_decoders {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(gst::Rank::PRIMARY + 1);
+                boosted.push(*name);
+            }
+        }
+
+        let vaapi_decoders = [
+            "vah264dec", "vah265dec", "vaav1dec", "vavp9dec", "vavp8dec",
+        ];
+        let mut demoted = Vec::new();
+        for name in &vaapi_decoders {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(gst::Rank::MARGINAL);
+                demoted.push(*name);
+            }
+        }
+
+        info!(
+            "[VIDEO] NVIDIA detected: boosted nvcodec {:?}, demoted VA-API {:?}",
+            boosted, demoted
+        );
+    } else {
+        info!("[VIDEO] Non-NVIDIA GPU: VA-API decoders preferred for DMA-BUF zero-copy");
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum VideoFrameFormat {
+    Rgba,
+    Nv12 {
+        y_stride: u32,
+        uv_offset: u32,
+        uv_stride: u32,
+    },
+    /// DMA-BUF zero-copy: file descriptors for each plane, no CPU-side data.
+    DmaBufNv12 {
+        y_fd: RawFd,
+        y_stride: u32,
+        y_offset: u32,
+        uv_fd: RawFd,
+        uv_stride: u32,
+        uv_offset: u32,
+    },
+    /// CUDA zero-copy: buffer stays in GPU memory, renderer uses CUDA-Vulkan interop.
+    CudaNv12 {
+        y_stride: u32,
+        uv_offset: u32,
+        uv_stride: u32,
+    },
+}
+
+/// Video frame carrying pixel data in either RGBA or NV12 format.
+/// Uses gst::Buffer to avoid copying data.
 #[derive(Clone)]
 pub struct VideoFrame {
     pub buffer: gst::Buffer,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    pub format: VideoFrameFormat,
     pub session_id: u64,
 }
 
@@ -49,6 +149,62 @@ static BUS_WATCHER_POOL: once_cell::sync::Lazy<Arc<BusWatcherPool>> =
 
 pub fn get_bus_watcher_pool() -> Arc<BusWatcherPool> {
     BUS_WATCHER_POOL.clone()
+}
+
+/// Extract DMA-BUF file descriptors and plane info from an NV12 GStreamer buffer.
+///
+/// NV12 buffers may carry 1 or 2 memory blocks:
+///   - 1 block: Y and UV packed into a single allocation (different offsets)
+///   - 2 blocks: Y and UV in separate DMA-BUF allocations
+///
+/// Falls back to regular NV12 if fd extraction fails.
+fn extract_dmabuf_nv12(buffer: &gst::Buffer, vi: &gst_video::VideoInfo) -> VideoFrameFormat {
+    let strides = vi.stride();
+    let offsets = vi.offset();
+
+    if buffer.n_memory() >= 2 {
+        // Separate DMA-BUFs per plane
+        let y_mem = buffer.peek_memory(0);
+        let uv_mem = buffer.peek_memory(1);
+
+        if let (Some(y_dmabuf), Some(uv_dmabuf)) = (
+            y_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
+            uv_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
+        ) {
+            let y_fd = y_dmabuf.fd();
+            let uv_fd = uv_dmabuf.fd();
+            return VideoFrameFormat::DmaBufNv12 {
+                y_fd,
+                y_stride: strides[0] as u32,
+                y_offset: offsets[0] as u32,
+                uv_fd,
+                uv_stride: strides[1] as u32,
+                uv_offset: offsets[1] as u32,
+            };
+        }
+    } else if buffer.n_memory() == 1 {
+        // Single DMA-BUF with both planes at different offsets
+        let mem = buffer.peek_memory(0);
+        if let Some(dmabuf) = mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>() {
+            let fd = dmabuf.fd();
+            return VideoFrameFormat::DmaBufNv12 {
+                y_fd: fd,
+                y_stride: strides[0] as u32,
+                y_offset: offsets[0] as u32,
+                uv_fd: fd,
+                uv_stride: strides[1] as u32,
+                uv_offset: offsets[1] as u32,
+            };
+        }
+    }
+
+    // Fallback: treat as regular NV12 (CPU-accessible)
+    tracing::warn!("[VIDEO] DMA-BUF memory detected but fd extraction failed, falling back to NV12 CPU path");
+    VideoFrameFormat::Nv12 {
+        y_stride: strides[0] as u32,
+        uv_offset: offsets[1] as u32,
+        uv_stride: strides[1] as u32,
+    }
 }
 
 pub struct VideoPlayer {
@@ -104,10 +260,68 @@ impl VideoPlayer {
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow::anyhow!("Failed to downcast to AppSink"))?;
 
-        // Configure appsink to output RGBA frames (same as gSlapper)
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
-            .build();
+        let mode = get_video_mode();
+        let caps = match mode {
+            VideoMode::ForceRgba => {
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "RGBA")
+                    .build()
+            }
+            VideoMode::ForceNv12 => {
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "NV12")
+                    .build()
+            }
+            VideoMode::ForceDmaBuf => {
+                // Strict: DMA-BUF only, no fallback. Will fail with not-negotiated
+                // if the decoder/driver can't export DMA-BUF.
+                gst::Caps::builder("video/x-raw")
+                    .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
+                    .field("format", "NV12")
+                    .build()
+            }
+            VideoMode::ForceCuda => {
+                // Strict: CUDAMemory only. Requires NVIDIA nvcodec decoders.
+                gst::Caps::builder("video/x-raw")
+                    .features(["memory:CUDAMemory"])
+                    .field("format", "NV12")
+                    .build()
+            }
+            VideoMode::Auto => {
+                let has_nvidia = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok();
+                if has_nvidia {
+                    // NVIDIA: CUDAMemory preferred (zero-copy via CUDA-Vulkan interop),
+                    // then DMA-BUF, then NV12 CPU fallback
+                    let cuda_caps = gst::Caps::builder("video/x-raw")
+                        .features(["memory:CUDAMemory"])
+                        .field("format", "NV12")
+                        .build();
+                    let dmabuf_caps = gst::Caps::builder("video/x-raw")
+                        .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
+                        .field("format", "NV12")
+                        .build();
+                    let nv12_caps = gst::Caps::builder("video/x-raw")
+                        .field("format", "NV12")
+                        .build();
+                    let mut caps = cuda_caps;
+                    caps.merge(dmabuf_caps);
+                    caps.merge(nv12_caps);
+                    caps
+                } else {
+                    // AMD/Intel: DMA-BUF preferred (VA-API zero-copy), NV12 fallback
+                    let dmabuf_caps = gst::Caps::builder("video/x-raw")
+                        .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
+                        .field("format", "NV12")
+                        .build();
+                    let nv12_caps = gst::Caps::builder("video/x-raw")
+                        .field("format", "NV12")
+                        .build();
+                    let mut caps = dmabuf_caps;
+                    caps.merge(nv12_caps);
+                    caps
+                }
+            }
+        };
 
         appsink.set_caps(Some(&caps));
         appsink.set_sync(true); // Sync to clock
@@ -139,7 +353,7 @@ impl VideoPlayer {
 
                     // CRITICAL: Pull sample and extract buffer in explicit scope
                     // This ensures sample is dropped immediately after buffer extraction
-                    let (buffer, width, height, stride) = {
+                    let (buffer, width, height, stride, format) = {
                         let sample = match sink.pull_sample() {
                             Ok(s) => s,
                             Err(_) => return Err(gst::FlowError::Error),
@@ -162,10 +376,73 @@ impl VideoPlayer {
 
                         let width = video_info.width();
                         let height = video_info.height();
-                        let stride = video_info.stride()[0] as u32;
 
-                        // sample is dropped here, releasing GStreamer sample resources
-                        (buffer, width, height, stride)
+                        // Prefer GstVideoMeta stride/offset (reflects actual memory layout
+                        // from hardware decoders like nvh264dec), fall back to VideoInfo
+                        let (strides, offsets) = unsafe {
+                            let raw_meta = gst_video::ffi::gst_buffer_get_video_meta(
+                                buffer.as_ptr() as *mut gst::ffi::GstBuffer,
+                            );
+                            if !raw_meta.is_null() {
+                                let meta = &*raw_meta;
+                                (meta.stride, meta.offset)
+                            } else {
+                                let vi_strides = video_info.stride();
+                                let vi_offsets = video_info.offset();
+                                let mut s = [0i32; 4];
+                                let mut o = [0usize; 4];
+                                for i in 0..4 {
+                                    s[i] = vi_strides[i];
+                                    o[i] = vi_offsets[i] as usize;
+                                }
+                                (s, o)
+                            }
+                        };
+                        let y_stride = strides[0] as u32;
+
+                        // Check caps features for memory type
+                        let is_cuda = caps.features(0).map_or(false, |f| {
+                            f.contains("memory:CUDAMemory")
+                        });
+
+                        let format = match video_info.format() {
+                            gst_video::VideoFormat::Nv12 => {
+                                if is_cuda {
+                                    tracing::debug!(
+                                        "[VIDEO] CUDA NV12 layout: y_stride={}, uv_offset={}, uv_stride={} ({}x{})",
+                                        strides[0], offsets[1], strides[1], width, height
+                                    );
+                                    VideoFrameFormat::CudaNv12 {
+                                        y_stride,
+                                        uv_offset: offsets[1] as u32,
+                                        uv_stride: strides[1] as u32,
+                                    }
+                                } else {
+                                    let is_dmabuf = buffer.n_memory() > 0
+                                        && buffer
+                                            .peek_memory(0)
+                                            .downcast_memory_ref::<gst_alloc::DmaBufMemory>()
+                                            .is_some();
+
+                                    if is_dmabuf {
+                                        extract_dmabuf_nv12(&buffer, &video_info)
+                                    } else {
+                                        VideoFrameFormat::Nv12 {
+                                            y_stride,
+                                            uv_offset: offsets[1] as u32,
+                                            uv_stride: strides[1] as u32,
+                                        }
+                                    }
+                                }
+                            }
+                            gst_video::VideoFormat::Rgba => VideoFrameFormat::Rgba,
+                            other => {
+                                tracing::warn!("[VIDEO] Unexpected format {:?}, treating as RGBA", other);
+                                VideoFrameFormat::Rgba
+                            }
+                        };
+
+                        (buffer, width, height, y_stride, format)
                     };
 
                     let frame = VideoFrame {
@@ -173,6 +450,7 @@ impl VideoPlayer {
                         width,
                         height,
                         stride,
+                        format,
                         session_id,
                     };
 
@@ -206,7 +484,7 @@ impl VideoPlayer {
         // Set appsink as the video sink
         pipeline.set_property("video-sink", &appsink);
 
-        info!("VideoPlayer created with playbin + appsink (RGBA mode)");
+        info!("VideoPlayer created with playbin + appsink (mode={:?}, caps={})", mode, caps);
 
         Ok(Self {
             pipeline,

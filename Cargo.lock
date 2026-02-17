@@ -1488,6 +1488,7 @@ dependencies = [
  "jwalk",
  "kaleidux-common",
  "libc",
+ "libloading",
  "naga",
  "notify",
  "once_cell",

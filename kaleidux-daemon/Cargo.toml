@@ -47,6 +47,7 @@ bytemuck = { version = "1.24.0", features = ["derive"] }
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads_runtime_support"] }
 
 libc = "0.2"
+libloading = "0.8"
 sysinfo = { version = "0.37.2", features = ["component"] }
 parking_lot = "0.12"
 futures = "0.3"

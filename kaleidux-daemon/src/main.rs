@@ -22,6 +22,7 @@ static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(2)));
 
 mod cache;
+mod cuda_interop;
 mod metrics;
 mod monitor;
 mod monitor_manager;
@@ -296,16 +297,16 @@ fn create_and_start_video_player(
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, about, long_about = None)]
 struct Args {
-    /// Show version information
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
-    version: Option<bool>,
-
     #[arg(long)]
     demo: bool,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     log: Option<u8>,
+
+    /// Force video decode mode: "cuda", "dmabuf", "nv12", or "rgba"
+    #[arg(long, value_name = "MODE")]
+    video_mode: Option<String>,
 }
 
 #[tokio::main]
@@ -383,6 +384,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // 1b. Set video decode mode from CLI flag
+    if let Some(ref mode_str) = args.video_mode {
+        let mode = match mode_str.to_lowercase().as_str() {
+            "cuda" | "nvdec" | "nvidia" => crate::video::VideoMode::ForceCuda,
+            "dmabuf" | "dma-buf" => crate::video::VideoMode::ForceDmaBuf,
+            "nv12" => crate::video::VideoMode::ForceNv12,
+            "rgba" => crate::video::VideoMode::ForceRgba,
+            other => {
+                warn!("Unknown --video-mode '{}', valid: cuda, dmabuf, nv12, rgba. Using auto.", other);
+                crate::video::VideoMode::Auto
+            }
+        };
+        crate::video::set_video_mode(mode);
+    }
+
     // 2. Load Configuration
     let mut config = match orchestration::Config::load().await {
         Ok(cfg) => cfg,
@@ -405,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Initialize GStreamer
     let gstreamer_start = Instant::now();
     gstreamer::init()?;
+    crate::video::configure_hw_decoders();
     let gstreamer_duration = gstreamer_start.elapsed();
     info!("GStreamer initialized.");
 
