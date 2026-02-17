@@ -22,6 +22,13 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 @group(0) @binding(1) var t_uv: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
+fn srgb_to_linear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y_raw = textureSample(t_y, samp, in.uv).r;
@@ -35,9 +42,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v = (uv_raw.g * 255.0 - 128.0) / 224.0;
 
     // BT.709 YUV→RGB matrix (limited range already handled above)
-    let r = y + 1.5748 * v;
-    let g = y - 0.1873 * u - 0.4681 * v;
-    let b = y + 1.8556 * u;
+    let r = clamp(y + 1.5748 * v, 0.0, 1.0);
+    let g = clamp(y - 0.1873 * u - 0.4681 * v, 0.0, 1.0);
+    let b = clamp(y + 1.8556 * u, 0.0, 1.0);
 
-    return vec4<f32>(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
+    // BT.709 produces gamma-encoded RGB; linearize so the sRGB render
+    // target's automatic OETF yields correct perceptual output.
+    return vec4<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0);
 }
