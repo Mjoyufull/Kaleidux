@@ -31,6 +31,7 @@ pub struct PerformanceMetrics {
     // Channel buffer tracking for memory leak detection
     pub frame_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, frames in channel)
     pub image_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, images in channel)
+    pub texture_pool_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, textures in pool)
 
     // Uptime tracking
     start_time: std::time::Instant,
@@ -95,6 +96,9 @@ impl PerformanceMetrics {
                 100,
             ))),
             image_channel_size_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
+                100,
+            ))),
+            texture_pool_size_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
                 100,
             ))),
             start_time: std::time::Instant::now(),
@@ -540,39 +544,86 @@ impl PerformanceMetrics {
         }
     }
 
+    pub fn record_texture_pool_size(&self, size: usize) {
+        let mut samples = self.texture_pool_size_samples.lock();
+        samples.push_back((std::time::Instant::now(), size));
+        if samples.len() > 100 {
+            samples.pop_front();
+        }
+    }
+
     pub fn check_resource_leaks(&self) -> Option<String> {
         let texture_samples = self.texture_count_samples.lock();
         let pipeline_samples = self.pipeline_count_samples.lock();
-
-        if texture_samples.len() < 10 || pipeline_samples.len() < 10 {
-            return None; // Not enough data
-        }
+        let frame_channel_samples = self.frame_channel_size_samples.lock();
+        let image_channel_samples = self.image_channel_size_samples.lock();
+        let texture_pool_samples = self.texture_pool_size_samples.lock();
 
         let mut warnings = Vec::new();
 
         // Check texture count growth
-        if let (Some(first), Some(last)) = (texture_samples.front(), texture_samples.back()) {
-            let growth = last.1.saturating_sub(first.1);
-            let duration = last.0.duration_since(first.0).as_secs();
-            if growth > 50 && duration > 60 {
-                let growth_rate = growth as f64 / duration as f64;
-                warnings.push(format!(
-                    "Texture count grew by {} over {}s ({:.2}/s)",
-                    growth, duration, growth_rate
-                ));
+        if texture_samples.len() >= 10 {
+            if let (Some(first), Some(last)) = (texture_samples.front(), texture_samples.back()) {
+                let growth = last.1.saturating_sub(first.1);
+                let duration = last.0.duration_since(first.0).as_secs();
+                if growth > 50 && duration > 60 {
+                    let growth_rate = growth as f64 / duration as f64;
+                    warnings.push(format!(
+                        "Texture count grew by {} over {}s ({:.2}/s)",
+                        growth, duration, growth_rate
+                    ));
+                }
             }
         }
 
         // Check pipeline count growth
-        if let (Some(first), Some(last)) = (pipeline_samples.front(), pipeline_samples.back()) {
-            let growth = last.1.saturating_sub(first.1);
-            let duration = last.0.duration_since(first.0).as_secs();
-            if growth > 20 && duration > 60 {
-                let growth_rate = growth as f64 / duration as f64;
-                warnings.push(format!(
-                    "Pipeline count grew by {} over {}s ({:.2}/s)",
-                    growth, duration, growth_rate
-                ));
+        if pipeline_samples.len() >= 10 {
+            if let (Some(first), Some(last)) = (pipeline_samples.front(), pipeline_samples.back()) {
+                let growth = last.1.saturating_sub(first.1);
+                let duration = last.0.duration_since(first.0).as_secs();
+                if growth > 20 && duration > 60 {
+                    let growth_rate = growth as f64 / duration as f64;
+                    warnings.push(format!(
+                        "Pipeline count grew by {} over {}s ({:.2}/s)",
+                        growth, duration, growth_rate
+                    ));
+                }
+            }
+        }
+
+        // Check frame channel accumulation
+        if frame_channel_samples.len() >= 10 {
+            if let Some((_, last_size)) = frame_channel_samples.back() {
+                if *last_size > 20 {
+                    warnings.push(format!(
+                        "Frame channel has {} frames queued (potential backpressure issue)",
+                        last_size
+                    ));
+                }
+            }
+        }
+
+        // Check image channel accumulation
+        if image_channel_samples.len() >= 10 {
+            if let Some((_, last_size)) = image_channel_samples.back() {
+                if *last_size > 4 {
+                    warnings.push(format!(
+                        "Image channel has {} images queued (potential backpressure issue)",
+                        last_size
+                    ));
+                }
+            }
+        }
+
+        // Check texture pool size
+        if texture_pool_samples.len() >= 10 {
+            if let Some((_, last_size)) = texture_pool_samples.back() {
+                if *last_size > 40 {
+                    warnings.push(format!(
+                        "Texture pool has {} textures (approaching limit of 50)",
+                        last_size
+                    ));
+                }
             }
         }
 

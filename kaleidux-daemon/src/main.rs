@@ -77,7 +77,7 @@ fn switch_wallpaper_content(
     video_players: &mut HashMap<String, video::VideoPlayer>,
     batch_id: Option<u64>,
     batch_trigger_time: Option<std::time::Instant>,
-    image_tx: &tokio::sync::mpsc::UnboundedSender<LoadedImage>,
+    image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
     log_prefix: &str,
 ) {
@@ -167,14 +167,17 @@ fn switch_wallpaper_content(
                 // Send decoded image (or error) to channel
                 match decode_result {
                     Ok(Ok((name, image_data, width, height, path))) => {
-                        // Use send for unbounded channel - won't block and allows all monitors to load simultaneously
-                        if let Err(e) = tx.send(LoadedImage {
-                            name: name.clone(),
-                            data: Some(image_data),
-                            width,
-                            height,
-                            _path: path,
-                        }) {
+                        // Use send().await for bounded channel - may wait briefly if channel is full
+                        if let Err(e) = tx
+                            .send(LoadedImage {
+                                name: name.clone(),
+                                data: Some(image_data),
+                                width,
+                                height,
+                                _path: path,
+                            })
+                            .await
+                        {
                             debug!(
                                 "[ASSET] {}: Failed to send decoded image (channel closed): {}",
                                 name, e
@@ -182,14 +185,16 @@ fn switch_wallpaper_content(
                         }
                     }
                     Ok(Err((name, path))) => {
-                        // Send error case - unbounded channel won't block
-                        let _ = tx.send(LoadedImage {
-                            name,
-                            data: None,
-                            width: 0,
-                            height: 0,
-                            _path: path,
-                        });
+                        // Send error case - may wait briefly if channel is full
+                        let _ = tx
+                            .send(LoadedImage {
+                                name,
+                                data: None,
+                                width: 0,
+                                height: 0,
+                                _path: path,
+                            })
+                            .await;
                     }
                     Err(e) => {
                         error!("Image decode task panicked: {}", e);
@@ -245,32 +250,47 @@ fn create_and_start_video_player(
         .unwrap_or(1.0);
 
     tokio::task::spawn_blocking(move || {
-        match video::VideoPlayer::new(&path_str, name_arc, session_id, frame_tx_clone) {
-            Ok(mut vp) => {
-                vp.set_volume(vol);
-                // Pre-buffer video to reduce first frame latency
-                if let Err(e) = vp.prebuffer() {
-                    debug!(
-                        "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
-                        name_str, e
-                    );
-                }
-                if vp.start().is_ok() {
-                    if let Err(e) =
-                        player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp))
-                    {
-                        error!("Failed to send video player back: {}", e);
+        let name_for_panic = name_str.clone();
+        let player_tx_panic = player_tx_clone.clone();
+        let session_id_panic = session_id;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match video::VideoPlayer::new(&path_str, name_arc, session_id, frame_tx_clone) {
+                Ok(mut vp) => {
+                    vp.set_volume(vol);
+                    if let Err(e) = vp.prebuffer() {
+                        debug!(
+                            "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
+                            name_str, e
+                        );
                     }
-                } else {
-                    error!("Failed to start video player");
-                    let _ = player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
+                    if vp.start().is_ok() {
+                        if let Err(e) = player_tx_clone
+                            .send(VideoPlayerResult::Success(name_str, session_id, vp))
+                        {
+                            error!("Failed to send video player back: {}", e);
+                        }
+                    } else {
+                        error!("Failed to start video player");
+                        let _ = player_tx_clone
+                            .send(VideoPlayerResult::Failure(name_str, session_id));
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create video player: {}", e);
+                    let _ =
+                        player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
                 }
             }
-            Err(e) => {
-                error!("Failed to create video player: {}", e);
-                // Note: metrics not available in this closure context
-                let _ = player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
-            }
+        }));
+
+        if result.is_err() {
+            error!(
+                "[VIDEO] {}: Video player task panicked! Sending failure.",
+                name_for_panic
+            );
+            let _ = player_tx_panic
+                .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
         }
     });
 }
@@ -464,12 +484,10 @@ async fn run_wayland_loop(
     let mut wgpu_ctx: Option<Arc<renderer::WgpuContext>> = None;
     let mut initial_surface: Option<wgpu::Surface<'static>> = None;
 
-    // Frame channel buffer: 30 frames = ~1s buffer at 30fps
-    // Reasonable buffer to prevent stuttering while maintaining backpressure
-    // Each frame can be 30-40MB, so 30 frames = ~900-1200MB max in channel
-    // This is acceptable for smooth playback across multiple monitors
+    // Frame channel: keep small to cap memory (each frame ~30-40MB).
+    // 6 slots = ~2 per video source + slack; prevents ~900MB+ spike when loop is slow.
     let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(30);
+        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(6);
     let mut renderers = HashMap::new();
     let outputs: Vec<_> = backend.output_state.outputs().collect();
 
@@ -478,7 +496,9 @@ async fn run_wayland_loop(
         backend_ref.display_ptr() as *mut std::ffi::c_void
     };
 
-    let mut surface_infos = Vec::new();
+    // Phase 1: Collect all output info first (fast, no IO)
+    let mut output_infos: Vec<(String, String, wayland_client::protocol::wl_output::WlOutput)> =
+        Vec::new();
     for output in outputs {
         let info = match backend.output_state.info(&output) {
             Some(i) => i,
@@ -486,16 +506,26 @@ async fn run_wayland_loop(
         };
         let name = info.name.as_deref().unwrap_or("unknown").to_string();
         let description = info.description.as_deref().unwrap_or("unknown").to_string();
+        info!("Found output: {} ({})", name, description);
+        output_infos.push((name, description, output));
+    }
 
-        info!("Creating surface for output: {} ({})", name, description);
-        monitor_manager.add_output(&name, &description).await;
-        let output_config = match monitor_manager.get_output_config(&name) {
+    // Phase 2: Initialize all outputs sequentially but with shared file discovery cache.
+    // The monitor_manager's add_output will reuse cached file lists for duplicate paths.
+    for (name, description, _) in &output_infos {
+        monitor_manager.add_output(name, description).await;
+    }
+
+    // Phase 3: Create Wayland surfaces (fast, no IO)
+    let mut surface_infos = Vec::new();
+    for (name, _description, output) in &output_infos {
+        let output_config = match monitor_manager.get_output_config(name) {
             Some(cfg) => cfg,
             None => continue,
         };
 
         let layer_surface = backend.create_wallpaper_surface(
-            &output,
+            output,
             &qh,
             name.clone(),
             output_config.layer.clone().into(),
@@ -506,7 +536,7 @@ async fn run_wayland_loop(
             display_ptr,
         };
         let surface_arc = Arc::new(raw_handle_surface);
-        surface_infos.push((name, surface_arc));
+        surface_infos.push((name.clone(), surface_arc));
     }
 
     if let Some((_, first_surface_arc)) = surface_infos.first() {
@@ -600,10 +630,10 @@ async fn run_wayland_loop(
 
     let (cmd_tx, mut cmd_rx) =
         tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
-    // Image channel: unbounded to support many monitors simultaneously
-    // Each image can be 35-40MB, but with proper processing this shouldn't accumulate
-    // Unbounded allows all monitors to load images without blocking
-    let (image_tx, mut image_rx) = tokio::sync::mpsc::unbounded_channel::<LoadedImage>();
+    // Image channel: bounded to prevent memory spikes from large images accumulating
+    // Each image can be 35-60MB (4K RGBA), so limit to 6 images max (2 per monitor with 3 monitors)
+    // This prevents unbounded growth if main loop is temporarily blocked
+    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(6);
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
     let script_cmd_tx = cmd_tx.clone();
 
@@ -693,6 +723,113 @@ async fn run_wayland_loop(
         "[STARTUP] Reached Initial Load section, renderers count: {}",
         renderers.len()
     );
+
+    // CRITICAL: Wait for all renderers to be configured before loading initial content
+    // This prevents race conditions where content is sent before renderers are ready
+    // Renderers become configured when they receive their first resize event from Wayland
+    info!("[STARTUP] Waiting for all renderers to be configured...");
+    let total_renderers = renderers.len();
+    let wait_start = Instant::now();
+    let mut configured_count = 0;
+    const MAX_WAIT_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Poll Wayland events until all renderers are configured or timeout
+    while configured_count < total_renderers && wait_start.elapsed() < MAX_WAIT_TIME {
+        // Process Wayland events to allow renderers to receive configure events
+        if let Some(guard) = conn.prepare_read() {
+            use std::os::unix::io::{AsFd, AsRawFd};
+            let fd = conn.as_fd().as_raw_fd();
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = 10; // Shorter timeout for more responsive checking
+            let ret = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if ret > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
+                if let Err(e) = guard.read() {
+                    error!("Failed to read Wayland events: {}", e);
+                }
+                if let Err(e) = event_queue.dispatch_pending(&mut backend) {
+                    error!("Failed to dispatch Wayland events: {}", e);
+                }
+                // CRITICAL: Flush after dispatch to ensure compositor processes events
+                let _ = conn.flush();
+            }
+        } else {
+            if let Err(e) = event_queue.dispatch_pending(&mut backend) {
+                error!("Failed to dispatch Wayland events: {}", e);
+            }
+            // CRITICAL: Flush even if no guard
+            let _ = conn.flush();
+        }
+
+        // CRITICAL FIX: Process pending_resizes to actually configure renderers
+        // This is what was missing - configure events arrive but were never processed
+        // The configure handler adds to pending_resizes, but we need to process them
+        // to call resize_checked() which sets configured = true
+        let resizes: Vec<_> = backend.pending_resizes.drain(..).collect();
+        for (name, w, h, _) in resizes {
+            if let Some(r) = renderers.get_mut(&name) {
+                let width = if w == 0 { r.config.width } else { w };
+                let height = if h == 0 { r.config.height } else { h };
+                let _ = r.resize_checked(width, height);
+                // resize_checked sets configured = true (renderer.rs:788)
+            }
+        }
+
+        // Check how many renderers are configured
+        configured_count = renderers.values().filter(|r| r.configured).count();
+        if configured_count < total_renderers {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await; // Shorter sleep
+        }
+    }
+
+    if configured_count < total_renderers {
+        warn!(
+            "[STARTUP] Only {}/{} renderers configured after {}ms timeout. Some wallpapers may not load initially.",
+            configured_count,
+            total_renderers,
+            wait_start.elapsed().as_millis()
+        );
+        // Log which renderers are not configured
+        for (name, r) in renderers.iter() {
+            if !r.configured {
+                warn!("[STARTUP] Renderer {} is not configured", name);
+            }
+        }
+    } else {
+        info!(
+            "[STARTUP] All {} renderers configured in {:.2}ms",
+            configured_count,
+            wait_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    // After timeout or all configured, force initial renders for any unconfigured renderers
+    // This ensures surfaces are committed and can receive frame callbacks even if configure
+    // events arrived late or were missed during the wait loop
+    for (name, r) in renderers.iter_mut() {
+        if !r.configured && r.config.width > 0 && r.config.height > 0 {
+            // Use configured size if available
+            if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == name) {
+                // Try to configure with existing size
+                let _ = r.resize_checked(r.config.width, r.config.height);
+                if r.configured {
+                    // Force an initial render to commit the surface
+                    let _ = r.render(
+                        renderer::BackendContext::Wayland {
+                            surface: layer_surface,
+                            qh: &qh,
+                        },
+                        Instant::now(),
+                    );
+                    r.request_frame_callback(layer_surface, &qh);
+                }
+            }
+        }
+    }
+
     info!("[STARTUP] About to call monitor_manager.tick()");
     let initial_changes = monitor_manager.tick();
     info!(
@@ -711,6 +848,18 @@ async fn run_wayland_loop(
     let mut next_session_id = 1u64;
     let batch_id = rand::random::<u64>();
     for (name, (path, content_type)) in initial_changes {
+        // Only check if renderer exists - don't skip if not configured
+        // The main loop will handle configure events and trigger renders
+        // This allows wallpapers to load even if configure events arrive late
+        if !renderers.contains_key(&name) {
+            warn!(
+                "[STARTUP] Skipping initial content for {} - renderer does not exist",
+                name
+            );
+            continue;
+        }
+        // Proceed even if not configured - main loop will handle it
+
         switch_wallpaper_content(
             &name,
             &path,
@@ -914,13 +1063,28 @@ async fn run_wayland_loop(
         // Process all frames (one per source, the latest)
         for (source_id, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(source_id.as_str()) {
-                let _video_start = std::time::Instant::now();
-                r.upload_frame(&frame);
-                // Record video CPU time (frame processing)
-                let video_duration = _video_start.elapsed();
-                metrics.record_video_cpu_time(video_duration);
-                // CRITICAL: Explicitly drop frame after processing to release gst::Buffer
-                drop(frame);
+                // Video: upload unless frame callbacks are stuck (prevents memory leak from
+                // WGPU staging buffers accumulating when compositor isn't consuming frames).
+                // Images: only upload when we'll present (callback not pending) or first frame.
+                let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
+                    // Always upload first frame (needed to start transition/display).
+                    // After that, throttle if callbacks are stuck >1s to prevent memory balloon.
+                    !r.has_current_texture() || !r.frame_callback_pending_too_long(1000)
+                } else {
+                    !r.frame_callback_pending || !r.has_current_texture()
+                };
+
+                if should_upload {
+                    let _video_start = std::time::Instant::now();
+                    r.upload_frame(&frame);
+                    let video_duration = _video_start.elapsed();
+                    metrics.record_video_cpu_time(video_duration);
+                    drop(frame);
+                } else {
+                    // Frame throttled - drop immediately to release gst::Buffer
+                    // This prevents buffer accumulation when renderer is busy or stuck
+                    drop(frame);
+                }
 
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some((_, layer_surface)) = backend
@@ -950,6 +1114,12 @@ async fn run_wayland_loop(
             } else {
                 // Renderer doesn't exist - drop frame immediately
                 drop(frame);
+            }
+        }
+        // Let GPU process uploads when we handled frames to limit staging queue growth
+        if frames_received > 0 {
+            if let Some(ctx) = &wgpu_ctx {
+                ctx.device.poll(wgpu::Maintain::Poll);
             }
         }
 
@@ -1059,11 +1229,11 @@ async fn run_wayland_loop(
 
         // Request missing frames and check for transition completion
         for (name, r) in renderers.iter_mut() {
-            if (r.needs_redraw
-                || r.transition_active
-                || r.valid_content_type == crate::queue::ContentType::Video)
-                && !r.frame_callback_pending
-            {
+            // Only request frame callbacks when we have content to render.
+            // Without a texture (current or prev), the renderer can't commit a frame,
+            // so the compositor will never send a callback -> infinite stuck loop.
+            let should_request = r.has_any_content() && (r.needs_redraw || r.transition_active);
+            if should_request {
                 if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == name) {
                     r.request_frame_callback(layer_surface, &qh);
                 }
@@ -1082,7 +1252,7 @@ async fn run_wayland_loop(
         // Cleanup texture pool periodically (every 3 seconds for more aggressive cleanup)
         if last_pool_cleanup.elapsed().as_secs() >= 3 {
             if let Some(ctx) = &wgpu_ctx {
-                ctx.cleanup_texture_pool();
+                ctx.cleanup_texture_pool(Some(&metrics));
                 // Removed blocking poll(Wait) to prevent UI freezes/deadlocks
             }
             last_pool_cleanup = Instant::now();
@@ -1274,18 +1444,16 @@ async fn run_x11_loop(
     }
 
     let mut video_players: HashMap<String, video::VideoPlayer> = HashMap::new();
-    // Frame channel buffer: 30 frames = ~1s buffer at 30fps
-    // Reasonable buffer to prevent stuttering while maintaining backpressure
-    // Each frame can be 30-40MB, so 30 frames = ~900-1200MB max in channel
-    // This is acceptable for smooth playback across multiple monitors
+    // Frame channel: keep small to cap memory (each frame ~30-40MB).
+    // 6 slots = ~2 per video source + slack; prevents ~900MB+ spike when loop is slow.
     let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(30);
+        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(6);
     let (cmd_tx, mut cmd_rx) =
         tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
-    // Image channel: unbounded to support many monitors simultaneously
-    // Each image can be 35-40MB, but with proper processing this shouldn't accumulate
-    // Unbounded allows all monitors to load images without blocking
-    let (image_tx, mut image_rx) = tokio::sync::mpsc::unbounded_channel::<LoadedImage>();
+    // Image channel: bounded to prevent memory spikes from large images accumulating
+    // Each image can be 35-60MB (4K RGBA), so limit to 6 images max (2 per monitor with 3 monitors)
+    // This prevents unbounded growth if main loop is temporarily blocked
+    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(6);
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
 
     // IPC Listener (duplicated setup for now to avoid complexity extracting)
@@ -1321,6 +1489,12 @@ async fn run_x11_loop(
 
     let mut next_session_id = 1u64;
     // Initial Load
+    // X11: Renderers are configured immediately (no Wayland configure events needed)
+    // But we still verify they exist before loading content
+    info!(
+        "[STARTUP] Reached Initial Load section, renderers count: {}",
+        renderers.len()
+    );
     info!("[STARTUP] About to call monitor_manager.tick()");
     let initial_changes = monitor_manager.tick();
     info!(
@@ -1338,6 +1512,16 @@ async fn run_x11_loop(
     }
     let batch_id = rand::random::<u64>();
     for (name, (path, content_type)) in initial_changes {
+        // CRITICAL: Only switch content if renderer exists
+        // X11 renderers are configured immediately, so we just check existence
+        if !renderers.contains_key(&name) {
+            warn!(
+                "[STARTUP] Skipping initial content for {} - renderer does not exist",
+                name
+            );
+            continue;
+        }
+
         switch_wallpaper_content(
             &name,
             &path,
@@ -1485,13 +1669,31 @@ async fn run_x11_loop(
         }
         for (src, frame) in latest_frames {
             if let Some(r) = renderers.get_mut(src.as_str()) {
-                let _video_start = std::time::Instant::now();
-                r.upload_frame(&frame);
-                // Record video CPU time (frame processing)
-                let video_duration = _video_start.elapsed();
-                metrics.record_video_cpu_time(video_duration);
-                // CRITICAL: Explicitly drop frame after processing to release gst::Buffer
-                drop(frame);
+                // THROTTLING FIX (Updated):
+                // For video: Always upload frames - X11 doesn't use frame callbacks, so no throttling needed.
+                // For images: Use strict throttling - only upload when callback not pending or first frame.
+                // Note: X11 doesn't use frame callbacks, but keeping logic consistent with Wayland path.
+                let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
+                    // Video: always upload (X11 has no callback mechanism)
+                    true
+                } else {
+                    // Images: strict throttling (original logic)
+                    !r.frame_callback_pending || !r.has_current_texture()
+                };
+
+                if should_upload {
+                    let _video_start = std::time::Instant::now();
+                    r.upload_frame(&frame);
+                    // Record video CPU time (frame processing)
+                    let video_duration = _video_start.elapsed();
+                    metrics.record_video_cpu_time(video_duration);
+                    // CRITICAL: Explicitly drop frame after processing to release gst::Buffer
+                    drop(frame);
+                } else {
+                    // Frame throttled - drop immediately to release gst::Buffer
+                    // This prevents buffer accumulation when renderer is busy
+                    drop(frame);
+                }
 
                 // X11: Render immediately if video
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
@@ -1597,7 +1799,7 @@ async fn run_x11_loop(
         // Cleanup texture pool periodically (every 3 seconds for more aggressive cleanup)
         if last_pool_cleanup_x11.elapsed().as_secs() >= 3 {
             if let Some(ctx) = &wgpu_ctx {
-                ctx.cleanup_texture_pool();
+                ctx.cleanup_texture_pool(Some(&metrics));
             }
             last_pool_cleanup_x11 = Instant::now();
         }
@@ -1647,7 +1849,7 @@ async fn handle_command(
     renderers: &mut HashMap<String, renderer::Renderer>,
     video_players: &mut HashMap<String, video::VideoPlayer>,
     frame_tx: &tokio::sync::mpsc::Sender<(Arc<String>, video::VideoEvent)>,
-    image_tx: &tokio::sync::mpsc::UnboundedSender<LoadedImage>,
+    image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
     next_session_id: &mut u64,
     loop_start: Instant,
@@ -1749,6 +1951,61 @@ async fn handle_command(
                 }
             }
         }
-        _ => Response::Ok,
+        Request::Pause => {
+            info!("[CMD] Pausing all video players and wallpaper cycling");
+            for (name, player) in video_players.iter() {
+                if let Err(e) = player.pause() {
+                    error!("[CMD] Failed to pause video for {}: {}", name, e);
+                }
+            }
+            monitor_manager.set_paused(true);
+            Response::Ok
+        }
+        Request::Resume => {
+            info!("[CMD] Resuming all video players and wallpaper cycling");
+            for (name, player) in video_players.iter() {
+                if let Err(e) = player.resume() {
+                    error!("[CMD] Failed to resume video for {}: {}", name, e);
+                }
+            }
+            monitor_manager.set_paused(false);
+            Response::Ok
+        }
+        Request::Stop => {
+            info!("[CMD] Stopping all video players");
+            let names: Vec<String> = video_players.keys().cloned().collect();
+            for name in names {
+                if let Some(mut player) = video_players.remove(&name) {
+                    tokio::spawn(async move {
+                        let _ = player.stop();
+                    });
+                }
+            }
+            Response::Ok
+        }
+        Request::Clear { output } => {
+            info!("[CMD] Clearing output: {:?}", output);
+            let targets: Vec<String> = match output {
+                Some(ref name) => {
+                    if renderers.contains_key(name) {
+                        vec![name.clone()]
+                    } else {
+                        return Response::Error(format!("Output not found: {}", name));
+                    }
+                }
+                None => renderers.keys().cloned().collect(),
+            };
+            for name in targets {
+                if let Some(mut vp) = video_players.remove(&name) {
+                    tokio::spawn(async move {
+                        let _ = vp.stop();
+                    });
+                }
+                if let Some(r) = renderers.get_mut(&name) {
+                    r.clear();
+                }
+            }
+            Response::Ok
+        }
     }
 }
