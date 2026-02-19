@@ -13,6 +13,18 @@ const FILE_STATS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fi
 const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlists");
 const BLACKLIST_TABLE: TableDefinition<&[u8], bool> = TableDefinition::new("blacklist");
 const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("history");
+const POOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_cache");
+
+/// Filesystem events that affect the active file pool
+#[derive(Debug, Clone)]
+pub enum PoolEvent {
+    /// A new file was created in a watched directory
+    Added(PathBuf),
+    /// A file was removed from a watched directory
+    Removed(PathBuf),
+    /// A file was modified in a watched directory
+    Modified(PathBuf),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -44,6 +56,7 @@ impl FileCache {
             let _ = write_txn.open_table(PLAYLISTS_TABLE)?;
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
             let _ = write_txn.open_table(HISTORY_TABLE)?;
+            let _ = write_txn.open_table(POOL_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -75,6 +88,55 @@ impl FileCache {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Write multiple file metadata entries in a single redb transaction
+    pub fn batch_set_file_metadata(&self, updates: &[(PathBuf, FileMetadata)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
+            for (path, metadata) in updates {
+                let path_str = path.to_string_lossy();
+                let path_bytes = path_str.as_bytes();
+                let data = bincode::serialize(metadata)?;
+                table.insert(path_bytes, data.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Persist a discovered file pool for a directory (keyed by directory path)
+    pub fn set_cached_pool(&self, dir: &Path, pool: &[PathBuf]) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(POOL_TABLE)?;
+            let key = dir.to_string_lossy();
+            let paths: Vec<String> = pool
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let data = bincode::serialize(&paths)?;
+            table.insert(key.as_ref(), data.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Load a previously cached file pool for a directory
+    pub fn get_cached_pool(&self, dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(POOL_TABLE)?;
+        let key = dir.to_string_lossy();
+        if let Some(data) = table.get(key.as_ref())? {
+            let paths: Vec<String> = bincode::deserialize(data.value())?;
+            Ok(Some(paths.into_iter().map(PathBuf::from).collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn is_file_valid(&self, path: &Path) -> Result<bool> {
@@ -338,35 +400,51 @@ impl DirectoryWatcher {
         Ok(())
     }
 
-    /// Process file system events and invalidate cache entries
-    pub async fn process_events(&mut self) {
+    /// Process file system events, invalidate cache entries, and return pool-affecting events
+    pub async fn process_events(&mut self) -> Vec<PoolEvent> {
+        let mut pool_events = Vec::new();
+
         while let Ok(Ok(event)) = self.event_rx.try_recv() {
             match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                EventKind::Create(_) => {
                     for path in event.paths {
                         if path.is_file() {
-                            // Invalidate cache entry for this file
+                            tracing::debug!("[CACHE] File created: {}", path.display());
+                            pool_events.push(PoolEvent::Added(path));
+                        }
+                    }
+                }
+                EventKind::Modify(_) => {
+                    for path in event.paths {
+                        if path.is_file() {
                             if let Err(e) = self.cache.invalidate_file(&path) {
                                 tracing::warn!(
                                     "[CACHE] Failed to invalidate cache for {}: {}",
                                     path.display(),
                                     e
                                 );
-                            } else {
-                                tracing::debug!(
-                                    "[CACHE] Invalidated cache for: {}",
-                                    path.display()
-                                );
                             }
-                        } else if path.is_dir() {
-                            // Directory changed - mark all files in this directory as dirty
-                            // For now, we'll just log it. Full directory invalidation could be added later.
-                            tracing::debug!("[CACHE] Directory changed: {}", path.display());
+                            pool_events.push(PoolEvent::Modified(path));
                         }
+                    }
+                }
+                EventKind::Remove(_) => {
+                    for path in event.paths {
+                        // Can't use is_file() here — the file is already deleted
+                        if let Err(e) = self.cache.invalidate_file(&path) {
+                            tracing::debug!(
+                                "[CACHE] Invalidation for removed path {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                        pool_events.push(PoolEvent::Removed(path));
                     }
                 }
                 _ => {}
             }
         }
+
+        pool_events
     }
 }

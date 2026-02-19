@@ -71,18 +71,50 @@ impl SmartQueue {
             stats.blacklist.len()
         );
 
-        // Run file discovery in background task to avoid blocking startup
-        let path_buf = path.to_path_buf();
-        let blacklist_clone = stats.blacklist.clone();
-        let cache_clone = cache.clone();
-        let metrics_clone = metrics.clone();
+        // Try loading cached pool from redb first (near-instant)
+        let pool = if let Ok(Some(cached_pool)) = cache.get_cached_pool(path) {
+            // Validate cached pool: filter out files that no longer exist
+            let valid_pool: Vec<PathBuf> = cached_pool
+                .into_iter()
+                .filter(|p| p.exists() && !stats.blacklist.contains(p))
+                .collect();
 
-        tracing::info!("[QUEUE] Starting file discovery for: {:?}", path_buf);
-        // Use spawn_blocking to run on thread pool (truly async, non-blocking)
-        let pool = tokio::task::spawn_blocking(move || {
-            Self::discover_content(&path_buf, &blacklist_clone, cache_clone, metrics_clone)
-        })
-        .await??;
+            if !valid_pool.is_empty() {
+                tracing::info!(
+                    "[QUEUE] Loaded cached pool: {} files for {:?}",
+                    valid_pool.len(),
+                    path
+                );
+
+                // Spawn background full discovery to refresh the pool and metadata cache
+                let bg_path = path.to_path_buf();
+                let bg_blacklist = stats.blacklist.clone();
+                let bg_cache = cache.clone();
+                let bg_metrics = metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics) {
+                        Ok(fresh_pool) => {
+                            tracing::info!(
+                                "[QUEUE] Background pool refresh complete: {} files",
+                                fresh_pool.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
+                        }
+                    }
+                });
+
+                valid_pool
+            } else {
+                tracing::info!("[QUEUE] Cached pool was stale, running full discovery");
+                Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone()).await?
+            }
+        } else {
+            tracing::info!("[QUEUE] No cached pool found, running full discovery");
+            Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone()).await?
+        };
+
         tracing::info!(
             "[QUEUE] File discovery completed, found {} files",
             pool.len()
@@ -110,6 +142,21 @@ impl SmartQueue {
             cache,
             pending_stats_updates: HashMap::new(),
         })
+    }
+
+    /// Run full file discovery on a blocking thread
+    async fn full_discovery(
+        path: &Path,
+        blacklist: &std::collections::HashSet<PathBuf>,
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
+    ) -> Result<Vec<PathBuf>> {
+        let path_buf = path.to_path_buf();
+        let blacklist_clone = blacklist.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::discover_content(&path_buf, &blacklist_clone, cache, metrics)
+        })
+        .await?
     }
 
     /// Create a queue from a pre-discovered file list (avoids re-scanning the directory)
@@ -192,12 +239,12 @@ impl SmartQueue {
     ) -> Result<Vec<PathBuf>> {
         let discovery_start = std::time::Instant::now();
         let mut files = Vec::new();
-        let mut cache_updates = Vec::new();
+        let mut cache_updates: Vec<(PathBuf, crate::cache::FileMetadata)> = Vec::new();
 
         // Use jwalk for parallel directory traversal
         let walk_dir = WalkDir::new(path)
             .follow_links(true)
-            .parallelism(jwalk::Parallelism::RayonNewPool(0)); // 0 = auto-detect CPU count, optimal thread usage
+            .parallelism(jwalk::Parallelism::RayonNewPool(0));
 
         // Collect entries in parallel
         let entries: Vec<_> = walk_dir
@@ -206,103 +253,88 @@ impl SmartQueue {
             .filter(|e| e.file_type().is_file())
             .collect();
 
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         for entry in entries {
             let p = entry.path().to_path_buf();
             if blacklist.contains(&p) {
                 continue;
             }
 
-            // Check cache first
-            let content_type = if let Ok(Some(metadata)) = cache.get_file_metadata(&p) {
-                // Check if file is still valid (mtime matches)
-                if let Ok(valid) = cache.is_file_valid(&p) {
-                    if valid {
-                        // Cache hit - use cached content type
+            // Single fs::metadata call per file — reused for both validation and cache update
+            let fs_meta = match std::fs::metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let fs_mtime = fs_meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Check cache: single redb read, inline validity check using fs_mtime
+            let (content_type, needs_cache_update) =
+                if let Ok(Some(cached)) = cache.get_file_metadata(&p) {
+                    if cached.mtime == fs_mtime {
+                        // Cache hit — mtime matches, file unchanged
                         if let Some(m) = &metrics {
                             m.record_cache_hit();
                         }
-                        match metadata.content_type {
+                        let ct = match cached.content_type {
                             0 => Some(ContentType::Image),
                             1 => Some(ContentType::Video),
                             _ => None,
-                        }
+                        };
+                        (ct, false)
                     } else {
-                        // File changed, re-check (cache miss due to invalidation)
+                        // Cache stale — file changed since last discovery
                         if let Some(m) = &metrics {
                             m.record_cache_miss();
                         }
-                        Self::get_content_type(&p)
+                        (Self::get_content_type(&p), true)
                     }
                 } else {
-                    // Error checking validity, re-check
+                    // Not in cache — first time seeing this file
                     if let Some(m) = &metrics {
                         m.record_cache_miss();
                     }
-                    Self::get_content_type(&p)
-                }
-            } else {
-                // Not in cache, check and cache it (cache miss)
-                if let Some(m) = &metrics {
-                    m.record_cache_miss();
-                }
-                Self::get_content_type(&p)
-            };
+                    (Self::get_content_type(&p), true)
+                };
 
             if let Some(ct) = content_type {
                 files.push(p.clone());
 
-                // Update cache with file metadata
-                match std::fs::metadata(&p) {
-                    Ok(metadata) => {
-                        match metadata
-                            .modified()
-                            .and_then(|t| {
-                                t.duration_since(UNIX_EPOCH).map_err(std::io::Error::other)
-                            })
-                            .map(|d| d.as_secs())
-                        {
-                            Ok(mtime) => {
-                                let size = metadata.len();
-                                match SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                {
-                                    Ok(discovered_at) => {
-                                        let file_metadata = crate::cache::FileMetadata {
-                                            mtime,
-                                            size,
-                                            content_type: match ct {
-                                                ContentType::Image => 0,
-                                                ContentType::Video => 1,
-                                            },
-                                            discovered_at,
-                                        };
-                                        cache_updates.push((p, file_metadata));
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("[QUEUE] Failed to get current time for cache update: {} (path: {:?})", e, p);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("[QUEUE] Failed to extract mtime for cache update: {} (path: {:?})", e, p);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[QUEUE] Failed to get metadata for cache update: {} (path: {:?})",
-                            e,
-                            p
-                        );
-                    }
+                // Only build cache update for new/changed entries (reuse fs_meta from above)
+                if needs_cache_update {
+                    cache_updates.push((
+                        p,
+                        crate::cache::FileMetadata {
+                            mtime: fs_mtime,
+                            size: fs_meta.len(),
+                            content_type: match ct {
+                                ContentType::Image => 0,
+                                ContentType::Video => 1,
+                            },
+                            discovered_at: now_secs,
+                        },
+                    ));
                 }
             }
         }
 
-        // Batch update cache
-        for (path, metadata) in cache_updates {
-            let _ = cache.set_file_metadata(&path, &metadata);
+        // Single batched redb write transaction for all metadata updates
+        if let Err(e) = cache.batch_set_file_metadata(&cache_updates) {
+            tracing::warn!("[QUEUE] Failed to batch-update file cache: {}", e);
+        }
+
+        // Persist the pool for instant reload on next startup
+        if let Err(e) = cache.set_cached_pool(path, &files) {
+            tracing::warn!("[QUEUE] Failed to cache file pool: {}", e);
         }
 
         if files.is_empty() {
@@ -313,9 +345,123 @@ impl SmartQueue {
         if let Some(m) = &metrics {
             let discovery_duration = discovery_start.elapsed();
             m.record_file_discovery_cpu_time(discovery_duration);
+            tracing::info!(
+                "[QUEUE] Discovery completed: {} files, {} cache updates, {:.1}ms",
+                files.len(),
+                cache_updates.len(),
+                discovery_duration.as_secs_f64() * 1000.0
+            );
         }
 
         Ok(files)
+    }
+
+    /// Apply incremental pool events from the filesystem watcher
+    pub fn apply_pool_events(&mut self, events: Vec<crate::cache::PoolEvent>) {
+        use crate::cache::PoolEvent;
+
+        let mut added = 0usize;
+        let mut removed = 0usize;
+
+        for event in events {
+            match event {
+                PoolEvent::Added(path) => {
+                    // Only add if it's a supported media file and not blacklisted
+                    if self.stats.blacklist.contains(&path) {
+                        continue;
+                    }
+                    if let Some(ct) = Self::get_content_type(&path) {
+                        if !self.pool.contains(&path) {
+                            self.pool.push(path.clone());
+                            added += 1;
+
+                            // Update cache metadata
+                            if let Ok(meta) = std::fs::metadata(&path) {
+                                let mtime = meta
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let now_secs = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let _ = self.cache.set_file_metadata(
+                                    &path,
+                                    &crate::cache::FileMetadata {
+                                        mtime,
+                                        size: meta.len(),
+                                        content_type: match ct {
+                                            ContentType::Image => 0,
+                                            ContentType::Video => 1,
+                                        },
+                                        discovered_at: now_secs,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                PoolEvent::Removed(path) => {
+                    let before = self.pool.len();
+                    self.pool.retain(|p| p != &path);
+                    if self.pool.len() < before {
+                        removed += 1;
+                        // Clamp current_index if it's now out of bounds
+                        if !self.pool.is_empty() {
+                            self.current_index = self.current_index.min(self.pool.len() - 1);
+                        }
+                    }
+                }
+                PoolEvent::Modified(path) => {
+                    // File content may have changed — re-check if it's still valid media
+                    if let Some(_ct) = Self::get_content_type(&path) {
+                        // Still valid, cache metadata was already invalidated by the watcher
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let _ = self.cache.set_file_metadata(
+                                &path,
+                                &crate::cache::FileMetadata {
+                                    mtime,
+                                    size: meta.len(),
+                                    content_type: match _ct {
+                                        ContentType::Image => 0,
+                                        ContentType::Video => 1,
+                                    },
+                                    discovered_at: now_secs,
+                                },
+                            );
+                        }
+                    } else {
+                        // No longer valid media, remove from pool
+                        self.pool.retain(|p| p != &path);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        if added > 0 || removed > 0 {
+            self.pool.sort();
+            // Update the cached pool
+            let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
+            tracing::info!(
+                "[QUEUE] Pool updated: +{} added, -{} removed, {} total",
+                added,
+                removed,
+                self.pool.len()
+            );
+        }
     }
 
     #[inline]

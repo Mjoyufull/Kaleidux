@@ -292,47 +292,43 @@ impl WgpuContext {
 
         let nv12_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("NV12 Convert Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/nv12_convert.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/nv12_convert.wgsl").into()),
         });
 
-        let nv12_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("NV12 Convert Pipeline Layout"),
-                bind_group_layouts: &[&nv12_bind_group_layout],
-                push_constant_ranges: &[],
-            });
+        let nv12_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("NV12 Convert Pipeline Layout"),
+            bind_group_layouts: &[&nv12_bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
-        let nv12_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("NV12 Convert Pipeline"),
-                layout: Some(&nv12_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &nv12_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &nv12_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                multiview: None,
-                cache: None,
-            });
+        let nv12_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("NV12 Convert Pipeline"),
+            layout: Some(&nv12_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &nv12_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &nv12_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
 
         Ok((
             Arc::new(Self {
@@ -2018,7 +2014,10 @@ impl Renderer {
                 crate::video::VideoFrameFormat::Nv12 { .. } => "NV12 CPU upload",
                 crate::video::VideoFrameFormat::Rgba => "RGBA CPU upload (legacy)",
             };
-            info!("[VIDEO] {}: Frame decode path: {} ({}x{})", self.name, path_name, width, height);
+            info!(
+                "[VIDEO] {}: Frame decode path: {} ({}x{})",
+                self.name, path_name, width, height
+            );
         }
 
         match &frame.format {
@@ -2043,9 +2042,8 @@ impl Renderer {
                 uv_offset,
             } => {
                 if !self.upload_frame_dmabuf_nv12(
-                    &texture, width, height,
-                    *y_fd, *y_stride, *y_offset,
-                    *uv_fd, *uv_stride, *uv_offset,
+                    &texture, width, height, *y_fd, *y_stride, *y_offset, *uv_fd, *uv_stride,
+                    *uv_offset,
                 ) {
                     warn!("[VIDEO] DMA-BUF import failed, falling back to NV12 CPU path");
                     self.upload_frame_nv12(
@@ -2059,10 +2057,12 @@ impl Renderer {
                 uv_stride,
             } => {
                 if !self.upload_frame_cuda_nv12(
-                    frame, &texture, width, height,
-                    *y_stride, *uv_offset, *uv_stride,
+                    frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
                 ) {
-                    error!("[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload", self.name);
+                    error!(
+                        "[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload",
+                        self.name
+                    );
                     self.upload_frame_nv12(
                         frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
                     );
@@ -2146,7 +2146,11 @@ impl Renderer {
 
             let y_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("NV12 Y Plane"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -2156,7 +2160,11 @@ impl Renderer {
             });
             let uv_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("NV12 UV Plane"),
-                size: wgpu::Extent3d { width: uv_width, height: uv_height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: uv_width,
+                    height: uv_height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -2192,16 +2200,30 @@ impl Renderer {
 
             if y_stride == y_aligned {
                 self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: y_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::ImageCopyTexture {
+                        texture: y_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
                     &src[..(y_stride * height) as usize],
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(y_stride), rows_per_image: Some(height) },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(y_stride),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                 );
             } else {
                 self.stride_temp_buffer.clear();
                 let required = (y_aligned * height) as usize;
                 if self.stride_temp_buffer.capacity() < required {
-                    self.stride_temp_buffer.reserve(required - self.stride_temp_buffer.capacity());
+                    self.stride_temp_buffer
+                        .reserve(required - self.stride_temp_buffer.capacity());
                 }
                 for row in 0..height {
                     let start = (row * y_stride) as usize;
@@ -2211,14 +2233,28 @@ impl Renderer {
                     }
                     let pad = y_aligned - y_bytes_per_row;
                     if pad > 0 {
-                        self.stride_temp_buffer.extend(std::iter::repeat_n(0u8, pad as usize));
+                        self.stride_temp_buffer
+                            .extend(std::iter::repeat_n(0u8, pad as usize));
                     }
                 }
                 self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: y_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::ImageCopyTexture {
+                        texture: y_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
                     &self.stride_temp_buffer,
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(y_aligned), rows_per_image: Some(height) },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(y_aligned),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                 );
             }
 
@@ -2231,17 +2267,31 @@ impl Renderer {
                 let uv_end = uv_src_offset + (uv_stride * uv_height) as usize;
                 if uv_end <= src.len() {
                     self.ctx.queue.write_texture(
-                        wgpu::ImageCopyTexture { texture: uv_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        wgpu::ImageCopyTexture {
+                            texture: uv_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
                         &src[uv_src_offset..uv_end],
-                        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(uv_stride), rows_per_image: Some(uv_height) },
-                        wgpu::Extent3d { width: uv_width, height: uv_height, depth_or_array_layers: 1 },
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(uv_stride),
+                            rows_per_image: Some(uv_height),
+                        },
+                        wgpu::Extent3d {
+                            width: uv_width,
+                            height: uv_height,
+                            depth_or_array_layers: 1,
+                        },
                     );
                 }
             } else {
                 self.stride_temp_buffer.clear();
                 let required = (uv_aligned * uv_height) as usize;
                 if self.stride_temp_buffer.capacity() < required {
-                    self.stride_temp_buffer.reserve(required - self.stride_temp_buffer.capacity());
+                    self.stride_temp_buffer
+                        .reserve(required - self.stride_temp_buffer.capacity());
                 }
                 for row in 0..uv_height {
                     let start = uv_src_offset + (row * uv_stride) as usize;
@@ -2251,14 +2301,28 @@ impl Renderer {
                     }
                     let pad = uv_aligned - uv_bytes_per_row;
                     if pad > 0 {
-                        self.stride_temp_buffer.extend(std::iter::repeat_n(0u8, pad as usize));
+                        self.stride_temp_buffer
+                            .extend(std::iter::repeat_n(0u8, pad as usize));
                     }
                 }
                 self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: uv_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::ImageCopyTexture {
+                        texture: uv_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
                     &self.stride_temp_buffer,
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(uv_aligned), rows_per_image: Some(uv_height) },
-                    wgpu::Extent3d { width: uv_width, height: uv_height, depth_or_array_layers: 1 },
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(uv_aligned),
+                        rows_per_image: Some(uv_height),
+                    },
+                    wgpu::Extent3d {
+                        width: uv_width,
+                        height: uv_height,
+                        depth_or_array_layers: 1,
+                    },
                 );
             }
             // map dropped here, releasing the GStreamer buffer
@@ -2274,26 +2338,44 @@ impl Renderer {
             ..Default::default()
         });
 
-        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("NV12 Convert Bind Group"),
-            layout: &self.ctx.nv12_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(y_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
-            ],
-        });
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("NV12 Convert Bind Group"),
+                layout: &self.ctx.nv12_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                    },
+                ],
+            });
 
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("NV12 Convert Encoder"),
-        });
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("NV12 Convert Encoder"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("NV12 Convert Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -2327,10 +2409,23 @@ impl Renderer {
             };
             let src_data = map.as_slice();
             self.ctx.queue.write_texture(
-                wgpu::ImageCopyTexture { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
                 src_data,
-                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(src_stride), rows_per_image: Some(height) },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(src_stride),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
             );
         } else {
             let align_mask = 255u32;
@@ -2339,7 +2434,8 @@ impl Renderer {
 
             self.stride_temp_buffer.clear();
             if self.stride_temp_buffer.capacity() < required_size {
-                self.stride_temp_buffer.reserve(required_size - self.stride_temp_buffer.capacity());
+                self.stride_temp_buffer
+                    .reserve(required_size - self.stride_temp_buffer.capacity());
             }
 
             {
@@ -2355,22 +2451,37 @@ impl Renderer {
                     let src_start = (row * src_stride) as usize;
                     let src_end = src_start + expected_stride as usize;
                     if src_end <= src_data.len() {
-                        self.stride_temp_buffer.extend_from_slice(&src_data[src_start..src_end]);
+                        self.stride_temp_buffer
+                            .extend_from_slice(&src_data[src_start..src_end]);
                     } else {
                         break;
                     }
                     let padding = aligned_stride - expected_stride;
                     if padding > 0 {
-                        self.stride_temp_buffer.extend(std::iter::repeat_n(0u8, padding as usize));
+                        self.stride_temp_buffer
+                            .extend(std::iter::repeat_n(0u8, padding as usize));
                     }
                 }
             }
 
             self.ctx.queue.write_texture(
-                wgpu::ImageCopyTexture { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
                 &self.stride_temp_buffer,
-                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(aligned_stride), rows_per_image: Some(height) },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_stride),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
             );
         }
     }
@@ -2430,26 +2541,44 @@ impl Renderer {
             ..Default::default()
         });
 
-        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("NV12 DMA-BUF Convert Bind Group"),
-            layout: &self.ctx.nv12_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
-            ],
-        });
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("NV12 DMA-BUF Convert Bind Group"),
+                layout: &self.ctx.nv12_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                    },
+                ],
+            });
 
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("NV12 DMA-BUF Convert Encoder"),
-        });
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("NV12 DMA-BUF Convert Encoder"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("NV12 DMA-BUF Convert Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &output_view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -2482,7 +2611,11 @@ impl Renderer {
         _uv_stride: u32,
     ) -> bool {
         // Check shared CUDA interop (lives in WgpuContext, shared across renderers)
-        if self.ctx.cuda_interop_failed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .ctx
+            .cuda_interop_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         {
@@ -2492,7 +2625,9 @@ impl Renderer {
                     Ok(ci) => *ci_lock = Some(ci),
                     Err(e) => {
                         error!("[VIDEO] {}: {e}", self.name);
-                        self.ctx.cuda_interop_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.ctx
+                            .cuda_interop_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         return false;
                     }
                 }
@@ -2528,8 +2663,13 @@ impl Renderer {
             ) {
                 Some(v) => v,
                 None => {
-                    error!("[VIDEO] {}: Failed to create CUDA-backed Y texture", self.name);
-                    self.ctx.cuda_interop_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    error!(
+                        "[VIDEO] {}: Failed to create CUDA-backed Y texture",
+                        self.name
+                    );
+                    self.ctx
+                        .cuda_interop_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }
             };
@@ -2545,9 +2685,14 @@ impl Renderer {
             ) {
                 Some(v) => v,
                 None => {
-                    error!("[VIDEO] {}: Failed to create CUDA-backed UV texture", self.name);
+                    error!(
+                        "[VIDEO] {}: Failed to create CUDA-backed UV texture",
+                        self.name
+                    );
                     ci.free_exportable(y_cuda_alloc);
-                    self.ctx.cuda_interop_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ctx
+                        .cuda_interop_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }
             };
@@ -2634,30 +2779,34 @@ impl Renderer {
             ..Default::default()
         });
 
-        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("NV12 CUDA Convert Bind Group"),
-            layout: &self.ctx.nv12_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&cache.y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&cache.uv_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                },
-            ],
-        });
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("NV12 CUDA Convert Bind Group"),
+                layout: &self.ctx.nv12_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&cache.y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&cache.uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                    },
+                ],
+            });
 
-        let mut encoder = self.ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("NV12 CUDA Convert Encoder"),
-            },
-        );
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("NV12 CUDA Convert Pass"),
@@ -2873,7 +3022,11 @@ fn import_dmabuf_as_texture(
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk_format)
-                .extent(vk::Extent3D { width, height, depth: 1 })
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -2897,10 +3050,7 @@ fn import_dmabuf_as_texture(
 
             // 3. Query DMA-BUF fd memory properties via VK_KHR_external_memory_fd
             let ash_instance = hal_device.shared_instance().raw_instance();
-            let ext_mem_fd = ash::khr::external_memory_fd::Device::new(
-                ash_instance,
-                raw_device,
-            );
+            let ext_mem_fd = ash::khr::external_memory_fd::Device::new(ash_instance, raw_device);
 
             let mut fd_mem_props = vk::MemoryFdPropertiesKHR::default();
             if let Err(e) = ext_mem_fd.get_memory_fd_properties(
@@ -2919,8 +3069,10 @@ fn import_dmabuf_as_texture(
             let memory_type_index = match find_memory_type(type_bits) {
                 Some(idx) => idx,
                 None => {
-                    error!("[DMABUF] No suitable memory type (reqs={:#x}, fd_props={:#x})",
-                           mem_reqs.memory_type_bits, fd_mem_props.memory_type_bits);
+                    error!(
+                        "[DMABUF] No suitable memory type (reqs={:#x}, fd_props={:#x})",
+                        mem_reqs.memory_type_bits, fd_mem_props.memory_type_bits
+                    );
                     raw_device.destroy_image(vk_image, None);
                     libc::close(owned_fd);
                     return None;
@@ -2932,8 +3084,7 @@ fn import_dmabuf_as_texture(
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
                 .fd(owned_fd);
 
-            let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default()
-                .image(vk_image);
+            let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(vk_image);
 
             let alloc_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(mem_reqs.size)
@@ -2967,7 +3118,11 @@ fn import_dmabuf_as_texture(
 
             let hal_desc = wgpu_hal::TextureDescriptor {
                 label: Some(label),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -2995,7 +3150,11 @@ fn import_dmabuf_as_texture(
     // 8. Wrap the HAL texture as a wgpu::Texture
     let wgpu_desc = wgpu::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -3004,7 +3163,9 @@ fn import_dmabuf_as_texture(
         view_formats: &[],
     };
 
-    Some(unsafe { device.create_texture_from_hal::<wgpu_hal::vulkan::Api>(hal_texture, &wgpu_desc) })
+    Some(unsafe {
+        device.create_texture_from_hal::<wgpu_hal::vulkan::Api>(hal_texture, &wgpu_desc)
+    })
 }
 
 /// Convert wgpu TextureFormat to Vulkan format.
@@ -3015,7 +3176,10 @@ fn wgpu_format_to_vk(format: wgpu::TextureFormat) -> Option<ash::vk::Format> {
         wgpu::TextureFormat::Rgba8UnormSrgb => Some(ash::vk::Format::R8G8B8A8_SRGB),
         wgpu::TextureFormat::Rgba8Unorm => Some(ash::vk::Format::R8G8B8A8_UNORM),
         _ => {
-            error!("[DMABUF] Unsupported texture format for DMA-BUF import: {:?}", format);
+            error!(
+                "[DMABUF] Unsupported texture format for DMA-BUF import: {:?}",
+                format
+            );
             None
         }
     }
@@ -3048,7 +3212,11 @@ fn create_cuda_backed_texture(
     height: u32,
     format: wgpu::TextureFormat,
     label: &str,
-) -> Option<(wgpu::Texture, crate::cuda_interop::ExportableCudaAllocation, CudaTexLayout)> {
+) -> Option<(
+    wgpu::Texture,
+    crate::cuda_interop::ExportableCudaAllocation,
+    CudaTexLayout,
+)> {
     use ash::vk;
 
     let vk_format = wgpu_format_to_vk(format)?;
@@ -3217,7 +3385,11 @@ fn create_cuda_backed_texture(
 
     let wgpu_desc = wgpu::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -3226,9 +3398,8 @@ fn create_cuda_backed_texture(
         view_formats: &[],
     };
 
-    let texture = unsafe {
-        device.create_texture_from_hal::<wgpu_hal::vulkan::Api>(hal_texture, &wgpu_desc)
-    };
+    let texture =
+        unsafe { device.create_texture_from_hal::<wgpu_hal::vulkan::Api>(hal_texture, &wgpu_desc) };
 
     Some((texture, cuda_alloc, tex_layout))
 }

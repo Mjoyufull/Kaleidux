@@ -255,43 +255,44 @@ fn create_and_start_video_player(
         let player_tx_panic = player_tx_clone.clone();
         let session_id_panic = session_id;
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match video::VideoPlayer::new(&path_str, name_arc, session_id, frame_tx_clone) {
-                Ok(mut vp) => {
-                    vp.set_volume(vol);
-                    if let Err(e) = vp.prebuffer() {
-                        debug!(
-                            "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
-                            name_str, e
-                        );
-                    }
-                    if vp.start().is_ok() {
-                        if let Err(e) = player_tx_clone
-                            .send(VideoPlayerResult::Success(name_str, session_id, vp))
-                        {
-                            error!("Failed to send video player back: {}", e);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || match video::VideoPlayer::new(&path_str, name_arc, session_id, frame_tx_clone) {
+                    Ok(mut vp) => {
+                        vp.set_volume(vol);
+                        if let Err(e) = vp.prebuffer() {
+                            debug!(
+                                "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
+                                name_str, e
+                            );
                         }
-                    } else {
-                        error!("Failed to start video player");
-                        let _ = player_tx_clone
-                            .send(VideoPlayerResult::Failure(name_str, session_id));
+                        if vp.start().is_ok() {
+                            if let Err(e) = player_tx_clone
+                                .send(VideoPlayerResult::Success(name_str, session_id, vp))
+                            {
+                                error!("Failed to send video player back: {}", e);
+                            }
+                        } else {
+                            error!("Failed to start video player");
+                            let _ = player_tx_clone
+                                .send(VideoPlayerResult::Failure(name_str, session_id));
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to create video player: {}", e);
-                    let _ =
-                        player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
-                }
-            }
-        }));
+                    Err(e) => {
+                        error!("Failed to create video player: {}", e);
+                        let _ =
+                            player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
+                    }
+                },
+            ));
 
         if result.is_err() {
             error!(
                 "[VIDEO] {}: Video player task panicked! Sending failure.",
                 name_for_panic
             );
-            let _ = player_tx_panic
-                .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
+            let _ =
+                player_tx_panic.send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
         }
     });
 }
@@ -392,7 +393,10 @@ async fn main() -> anyhow::Result<()> {
             "nv12" => crate::video::VideoMode::ForceNv12,
             "rgba" => crate::video::VideoMode::ForceRgba,
             other => {
-                warn!("Unknown --video-mode '{}', valid: cuda, dmabuf, nv12, rgba. Using auto.", other);
+                warn!(
+                    "Unknown --video-mode '{}', valid: cuda, dmabuf, nv12, rgba. Using auto.",
+                    other
+                );
                 crate::video::VideoMode::Auto
             }
         };
@@ -514,8 +518,11 @@ async fn run_wayland_loop(
     };
 
     // Phase 1: Collect all output info first (fast, no IO)
-    let mut output_infos: Vec<(String, String, wayland_client::protocol::wl_output::WlOutput)> =
-        Vec::new();
+    let mut output_infos: Vec<(
+        String,
+        String,
+        wayland_client::protocol::wl_output::WlOutput,
+    )> = Vec::new();
     for output in outputs {
         let info = match backend.output_state.info(&output) {
             Some(i) => i,
@@ -1281,9 +1288,10 @@ async fn run_wayland_loop(
             last_stats_flush = Instant::now();
         }
 
-        // Process directory watcher events (cache invalidation)
+        // Process directory watcher events and apply pool updates
         if let Some(ref mut watcher) = dir_watcher {
-            watcher.process_events().await;
+            let pool_events = watcher.process_events().await;
+            monitor_manager.apply_pool_events(pool_events);
         }
 
         // Log metrics summary every 30 seconds (or 10 seconds for testing)
@@ -1821,9 +1829,10 @@ async fn run_x11_loop(
             last_pool_cleanup_x11 = Instant::now();
         }
 
-        // Process directory watcher events (cache invalidation)
+        // Process directory watcher events and apply pool updates
         if let Some(ref mut watcher) = dir_watcher {
-            let _ = watcher.process_events().await;
+            let pool_events = watcher.process_events().await;
+            monitor_manager.apply_pool_events(pool_events);
         }
 
         // Flush stats every 5 seconds (batched writes)

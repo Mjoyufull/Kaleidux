@@ -53,8 +53,9 @@ kldctl next
 ## Features
 
 - **Video Support**: Seamlessly loop videos as wallpapers using GStreamer.
+- **Hardware-accelerated video**: Zero-CPU-copy paths on supported GPUs — NVIDIA (`--video-mode cuda`) and AMD/Intel (DMA-BUF when the decoder supports it).
 - **Image Support**: High-quality image rendering and transitions.
-- **Hardware Accelerated**: Powered by `WGPU` for near-zero CPU overhead during transitions.
+- **Hardware Accelerated**: Powered by `WGPU` for low CPU overhead during rendering and transitions.
 - **50+ Transitions**: Huge library of GLSL transitions (fade, cube, doom, wipe, ripple, etc.).
 - **Multi-Monitor**: Independent queue management for each output.
 - **Monitor Behaviors**: `Independent`, `Synchronized`, or `Grouped` monitor support.
@@ -118,9 +119,10 @@ The core background service handling rendering and display interop.
 Usage: kaleidux-daemon [OPTIONS]
 
 Options:
-      --demo       Run in demo mode (rotating built-in shaders)
-      --log <PATH> Specify log file path
-  -h, --help       Show help
+      --demo              Run in demo mode (rotating built-in shaders)
+      --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
+      --video-mode <MODE> Force video decode path: auto, cuda, dmabuf, nv12, rgba
+  -h, --help              Show help
 ```
 
 ### Controller (`kldctl`)
@@ -176,7 +178,7 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **High CPU**: Video frames currently use a CPU-RGBA roundtrip. Zero-copy is planned.
+- **High CPU during video**: Use a zero-copy path when possible: on NVIDIA run with `--video-mode cuda`; on AMD/Intel the daemon prefers DMA-BUF automatically. If your driver does not support it, video falls back to NV12 or RGBA CPU upload.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
 ## Contributing

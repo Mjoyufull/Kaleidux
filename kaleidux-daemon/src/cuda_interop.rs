@@ -28,9 +28,12 @@ type FnCuCtxSynchronize = unsafe extern "C" fn() -> CUresult;
 // Virtual memory management (CUDA 10.2+)
 type FnCuMemGetAllocationGranularity =
     unsafe extern "C" fn(*mut usize, *const CUmemAllocationProp, u32) -> CUresult;
-type FnCuMemCreate =
-    unsafe extern "C" fn(*mut CUmemGenericAllocationHandle, usize, *const CUmemAllocationProp, u64)
-        -> CUresult;
+type FnCuMemCreate = unsafe extern "C" fn(
+    *mut CUmemGenericAllocationHandle,
+    usize,
+    *const CUmemAllocationProp,
+    u64,
+) -> CUresult;
 type FnCuMemExportToShareableHandle =
     unsafe extern "C" fn(*mut std::ffi::c_void, CUmemGenericAllocationHandle, u32, u64) -> CUresult;
 type FnCuMemAddressReserve =
@@ -225,7 +228,10 @@ impl CudaInterop {
     /// Allocate CUDA memory exportable as a POSIX fd for Vulkan import.
     /// Returns (allocation, fd). The fd ownership transfers to the caller
     /// (Vulkan takes ownership on vkAllocateMemory with VkImportMemoryFdInfoKHR).
-    pub fn allocate_exportable(&self, min_size: usize) -> Result<(ExportableCudaAllocation, RawFd), String> {
+    pub fn allocate_exportable(
+        &self,
+        min_size: usize,
+    ) -> Result<(ExportableCudaAllocation, RawFd), String> {
         self.push_context()?;
 
         unsafe {
@@ -284,8 +290,7 @@ impl CudaInterop {
 
             // Reserve virtual address space
             let mut dev_ptr: CUdeviceptr = 0;
-            let res =
-                (self.cu_mem_address_reserve)(&mut dev_ptr, alloc_size, granularity, 0, 0);
+            let res = (self.cu_mem_address_reserve)(&mut dev_ptr, alloc_size, granularity, 0, 0);
             if res != CUDA_SUCCESS {
                 (self.cu_mem_release)(handle);
                 return Err(cuda_err("cuMemAddressReserve", res));

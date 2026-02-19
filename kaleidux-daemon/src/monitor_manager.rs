@@ -1111,6 +1111,24 @@ impl MonitorManager {
         Ok(())
     }
 
+    /// Forward filesystem watcher events to all active queues for incremental pool updates
+    pub fn apply_pool_events(&mut self, events: Vec<crate::cache::PoolEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        if let Some(q) = &mut self.shared_queue {
+            q.apply_pool_events(events.clone());
+        }
+        for q in self.group_queues.values_mut() {
+            q.apply_pool_events(events.clone());
+        }
+        for orch in self.outputs.values_mut() {
+            if let Some(q) = &mut orch.queue {
+                q.apply_pool_events(events.clone());
+            }
+        }
+    }
+
     fn get_any_queue(&self) -> Option<&SmartQueue> {
         if let Some(q) = &self.shared_queue {
             return Some(q);

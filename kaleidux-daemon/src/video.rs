@@ -51,9 +51,7 @@ pub fn configure_hw_decoders() {
     let has_nvidia = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok();
 
     if has_nvidia {
-        let nvcodec_decoders = [
-            "nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec",
-        ];
+        let nvcodec_decoders = ["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec"];
         let mut boosted = Vec::new();
         for name in &nvcodec_decoders {
             if let Some(factory) = gst::ElementFactory::find(name) {
@@ -62,9 +60,7 @@ pub fn configure_hw_decoders() {
             }
         }
 
-        let vaapi_decoders = [
-            "vah264dec", "vah265dec", "vaav1dec", "vavp9dec", "vavp8dec",
-        ];
+        let vaapi_decoders = ["vah264dec", "vah265dec", "vaav1dec", "vavp9dec", "vavp8dec"];
         let mut demoted = Vec::new();
         for name in &vaapi_decoders {
             if let Some(factory) = gst::ElementFactory::find(name) {
@@ -199,7 +195,9 @@ fn extract_dmabuf_nv12(buffer: &gst::Buffer, vi: &gst_video::VideoInfo) -> Video
     }
 
     // Fallback: treat as regular NV12 (CPU-accessible)
-    tracing::warn!("[VIDEO] DMA-BUF memory detected but fd extraction failed, falling back to NV12 CPU path");
+    tracing::warn!(
+        "[VIDEO] DMA-BUF memory detected but fd extraction failed, falling back to NV12 CPU path"
+    );
     VideoFrameFormat::Nv12 {
         y_stride: strides[0] as u32,
         uv_offset: offsets[1] as u32,
@@ -262,16 +260,12 @@ impl VideoPlayer {
 
         let mode = get_video_mode();
         let caps = match mode {
-            VideoMode::ForceRgba => {
-                gst::Caps::builder("video/x-raw")
-                    .field("format", "RGBA")
-                    .build()
-            }
-            VideoMode::ForceNv12 => {
-                gst::Caps::builder("video/x-raw")
-                    .field("format", "NV12")
-                    .build()
-            }
+            VideoMode::ForceRgba => gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .build(),
+            VideoMode::ForceNv12 => gst::Caps::builder("video/x-raw")
+                .field("format", "NV12")
+                .build(),
             VideoMode::ForceDmaBuf => {
                 // Strict: DMA-BUF only, no fallback. Will fail with not-negotiated
                 // if the decoder/driver can't export DMA-BUF.
@@ -484,7 +478,10 @@ impl VideoPlayer {
         // Set appsink as the video sink
         pipeline.set_property("video-sink", &appsink);
 
-        info!("VideoPlayer created with playbin + appsink (mode={:?}, caps={})", mode, caps);
+        info!(
+            "VideoPlayer created with playbin + appsink (mode={:?}, caps={})",
+            mode, caps
+        );
 
         Ok(Self {
             pipeline,

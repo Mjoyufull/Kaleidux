@@ -91,7 +91,7 @@ print("Automated tick at " + now.format("%H:%M"));
 ## Transitions Reference
 
 Kaleidux includes over 50 transitions. Most can be used with a simple name string, or a table to configure parameters,
-see the [transition examples](./transitions_example.toml).
+see the [transition examples](./transitions_examples.toml).
 
 **Example parametric transition:**
 
@@ -106,4 +106,16 @@ transition = { type = "cube", persp = 0.7, unzoom = 0.3, reflection = 0.4, float
 - `smoothness`: How "hard" the transition edge is.
 - `direction`: For wipe/directional effects (e.g. `[1.0, 0.0]`).
 
-ts
+## Video decode mode
+
+The daemon supports several video frame paths. Use `--video-mode <MODE>` to force a mode, or omit it for automatic selection.
+
+| Mode     | Description |
+| -------- | ----------- |
+| `auto`   | **(Default)** On NVIDIA: try CUDA memory (zero CPU copy), then DMA-BUF, then NV12. On AMD/Intel: try DMA-BUF (true zero-copy when supported), then NV12. |
+| `cuda`   | Force NVIDIA CUDA memory + CUDA–Vulkan interop. Requires nvcodec decoders (e.g. nvh264dec). Fails if not available. |
+| `dmabuf` | Force DMA-BUF. Use on AMD/Intel when the decoder exports DMA-BUF. Fails if not available. |
+| `nv12`   | Request NV12 from the decoder; frames are uploaded to the GPU via CPU (no zero-copy). |
+| `rgba`   | Legacy: decoder outputs RGBA; frames are uploaded via CPU. |
+
+For lowest CPU use during video: on NVIDIA run `kaleidux-daemon --video-mode cuda`; on AMD/Intel, `auto` or `--video-mode dmabuf` when your driver supports DMA-BUF export.
