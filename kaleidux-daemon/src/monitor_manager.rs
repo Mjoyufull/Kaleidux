@@ -169,7 +169,10 @@ impl OutputOrchestrator {
     pub fn mark_transition_completed(&mut self) {
         if self.display_start_time.is_none() && self.current_path.is_some() {
             self.display_start_time = Some(Instant::now());
-            debug!("Transition completed for {} - duration timer now active (2s of content display starts now)", self._name);
+            debug!(
+                "Transition completed for {} - duration timer now active (2s of content display starts now)",
+                self._name
+            );
         }
     }
 
@@ -943,7 +946,10 @@ impl MonitorManager {
                 // Set it when first output completes transition
                 if self.shared_display_start_time.is_none() {
                     self.shared_display_start_time = Some(now);
-                    debug!("Synchronized mode: First output ({}) completed transition - shared display timer started", name);
+                    debug!(
+                        "Synchronized mode: First output ({}) completed transition - shared display timer started",
+                        name
+                    );
                 }
                 // All synchronized outputs use the shared time
                 if let Some(orch) = self.outputs.get_mut(name) {
@@ -956,7 +962,10 @@ impl MonitorManager {
                     // Set group time when first output in group completes transition
                     if !self.group_display_start_times.contains_key(gid) {
                         self.group_display_start_times.insert(*gid, now);
-                        debug!("Group {}: First output ({}) completed transition - group display timer started", gid, name);
+                        debug!(
+                            "Group {}: First output ({}) completed transition - group display timer started",
+                            gid, name
+                        );
                     }
                     // All outputs in group use the group time
                     if let Some(orch) = self.outputs.get_mut(name) {
@@ -1024,12 +1033,13 @@ impl MonitorManager {
             PlaylistCommand::Load { name } => {
                 let mut error = None;
                 self.apply_to_all_queues(|q| {
-                    if let Err(e) = q.set_playlist(name.clone()) {
-                        error = Some(e.to_string());
-                        let _ = q.save_stats(); // Save active playlist state? SmartQueue doesn't persist active_playlist yet
-                        Err(e)
-                    } else {
-                        q.save_stats()
+                    match q.set_playlist(name.clone()) {
+                        Err(e) => {
+                            error = Some(e.to_string());
+                            let _ = q.save_stats(); // Save active playlist state? SmartQueue doesn't persist active_playlist yet
+                            Err(e)
+                        }
+                        _ => q.save_stats(),
                     }
                 });
                 if let Some(e) = error {

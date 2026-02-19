@@ -72,47 +72,52 @@ impl SmartQueue {
         );
 
         // Try loading cached pool from redb first (near-instant)
-        let pool = if let Ok(Some(cached_pool)) = cache.get_cached_pool(path) {
-            // Validate cached pool: filter out files that no longer exist
-            let valid_pool: Vec<PathBuf> = cached_pool
-                .into_iter()
-                .filter(|p| p.exists() && !stats.blacklist.contains(p))
-                .collect();
+        let pool = match cache.get_cached_pool(path) {
+            Ok(Some(cached_pool)) => {
+                // Validate cached pool: filter out files that no longer exist
+                let valid_pool: Vec<PathBuf> = cached_pool
+                    .into_iter()
+                    .filter(|p| p.exists() && !stats.blacklist.contains(p))
+                    .collect();
 
-            if !valid_pool.is_empty() {
-                tracing::info!(
-                    "[QUEUE] Loaded cached pool: {} files for {:?}",
-                    valid_pool.len(),
-                    path
-                );
+                if !valid_pool.is_empty() {
+                    tracing::info!(
+                        "[QUEUE] Loaded cached pool: {} files for {:?}",
+                        valid_pool.len(),
+                        path
+                    );
 
-                // Spawn background full discovery to refresh the pool and metadata cache
-                let bg_path = path.to_path_buf();
-                let bg_blacklist = stats.blacklist.clone();
-                let bg_cache = cache.clone();
-                let bg_metrics = metrics.clone();
-                tokio::task::spawn_blocking(move || {
-                    match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics) {
-                        Ok(fresh_pool) => {
-                            tracing::info!(
-                                "[QUEUE] Background pool refresh complete: {} files",
-                                fresh_pool.len()
-                            );
+                    // Spawn background full discovery to refresh the pool and metadata cache
+                    let bg_path = path.to_path_buf();
+                    let bg_blacklist = stats.blacklist.clone();
+                    let bg_cache = cache.clone();
+                    let bg_metrics = metrics.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics)
+                        {
+                            Ok(fresh_pool) => {
+                                tracing::info!(
+                                    "[QUEUE] Background pool refresh complete: {} files",
+                                    fresh_pool.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
-                        }
-                    }
-                });
+                    });
 
-                valid_pool
-            } else {
-                tracing::info!("[QUEUE] Cached pool was stale, running full discovery");
+                    valid_pool
+                } else {
+                    tracing::info!("[QUEUE] Cached pool was stale, running full discovery");
+                    Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone())
+                        .await?
+                }
+            }
+            _ => {
+                tracing::info!("[QUEUE] No cached pool found, running full discovery");
                 Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone()).await?
             }
-        } else {
-            tracing::info!("[QUEUE] No cached pool found, running full discovery");
-            Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone()).await?
         };
 
         tracing::info!(
@@ -278,8 +283,8 @@ impl SmartQueue {
                 .unwrap_or(0);
 
             // Check cache: single redb read, inline validity check using fs_mtime
-            let (content_type, needs_cache_update) =
-                if let Ok(Some(cached)) = cache.get_file_metadata(&p) {
+            let (content_type, needs_cache_update) = match cache.get_file_metadata(&p) {
+                Ok(Some(cached)) => {
                     if cached.mtime == fs_mtime {
                         // Cache hit — mtime matches, file unchanged
                         if let Some(m) = &metrics {
@@ -298,13 +303,15 @@ impl SmartQueue {
                         }
                         (Self::get_content_type(&p), true)
                     }
-                } else {
+                }
+                _ => {
                     // Not in cache — first time seeing this file
                     if let Some(m) = &metrics {
                         m.record_cache_miss();
                     }
                     (Self::get_content_type(&p), true)
-                };
+                }
+            };
 
             if let Some(ct) = content_type {
                 files.push(p.clone());

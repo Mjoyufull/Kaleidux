@@ -1,5 +1,5 @@
 use kaleidux_common::{Request, Response};
-use rhai::{Engine, Scope, AST};
+use rhai::{AST, Engine, Scope};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};

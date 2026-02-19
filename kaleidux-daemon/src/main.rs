@@ -1,15 +1,15 @@
 use kaleidux_common::{Request, Response, Transition};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt as subscriber_fmt;
-use tracing_subscriber::{prelude::*, EnvFilter, Registry};
-use wayland_client::{globals::registry_queue_init, Connection};
+use tracing_subscriber::{EnvFilter, Registry, prelude::*};
+use wayland_client::{Connection, globals::registry_queue_init};
 use x11rb::connection::Connection as X11Connection;
 
 // Use jemalloc for better memory fragmentation handling in long-running processes
@@ -575,78 +575,83 @@ async fn run_wayland_loop(
         info!("WGPU initialized on GPU: {:?}", adapter_name);
     }
 
-    if let Some(ctx) = wgpu_ctx.clone() {
-        let first_name = surface_infos.first().map(|(n, _)| n.clone());
+    match wgpu_ctx.clone() {
+        Some(ctx) => {
+            let first_name = surface_infos.first().map(|(n, _)| n.clone());
 
-        for (name, surface_arc) in surface_infos {
-            let ctx_clone = ctx.clone();
-            let is_first = Some(&name) == first_name.as_ref();
-            let init_surf = if is_first {
-                initial_surface.take()
-            } else {
-                None
-            };
+            for (name, surface_arc) in surface_infos {
+                let ctx_clone = ctx.clone();
+                let is_first = Some(&name) == first_name.as_ref();
+                let init_surf = if is_first {
+                    initial_surface.take()
+                } else {
+                    None
+                };
 
-            let metrics_clone = metrics.clone();
+                let metrics_clone = metrics.clone();
 
-            info!("[STARTUP] Initializing renderer for {}", name);
+                info!("[STARTUP] Initializing renderer for {}", name);
 
-            // Offload WGPU surface creation to blocking thread to avoid checking generic runtime
-            let name_for_bg = name.clone();
-            let spawn_handler = tokio::task::spawn_blocking(move || {
-                renderer::Renderer::new(
-                    name_for_bg,
-                    ctx_clone,
-                    surface_arc,
-                    init_surf,
-                    Some(metrics_clone),
-                )
-            });
+                // Offload WGPU surface creation to blocking thread to avoid checking generic runtime
+                let name_for_bg = name.clone();
+                let spawn_handler = tokio::task::spawn_blocking(move || {
+                    renderer::Renderer::new(
+                        name_for_bg,
+                        ctx_clone,
+                        surface_arc,
+                        init_surf,
+                        Some(metrics_clone),
+                    )
+                });
 
-            // Set a timeout strictly for the initialization
-            match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
-                Ok(join_res) => match join_res {
-                    Ok(render_res) => match render_res {
-                        Ok(mut r) => {
-                            if let Some(output_config) = monitor_manager.get_output_config(&name) {
-                                r.apply_config(output_config);
+                // Set a timeout strictly for the initialization
+                match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
+                    Ok(join_res) => match join_res {
+                        Ok(render_res) => match render_res {
+                            Ok(mut r) => {
+                                if let Some(output_config) =
+                                    monitor_manager.get_output_config(&name)
+                                {
+                                    r.apply_config(output_config);
+                                }
+                                renderers.insert(name.clone(), r);
+                                info!("[STARTUP] Renderer initialized successfully for {}", name);
                             }
-                            renderers.insert(name.clone(), r);
-                            info!("[STARTUP] Renderer initialized successfully for {}", name);
-                        }
+                            Err(e) => {
+                                error!("Failed to create renderer for output {}: {}", name, e);
+                                metrics.record_error("renderer_creation");
+                            }
+                        },
                         Err(e) => {
-                            error!("Failed to create renderer for output {}: {}", name, e);
-                            metrics.record_error("renderer_creation");
+                            error!("Thread join error for output {}: {}", name, e);
+                            metrics.record_error("renderer_thread_error");
                         }
                     },
-                    Err(e) => {
-                        error!("Thread join error for output {}: {}", name, e);
-                        metrics.record_error("renderer_thread_error");
+                    Err(_) => {
+                        // Timeout occurred
+                        error!(
+                            "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
+                            name
+                        );
+                        metrics.record_error("renderer_creation_timeout");
                     }
-                },
-                Err(_) => {
-                    // Timeout occurred
-                    error!(
-                        "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
-                        name
-                    );
-                    metrics.record_error("renderer_creation_timeout");
                 }
+                // Poll device to process submission/initialization commands
+                ctx.device.poll(wgpu::Maintain::Poll);
             }
-            // Poll device to process submission/initialization commands
-            ctx.device.poll(wgpu::Maintain::Poll);
+            // All renderers created - full initialization complete
+            metrics.record_full_init();
+            if log_level.map(|l| l >= 3).unwrap_or(false) {
+                metrics.log_startup_summary();
+            }
+            info!(
+                "[STARTUP] All renderers created, count: {}",
+                renderers.len()
+            );
         }
-        // All renderers created - full initialization complete
-        metrics.record_full_init();
-        if log_level.map(|l| l >= 3).unwrap_or(false) {
-            metrics.log_startup_summary();
+        _ => {
+            warn!("[STARTUP] No WGPU context available, cannot create renderers!");
         }
-        info!(
-            "[STARTUP] All renderers created, count: {}",
-            renderers.len()
-        );
-    } else {
-        warn!("[STARTUP] No WGPU context available, cannot create renderers!");
     }
 
     info!("[STARTUP] Creating video players HashMap");
@@ -760,32 +765,35 @@ async fn run_wayland_loop(
     // Poll Wayland events until all renderers are configured or timeout
     while configured_count < total_renderers && wait_start.elapsed() < MAX_WAIT_TIME {
         // Process Wayland events to allow renderers to receive configure events
-        if let Some(guard) = conn.prepare_read() {
-            use std::os::unix::io::{AsFd, AsRawFd};
-            let fd = conn.as_fd().as_raw_fd();
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout_ms = 10; // Shorter timeout for more responsive checking
-            let ret = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-            if ret > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
-                if let Err(e) = guard.read() {
-                    error!("Failed to read Wayland events: {}", e);
+        match conn.prepare_read() {
+            Some(guard) => {
+                use std::os::unix::io::{AsFd, AsRawFd};
+                let fd = conn.as_fd().as_raw_fd();
+                let mut poll_fd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = 10; // Shorter timeout for more responsive checking
+                let ret = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+                if ret > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
+                    if let Err(e) = guard.read() {
+                        error!("Failed to read Wayland events: {}", e);
+                    }
+                    if let Err(e) = event_queue.dispatch_pending(&mut backend) {
+                        error!("Failed to dispatch Wayland events: {}", e);
+                    }
+                    // CRITICAL: Flush after dispatch to ensure compositor processes events
+                    let _ = conn.flush();
                 }
+            }
+            _ => {
                 if let Err(e) = event_queue.dispatch_pending(&mut backend) {
                     error!("Failed to dispatch Wayland events: {}", e);
                 }
-                // CRITICAL: Flush after dispatch to ensure compositor processes events
+                // CRITICAL: Flush even if no guard
                 let _ = conn.flush();
             }
-        } else {
-            if let Err(e) = event_queue.dispatch_pending(&mut backend) {
-                error!("Failed to dispatch Wayland events: {}", e);
-            }
-            // CRITICAL: Flush even if no guard
-            let _ = conn.flush();
         }
 
         // CRITICAL FIX: Process pending_resizes to actually configure renderers

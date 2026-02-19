@@ -128,7 +128,7 @@ impl SystemMonitor {
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
                     proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // KB to MB
-                                                                          // Record memory usage in metrics
+                    // Record memory usage in metrics
                     if let Some(m) = &self.metrics {
                         m.record_memory_usage(proc_mem as f64);
                     }

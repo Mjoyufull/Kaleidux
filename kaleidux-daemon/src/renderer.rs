@@ -1,7 +1,7 @@
 use crate::shaders::Transition;
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use smithay_client_toolkit::shell::{wlr_layer::LayerSurface, WaylandSurface};
+use smithay_client_toolkit::shell::{WaylandSurface, wlr_layer::LayerSurface};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -57,13 +57,14 @@ impl PipelineLRU {
     }
 
     fn get(&mut self, key: &str) -> Option<Arc<wgpu::RenderPipeline>> {
-        if let Some(pipeline) = self.pipelines.get(key).cloned() {
-            // Move to back (most recently used)
-            self.access_order.retain(|k| k != key);
-            self.access_order.push_back(key.to_string());
-            Some(pipeline)
-        } else {
-            None
+        match self.pipelines.get(key).cloned() {
+            Some(pipeline) => {
+                // Move to back (most recently used)
+                self.access_order.retain(|k| k != key);
+                self.access_order.push_back(key.to_string());
+                Some(pipeline)
+            }
+            _ => None,
         }
     }
 
@@ -805,7 +806,10 @@ impl Renderer {
             // Check capabilities FIRST to avoid hard panic in wgpu on Nvidia/Wayland
             let caps = self.target_caps();
             if caps.formats.is_empty() {
-                warn!("Surface {} is not ready for configuration (no formats). Skipping reconfiguration.", self.name);
+                warn!(
+                    "Surface {} is not ready for configuration (no formats). Skipping reconfiguration.",
+                    self.name
+                );
                 self.configured = false;
                 return Ok(());
             }
@@ -828,8 +832,10 @@ impl Renderer {
             // Re-create composition texture
             // If transition is active, log that it will continue with new size
             if self.transition_active {
-                info!("[TRANSITION] {}: Surface resized during transition, recreating composition texture ({}x{})", 
-                    self.name, width, height);
+                info!(
+                    "[TRANSITION] {}: Surface resized during transition, recreating composition texture ({}x{})",
+                    self.name, width, height
+                );
             }
             let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Composition Texture"),
@@ -892,8 +898,10 @@ impl Renderer {
             }
 
             if self.transition_active {
-                warn!("[TRANSITION] {}: Composition texture missing during active transition, creating now ({}x{})", 
-                    self.name, self.config.width, self.config.height);
+                warn!(
+                    "[TRANSITION] {}: Composition texture missing during active transition, creating now ({}x{})",
+                    self.name, self.config.width, self.config.height
+                );
             } else {
                 debug!(
                     "[RENDER] {}: Creating composition texture ({}x{})",
@@ -1221,8 +1229,14 @@ impl Renderer {
                 let elapsed = frame_time.saturating_duration_since(start).as_secs_f32();
                 let new_progress = (elapsed / self.transition_duration).min(1.0);
                 if new_progress != self.transition_progress {
-                    debug!("[TRANSITION] {}: Progress updated {:.3} -> {:.3} (elapsed={:.3}s, duration={:.3}s)", 
-                        self.name, self.transition_progress, new_progress, elapsed, self.transition_duration);
+                    debug!(
+                        "[TRANSITION] {}: Progress updated {:.3} -> {:.3} (elapsed={:.3}s, duration={:.3}s)",
+                        self.name,
+                        self.transition_progress,
+                        new_progress,
+                        elapsed,
+                        self.transition_duration
+                    );
                 }
                 self.transition_progress = new_progress;
 
@@ -1260,10 +1274,19 @@ impl Renderer {
 
                             info!(
                                 "[AUDIT] Transition Completed {}{}:\n  - Duration: {:.3}s (Target: {:.3}s)\n  - Frames: {} (Avg {:.1} FPS)\n  - Drift: {:.3}s",
-                                self.name, batch_info, duration.as_secs_f32(), stats.target_duration, stats.frame_count, fps, drift
+                                self.name,
+                                batch_info,
+                                duration.as_secs_f32(),
+                                stats.target_duration,
+                                stats.frame_count,
+                                fps,
+                                drift
                             );
                         } else {
-                            info!("[TRANSITION] {}: Transition completed (progress={:.3}) - No stats available", self.name, self.transition_progress);
+                            info!(
+                                "[TRANSITION] {}: Transition completed (progress={:.3}) - No stats available",
+                                self.name, self.transition_progress
+                            );
                         }
                     }
                 }
@@ -1278,7 +1301,10 @@ impl Renderer {
                         let age = now.saturating_duration_since(batch_start).as_secs_f32();
                         if age > self.transition_duration * 0.8 {
                             // Too old, start nearly from zero (0.1s in) to ensure transition is visible
-                            debug!("[TRANSITION] {}: Batch start time too old ({:.3}s), capping drift to preserve transition", self.name, age);
+                            debug!(
+                                "[TRANSITION] {}: Batch start time too old ({:.3}s), capping drift to preserve transition",
+                                self.name, age
+                            );
                             now.checked_sub(std::time::Duration::from_millis(100))
                                 .unwrap_or(now)
                         } else {
@@ -1301,8 +1327,10 @@ impl Renderer {
                     batch_id: self.active_batch_id,
                 });
 
-                info!("[TRANSITION] {}: Starting transition (duration={:.3}s, initial_progress={:.3})", 
-                    self.name, self.transition_duration, self.transition_progress);
+                info!(
+                    "[TRANSITION] {}: Starting transition (duration={:.3}s, initial_progress={:.3})",
+                    self.name, self.transition_duration, self.transition_progress
+                );
             }
         }
 
@@ -1488,8 +1516,10 @@ impl Renderer {
         } else if self.prev_texture.is_some() {
             // No current texture but have previous -> show previous (during transition)
             // This should only happen briefly during transitions
-            debug!("[RENDER] {}: No current_texture, falling back to prev_texture (transition_active={})", 
-                self.name, self.transition_active);
+            debug!(
+                "[RENDER] {}: No current_texture, falling back to prev_texture (transition_active={})",
+                self.name, self.transition_active
+            );
             Some(BlitSource::Prev)
         } else {
             // No textures at all -> black screen
@@ -1559,7 +1589,10 @@ impl Renderer {
                     // Fallback logic: if Composition fails, try Prev, then Current
                     let fallback_view = match blit_source {
                         BlitSource::Composition => {
-                            warn!("[RENDER] {}: Composition texture view missing, falling back to prev", self.name);
+                            warn!(
+                                "[RENDER] {}: Composition texture view missing, falling back to prev",
+                                self.name
+                            );
                             self.prev_texture_view.as_ref().or_else(|| {
                                 warn!("[RENDER] {}: Prev texture view also missing, falling back to current", self.name);
                                 self.current_texture_view.as_ref()
@@ -1614,11 +1647,13 @@ impl Renderer {
                             self.blit_source_is_prev = is_prev;
                         }
                         None => {
-                            error!("Texture view missing for blit source {:?} and all fallbacks failed (current={}, prev={}, composition={})",
-                                    blit_source,
-                                    self.current_texture_view.is_some(),
-                                    self.prev_texture_view.is_some(),
-                                    self.composition_texture_view.is_some());
+                            error!(
+                                "Texture view missing for blit source {:?} and all fallbacks failed (current={}, prev={}, composition={})",
+                                blit_source,
+                                self.current_texture_view.is_some(),
+                                self.prev_texture_view.is_some(),
+                                self.composition_texture_view.is_some()
+                            );
                             return Ok(()); // Can't render anything
                         }
                     }
@@ -1733,8 +1768,13 @@ impl Renderer {
         wl_surface.frame(qh, wl_surface.clone());
         self.frame_callback_pending = true;
         self.last_frame_request = Some(std::time::Instant::now());
-        tracing::debug!("[FRAME] {}: Requested frame callback (configured={}, needs_redraw={}, transition_progress={:.3})", 
-            self.name, self.configured, self.needs_redraw, self.transition_progress);
+        tracing::debug!(
+            "[FRAME] {}: Requested frame callback (configured={}, needs_redraw={}, transition_progress={:.3})",
+            self.name,
+            self.configured,
+            self.needs_redraw,
+            self.transition_progress
+        );
     }
 
     pub fn set_content_type(&mut self, content_type: crate::queue::ContentType) {
@@ -1963,8 +2003,10 @@ impl Renderer {
         if self.valid_content_type != crate::queue::ContentType::Video
             || frame.session_id != self.active_video_session_id
         {
-            debug!("[VIDEO] {}: Discarding stale video frame - valid_type={:?}, frame_session={}, active_session={}", 
-                self.name, self.valid_content_type, frame.session_id, self.active_video_session_id);
+            debug!(
+                "[VIDEO] {}: Discarding stale video frame - valid_type={:?}, frame_session={}, active_session={}",
+                self.name, self.valid_content_type, frame.session_id, self.active_video_session_id
+            );
             return;
         }
 
@@ -1979,32 +2021,33 @@ impl Renderer {
 
         // Get or reuse the RGBA output texture (same size = reuse)
         let needs_new_texture = self.current_texture_size != Some((width, height));
-        let texture = if let Some(curr) = self.current_texture.take() {
-            if !needs_new_texture {
-                curr
-            } else {
-                self.current_texture_view = None;
-                if let Some((w, h)) = self.current_texture_size {
-                    self.ctx.return_texture_to_pool(curr, w, h);
+        let texture = match self.current_texture.take() {
+            Some(curr) => {
+                if !needs_new_texture {
+                    curr
+                } else {
+                    self.current_texture_view = None;
+                    if let Some((w, h)) = self.current_texture_size {
+                        self.ctx.return_texture_to_pool(curr, w, h);
+                    }
+                    self.ctx.get_texture_from_pool(
+                        width,
+                        height,
+                        wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        self.metrics.as_deref(),
+                    )
                 }
-                self.ctx.get_texture_from_pool(
-                    width,
-                    height,
-                    wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    self.metrics.as_deref(),
-                )
             }
-        } else {
-            self.ctx.get_texture_from_pool(
+            _ => self.ctx.get_texture_from_pool(
                 width,
                 height,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 self.metrics.as_deref(),
-            )
+            ),
         };
 
         if is_first_frame_after_switch {
@@ -2102,24 +2145,32 @@ impl Renderer {
             }
 
             if self.prev_texture.is_some() {
-                info!("[TRANSITION] {}: First video frame after switch - transition will start on first render frame", self.name);
+                info!(
+                    "[TRANSITION] {}: First video frame after switch - transition will start on first render frame",
+                    self.name
+                );
                 self.transition_start_time = None;
                 self.transition_progress = 0.0;
                 self.transition_active = true;
             } else {
-                info!("[TRANSITION] {}: First video frame after switch (Instant) - transition signaled as complete", self.name);
+                info!(
+                    "[TRANSITION] {}: First video frame after switch (Instant) - transition signaled as complete",
+                    self.name
+                );
                 self.transition_active = false;
                 self.transition_progress = 1.0;
                 self.transition_just_completed = true;
             }
         }
 
-        debug!("[TRANSITION] {}: Video frame uploaded - current_texture={}, prev_texture={}, transition_progress={:.3}, transition_start_time={:?}",
+        debug!(
+            "[TRANSITION] {}: Video frame uploaded - current_texture={}, prev_texture={}, transition_progress={:.3}, transition_start_time={:?}",
             self.name,
             self.current_texture.is_some(),
             self.prev_texture.is_some(),
             self.transition_progress,
-            self.transition_start_time.is_some());
+            self.transition_start_time.is_some()
+        );
 
         self.ctx.device.poll(wgpu::Maintain::Poll);
     }
@@ -2702,9 +2753,13 @@ impl Renderer {
 
             info!(
                 "[VIDEO] {}: CUDA zero-copy textures: {}x{}, Y(pitch={} offset={}) UV(pitch={} offset={})",
-                self.name, width, height,
-                y_layout.row_pitch, y_layout.offset,
-                uv_layout.row_pitch, uv_layout.offset
+                self.name,
+                width,
+                height,
+                y_layout.row_pitch,
+                y_layout.offset,
+                uv_layout.row_pitch,
+                uv_layout.offset
             );
 
             self.cuda_textures = Some(CudaTextureCache {
@@ -2874,8 +2929,12 @@ impl Renderer {
         // We want to keep it around to see if next content (video frame) matches.
         // upload_frame will check needs_new_texture against this size.
 
-        debug!("[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, transition_started, current_texture cleared", 
-            self.name, had_current, self.prev_texture.is_some());
+        debug!(
+            "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, transition_started, current_texture cleared",
+            self.name,
+            had_current,
+            self.prev_texture.is_some()
+        );
     }
 
     pub fn abort_transition(&mut self) {

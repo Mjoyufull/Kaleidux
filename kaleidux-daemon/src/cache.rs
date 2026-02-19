@@ -69,11 +69,12 @@ impl FileCache {
 
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
-        if let Some(data) = table.get(path_bytes)? {
-            let metadata: FileMetadata = bincode::deserialize(data.value())?;
-            Ok(Some(metadata))
-        } else {
-            Ok(None)
+        match table.get(path_bytes)? {
+            Some(data) => {
+                let metadata: FileMetadata = postcard::from_bytes(data.value())?;
+                Ok(Some(metadata))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -83,7 +84,7 @@ impl FileCache {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
             let path_str = path.to_string_lossy();
             let path_bytes = path_str.as_bytes();
-            let data = bincode::serialize(metadata)?;
+            let data = postcard::to_allocvec(metadata)?;
             table.insert(path_bytes, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -101,7 +102,7 @@ impl FileCache {
             for (path, metadata) in updates {
                 let path_str = path.to_string_lossy();
                 let path_bytes = path_str.as_bytes();
-                let data = bincode::serialize(metadata)?;
+                let data = postcard::to_allocvec(metadata)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
         }
@@ -119,7 +120,7 @@ impl FileCache {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            let data = bincode::serialize(&paths)?;
+            let data = postcard::to_allocvec(&paths)?;
             table.insert(key.as_ref(), data.as_slice())?;
         }
         write_txn.commit()?;
@@ -131,11 +132,12 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(POOL_TABLE)?;
         let key = dir.to_string_lossy();
-        if let Some(data) = table.get(key.as_ref())? {
-            let paths: Vec<String> = bincode::deserialize(data.value())?;
-            Ok(Some(paths.into_iter().map(PathBuf::from).collect()))
-        } else {
-            Ok(None)
+        match table.get(key.as_ref())? {
+            Some(data) => {
+                let paths: Vec<String> = postcard::from_bytes(data.value())?;
+                Ok(Some(paths.into_iter().map(PathBuf::from).collect()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -157,11 +159,12 @@ impl FileCache {
 
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
-        if let Some(data) = table.get(path_bytes)? {
-            let stats: crate::queue::FileStats = bincode::deserialize(data.value())?;
-            Ok(Some(stats))
-        } else {
-            Ok(None)
+        match table.get(path_bytes)? {
+            Some(data) => {
+                let stats: crate::queue::FileStats = postcard::from_bytes(data.value())?;
+                Ok(Some(stats))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -172,7 +175,7 @@ impl FileCache {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
             let path_str = path.to_string_lossy();
             let path_bytes = path_str.as_bytes();
-            let data = bincode::serialize(stats)?;
+            let data = postcard::to_allocvec(stats)?;
             table.insert(path_bytes, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -189,7 +192,7 @@ impl FileCache {
             for (path, stats) in updates {
                 let path_str = path.to_string_lossy();
                 let path_bytes = path_str.as_bytes();
-                let data = bincode::serialize(stats)?;
+                let data = postcard::to_allocvec(stats)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
         }
@@ -207,7 +210,7 @@ impl FileCache {
         for item in table.iter()? {
             let (key, value) = item?;
             let path = PathBuf::from(String::from_utf8_lossy(key.value()).to_string());
-            let file_stats: crate::queue::FileStats = bincode::deserialize(value.value())?;
+            let file_stats: crate::queue::FileStats = postcard::from_bytes(value.value())?;
             stats.insert(path, file_stats);
         }
 
@@ -219,11 +222,12 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
 
-        if let Some(data) = table.get(name)? {
-            let playlist: crate::queue::Playlist = bincode::deserialize(data.value())?;
-            Ok(Some(playlist))
-        } else {
-            Ok(None)
+        match table.get(name)? {
+            Some(data) => {
+                let playlist: crate::queue::Playlist = postcard::from_bytes(data.value())?;
+                Ok(Some(playlist))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -231,7 +235,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PLAYLISTS_TABLE)?;
-            let data = bincode::serialize(playlist)?;
+            let data = postcard::to_allocvec(playlist)?;
             table.insert(name, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -248,7 +252,7 @@ impl FileCache {
         for item in table.iter()? {
             let (key, value) = item?;
             let name = key.value().to_string();
-            let playlist: crate::queue::Playlist = bincode::deserialize(value.value())?;
+            let playlist: crate::queue::Playlist = postcard::from_bytes(value.value())?;
             playlists.insert(name, playlist);
         }
 
@@ -314,7 +318,7 @@ impl FileCache {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            let data = bincode::serialize(&paths)?;
+            let data = postcard::to_allocvec(&paths)?;
             table.insert(output_name, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -324,11 +328,12 @@ impl FileCache {
     pub fn get_history(&self, output_name: &str) -> Result<Vec<PathBuf>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(HISTORY_TABLE)?;
-        if let Some(data) = table.get(output_name)? {
-            let paths: Vec<String> = bincode::deserialize(data.value())?;
-            Ok(paths.into_iter().map(PathBuf::from).collect())
-        } else {
-            Ok(Vec::new())
+        match table.get(output_name)? {
+            Some(data) => {
+                let paths: Vec<String> = postcard::from_bytes(data.value())?;
+                Ok(paths.into_iter().map(PathBuf::from).collect())
+            }
+            _ => Ok(Vec::new()),
         }
     }
 

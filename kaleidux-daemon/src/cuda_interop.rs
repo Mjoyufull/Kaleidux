@@ -142,7 +142,7 @@ fn cuda_err(name: &str, res: CUresult) -> String {
 }
 
 macro_rules! load_fn {
-    ($lib:expr, $sym:literal) => {{
+    ($lib:expr_2021, $sym:literal) => {{
         *$lib
             .get($sym)
             .map_err(|e| format!("[CUDA] {}: {e}", std::str::from_utf8($sym).unwrap_or("?")))?

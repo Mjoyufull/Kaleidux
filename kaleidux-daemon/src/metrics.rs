@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Performance metrics for monitoring
@@ -461,22 +461,14 @@ impl PerformanceMetrics {
         let hits = self.texture_pool_hits.load(Ordering::Relaxed) as f64;
         let misses = self.texture_pool_misses.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 
     pub fn get_cache_hit_rate(&self) -> f64 {
         let hits = self.cache_hits.load(Ordering::Relaxed) as f64;
         let misses = self.cache_misses.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 
     pub fn get_avg_frame_time_ms(&self) -> f64 {
@@ -687,7 +679,8 @@ impl PerformanceMetrics {
             self.get_p99_frame_time_ms(),
             self.get_texture_pool_hit_rate() * 100.0,
             self.texture_pool_hits.load(Ordering::Relaxed),
-            self.texture_pool_hits.load(Ordering::Relaxed) + self.texture_pool_misses.load(Ordering::Relaxed),
+            self.texture_pool_hits.load(Ordering::Relaxed)
+                + self.texture_pool_misses.load(Ordering::Relaxed),
             self.get_cache_hit_rate() * 100.0,
             self.cache_hits.load(Ordering::Relaxed),
             self.cache_hits.load(Ordering::Relaxed) + self.cache_misses.load(Ordering::Relaxed),

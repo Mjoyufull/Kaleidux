@@ -4,8 +4,8 @@ use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
@@ -321,8 +321,8 @@ impl VideoPlayer {
         appsink.set_sync(true); // Sync to clock
         appsink.set_drop(true); // Drop frames if late - CRITICAL for preventing buffer accumulation
         appsink.set_max_buffers(1); // Match gSlapper: 1 buffer to minimize latency and memory
-                                    // CRITICAL: Enable emit-signals to get callbacks, but ensure we handle them quickly
-                                    // The new_sample callback will be called for each frame
+        // CRITICAL: Enable emit-signals to get callbacks, but ensure we handle them quickly
+        // The new_sample callback will be called for each frame
 
         // Keep source_id for closure
         let cb_source_id = source_id.clone();
