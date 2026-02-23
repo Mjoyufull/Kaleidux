@@ -21,8 +21,9 @@ impl SystemMonitor {
     pub fn new_with_metrics(
         metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
     ) -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
 
         // Detect GPU type
         let has_nvidia = fs::metadata("/proc/driver/nvidia/gpus").is_ok();

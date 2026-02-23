@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use jwalk::WalkDir;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,11 +43,13 @@ pub struct SmartQueue {
     pub video_ratio: u8,
     pub strategy: crate::orchestration::SortingStrategy,
     pub current_index: usize,
-    pub history: Vec<PathBuf>,
+    pub history: VecDeque<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
     pub cache: Arc<FileCache>,
     pending_stats_updates: HashMap<PathBuf, FileStats>,
+    // In-memory cache of content types to avoid file I/O on every pick (P-01)
+    content_type_cache: HashMap<PathBuf, ContentType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +74,7 @@ impl SmartQueue {
         );
 
         // Try loading cached pool from redb first (near-instant)
+        let mut ct_cache_init: Option<HashMap<PathBuf, ContentType>> = None;
         let pool = match cache.get_cached_pool(path) {
             Ok(Some(cached_pool)) => {
                 // Validate cached pool: filter out files that no longer exist
@@ -95,7 +98,7 @@ impl SmartQueue {
                     tokio::task::spawn_blocking(move || {
                         match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics)
                         {
-                            Ok(fresh_pool) => {
+                            Ok((fresh_pool, _ct_cache)) => {
                                 tracing::info!(
                                     "[QUEUE] Background pool refresh complete: {} files",
                                     fresh_pool.len()
@@ -110,13 +113,24 @@ impl SmartQueue {
                     valid_pool
                 } else {
                     tracing::info!("[QUEUE] Cached pool was stale, running full discovery");
-                    Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone())
-                        .await?
+                    let (pool, ct) = Self::full_discovery(
+                        path,
+                        &stats.blacklist,
+                        cache.clone(),
+                        metrics.clone(),
+                    )
+                    .await?;
+                    ct_cache_init = Some(ct);
+                    pool
                 }
             }
             _ => {
                 tracing::info!("[QUEUE] No cached pool found, running full discovery");
-                Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone()).await?
+                let (pool, ct) =
+                    Self::full_discovery(path, &stats.blacklist, cache.clone(), metrics.clone())
+                        .await?;
+                ct_cache_init = Some(ct);
+                pool
             }
         };
 
@@ -141,11 +155,12 @@ impl SmartQueue {
             video_ratio,
             strategy,
             current_index,
-            history: Vec::new(),
+            history: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
             pending_stats_updates: HashMap::new(),
+            content_type_cache: ct_cache_init.unwrap_or_default(),
         })
     }
 
@@ -155,7 +170,7 @@ impl SmartQueue {
         blacklist: &std::collections::HashSet<PathBuf>,
         cache: Arc<FileCache>,
         metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
         let path_buf = path.to_path_buf();
         let blacklist_clone = blacklist.clone();
         tokio::task::spawn_blocking(move || {
@@ -188,11 +203,12 @@ impl SmartQueue {
             video_ratio,
             strategy,
             current_index,
-            history: Vec::new(),
+            history: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
             pending_stats_updates: HashMap::new(),
+            content_type_cache: HashMap::new(),
         })
     }
 
@@ -241,9 +257,10 @@ impl SmartQueue {
         blacklist: &std::collections::HashSet<PathBuf>,
         cache: Arc<FileCache>,
         metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
         let discovery_start = std::time::Instant::now();
         let mut files = Vec::new();
+        let mut ct_cache: HashMap<PathBuf, ContentType> = HashMap::new();
         let mut cache_updates: Vec<(PathBuf, crate::cache::FileMetadata)> = Vec::new();
 
         // Use jwalk for parallel directory traversal
@@ -315,6 +332,7 @@ impl SmartQueue {
 
             if let Some(ct) = content_type {
                 files.push(p.clone());
+                ct_cache.insert(p.clone(), ct);
 
                 // Only build cache update for new/changed entries (reuse fs_meta from above)
                 if needs_cache_update {
@@ -360,7 +378,15 @@ impl SmartQueue {
             );
         }
 
-        Ok(files)
+        Ok((files, ct_cache))
+    }
+
+    /// Look up a path's ContentType from the in-memory cache, falling back to file I/O
+    fn cached_content_type(&self, path: &Path) -> Option<ContentType> {
+        if let Some(ct) = self.content_type_cache.get(path) {
+            return Some(*ct);
+        }
+        Self::get_content_type(path)
     }
 
     /// Apply incremental pool events from the filesystem watcher
@@ -380,6 +406,7 @@ impl SmartQueue {
                     if let Some(ct) = Self::get_content_type(&path) {
                         if !self.pool.contains(&path) {
                             self.pool.push(path.clone());
+                            self.content_type_cache.insert(path.clone(), ct);
                             added += 1;
 
                             // Update cache metadata
@@ -415,6 +442,7 @@ impl SmartQueue {
                     self.pool.retain(|p| p != &path);
                     if self.pool.len() < before {
                         removed += 1;
+                        self.content_type_cache.remove(&path);
                         // Clamp current_index if it's now out of bounds
                         if !self.pool.is_empty() {
                             self.current_index = self.current_index.min(self.pool.len() - 1);
@@ -452,6 +480,7 @@ impl SmartQueue {
                     } else {
                         // No longer valid media, remove from pool
                         self.pool.retain(|p| p != &path);
+                        self.content_type_cache.remove(&path);
                         removed += 1;
                     }
                 }
@@ -487,10 +516,10 @@ impl SmartQueue {
         if let Some(ref p) = picked {
             self.update_stats(p);
             // Add to history (limit to 50 items)
-            if self.history.last() != Some(p) {
-                self.history.push(p.clone());
+            if self.history.back() != Some(p) {
+                self.history.push_back(p.clone());
                 if self.history.len() > 50 {
-                    self.history.remove(0);
+                    self.history.pop_front();
                 }
             }
         }
@@ -550,8 +579,8 @@ impl SmartQueue {
             _ => {
                 // For non-sequential, use history
                 if self.history.len() > 1 {
-                    self.history.pop(); // Remove current
-                    self.history.last().cloned()
+                    self.history.pop_back(); // Remove current
+                    self.history.back().cloned()
                 } else {
                     None
                 }
@@ -573,7 +602,7 @@ impl SmartQueue {
             .pool
             .iter()
             .filter(|p| {
-                let is_video = matches!(Self::get_content_type(p), Some(ContentType::Video));
+                let is_video = matches!(self.cached_content_type(p), Some(ContentType::Video));
                 is_video == is_video_cycle
             })
             .collect();
@@ -619,7 +648,7 @@ impl SmartQueue {
             .pool
             .iter()
             .filter(|p| {
-                let content_type = Self::get_content_type(p);
+                let content_type = self.cached_content_type(p);
                 let is_video = matches!(content_type, Some(ContentType::Video));
                 is_video == is_video_cycle
             })
@@ -674,6 +703,7 @@ impl SmartQueue {
     }
 
     fn update_stats(&mut self, path: &Path) {
+        let now = Utc::now();
         // Update the stat in memory
         let stat = self
             .stats
@@ -685,7 +715,7 @@ impl SmartQueue {
                 love_multiplier: 1.0,
             });
         stat.count += 1;
-        stat.last_seen = Some(Utc::now());
+        stat.last_seen = Some(now);
 
         // Add to pending updates for batched write
         self.pending_stats_updates
@@ -774,12 +804,14 @@ impl SmartQueue {
             }
         } else {
             // Reset to full discovery (no metrics available in this context)
-            self.pool = Self::discover_content(
+            let (pool, ct_cache) = Self::discover_content(
                 &self.root_path,
                 &self.stats.blacklist,
                 self.cache.clone(),
                 None,
             )?;
+            self.pool = pool;
+            self.content_type_cache = ct_cache;
         }
 
         self.active_playlist = name;

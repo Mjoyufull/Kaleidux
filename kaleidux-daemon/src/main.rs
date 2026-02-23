@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
             Some(2) => LevelFilter::INFO,
             Some(3) => LevelFilter::DEBUG,
             Some(4) => LevelFilter::TRACE,
-            None => LevelFilter::INFO,
+            None => LevelFilter::OFF,
             _ => LevelFilter::INFO,
         };
 
@@ -372,15 +372,7 @@ async fn main() -> anyhow::Result<()> {
             );
             (Some(file_guard), Some(stdout_guard))
         } else {
-            let stdout_layer = subscriber_fmt::layer()
-                .with_writer(std::io::stdout)
-                .with_timer(CustomTimer);
-
-            Registry::default()
-                .with(env_filter)
-                .with(stdout_layer)
-                .init();
-            info!("Kaleidux Daemon starting...");
+            // Default: No logging initialized to improve performance
             (None, None)
         }
     };
@@ -505,10 +497,10 @@ async fn run_wayland_loop(
     let mut wgpu_ctx: Option<Arc<renderer::WgpuContext>> = None;
     let mut initial_surface: Option<wgpu::Surface<'static>> = None;
 
-    // Frame channel: keep small to cap memory (each frame ~30-40MB).
-    // 6 slots = ~2 per video source + slack; prevents ~900MB+ spike when loop is slow.
+    // Frame channel: increased capacity to 32 to cushion against micro-stutters
+    // when multiple video sources are active. Memory cap is still reasonable (~1GB slack).
     let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(6);
+        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(32);
     let mut renderers = HashMap::new();
     let outputs: Vec<_> = backend.output_state.outputs().collect();
 
@@ -660,9 +652,8 @@ async fn run_wayland_loop(
     let (cmd_tx, mut cmd_rx) =
         tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
     // Image channel: bounded to prevent memory spikes from large images accumulating
-    // Each image can be 35-60MB (4K RGBA), so limit to 6 images max (2 per monitor with 3 monitors)
-    // This prevents unbounded growth if main loop is temporarily blocked
-    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(6);
+    // Increased to 16 to prevent backpressure during batch transitions
+    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(16);
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
     let script_cmd_tx = cmd_tx.clone();
 
@@ -844,7 +835,7 @@ async fn run_wayland_loop(
     for (name, r) in renderers.iter_mut() {
         if !r.configured && r.config.width > 0 && r.config.height > 0 {
             // Use configured size if available
-            if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == name) {
+            if let Some(layer_surface) = backend.surfaces.get(name) {
                 // Try to configure with existing size
                 let _ = r.resize_checked(r.config.width, r.config.height);
                 if r.configured {
@@ -993,9 +984,7 @@ async fn run_wayland_loop(
                     let height = if h == 0 { r.config.height } else { h };
                     let _ = r.resize_checked(width, height);
                     if r.configured {
-                        if let Some((_, layer_surface)) =
-                            backend.surfaces.iter().find(|(n, _)| n == &name)
-                        {
+                        if let Some(layer_surface) = backend.surfaces.get(&name) {
                             // Force an initial render to commit the surface after resize
                             // This ensures the compositor knows the surface is ready and will send frame callbacks
                             let _ = r.render(
@@ -1119,11 +1108,7 @@ async fn run_wayland_loop(
                 }
 
                 if r.valid_content_type == crate::queue::ContentType::Video {
-                    if let Some((_, layer_surface)) = backend
-                        .surfaces
-                        .iter()
-                        .find(|(n, _)| n == source_id.as_str())
-                    {
+                    if let Some(layer_surface) = backend.surfaces.get(source_id.as_str()) {
                         // Deadlock fix: if this is the first frame of a transition (progress == 0),
                         // we MUST render and commit it to trigger the Wayland frame callback loop,
                         // even if a callback is technically "pending" from the switch event.
@@ -1148,12 +1133,7 @@ async fn run_wayland_loop(
                 drop(frame);
             }
         }
-        // Let GPU process uploads when we handled frames to limit staging queue growth
-        if frames_received > 0 {
-            if let Some(ctx) = &wgpu_ctx {
-                ctx.device.poll(wgpu::Maintain::Poll);
-            }
-        }
+        // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
 
         // Handle Images
         let mut images_received = 0;
@@ -1176,9 +1156,7 @@ async fn run_wayland_loop(
                     let _ = r.upload_image_data(data, msg.width, msg.height);
                     debug!("[IMAGE] Rendering after upload for {}", msg.name);
                     if r.configured {
-                        if let Some((_, layer_surface)) =
-                            backend.surfaces.iter().find(|(n, _)| n == &msg.name)
-                        {
+                        if let Some(layer_surface) = backend.surfaces.get(&msg.name) {
                             let _ = r.render(
                                 renderer::BackendContext::Wayland {
                                     surface: layer_surface,
@@ -1242,8 +1220,7 @@ async fn run_wayland_loop(
             if let Some(r) = renderers.get_mut(&name) {
                 r.frame_callback_pending = false;
                 r.last_frame_request = None;
-                if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == &name)
-                {
+                if let Some(layer_surface) = backend.surfaces.get(&name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
@@ -1266,7 +1243,7 @@ async fn run_wayland_loop(
             // so the compositor will never send a callback -> infinite stuck loop.
             let should_request = r.has_any_content() && (r.needs_redraw || r.transition_active);
             if should_request {
-                if let Some((_, layer_surface)) = backend.surfaces.iter().find(|(n, _)| n == name) {
+                if let Some(layer_surface) = backend.surfaces.get(name) {
                     r.request_frame_callback(layer_surface, &qh);
                 }
             }
@@ -1477,16 +1454,15 @@ async fn run_x11_loop(
     }
 
     let mut video_players: HashMap<String, video::VideoPlayer> = HashMap::new();
-    // Frame channel: keep small to cap memory (each frame ~30-40MB).
-    // 6 slots = ~2 per video source + slack; prevents ~900MB+ spike when loop is slow.
+    // Frame channel: increased capacity to 32 to cushion against micro-stutters
+    // when multiple video sources are active. Memory cap is still reasonable (~1GB slack).
     let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(6);
+        tokio::sync::mpsc::channel::<(Arc<String>, video::VideoEvent)>(32);
     let (cmd_tx, mut cmd_rx) =
         tokio::sync::mpsc::unbounded_channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
     // Image channel: bounded to prevent memory spikes from large images accumulating
-    // Each image can be 35-60MB (4K RGBA), so limit to 6 images max (2 per monitor with 3 monitors)
-    // This prevents unbounded growth if main loop is temporarily blocked
-    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(6);
+    // Increased to 16 to prevent backpressure during batch transitions
+    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(16);
     let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
 
     // IPC Listener (duplicated setup for now to avoid complexity extracting)

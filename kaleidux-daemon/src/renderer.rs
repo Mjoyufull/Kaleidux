@@ -40,10 +40,11 @@ pub struct TexturePoolEntry {
     last_used: std::time::Instant,
 }
 
-// LRU cache for transition pipelines
+// LRU cache for transition pipelines (P-04: O(1) access via counter-based tracking)
 pub struct PipelineLRU {
     pipelines: HashMap<String, Arc<wgpu::RenderPipeline>>,
-    access_order: std::collections::VecDeque<String>, // Most recently used at back
+    access_order: HashMap<String, u64>,
+    order_counter: u64,
     max_size: usize,
 }
 
@@ -51,7 +52,8 @@ impl PipelineLRU {
     fn new(max_size: usize) -> Self {
         Self {
             pipelines: HashMap::new(),
-            access_order: std::collections::VecDeque::new(),
+            access_order: HashMap::new(),
+            order_counter: 0,
             max_size,
         }
     }
@@ -59,9 +61,10 @@ impl PipelineLRU {
     fn get(&mut self, key: &str) -> Option<Arc<wgpu::RenderPipeline>> {
         match self.pipelines.get(key).cloned() {
             Some(pipeline) => {
-                // Move to back (most recently used)
-                self.access_order.retain(|k| k != key);
-                self.access_order.push_back(key.to_string());
+                // O(1) update: set access counter to latest value
+                self.order_counter += 1;
+                self.access_order
+                    .insert(key.to_string(), self.order_counter);
                 Some(pipeline)
             }
             _ => None,
@@ -71,19 +74,27 @@ impl PipelineLRU {
     fn insert(&mut self, key: String, pipeline: Arc<wgpu::RenderPipeline>) {
         // Remove if already exists
         if self.pipelines.contains_key(&key) {
-            self.access_order.retain(|k| k != &key);
+            // Already tracked, just update
         } else {
             // Evict least recently used if at capacity
             while self.pipelines.len() >= self.max_size {
-                if let Some(lru_key) = self.access_order.pop_front() {
+                // Find key with smallest counter value (LRU)
+                if let Some(lru_key) = self
+                    .access_order
+                    .iter()
+                    .min_by_key(|(_, v)| *v)
+                    .map(|(k, _)| k.clone())
+                {
                     self.pipelines.remove(&lru_key);
+                    self.access_order.remove(&lru_key);
                 } else {
                     break;
                 }
             }
         }
-        self.pipelines.insert(key.clone(), pipeline);
-        self.access_order.push_back(key);
+        self.order_counter += 1;
+        self.access_order.insert(key.clone(), self.order_counter);
+        self.pipelines.insert(key, pipeline);
     }
 
     pub fn len(&self) -> usize {
@@ -549,32 +560,51 @@ impl WgpuContext {
         let mut pool = self.texture_pool.lock();
         let now = std::time::Instant::now();
 
-        // 1. Collect all valid (non-expired) textures
-        let mut all_entries: Vec<((u32, u32), TexturePoolEntry)> = Vec::new();
-        let old_pool = std::mem::take(&mut *pool);
-        for (key, entries) in old_pool {
-            for entry in entries {
-                if now.duration_since(entry.last_used).as_secs() < 10 {
-                    all_entries.push((key, entry));
+        // Remove expired entries in-place (P-11: avoids full HashMap reconstruction)
+        for entries in pool.values_mut() {
+            entries.retain(|e| now.duration_since(e.last_used).as_secs() < 10);
+        }
+        pool.retain(|_, v| !v.is_empty());
+
+        // If over global limit, trim oldest across all resolutions
+        let total: usize = pool.values().map(|v| v.len()).sum();
+        if total > MAX_TEXTURE_POOL_SIZE {
+            let mut excess = total - MAX_TEXTURE_POOL_SIZE;
+            // Collect (key, index, last_used) for sorting
+            let mut oldest: Vec<((u32, u32), usize, std::time::Instant)> = pool
+                .iter()
+                .flat_map(|(&k, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, e)| (k, i, e.last_used))
+                })
+                .collect();
+            oldest.sort_by_key(|&(_, _, t)| t);
+
+            // Remove oldest entries (iterate in age order, adjust indices)
+            let mut removed_per_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+            for &(key, idx, _) in &oldest {
+                if excess == 0 {
+                    break;
+                }
+                removed_per_key.entry(key).or_default().push(idx);
+                excess -= 1;
+            }
+            for (key, mut indices) in removed_per_key {
+                indices.sort_unstable_by(|a, b| b.cmp(a)); // Remove from end first
+                if let Some(entries) = pool.get_mut(&key) {
+                    for idx in indices {
+                        if idx < entries.len() {
+                            entries.remove(idx);
+                        }
+                    }
                 }
             }
+            pool.retain(|_, v| !v.is_empty());
         }
 
-        // 2. If over global limit, sort and truncate
-        if all_entries.len() > MAX_TEXTURE_POOL_SIZE {
-            // Sort oldest first (smallest Instant)
-            all_entries.sort_by_key(|(_, entry)| entry.last_used);
-            // Drop oldest items
-            let keep_start = all_entries.len() - MAX_TEXTURE_POOL_SIZE;
-            all_entries.drain(0..keep_start);
-        }
-
-        // 3. Re-populate pool
-        for (key, entry) in all_entries {
-            pool.entry(key).or_default().push(entry);
-        }
-
-        // 4. Record pool size for leak detection
+        // Record pool size for leak detection
         let pool_size: usize = pool.values().map(|v| v.len()).sum();
         if let Some(m) = metrics {
             m.record_texture_pool_size(pool_size);
@@ -1722,16 +1752,9 @@ impl Renderer {
 
         // CRITICAL: Reset needs_redraw AFTER we've actually rendered and presented
         // This ensures we render at least once for static images
-        if self.transition_active {
-            // Transition in progress - MUST keep rendering until complete
-            self.needs_redraw = true;
-        } else if !self.transition_active
-            && self.valid_content_type != crate::queue::ContentType::Video
-        {
-            // Transition complete and not video - can reset needs_redraw now that we've presented
-            self.needs_redraw = false;
-        }
-        // For video, keep needs_redraw=true so we continue requesting frame callbacks
+        // We reset to false even for video; video.rs will set it to true
+        // when a new frame is uploaded, preventing redundant renders between frames.
+        self.needs_redraw = false;
 
         // Record renderer CPU time
         if let Some(m) = &self.metrics {
@@ -2172,7 +2195,7 @@ impl Renderer {
             self.transition_start_time.is_some()
         );
 
-        self.ctx.device.poll(wgpu::Maintain::Poll);
+        // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
     }
 
     /// Upload an NV12 frame: write Y and UV planes to staging textures, then
@@ -2987,25 +3010,25 @@ impl Renderer {
         self.needs_redraw = true;
     }
     fn update_transition_bind_group(&mut self) {
-        // Only recreate if bind group doesn't exist or texture views changed
-        // Check if we already have a valid bind group with the same texture views
+        // Skip recreation if bind group already exists — it's invalidated to None
+        // whenever textures change (upload_image_data, upload_frame, switch_content)
+        if self.transition_bind_group.is_some() {
+            return;
+        }
+
+        // Only recreate if both texture views are present
         let prev_view = match self.prev_texture_view.as_ref() {
             Some(v) => v,
             None => {
-                self.transition_bind_group = None;
                 return;
             }
         };
         let current_view = match self.current_texture_view.as_ref() {
             Some(v) => v,
             None => {
-                self.transition_bind_group = None;
                 return;
             }
         };
-
-        // Always recreate bind group to ensure it matches current texture views
-        // This prevents stale bind groups if invalidation logic elsewhere is missed
 
         self.transition_bind_group = Some(self.ctx.device.create_bind_group(
             &wgpu::BindGroupDescriptor {
@@ -3092,7 +3115,7 @@ fn import_dmabuf_as_texture(
                 .tiling(vk::ImageTiling::LINEAR)
                 .usage(vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::PREINITIALIZED)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut external_memory_info);
 
             let vk_image = match raw_device.create_image(&image_info, None) {
@@ -3160,7 +3183,9 @@ fn import_dmabuf_as_texture(
                     return None;
                 }
             };
-            // After successful vkAllocateMemory, Vulkan owns the fd.
+            // Success: Vulkan now owns the FD.
+            // DO NOT manually close it here (it causes intermittent double-close crashes).
+            // The driver/Vulkan implementation is responsible for closing the imported FD.
 
             // 6. Bind imported memory to the image
             if let Err(e) = raw_device.bind_image_memory(vk_image, vk_memory, 0) {
@@ -3299,7 +3324,7 @@ fn create_cuda_backed_texture(
                 .tiling(vk::ImageTiling::LINEAR)
                 .usage(vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::PREINITIALIZED)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut external_memory_info);
 
             let probe_image = raw_device.create_image(&image_info, None).ok()?;
@@ -3359,7 +3384,7 @@ fn create_cuda_backed_texture(
                 .tiling(vk::ImageTiling::LINEAR)
                 .usage(vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::PREINITIALIZED)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
                 .push_next(&mut external_memory_info);
 
             let vk_image = match raw_device.create_image(&image_info, None) {
@@ -3403,6 +3428,10 @@ fn create_cuda_backed_texture(
                     return None;
                 }
             };
+
+            // Success: Vulkan now owns the FD. 
+            // DO NOT manually close it here (it causes intermittent double-close crashes).
+            // The driver/Vulkan implementation is responsible for closing the imported FD.
 
             if let Err(e) = raw_device.bind_image_memory(vk_image, vk_memory, 0) {
                 error!("[CUDA-VK] vkBindImageMemory failed: {:?}", e);

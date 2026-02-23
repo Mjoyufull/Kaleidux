@@ -54,6 +54,12 @@ vec4 getToColor(vec2 uv) {
 
 pub struct ShaderManager;
 
+// Process-wide cache of compiled WGSL shader strings (P-21)
+// Keyed by transition name — avoids duplicate GLSL→WGSL compilation across renderers
+static WGSL_CACHE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, String>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 impl ShaderManager {
     pub fn compile_glsl(
         name: &str,
@@ -217,6 +223,12 @@ impl ShaderManager {
 
     pub fn get_builtin_shader(transition: &Transition) -> anyhow::Result<String> {
         let name = transition.name();
+
+        // Check process-wide cache first (P-21)
+        if let Some(cached) = WGSL_CACHE.lock().get(&name) {
+            return Ok(cached.clone());
+        }
+
         let glsl = Self::get_builtin_glsl(&name)
             .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?;
 
@@ -399,7 +411,11 @@ impl ShaderManager {
             _ => "",
         };
 
-        Self::compile_glsl(&name, glsl, mapping)
+        let wgsl = Self::compile_glsl(&name, glsl, mapping)?;
+
+        // Store in process-wide cache (P-21)
+        WGSL_CACHE.lock().insert(name, wgsl.clone());
+        Ok(wgsl)
     }
 
     pub fn get_builtin_glsl(name: &str) -> Option<&'static str> {

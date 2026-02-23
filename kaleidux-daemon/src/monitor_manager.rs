@@ -1156,7 +1156,7 @@ impl MonitorManager {
 
     pub fn get_history(&self, output_name: Option<String>) -> Vec<String> {
         let history = Vec::new();
-        let to_strings = |paths: &[PathBuf]| -> Vec<String> {
+        let to_strings = |paths: &std::collections::VecDeque<PathBuf>| -> Vec<String> {
             paths
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())

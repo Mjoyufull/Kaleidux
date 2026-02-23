@@ -104,7 +104,7 @@ pub struct WaylandBackend {
     pub output_state: OutputState,
     pub layer_shell: LayerShell,
     pub shm: Shm,
-    pub surfaces: Vec<(String, LayerSurface)>,
+    pub surfaces: std::collections::HashMap<String, LayerSurface>,
     // (name, width, height, serial)
     pub pending_resizes: Vec<(String, u32, u32, u32)>,
     // Frame callback notifications: surface name -> should render
@@ -125,7 +125,7 @@ impl WaylandBackend {
             output_state,
             layer_shell,
             shm,
-            surfaces: Vec::new(),
+            surfaces: std::collections::HashMap::new(),
             pending_resizes: Vec::new(),
             frame_callback_ready: std::collections::HashSet::new(),
         })
@@ -155,7 +155,7 @@ impl WaylandBackend {
         layer_surface.commit();
 
         // Keep track of them
-        self.surfaces.push((name, layer_surface.clone()));
+        self.surfaces.insert(name, layer_surface.clone());
 
         Ok(layer_surface)
     }
@@ -286,7 +286,7 @@ impl LayerShellHandler for WaylandBackend {
             "Layer surface CLOSED by compositor for output: {}. Surface will be re-created if output still exists.",
             name
         );
-        self.surfaces.retain(|(_, s)| s != layer_surface);
+        self.surfaces.retain(|_, s| s != layer_surface);
     }
     fn configure(
         &mut self,
