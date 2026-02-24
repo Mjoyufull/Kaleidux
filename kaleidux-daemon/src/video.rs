@@ -154,10 +154,11 @@ pub fn get_bus_watcher_pool() -> Arc<BusWatcherPool> {
 ///   - 2 blocks: Y and UV in separate DMA-BUF allocations
 ///
 /// Falls back to regular NV12 if fd extraction fails.
-fn extract_dmabuf_nv12(buffer: &gst::Buffer, vi: &gst_video::VideoInfo) -> VideoFrameFormat {
-    let strides = vi.stride();
-    let offsets = vi.offset();
-
+fn extract_dmabuf_nv12(
+    buffer: &gst::Buffer,
+    strides: [i32; 4],
+    offsets: [usize; 4],
+) -> VideoFrameFormat {
     if buffer.n_memory() >= 2 {
         // Separate DMA-BUFs per plane
         let y_mem = buffer.peek_memory(0);
@@ -419,7 +420,7 @@ impl VideoPlayer {
                                             .is_some();
 
                                     if is_dmabuf {
-                                        extract_dmabuf_nv12(&buffer, &video_info)
+                                        extract_dmabuf_nv12(&buffer, strides, offsets)
                                     } else {
                                         VideoFrameFormat::Nv12 {
                                             y_stride,

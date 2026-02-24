@@ -451,7 +451,8 @@ impl SmartQueue {
                 }
                 PoolEvent::Modified(path) => {
                     // File content may have changed — re-check if it's still valid media
-                    if let Some(_ct) = Self::get_content_type(&path) {
+                    if let Some(ct) = Self::get_content_type(&path) {
+                        self.content_type_cache.insert(path.clone(), ct);
                         // Still valid, cache metadata was already invalidated by the watcher
                         if let Ok(meta) = std::fs::metadata(&path) {
                             let mtime = meta
@@ -469,7 +470,7 @@ impl SmartQueue {
                                 &crate::cache::FileMetadata {
                                     mtime,
                                     size: meta.len(),
-                                    content_type: match _ct {
+                                    content_type: match ct {
                                         ContentType::Image => 0,
                                         ContentType::Video => 1,
                                     },

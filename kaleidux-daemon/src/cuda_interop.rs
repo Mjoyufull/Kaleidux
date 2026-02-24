@@ -132,10 +132,11 @@ pub struct CudaInterop {
     cu_mem_unmap: FnCuMemUnmap,
     cu_mem_address_free: FnCuMemAddressFree,
     cu_mem_release: FnCuMemRelease,
+    op_lock: parking_lot::Mutex<()>,
 }
 
 unsafe impl Send for CudaInterop {}
-unsafe impl Sync for CudaInterop {}
+// Sync removed (Audit Point 1): Context operations require internal serialization.
 
 fn cuda_err(name: &str, res: CUresult) -> String {
     format!("[CUDA] {name} failed with error code {res}")
@@ -213,6 +214,7 @@ impl CudaInterop {
                 cu_mem_unmap,
                 cu_mem_address_free,
                 cu_mem_release,
+                op_lock: parking_lot::Mutex::new(()),
             })
         }
     }
@@ -232,6 +234,7 @@ impl CudaInterop {
         &self,
         min_size: usize,
     ) -> Result<(ExportableCudaAllocation, RawFd), String> {
+        let _guard = self.op_lock.lock();
         self.push_context()?;
 
         unsafe {
@@ -292,6 +295,7 @@ impl CudaInterop {
             let mut dev_ptr: CUdeviceptr = 0;
             let res = (self.cu_mem_address_reserve)(&mut dev_ptr, alloc_size, granularity, 0, 0);
             if res != CUDA_SUCCESS {
+                libc::close(fd); // Audit Point 2: Close leaked fd
                 (self.cu_mem_release)(handle);
                 return Err(cuda_err("cuMemAddressReserve", res));
             }
@@ -299,6 +303,7 @@ impl CudaInterop {
             // Map the allocation to the reserved address
             let res = (self.cu_mem_map)(dev_ptr, alloc_size, 0, handle, 0);
             if res != CUDA_SUCCESS {
+                libc::close(fd); // Audit Point 2: Close leaked fd
                 (self.cu_mem_address_free)(dev_ptr, alloc_size);
                 (self.cu_mem_release)(handle);
                 return Err(cuda_err("cuMemMap", res));
@@ -314,6 +319,7 @@ impl CudaInterop {
             };
             let res = (self.cu_mem_set_access)(dev_ptr, alloc_size, &access_desc, 1);
             if res != CUDA_SUCCESS {
+                libc::close(fd); // Audit Point 2: Close leaked fd
                 (self.cu_mem_unmap)(dev_ptr, alloc_size);
                 (self.cu_mem_address_free)(dev_ptr, alloc_size);
                 (self.cu_mem_release)(handle);
@@ -337,6 +343,7 @@ impl CudaInterop {
     }
 
     pub fn synchronize(&self) -> Result<(), String> {
+        let _guard = self.op_lock.lock();
         self.push_context()?;
         let res = unsafe { (self.cu_ctx_synchronize)() };
         if res != CUDA_SUCCESS {
@@ -346,6 +353,7 @@ impl CudaInterop {
     }
 
     pub fn free_exportable(&self, alloc: ExportableCudaAllocation) {
+        let _guard = self.op_lock.lock();
         let _ = self.push_context();
         unsafe {
             (self.cu_mem_unmap)(alloc.dev_ptr, alloc.alloc_size);
@@ -363,6 +371,7 @@ impl CudaInterop {
         width_bytes: usize,
         height: usize,
     ) -> Result<(), String> {
+        let _guard = self.op_lock.lock();
         self.push_context()?;
 
         let params = CudaMemcpy2D {
@@ -406,7 +415,7 @@ impl Drop for CudaInterop {
 // ── GStreamer CUDA buffer mapping ───────────────────────────────────────
 
 pub struct CudaMapGuard {
-    raw_buf: *mut gstreamer::ffi::GstBuffer,
+    buffer: gstreamer::Buffer, // Own the buffer to prevent UAF (Audit Point 3)
     map_info: gstreamer::ffi::GstMapInfo,
 }
 
@@ -421,7 +430,7 @@ impl CudaMapGuard {
 impl Drop for CudaMapGuard {
     fn drop(&mut self) {
         unsafe {
-            gstreamer::ffi::gst_buffer_unmap(self.raw_buf, &mut self.map_info);
+            gstreamer::ffi::gst_buffer_unmap(self.buffer.as_ptr() as *mut _, &mut self.map_info);
         }
     }
 }
@@ -429,11 +438,14 @@ impl Drop for CudaMapGuard {
 pub fn map_buffer_cuda(buffer: &gstreamer::Buffer) -> Option<CudaMapGuard> {
     const GST_MAP_CUDA: u32 = 1 << 17;
     unsafe {
-        let raw_buf = buffer.as_ptr() as *mut gstreamer::ffi::GstBuffer;
         let mut map_info: gstreamer::ffi::GstMapInfo = std::mem::zeroed();
         let flags = gstreamer::ffi::GST_MAP_READ | GST_MAP_CUDA;
 
-        let ok = gstreamer::ffi::gst_buffer_map(raw_buf, &mut map_info, flags);
+        let ok = gstreamer::ffi::gst_buffer_map(
+            buffer.as_ptr() as *mut gstreamer::ffi::GstBuffer,
+            &mut map_info,
+            flags,
+        );
 
         if ok == 0 {
             error!("[CUDA] gst_buffer_map with CUDA flag failed");
@@ -442,10 +454,13 @@ pub fn map_buffer_cuda(buffer: &gstreamer::Buffer) -> Option<CudaMapGuard> {
 
         if map_info.data.is_null() {
             error!("[CUDA] gst_buffer_map returned null data pointer");
-            gstreamer::ffi::gst_buffer_unmap(raw_buf, &mut map_info);
+            gstreamer::ffi::gst_buffer_unmap(buffer.as_ptr() as *mut _, &mut map_info);
             return None;
         }
 
-        Some(CudaMapGuard { raw_buf, map_info })
+        Some(CudaMapGuard {
+            buffer: buffer.clone(),
+            map_info,
+        })
     }
 }

@@ -312,13 +312,12 @@ impl LayerShellHandler for WaylandBackend {
             name, protocol_id, width, height, serial
         );
         tracing::trace!(
-            "[WAYLAND] [TRACE] Configure details: name={}, id=#{}, w={}, h={}, serial={}, suggest_resize={:?}, suggest_rescale={:?}",
+            "[WAYLAND] [TRACE] Configure details: name={}, id=#{}, w={}, h={}, serial={}, suggest_resize={:?}",
             name,
             protocol_id,
             width,
             height,
             serial,
-            config.new_size,
             config.new_size
         );
 

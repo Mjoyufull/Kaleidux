@@ -2846,7 +2846,7 @@ impl Renderer {
             // GPU-side copy: UV plane
             if let Err(e) = ci.copy_2d(
                 base_ptr + uv_offset as u64,
-                y_stride as usize,
+                _uv_stride as usize,
                 cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64,
                 cache.uv_pitch,
                 width as usize,
@@ -3077,6 +3077,14 @@ impl Drop for Renderer {
         // Abort background shader precompilation task to prevent resource leaks
         if let Some(handle) = self.shader_precompile_handle.take() {
             handle.abort();
+        }
+
+        // Clean up CUDA exportable allocations (Audit Point 1 in renderer.rs)
+        if let Some(cuda_cache) = self.cuda_textures.take() {
+            if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
+                interop.free_exportable(cuda_cache.y_cuda_alloc);
+                interop.free_exportable(cuda_cache.uv_cuda_alloc);
+            }
         }
     }
 }

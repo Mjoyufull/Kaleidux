@@ -329,8 +329,13 @@ impl ShaderManager {
                 "bool direction = getFromParams(0) > 0.5; float l_threshold = getFromParams(1); bool above = false;"
             }
             Transition::Luma => {
-                return Self::compile_glsl("fade", Self::get_builtin_glsl("fade").unwrap(), "");
-            } // Temporary fix: Luma crashes without secondary texture, fallback to fade.
+                // FALLBACK: Use fade for now, but ensure it's cached under "Luma".
+                // Luma crashes without secondary texture in current implementation.
+                let glsl = Self::get_builtin_glsl("fade").unwrap();
+                let wgsl = Self::compile_glsl("fade", glsl, "")?;
+                WGSL_CACHE.lock().insert("Luma".to_string(), wgsl.clone());
+                return Ok(wgsl);
+            }
             Transition::Morph { .. } => "float strength = getFromParams(0);",
             Transition::Mosaic { .. } => {
                 "int endx = int(getFromParams(0)); int endy = int(getFromParams(1));"
