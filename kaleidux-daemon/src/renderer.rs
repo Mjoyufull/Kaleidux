@@ -532,6 +532,11 @@ impl WgpuContext {
 
     /// Return a texture to the pool for reuse
     pub fn return_texture_to_pool(&self, texture: wgpu::Texture, width: u32, height: u32) {
+        if texture.mip_level_count() > 1 {
+            // Textures with mipmaps cannot be reused for video frames
+            return;
+        }
+
         let mut pool = self.texture_pool.lock();
         let key = (width, height);
 
@@ -1789,6 +1794,11 @@ impl Renderer {
 
         let wl_surface = layer_surface.wl_surface();
         wl_surface.frame(qh, wl_surface.clone());
+
+        // CRITICAL: Commit the surface to ensure the frame callback is registered and processed
+        // This prevents the compositor from "hanging" the surface if it's waiting for a commit
+        wl_surface.commit();
+
         self.frame_callback_pending = true;
         self.last_frame_request = Some(std::time::Instant::now());
         tracing::debug!(
@@ -2042,8 +2052,13 @@ impl Renderer {
         let width = frame.width;
         let height = frame.height;
 
-        // Get or reuse the RGBA output texture (same size = reuse)
-        let needs_new_texture = self.current_texture_size != Some((width, height));
+        // Get or reuse the RGBA output texture (same size AND single mip level = reuse)
+        let needs_new_texture = match self.current_texture.as_ref() {
+            Some(curr) => {
+                self.current_texture_size != Some((width, height)) || curr.mip_level_count() > 1
+            }
+            None => true,
+        };
         let texture = match self.current_texture.take() {
             Some(curr) => {
                 if !needs_new_texture {
