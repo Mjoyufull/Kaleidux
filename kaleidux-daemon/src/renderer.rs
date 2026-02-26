@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smithay_client_toolkit::shell::{WaylandSurface, wlr_layer::LayerSurface};
 use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use wayland_client::QueueHandle;
@@ -2123,7 +2124,14 @@ impl Renderer {
                 uv_offset,
             } => {
                 if !self.upload_frame_dmabuf_nv12(
-                    &texture, width, height, *y_fd, *y_stride, *y_offset, *uv_fd, *uv_stride,
+                    &texture,
+                    width,
+                    height,
+                    y_fd.as_raw_fd(),
+                    *y_stride,
+                    *y_offset,
+                    uv_fd.as_raw_fd(),
+                    *uv_stride,
                     *uv_offset,
                 ) {
                     warn!("[VIDEO] DMA-BUF import failed, falling back to NV12 CPU path");
@@ -2319,6 +2327,13 @@ impl Renderer {
                     let end = start + y_bytes_per_row as usize;
                     if end <= src.len() {
                         self.stride_temp_buffer.extend_from_slice(&src[start..end]);
+                    } else {
+                        error!(
+                            "[RENDERER] Y plane truncated row detected (expected {} bytes, have {}). Aborting upload.",
+                            end,
+                            src.len()
+                        );
+                        return;
                     }
                     let pad = y_aligned - y_bytes_per_row;
                     if pad > 0 {
@@ -2387,6 +2402,13 @@ impl Renderer {
                     let end = start + uv_bytes_per_row as usize;
                     if end <= src.len() {
                         self.stride_temp_buffer.extend_from_slice(&src[start..end]);
+                    } else {
+                        error!(
+                            "[RENDERER] UV plane truncated row detected (expected {} bytes, have {}). Aborting upload.",
+                            end,
+                            src.len()
+                        );
+                        return;
                     }
                     let pad = uv_aligned - uv_bytes_per_row;
                     if pad > 0 {
@@ -2585,10 +2607,10 @@ impl Renderer {
         height: u32,
         y_fd: std::os::unix::io::RawFd,
         y_stride: u32,
-        _y_offset: u32,
+        y_offset: u32,
         uv_fd: std::os::unix::io::RawFd,
         uv_stride: u32,
-        _uv_offset: u32,
+        uv_offset: u32,
     ) -> bool {
         let uv_width = width / 2;
         let uv_height = height / 2;
@@ -2600,6 +2622,7 @@ impl Renderer {
             width,
             height,
             y_stride,
+            y_offset,
             wgpu::TextureFormat::R8Unorm,
             "DMA-BUF Y Plane",
         ) {
@@ -2614,6 +2637,7 @@ impl Renderer {
             uv_width,
             uv_height,
             uv_stride,
+            uv_offset,
             wgpu::TextureFormat::Rg8Unorm,
             "DMA-BUF UV Plane",
         ) {
@@ -2697,7 +2721,7 @@ impl Renderer {
         height: u32,
         y_stride: u32,
         uv_offset: u32,
-        _uv_stride: u32,
+        uv_stride: u32,
     ) -> bool {
         // Check shared CUDA interop (lives in WgpuContext, shared across renderers)
         if self
@@ -2846,7 +2870,7 @@ impl Renderer {
             // GPU-side copy: UV plane
             if let Err(e) = ci.copy_2d(
                 base_ptr + uv_offset as u64,
-                _uv_stride as usize,
+                uv_stride as usize,
                 cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64,
                 cache.uv_pitch,
                 width as usize,
@@ -3098,7 +3122,8 @@ fn import_dmabuf_as_texture(
     fd: std::os::unix::io::RawFd,
     width: u32,
     height: u32,
-    _stride: u32,
+    stride: u32,
+    offset: u32,
     format: wgpu::TextureFormat,
     label: &str,
 ) -> Option<wgpu::Texture> {
@@ -3111,7 +3136,40 @@ fn import_dmabuf_as_texture(
         return None;
     }
 
-    let vk_format = wgpu_format_to_vk(format)?;
+    let vk_format = match wgpu_format_to_vk(format) {
+        Some(f) => f,
+        None => {
+            unsafe {
+                libc::close(owned_fd);
+            }
+            return None;
+        }
+    };
+
+    // Validation (P-21): Check if offset + (height * stride) fits in the buffer
+    let buf_size = unsafe { libc::lseek(owned_fd, 0, libc::SEEK_END) };
+    if buf_size < 0 {
+        error!("[DMABUF] Failed to lseek fd {owned_fd}");
+        unsafe {
+            libc::close(owned_fd);
+        }
+        return None;
+    }
+    unsafe {
+        libc::lseek(owned_fd, 0, libc::SEEK_SET);
+    }
+
+    let req_size = offset as i64 + (height as i64 * stride as i64);
+    if req_size > buf_size {
+        error!(
+            "[DMABUF] {label} validation failed: req_size {} > buf_size {} (offset={}, h={}, stride={})",
+            req_size, buf_size, offset, height, stride
+        );
+        unsafe {
+            libc::close(owned_fd);
+        }
+        return None;
+    }
 
     // Access the underlying Vulkan device through wgpu-hal's callback API
     // and perform all Vulkan operations inside.
@@ -3211,7 +3269,9 @@ fn import_dmabuf_as_texture(
             // The driver/Vulkan implementation is responsible for closing the imported FD.
 
             // 6. Bind imported memory to the image
-            if let Err(e) = raw_device.bind_image_memory(vk_image, vk_memory, 0) {
+            if let Err(e) =
+                raw_device.bind_image_memory(vk_image, vk_memory, offset as vk::DeviceSize)
+            {
                 error!("[DMABUF] vkBindImageMemory failed: {:?}", e);
                 raw_device.free_memory(vk_memory, None);
                 raw_device.destroy_image(vk_image, None);
@@ -3252,7 +3312,15 @@ fn import_dmabuf_as_texture(
         })?
     };
 
-    let hal_texture = hal_texture?;
+    let hal_texture = match hal_texture {
+        Some(t) => t,
+        None => {
+            unsafe {
+                libc::close(owned_fd);
+            }
+            return None;
+        }
+    };
 
     // 8. Wrap the HAL texture as a wgpu::Texture
     let wgpu_desc = wgpu::TextureDescriptor {
@@ -3414,6 +3482,7 @@ fn create_cuda_backed_texture(
                 Ok(img) => img,
                 Err(e) => {
                     error!("[CUDA-VK] Failed to create VkImage: {:?}", e);
+                    unsafe { libc::close(fd); }
                     return None;
                 }
             };
@@ -3425,6 +3494,7 @@ fn create_cuda_backed_texture(
                     error!("[CUDA-VK] No compatible memory type (image={:#x})",
                            mem_reqs.memory_type_bits);
                     raw_device.destroy_image(vk_image, None);
+                    unsafe { libc::close(fd); }
                     return None;
                 }
             };
@@ -3448,6 +3518,7 @@ fn create_cuda_backed_texture(
                 Err(e) => {
                     error!("[CUDA-VK] vkAllocateMemory (import fd={fd}, size={cuda_export_size}) failed: {:?}", e);
                     raw_device.destroy_image(vk_image, None);
+                    unsafe { libc::close(fd); }
                     return None;
                 }
             };
@@ -3492,7 +3563,13 @@ fn create_cuda_backed_texture(
         })?
     };
 
-    let hal_texture = hal_texture?;
+    let hal_texture = match hal_texture {
+        Some(t) => t,
+        None => {
+            ci.free_exportable(cuda_alloc);
+            return None;
+        }
+    };
 
     let wgpu_desc = wgpu::TextureDescriptor {
         label: Some(label),

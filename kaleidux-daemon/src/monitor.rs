@@ -2,7 +2,6 @@ use std::fs;
 use std::process::Command;
 use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 pub struct SystemMonitor {
@@ -94,7 +93,11 @@ impl SystemMonitor {
     }
 
     pub async fn run(mut self) {
-        let mut interval = interval(Duration::from_secs(10));
+        let interval_duration = Duration::from_secs(10);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + interval_duration,
+            interval_duration,
+        );
 
         info!("[MONITOR] Starting resource monitoring...");
         if self.has_nvidia {
@@ -128,7 +131,7 @@ impl SystemMonitor {
                 );
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
-                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // KB to MB
+                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // Bytes to MB (assuming sysinfo returns bytes for process memory)
                     // Record memory usage in metrics
                     if let Some(m) = &self.metrics {
                         m.record_memory_usage(proc_mem as f64);

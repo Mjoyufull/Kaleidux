@@ -266,33 +266,35 @@ fn create_and_start_video_player(
                                 name_str, e
                             );
                         }
-                        if vp.start().is_ok() {
-                            if let Err(e) = player_tx_clone
-                                .send(VideoPlayerResult::Success(name_str, session_id, vp))
-                            {
-                                error!("Failed to send video player back: {}", e);
-                            }
+                        if let Err(e) = vp.start() {
+                            error!("[VIDEO] {}: Failed to start video player: {}", name_str, e);
+                            Err(e.into())
                         } else {
-                            error!("Failed to start video player");
-                            let _ = player_tx_clone
-                                .send(VideoPlayerResult::Failure(name_str, session_id));
+                            Ok(vp)
                         }
                     }
                     Err(e) => {
-                        error!("Failed to create video player: {}", e);
-                        let _ =
-                            player_tx_clone.send(VideoPlayerResult::Failure(name_str, session_id));
+                        error!("[VIDEO] {}: Failed to create video player: {}", name_str, e);
+                        Err(e)
                     }
                 },
             ));
 
-        if result.is_err() {
-            error!(
-                "[VIDEO] {}: Video player task panicked! Sending failure.",
-                name_for_panic
-            );
-            let _ =
-                player_tx_panic.send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
+        match result {
+            Ok(Ok(vp)) => {
+                if let Err(e) =
+                    player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp))
+                {
+                    error!("[VIDEO] Failed to send video player back: {}", e);
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                if result.is_err() {
+                    error!("[VIDEO] {}: Video player task panicked!", name_for_panic);
+                }
+                let _ = player_tx_panic
+                    .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
+            }
         }
     });
 }
@@ -381,15 +383,18 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref mode_str) = args.video_mode {
         let mode = match mode_str.to_lowercase().as_str() {
             "cuda" | "nvdec" | "nvidia" => crate::video::VideoMode::ForceCuda,
-            "dmabuf" | "dma-buf" => crate::video::VideoMode::ForceDmaBuf,
+            "dmabuf" | "dma-buf" | "zero-copy" => crate::video::VideoMode::ForceDmaBuf,
             "nv12" => crate::video::VideoMode::ForceNv12,
             "rgba" => crate::video::VideoMode::ForceRgba,
+            "auto" => crate::video::VideoMode::Auto,
             other => {
-                warn!(
-                    "Unknown --video-mode '{}', valid: cuda, dmabuf, nv12, rgba. Using auto.",
+                let msg = format!(
+                    "ERROR: Unknown --video-mode '{}', valid: auto, cuda, dmabuf, nv12, rgba",
                     other
                 );
-                crate::video::VideoMode::Auto
+                eprintln!("{}", msg);
+                error!("{}", msg);
+                std::process::exit(1);
             }
         };
         crate::video::set_video_mode(mode);

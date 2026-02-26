@@ -995,22 +995,30 @@ impl MonitorManager {
                     strategy: crate::orchestration::SortingStrategy::Loveit,
                     enabled: true,
                 };
-                self.apply_to_all_queues(|q| {
+                let errors = self.apply_to_all_queues(|q| {
                     q.stats.playlists.insert(name.clone(), playlist.clone());
                     q.save_stats()
                 });
-                Response::Ok
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             PlaylistCommand::Delete { name } => {
-                self.apply_to_all_queues(|q| {
+                let errors = self.apply_to_all_queues(|q| {
                     q.stats.playlists.remove(&name);
                     q.save_stats()
                 });
-                Response::Ok
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             PlaylistCommand::Add { name, path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| {
+                let errors = self.apply_to_all_queues(|q| {
                     if let Some(pl) = q.stats.playlists.get_mut(&name) {
                         if !pl.paths.contains(&path_buf) {
                             pl.paths.push(path_buf.clone());
@@ -1018,32 +1026,33 @@ impl MonitorManager {
                     }
                     q.save_stats()
                 });
-                Response::Ok
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             PlaylistCommand::Remove { name, path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| {
+                let errors = self.apply_to_all_queues(|q| {
                     if let Some(pl) = q.stats.playlists.get_mut(&name) {
                         pl.paths.retain(|p| p != &path_buf);
                     }
                     q.save_stats()
                 });
-                Response::Ok
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             PlaylistCommand::Load { name } => {
-                let mut error = None;
-                self.apply_to_all_queues(|q| {
-                    match q.set_playlist(name.clone()) {
-                        Err(e) => {
-                            error = Some(e.to_string());
-                            let _ = q.save_stats(); // Save active playlist state? SmartQueue doesn't persist active_playlist yet
-                            Err(e)
-                        }
-                        _ => q.save_stats(),
-                    }
+                let errors = self.apply_to_all_queues(|q| {
+                    q.set_playlist(name.clone())?;
+                    q.save_stats()
                 });
-                if let Some(e) = error {
-                    Response::Error(e)
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
                 } else {
                     Response::Ok
                 }
@@ -1064,13 +1073,21 @@ impl MonitorManager {
         match cmd {
             BlacklistCommand::Add { path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| q.blacklist_file(path_buf.clone()));
-                Response::Ok
+                let errors = self.apply_to_all_queues(|q| q.blacklist_file(path_buf.clone()));
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             BlacklistCommand::Remove { path } => {
                 let path_buf = PathBuf::from(path);
-                self.apply_to_all_queues(|q| q.unblacklist_file(path_buf.clone()));
-                Response::Ok
+                let errors = self.apply_to_all_queues(|q| q.unblacklist_file(path_buf.clone()));
+                if let Some(e) = errors.first() {
+                    Response::Error(e.to_string())
+                } else {
+                    Response::Ok
+                }
             }
             BlacklistCommand::List => {
                 if let Some(q) = self.get_any_queue() {
@@ -1088,37 +1105,57 @@ impl MonitorManager {
         }
     }
 
-    fn apply_to_all_queues<F>(&mut self, mut f: F)
+    fn apply_to_all_queues<F>(&mut self, mut f: F) -> Vec<anyhow::Error>
     where
         F: FnMut(&mut SmartQueue) -> Result<()>,
     {
+        let mut errors = Vec::new();
         if let Some(q) = &mut self.shared_queue {
-            let _ = f(q);
+            if let Err(e) = f(q) {
+                errors.push(e);
+            }
         }
         for q in self.group_queues.values_mut() {
-            let _ = f(q);
+            if let Err(e) = f(q) {
+                errors.push(e);
+            }
         }
         for orch in self.outputs.values_mut() {
             if let Some(q) = &mut orch.queue {
-                let _ = f(q);
+                if let Err(e) = f(q) {
+                    errors.push(e);
+                }
             }
         }
+        errors
     }
 
     /// Flush pending stats updates from all queues (batched write)
     pub fn flush_all_stats(&mut self) -> Result<()> {
+        let mut first_err = None;
         if let Some(q) = &mut self.shared_queue {
-            let _ = q.flush_stats();
+            if let Err(e) = q.flush_stats() {
+                first_err = first_err.or(Some(e));
+            }
         }
         for q in self.group_queues.values_mut() {
-            let _ = q.flush_stats();
+            if let Err(e) = q.flush_stats() {
+                first_err = first_err.or(Some(e));
+            }
         }
         for orch in self.outputs.values_mut() {
             if let Some(q) = &mut orch.queue {
-                let _ = q.flush_stats();
+                if let Err(e) = q.flush_stats() {
+                    first_err = first_err.or(Some(e));
+                }
             }
         }
-        Ok(())
+
+        if let Some(e) = first_err {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     /// Forward filesystem watcher events to all active queues for incremental pool updates
@@ -1126,6 +1163,18 @@ impl MonitorManager {
         if events.is_empty() {
             return;
         }
+
+        // Process events to invalidate our internal cache
+        for event in &events {
+            match event {
+                crate::cache::PoolEvent::Added(path)
+                | crate::cache::PoolEvent::Removed(path)
+                | crate::cache::PoolEvent::Modified(path) => {
+                    self.invalidate_cache(path);
+                }
+            }
+        }
+
         if let Some(q) = &mut self.shared_queue {
             q.apply_pool_events(events.clone());
         }
@@ -1152,6 +1201,15 @@ impl MonitorManager {
             }
         }
         None
+    }
+
+    pub fn invalidate_cache(&mut self, path: &PathBuf) {
+        // Invalidate entry for the file itself (if it was cached directly)
+        self.discovered_files_cache.remove(path);
+        // Also invalidate the parent directory as the list of files has changed
+        if let Some(parent) = path.parent() {
+            self.discovered_files_cache.remove(&parent.to_path_buf());
+        }
     }
 
     pub fn get_history(&self, output_name: Option<String>) -> Vec<String> {

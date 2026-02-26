@@ -14,6 +14,9 @@ const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("play
 const BLACKLIST_TABLE: TableDefinition<&[u8], bool> = TableDefinition::new("blacklist");
 const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("history");
 const POOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_cache");
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+const CACHE_VERSION: u64 = 3;
 
 /// Filesystem events that affect the active file pool
 #[derive(Debug, Clone)]
@@ -46,7 +49,31 @@ impl FileCache {
         std::fs::create_dir_all(&cache_dir)?;
 
         let db_path = cache_dir.join("cache.redb");
-        let db = Database::create(&db_path)?;
+        let mut db = Database::create(&db_path)?;
+
+        // Check version
+        let mut needs_wipe = false;
+        {
+            let read_txn = db.begin_read()?;
+            if let Ok(table) = read_txn.open_table(META_TABLE) {
+                if let Some(v) = table.get("version")? {
+                    if v.value() != CACHE_VERSION {
+                        needs_wipe = true;
+                    }
+                } else {
+                    needs_wipe = true;
+                }
+            } else {
+                needs_wipe = true;
+            }
+        }
+
+        if needs_wipe {
+            tracing::info!("[CACHE] Cache version mismatch or missing, wiping database...");
+            drop(db);
+            let _ = std::fs::remove_file(&db_path);
+            db = Database::create(&db_path)?;
+        }
 
         // Initialize tables
         let write_txn = db.begin_write()?;
@@ -57,6 +84,8 @@ impl FileCache {
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
             let _ = write_txn.open_table(HISTORY_TABLE)?;
             let _ = write_txn.open_table(POOL_TABLE)?;
+            let mut meta = write_txn.open_table(META_TABLE)?;
+            meta.insert("version", CACHE_VERSION)?;
         }
         write_txn.commit()?;
 
@@ -409,44 +438,55 @@ impl DirectoryWatcher {
     pub async fn process_events(&mut self) -> Vec<PoolEvent> {
         let mut pool_events = Vec::new();
 
-        while let Ok(Ok(event)) = self.event_rx.try_recv() {
-            match event.kind {
-                EventKind::Create(_) => {
-                    for path in event.paths {
-                        if path.is_file() {
-                            tracing::debug!("[CACHE] File created: {}", path.display());
-                            pool_events.push(PoolEvent::Added(path));
-                        }
-                    }
-                }
-                EventKind::Modify(_) => {
-                    for path in event.paths {
-                        if path.is_file() {
-                            if let Err(e) = self.cache.invalidate_file(&path) {
-                                tracing::warn!(
-                                    "[CACHE] Failed to invalidate cache for {}: {}",
-                                    path.display(),
-                                    e
-                                );
+        loop {
+            match self.event_rx.try_recv() {
+                Ok(Ok(event)) => {
+                    match event.kind {
+                        EventKind::Create(_) => {
+                            for path in event.paths {
+                                if path.is_file() {
+                                    tracing::debug!("[CACHE] File created: {}", path.display());
+                                    pool_events.push(PoolEvent::Added(path));
+                                }
                             }
-                            pool_events.push(PoolEvent::Modified(path));
                         }
+                        EventKind::Modify(_) => {
+                            for path in event.paths {
+                                if path.is_file() {
+                                    if let Err(e) = self.cache.invalidate_file(&path) {
+                                        tracing::warn!(
+                                            "[CACHE] Failed to invalidate cache for {}: {}",
+                                            path.display(),
+                                            e
+                                        );
+                                    }
+                                    pool_events.push(PoolEvent::Modified(path));
+                                }
+                            }
+                        }
+                        EventKind::Remove(_) => {
+                            for path in event.paths {
+                                // Can't use is_file() here — the file is already deleted.
+                                // Emit only if it looks like a file (has extension).
+                                if path.extension().is_some() {
+                                    if let Err(e) = self.cache.invalidate_file(&path) {
+                                        tracing::debug!(
+                                            "[CACHE] Invalidation for removed path {}: {}",
+                                            path.display(),
+                                            e
+                                        );
+                                    }
+                                    pool_events.push(PoolEvent::Removed(path));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                EventKind::Remove(_) => {
-                    for path in event.paths {
-                        // Can't use is_file() here — the file is already deleted
-                        if let Err(e) = self.cache.invalidate_file(&path) {
-                            tracing::debug!(
-                                "[CACHE] Invalidation for removed path {}: {}",
-                                path.display(),
-                                e
-                            );
-                        }
-                        pool_events.push(PoolEvent::Removed(path));
-                    }
+                Ok(Err(e)) => {
+                    tracing::error!("[CACHE] Watcher error: {}", e);
                 }
-                _ => {}
+                Err(_) => break, // Empty or disconnected
             }
         }
 

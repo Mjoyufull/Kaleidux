@@ -667,6 +667,24 @@ impl PerformanceMetrics {
             renderer_avg, video_avg, file_disc_avg, shader_avg
         );
 
+        let hits = self.texture_pool_hits.load(Ordering::Relaxed);
+        let misses = self.texture_pool_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        let texture_hit_rate = if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        };
+
+        let c_hits = self.cache_hits.load(Ordering::Relaxed);
+        let c_misses = self.cache_misses.load(Ordering::Relaxed);
+        let c_total = c_hits + c_misses;
+        let cache_hit_rate = if c_total == 0 {
+            0.0
+        } else {
+            c_hits as f64 / c_total as f64
+        };
+
         tracing::info!(
             "[METRICS] Uptime: {} | Memory: {} | GPU: {} | Errors: {} | Frame time: avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms | Texture pool: hit_rate={:.1}% ({}/{}) | Cache: hit_rate={:.1}% ({}/{}) | Transitions: {} | Component CPU: {}{}",
             uptime_str,
@@ -677,13 +695,12 @@ impl PerformanceMetrics {
             self.get_p50_frame_time_ms(),
             self.get_p95_frame_time_ms(),
             self.get_p99_frame_time_ms(),
-            self.get_texture_pool_hit_rate() * 100.0,
-            self.texture_pool_hits.load(Ordering::Relaxed),
-            self.texture_pool_hits.load(Ordering::Relaxed)
-                + self.texture_pool_misses.load(Ordering::Relaxed),
-            self.get_cache_hit_rate() * 100.0,
-            self.cache_hits.load(Ordering::Relaxed),
-            self.cache_hits.load(Ordering::Relaxed) + self.cache_misses.load(Ordering::Relaxed),
+            texture_hit_rate * 100.0,
+            hits,
+            total,
+            cache_hit_rate * 100.0,
+            c_hits,
+            c_total,
             self.transition_count.load(Ordering::Relaxed),
             component_cpu,
             leak_msg

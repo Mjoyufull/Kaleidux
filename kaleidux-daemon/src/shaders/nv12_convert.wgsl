@@ -22,11 +22,8 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 @group(0) @binding(1) var t_uv: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
-fn srgb_to_linear(c: f32) -> f32 {
-    if (c <= 0.04045) {
-        return c / 12.92;
-    }
-    return pow((c + 0.055) / 1.055, 2.4);
+fn bt1886_eotf(c: f32) -> f32 {
+    return pow(max(c, 0.0), 2.4);
 }
 
 @fragment
@@ -46,7 +43,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let g = clamp(y - 0.1873 * u - 0.4681 * v, 0.0, 1.0);
     let b = clamp(y + 1.8556 * u, 0.0, 1.0);
 
-    // BT.709 produces gamma-encoded RGB; linearize so the sRGB render
-    // target's automatic OETF yields correct perceptual output.
-    return vec4<f32>(srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0);
+    // BT.1886 defines the EOTF (monitor behavior) as a power law with gamma 2.4.
+    // We linearize here so the sRGB render target's automatic OETF yields correct output.
+    return vec4<f32>(bt1886_eotf(r), bt1886_eotf(g), bt1886_eotf(b), 1.0);
 }

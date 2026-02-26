@@ -3,7 +3,7 @@ use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
@@ -78,7 +78,7 @@ pub fn configure_hw_decoders() {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum VideoFrameFormat {
     Rgba,
     Nv12 {
@@ -87,11 +87,12 @@ pub enum VideoFrameFormat {
         uv_stride: u32,
     },
     /// DMA-BUF zero-copy: file descriptors for each plane, no CPU-side data.
+    /// File descriptors are owned and will be closed when dropped.
     DmaBufNv12 {
-        y_fd: RawFd,
+        y_fd: OwnedFd,
         y_stride: u32,
         y_offset: u32,
-        uv_fd: RawFd,
+        uv_fd: OwnedFd,
         uv_stride: u32,
         uv_offset: u32,
     },
@@ -101,6 +102,47 @@ pub enum VideoFrameFormat {
         uv_offset: u32,
         uv_stride: u32,
     },
+}
+
+impl Clone for VideoFrameFormat {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Rgba => Self::Rgba,
+            Self::Nv12 {
+                y_stride,
+                uv_offset,
+                uv_stride,
+            } => Self::Nv12 {
+                y_stride: *y_stride,
+                uv_offset: *uv_offset,
+                uv_stride: *uv_stride,
+            },
+            Self::CudaNv12 {
+                y_stride,
+                uv_offset,
+                uv_stride,
+            } => Self::CudaNv12 {
+                y_stride: *y_stride,
+                uv_offset: *uv_offset,
+                uv_stride: *uv_stride,
+            },
+            Self::DmaBufNv12 {
+                y_fd,
+                y_stride,
+                y_offset,
+                uv_fd,
+                uv_stride,
+                uv_offset,
+            } => Self::DmaBufNv12 {
+                y_fd: y_fd.try_clone().expect("Failed to clone y_fd"),
+                y_stride: *y_stride,
+                y_offset: *y_offset,
+                uv_fd: uv_fd.try_clone().expect("Failed to clone uv_fd"),
+                uv_stride: *uv_stride,
+                uv_offset: *uv_offset,
+            },
+        }
+    }
 }
 
 /// Video frame carrying pixel data in either RGBA or NV12 format.
@@ -159,6 +201,19 @@ fn extract_dmabuf_nv12(
     strides: [i32; 4],
     offsets: [usize; 4],
 ) -> VideoFrameFormat {
+    // Validate strides before casting to u32 (silently wraps if negative)
+    if strides[0] < 0 || strides[1] < 0 {
+        tracing::warn!(
+            "[VIDEO] Negative strides detected ({}, {}), falling back to CPU path",
+            strides[0],
+            strides[1]
+        );
+        return VideoFrameFormat::Nv12 {
+            y_stride: strides[0].max(0) as u32,
+            uv_offset: offsets[1] as u32,
+            uv_stride: strides[1].max(0) as u32,
+        };
+    }
     if buffer.n_memory() >= 2 {
         // Separate DMA-BUFs per plane
         let y_mem = buffer.peek_memory(0);
@@ -168,8 +223,8 @@ fn extract_dmabuf_nv12(
             y_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
             uv_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
         ) {
-            let y_fd = y_dmabuf.fd();
-            let uv_fd = uv_dmabuf.fd();
+            let y_fd = unsafe { OwnedFd::from_raw_fd(y_dmabuf.fd()) };
+            let uv_fd = unsafe { OwnedFd::from_raw_fd(uv_dmabuf.fd()) };
             return VideoFrameFormat::DmaBufNv12 {
                 y_fd,
                 y_stride: strides[0] as u32,
@@ -183,12 +238,15 @@ fn extract_dmabuf_nv12(
         // Single DMA-BUF with both planes at different offsets
         let mem = buffer.peek_memory(0);
         if let Some(dmabuf) = mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>() {
-            let fd = dmabuf.fd();
+            let fd = unsafe { OwnedFd::from_raw_fd(dmabuf.fd()) };
+            let fd_uv = fd
+                .try_clone()
+                .unwrap_or_else(|_| unsafe { OwnedFd::from_raw_fd(dmabuf.fd()) });
             return VideoFrameFormat::DmaBufNv12 {
                 y_fd: fd,
                 y_stride: strides[0] as u32,
                 y_offset: offsets[0] as u32,
-                uv_fd: fd,
+                uv_fd: fd_uv,
                 uv_stride: strides[1] as u32,
                 uv_offset: offsets[1] as u32,
             };
@@ -196,9 +254,13 @@ fn extract_dmabuf_nv12(
     }
 
     // Fallback: treat as regular NV12 (CPU-accessible)
-    tracing::warn!(
-        "[VIDEO] DMA-BUF memory detected but fd extraction failed, falling back to NV12 CPU path"
-    );
+    if buffer.n_memory() == 0 {
+        tracing::debug!("[VIDEO] No memory blocks on buffer, falling back to CPU path");
+    } else {
+        tracing::warn!(
+            "[VIDEO] DMA-BUF memory detected but fd extraction failed, falling back to NV12 CPU path"
+        );
+    }
     VideoFrameFormat::Nv12 {
         y_stride: strides[0] as u32,
         uv_offset: offsets[1] as u32,
@@ -301,6 +363,8 @@ impl VideoPlayer {
                     let mut caps = cuda_caps;
                     caps.merge(dmabuf_caps);
                     caps.merge(nv12_caps);
+                    // Add generic fallback
+                    caps.merge(gst::Caps::builder("video/x-raw").build());
                     caps
                 } else {
                     // AMD/Intel: DMA-BUF preferred (VA-API zero-copy), NV12 fallback
@@ -313,6 +377,8 @@ impl VideoPlayer {
                         .build();
                     let mut caps = dmabuf_caps;
                     caps.merge(nv12_caps);
+                    // Add generic fallback
+                    caps.merge(gst::Caps::builder("video/x-raw").build());
                     caps
                 }
             }
@@ -432,8 +498,8 @@ impl VideoPlayer {
                             }
                             gst_video::VideoFormat::Rgba => VideoFrameFormat::Rgba,
                             other => {
-                                tracing::warn!("[VIDEO] Unexpected format {:?}, treating as RGBA", other);
-                                VideoFrameFormat::Rgba
+                                tracing::error!("[VIDEO] Unsupported format {:?}, negotiation failed", other);
+                                return Err(gst::FlowError::NotNegotiated);
                             }
                         };
 

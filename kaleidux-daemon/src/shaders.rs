@@ -329,11 +329,13 @@ impl ShaderManager {
                 "bool direction = getFromParams(0) > 0.5; float l_threshold = getFromParams(1); bool above = false;"
             }
             Transition::Luma => {
-                // FALLBACK: Use fade for now, but ensure it's cached under "Luma".
+                // FALLBACK: Use fade for now, but ensure it's cached correctly.
                 // Luma crashes without secondary texture in current implementation.
-                let glsl = Self::get_builtin_glsl("fade").unwrap();
+                let name = transition.name();
+                let glsl = Self::get_builtin_glsl("fade")
+                    .ok_or_else(|| anyhow::anyhow!("Failed to find fallback shader 'fade'"))?;
                 let wgsl = Self::compile_glsl("fade", glsl, "")?;
-                WGSL_CACHE.lock().insert("Luma".to_string(), wgsl.clone());
+                WGSL_CACHE.lock().insert(name.to_lowercase(), wgsl.clone());
                 return Ok(wgsl);
             }
             Transition::Morph { .. } => "float strength = getFromParams(0);",

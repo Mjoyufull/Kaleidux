@@ -74,14 +74,20 @@ impl SmartQueue {
         );
 
         // Try loading cached pool from redb first (near-instant)
-        let mut ct_cache_init: Option<HashMap<PathBuf, ContentType>> = None;
+        let mut ct_cache_init: Option<HashMap<PathBuf, ContentType>>;
         let pool = match cache.get_cached_pool(path) {
             Ok(Some(cached_pool)) => {
                 // Validate cached pool: filter out files that no longer exist
-                let valid_pool: Vec<PathBuf> = cached_pool
-                    .into_iter()
-                    .filter(|p| p.exists() && !stats.blacklist.contains(p))
-                    .collect();
+                let valid_pool = {
+                    let cp = cached_pool.clone();
+                    let bl = stats.blacklist.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cp.into_iter()
+                            .filter(|p| p.exists() && !bl.contains(p))
+                            .collect::<Vec<PathBuf>>()
+                    })
+                    .await?
+                };
 
                 if !valid_pool.is_empty() {
                     tracing::info!(
@@ -95,20 +101,37 @@ impl SmartQueue {
                     let bg_blacklist = stats.blacklist.clone();
                     let bg_cache = cache.clone();
                     let bg_metrics = metrics.clone();
+                    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
                     tokio::task::spawn_blocking(move || {
                         match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics)
                         {
-                            Ok((fresh_pool, _ct_cache)) => {
-                                tracing::info!(
-                                    "[QUEUE] Background pool refresh complete: {} files",
-                                    fresh_pool.len()
-                                );
+                            Ok(res) => {
+                                let _ = tx.blocking_send(res);
                             }
                             Err(e) => {
                                 tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
                             }
                         }
                     });
+
+                    // We wrap the receiver so we can periodically check it or use it in an event loop
+                    // But for the initial creation, we can't easily block here if we want to stay async.
+                    // Instead, we'll let the monitor_manager handle the swap when it receives the update.
+                    // For now, let's at least populate the initial cache from disk to avoid the I/O bottleneck.
+
+                    let mut init_map = HashMap::new();
+                    for path in &valid_pool {
+                        if let Ok(Some(meta)) = cache.get_file_metadata(path) {
+                            let ct = if meta.content_type == 0 {
+                                ContentType::Image
+                            } else {
+                                ContentType::Video
+                            };
+                            init_map.insert(path.clone(), ct);
+                        }
+                    }
+                    ct_cache_init = Some(init_map);
 
                     valid_pool
                 } else {
@@ -483,6 +506,10 @@ impl SmartQueue {
                         self.pool.retain(|p| p != &path);
                         self.content_type_cache.remove(&path);
                         removed += 1;
+
+                        // Clamp index to avoid panics if we removed the last item
+                        self.current_index =
+                            self.current_index.min(self.pool.len().saturating_sub(1));
                     }
                 }
             }

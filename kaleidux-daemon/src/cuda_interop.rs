@@ -1,3 +1,6 @@
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("CUDA interop is only supported on 64-bit targets.");
+
 use std::os::unix::io::RawFd;
 use tracing::{error, info};
 
@@ -69,6 +72,9 @@ struct CudaMemcpy2D {
     width_in_bytes: usize,
     height: usize,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<CudaMemcpy2D>() == 128);
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -17,7 +17,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler},
 };
 use std::ptr::NonNull;
-use tracing::info;
+use tracing::{error, info, warn};
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::GlobalList,
@@ -155,7 +155,9 @@ impl WaylandBackend {
         layer_surface.commit();
 
         // Keep track of them
-        self.surfaces.insert(name, layer_surface.clone());
+        if let Some(_prev) = self.surfaces.insert(name.clone(), layer_surface.clone()) {
+            warn!("[WAYLAND] Replacing existing LayerSurface for {}", name);
+        }
 
         Ok(layer_surface)
     }
