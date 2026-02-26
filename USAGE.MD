@@ -106,16 +106,19 @@ transition = { type = "cube", persp = 0.7, unzoom = 0.3, reflection = 0.4, float
 - `smoothness`: How "hard" the transition edge is.
 - `direction`: For wipe/directional effects (e.g. `[1.0, 0.0]`).
 
-## Video decode mode
+## Video Decode Mode
 
 The daemon supports several video frame paths. Use `--video-mode <MODE>` to force a mode, or omit it for automatic selection.
 
-| Mode     | Description |
-| -------- | ----------- |
-| `auto`   | **(Default)** On NVIDIA: try CUDA memory (zero CPU copy), then DMA-BUF, then NV12. On AMD/Intel: try DMA-BUF (true zero-copy when supported), then NV12. |
-| `cuda`   | Force NVIDIA CUDA memory + CUDA–Vulkan interop. Requires nvcodec decoders (e.g. nvh264dec). Fails if not available. |
-| `dmabuf` | Force DMA-BUF. Use on AMD/Intel when the decoder exports DMA-BUF. Fails if not available. |
-| `nv12`   | Request NV12 from the decoder; frames are uploaded to the GPU via CPU (no zero-copy). |
-| `rgba`   | Legacy: decoder outputs RGBA; frames are uploaded via CPU. |
+| Mode     | Description                                                                                                                             |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto`   | **(Default)** Automatically picks the fastest available mode (e.g., `dmabuf` for Intel/AMD/NVIDIA). Replaces the old `zero-copy` alias. |
+| `cuda`   | Force NVIDIA CUDA memory + CUDA--Vulkan interop (true zero-copy). Requires NVIDIA drivers 535+.                                         |
+| `dmabuf` | Force DMA-BUF zero-copy path. Supported on Intel, AMD, and NVIDIA (requires NVIDIA 550+).                                               |
+| `nv12`   | Request NV12 from the decoder; frames are uploaded to the GPU via CPU (no zero-copy).                                                   |
+| `rgba`   | Legacy: decoder outputs RGBA; frames are uploaded via CPU (slowest).                                                                    |
 
-For lowest CPU use during video: on NVIDIA run `kaleidux-daemon --video-mode cuda`; on AMD/Intel, `auto` or `--video-mode dmabuf` when your driver supports DMA-BUF export.
+The zero-copy alias is no longer accepted; using --video-mode zero-copy will error. Users should switch to --video-mode auto for the best available zero-copy path.
+
+`kaleidux-daemon` (the daemon binary, typically started as a background service)
+provides the core engine, while `kldctl` is the command-line interface for controlling it.
