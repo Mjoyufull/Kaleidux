@@ -1420,8 +1420,7 @@ impl Renderer {
                 .queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-            // Always update bind group to ensure it matches current texture views
-            // (Optimization removed to guarantee correctness if views change)
+            // Recreate bind group only if invalidated (set to None when textures change)
             self.update_transition_bind_group();
 
             if let Some(bind_group) = &self.transition_bind_group {
@@ -1867,8 +1866,13 @@ impl Renderer {
         drop(self.current_texture.take());
         drop(self.current_texture_view.take());
 
-        // Calculate mip levels
-        let mip_level_count = ((width.max(height) as f32).log2().floor() as u32) + 1;
+        // Cap mip levels to output resolution — levels below the output's pixel size are never sampled
+        let max_useful = ((self.config.width.max(self.config.height) as f32)
+            .log2()
+            .floor() as u32)
+            + 1;
+        let mip_level_count =
+            (((width.max(height) as f32).log2().floor() as u32) + 1).min(max_useful);
 
         // Use Rgba8UnormSrgb for proper color space
         // Use texture pool for image textures (but note: images need mipmaps, so we can't fully pool them)

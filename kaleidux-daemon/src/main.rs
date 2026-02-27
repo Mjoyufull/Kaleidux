@@ -126,6 +126,9 @@ fn switch_wallpaper_content(
         r.switch_content();
 
         if content_type == crate::queue::ContentType::Image {
+            let target_width = r.config.width.clone();
+            let target_height = r.config.height.clone();
+
             let name_clone = name.to_string();
             let path_clone = path.to_path_buf();
             let tx = image_tx.clone();
@@ -154,8 +157,41 @@ fn switch_wallpaper_content(
                     tokio::task::spawn_blocking(move || match image::open(&path_clone) {
                         Ok(img) => {
                             let rgba = img.to_rgba8();
-                            let (width, height) = rgba.dimensions();
-                            let image_data = rgba.into_raw();
+                            let (orig_w, orig_h) = rgba.dimensions();
+
+                            let (image_data, width, height) = if orig_w > target_width
+                                || orig_h > target_height
+                            {
+                                let scale = (target_width as f32 / orig_w as f32)
+                                    .max(target_height as f32 / orig_h as f32);
+                                let new_w = ((orig_w as f32 * scale).round() as u32).max(1);
+                                let new_h = ((orig_h as f32 * scale).round() as u32).max(1);
+
+                                use fast_image_resize as fr;
+                                let src = fr::images::Image::from_vec_u8(
+                                    orig_w,
+                                    orig_h,
+                                    rgba.into_raw(),
+                                    fr::PixelType::U8x4,
+                                )
+                                .unwrap();
+                                let mut dst =
+                                    fr::images::Image::new(new_w, new_h, fr::PixelType::U8x4);
+                                let mut resizer = fr::Resizer::new();
+                                resizer
+                                    .resize(
+                                        &src,
+                                        &mut dst,
+                                        &fr::ResizeOptions::new().resize_alg(
+                                            fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
+                                        ),
+                                    )
+                                    .unwrap();
+                                (dst.into_vec(), new_w, new_h)
+                            } else {
+                                (rgba.into_raw(), orig_w, orig_h)
+                            };
+
                             Ok((name_clone.clone(), image_data, width, height, path_clone))
                         }
                         Err(e) => {
@@ -378,6 +414,11 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         }
     };
+
+    // Load compiled WGSL shader strings from disk (P-15 cache layer 1)
+    if let Err(e) = crate::shaders::ShaderManager::load_cache() {
+        tracing::debug!("[SHADER] Could not load WGSL cache: {}", e);
+    }
 
     // 1b. Set video decode mode from CLI flag
     if let Some(ref mode_str) = args.video_mode {
@@ -906,6 +947,12 @@ async fn run_wayland_loop(
     }
 
     // Main Loop (Wayland)
+    let wayland_fd = {
+        use std::os::unix::io::{AsFd, AsRawFd};
+        tokio::io::unix::AsyncFd::new(conn.as_fd().as_raw_fd())
+            .expect("Failed to create AsyncFd for Wayland connection")
+    };
+
     loop {
         let loop_start = Instant::now();
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -925,6 +972,33 @@ async fn run_wayland_loop(
             }
         }
 
+        let any_active = renderers.values().any(|r| {
+            r.transition_active
+                || r.needs_redraw
+                || r.valid_content_type == crate::queue::ContentType::Video
+        });
+
+        let mut cmd_buf = None;
+        let mut frame_buf = None;
+        let mut image_buf = None;
+        let mut player_buf = None;
+
+        if !any_active && !connection_dead {
+            // Idle — block until any event source is ready
+            tokio::select! {
+                cmd = cmd_rx.recv() => { if let Some(c) = cmd { cmd_buf = Some(c); } }
+                frame = frame_rx.recv() => { if let Some(f) = frame { frame_buf = Some(f); } }
+                image = image_rx.recv() => { if let Some(i) = image { image_buf = Some(i); } }
+                player = player_rx.recv() => { if let Some(p) = player { player_buf = Some(p); } }
+                result = wayland_fd.readable() => {
+                    if let Ok(mut guard) = result {
+                        guard.clear_ready();
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+        }
+
         // Wayland Event Polling
         if let Some(guard) = conn.prepare_read() {
             use std::os::unix::io::{AsFd, AsRawFd};
@@ -934,7 +1008,7 @@ async fn run_wayland_loop(
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let ret = unsafe { libc::poll(&mut poll_fd, 1, 5) };
+            let ret = unsafe { libc::poll(&mut poll_fd, 1, 0) }; // 0 timeout, we don't block tokio thread here anymore
             if ret > 0 && (poll_fd.revents & libc::POLLIN != 0) {
                 let _ = guard.read();
             }
@@ -1036,6 +1110,22 @@ async fn run_wayland_loop(
         }
 
         // Handle Commands
+        if let Some((req, resp)) = cmd_buf.take() {
+            let response = handle_command(
+                req,
+                &mut monitor_manager,
+                &mut renderers,
+                &mut video_players,
+                &frame_tx,
+                &image_tx,
+                &player_tx,
+                &mut next_session_id,
+                loop_start,
+                &shutdown_flag,
+            )
+            .await;
+            let _ = resp.send(response);
+        }
         while let Ok((req, resp)) = cmd_rx.try_recv() {
             let response = handle_command(
                 req,
@@ -1060,6 +1150,20 @@ async fn run_wayland_loop(
         let mut latest_frames: HashMap<Arc<String>, video::VideoFrame> = HashMap::new();
         let mut frames_received = 0;
         let mut frames_discarded = 0;
+        if let Some((source_id, event)) = frame_buf.take() {
+            frames_received += 1;
+            match event {
+                video::VideoEvent::Frame(frame) => {
+                    if latest_frames.insert(source_id.clone(), frame).is_some() {
+                        frames_discarded += 1;
+                    }
+                }
+                video::VideoEvent::Error(msg) => {
+                    tracing::error!("Video error {}: {}", source_id, msg);
+                    metrics.record_error("video_decode");
+                }
+            }
+        }
         while let Ok((source_id, event)) = frame_rx.try_recv() {
             frames_received += 1;
             match event {
@@ -1142,7 +1246,10 @@ async fn run_wayland_loop(
 
         // Handle Images
         let mut images_received = 0;
-        while let Ok(msg) = image_rx.try_recv() {
+        let image_iter = std::iter::once(image_buf.take())
+            .flatten()
+            .chain(std::iter::from_fn(|| image_rx.try_recv().ok()));
+        for msg in image_iter {
             images_received += 1;
             debug!(
                 "[IMAGE] Received image for {}: data={}, size={}x{}",
@@ -1193,7 +1300,10 @@ async fn run_wayland_loop(
         }
 
         // Async Video Players
-        while let Ok(res) = player_rx.try_recv() {
+        let player_iter = std::iter::once(player_buf.take())
+            .flatten()
+            .chain(std::iter::from_fn(|| player_rx.try_recv().ok()));
+        for res in player_iter {
             match res {
                 VideoPlayerResult::Success(name, session_id, mut player) => {
                     if renderers.get(&name).map(|r| r.active_video_session_id) == Some(session_id) {
@@ -1299,14 +1409,19 @@ async fn run_wayland_loop(
             last_metrics_log = Instant::now();
         }
 
-        // Timing
+        // Timing: only sleep at vsync rate when actively rendering
         let elapsed = loop_start.elapsed();
-        if elapsed < target_frame_time {
+        if any_active && elapsed < target_frame_time {
             tokio::time::sleep(target_frame_time - elapsed).await;
         }
         if let Some(ctx) = &wgpu_ctx {
             ctx.device.poll(wgpu::Maintain::Poll);
         }
+    }
+
+    // Persist WGSL cache to disk on shutdown (P-15 cache layer 1)
+    if let Err(e) = crate::shaders::ShaderManager::save_cache() {
+        tracing::warn!("[SHADER] Failed to save WGSL cache: {}", e);
     }
 
     Ok(())
@@ -1570,10 +1685,43 @@ async fn run_x11_loop(
     });
 
     // X11 Loop
+    let x11_fd = {
+        use std::os::unix::io::AsRawFd;
+        tokio::io::unix::AsyncFd::new(backend.conn.as_raw_fd())
+            .expect("Failed to create AsyncFd for X11 connection")
+    };
+
     loop {
         let loop_start = Instant::now();
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
+        }
+
+        let any_active = renderers.values().any(|r| {
+            r.transition_active
+                || r.needs_redraw
+                || r.valid_content_type == crate::queue::ContentType::Video
+        });
+
+        let mut cmd_buf = None;
+        let mut frame_buf = None;
+        let mut image_buf = None;
+        let mut player_buf = None;
+
+        if !any_active {
+            // Idle — block until any event source is ready
+            tokio::select! {
+                cmd = cmd_rx.recv() => { if let Some(c) = cmd { cmd_buf = Some(c); } }
+                frame = frame_rx.recv() => { if let Some(f) = frame { frame_buf = Some(f); } }
+                image = image_rx.recv() => { if let Some(i) = image { image_buf = Some(i); } }
+                player = player_rx.recv() => { if let Some(p) = player { player_buf = Some(p); } }
+                result = x11_fd.readable() => {
+                    if let Ok(mut guard) = result {
+                        guard.clear_ready();
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
 
         // Poll X11 events (non-blocking)
@@ -1637,7 +1785,10 @@ async fn run_x11_loop(
         }
 
         // Commands
-        while let Ok((req, resp)) = cmd_rx.try_recv() {
+        let cmd_iter = std::iter::once(cmd_buf.take())
+            .flatten()
+            .chain(std::iter::from_fn(|| cmd_rx.try_recv().ok()));
+        for (req, resp) in cmd_iter {
             let response = handle_command(
                 req,
                 &mut monitor_manager,
@@ -1660,7 +1811,10 @@ async fn run_x11_loop(
             let mut frames = HashMap::new();
             let mut count = 0;
             let mut discarded = 0;
-            while let Ok((src, evt)) = frame_rx.try_recv() {
+            let frame_iter = std::iter::once(frame_buf.take())
+                .flatten()
+                .chain(std::iter::from_fn(|| frame_rx.try_recv().ok()));
+            for (src, evt) in frame_iter {
                 count += 1;
                 if let video::VideoEvent::Frame(f) = evt {
                     // If we already have a frame for this source, drop the old one
@@ -1726,7 +1880,10 @@ async fn run_x11_loop(
             }
         }
         let mut images_received_x11 = 0;
-        while let Ok(msg) = image_rx.try_recv() {
+        let img_iter = std::iter::once(image_buf.take())
+            .flatten()
+            .chain(std::iter::from_fn(|| image_rx.try_recv().ok()));
+        for msg in img_iter {
             images_received_x11 += 1;
             if let Some(r) = renderers.get_mut(&msg.name) {
                 if let Some(data) = msg.data {
@@ -1753,7 +1910,10 @@ async fn run_x11_loop(
         if images_received_x11 > 0 {
             metrics.record_image_channel_size(images_received_x11);
         }
-        while let Ok(msg) = player_rx.try_recv() {
+        let plr_iter = std::iter::once(player_buf.take())
+            .flatten()
+            .chain(std::iter::from_fn(|| player_rx.try_recv().ok()));
+        for msg in plr_iter {
             match msg {
                 VideoPlayerResult::Success(name, session_id, mut p) => {
                     if renderers.get(&name).map(|r| r.active_video_session_id) == Some(session_id) {
@@ -1845,13 +2005,19 @@ async fn run_x11_loop(
             last_metrics_log = Instant::now();
         }
 
+        // Timing: only sleep at vsync rate when actively rendering
         let elapsed = loop_start.elapsed();
-        if elapsed < target_frame_time {
+        if any_active && elapsed < target_frame_time {
             tokio::time::sleep(target_frame_time - elapsed).await;
         }
         if let Some(ctx) = &wgpu_ctx {
             ctx.device.poll(wgpu::Maintain::Poll);
         }
+    }
+
+    // Persist WGSL cache to disk on shutdown (P-15 cache layer 1)
+    if let Err(e) = crate::shaders::ShaderManager::save_cache() {
+        tracing::warn!("[SHADER] Failed to save WGSL cache: {}", e);
     }
 
     Ok(())

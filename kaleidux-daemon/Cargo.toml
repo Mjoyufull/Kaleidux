@@ -52,3 +52,6 @@ sysinfo = { version = "0.38", features = ["component"] }
 parking_lot = "0.12"
 futures = "0.3"
 notify = { workspace = true }
+nvml-wrapper = "0.10"
+lru = "0.14"
+fast_image_resize = { version = "5", features = ["image"] }

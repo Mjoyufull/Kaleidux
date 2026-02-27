@@ -96,8 +96,7 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_CACHE_TABLE)?;
 
-        let path_str = path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
+        let path_bytes = path.as_os_str().as_encoded_bytes();
         match table.get(path_bytes)? {
             Some(data) => {
                 let metadata: FileMetadata = postcard::from_bytes(data.value())?;
@@ -111,8 +110,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
-            let path_str = path.to_string_lossy();
-            let path_bytes = path_str.as_bytes();
+            let path_bytes = path.as_os_str().as_encoded_bytes();
             let data = postcard::to_allocvec(metadata)?;
             table.insert(path_bytes, data.as_slice())?;
         }
@@ -129,8 +127,7 @@ impl FileCache {
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
             for (path, metadata) in updates {
-                let path_str = path.to_string_lossy();
-                let path_bytes = path_str.as_bytes();
+                let path_bytes = path.as_os_str().as_encoded_bytes();
                 let data = postcard::to_allocvec(metadata)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
@@ -186,8 +183,7 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
 
-        let path_str = path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
+        let path_bytes = path.as_os_str().as_encoded_bytes();
         match table.get(path_bytes)? {
             Some(data) => {
                 let stats: crate::queue::FileStats = postcard::from_bytes(data.value())?;
@@ -202,8 +198,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
-            let path_str = path.to_string_lossy();
-            let path_bytes = path_str.as_bytes();
+            let path_bytes = path.as_os_str().as_encoded_bytes();
             let data = postcard::to_allocvec(stats)?;
             table.insert(path_bytes, data.as_slice())?;
         }
@@ -219,8 +214,7 @@ impl FileCache {
         {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
             for (path, stats) in updates {
-                let path_str = path.to_string_lossy();
-                let path_bytes = path_str.as_bytes();
+                let path_bytes = path.as_os_str().as_encoded_bytes();
                 let data = postcard::to_allocvec(stats)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
@@ -304,8 +298,7 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(BLACKLIST_TABLE)?;
 
-        let path_str = path.to_string_lossy();
-        let path_bytes = path_str.as_bytes();
+        let path_bytes = path.as_os_str().as_encoded_bytes();
         Ok(table.get(path_bytes)?.is_some())
     }
 
@@ -313,8 +306,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(BLACKLIST_TABLE)?;
-            let path_str = path.to_string_lossy();
-            let path_bytes = path_str.as_bytes();
+            let path_bytes = path.as_os_str().as_encoded_bytes();
             if blacklisted {
                 table.insert(path_bytes, true)?;
             } else {
@@ -391,8 +383,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
-            let path_str = path.to_string_lossy();
-            let path_bytes = path_str.as_bytes();
+            let path_bytes = path.as_os_str().as_encoded_bytes();
             table.remove(path_bytes)?;
         }
         write_txn.commit()?;

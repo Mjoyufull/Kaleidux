@@ -5,16 +5,18 @@ use jwalk::WalkDir;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Stats capacity for LRU eviction — entries beyond this are auto-evicted
+const STATS_LRU_CAP: usize = 5000;
+
+#[derive(Debug)]
 pub struct LoveitData {
-    pub files: HashMap<PathBuf, FileStats>,
-    #[serde(default)]
+    pub files: lru::LruCache<PathBuf, FileStats>,
     pub playlists: HashMap<String, Playlist>,
-    #[serde(default)]
     pub blacklist: std::collections::HashSet<PathBuf>,
 }
 
@@ -694,7 +696,7 @@ impl SmartQueue {
         let now = Utc::now();
 
         for path in &active_pool {
-            let stat = self.stats.files.get(*path).cloned().unwrap_or_default();
+            let stat = self.stats.files.peek(*path).cloned().unwrap_or_default();
 
             // Score = LoveMultiplier / (1 + Count) * RecencyFactor
             let count_score = 100.0 / (stat.count as f32 + 1.0);
@@ -732,12 +734,11 @@ impl SmartQueue {
 
     fn update_stats(&mut self, path: &Path) {
         let now = Utc::now();
-        // Update the stat in memory
+        // get_or_insert_mut promotes existing entries and auto-evicts oldest when at capacity
         let stat = self
             .stats
             .files
-            .entry(path.to_path_buf())
-            .or_insert_with(|| FileStats {
+            .get_or_insert_mut(path.to_path_buf(), || FileStats {
                 count: 0,
                 last_seen: None,
                 love_multiplier: 1.0,
@@ -748,20 +749,7 @@ impl SmartQueue {
         // Add to pending updates for batched write
         self.pending_stats_updates
             .insert(path.to_path_buf(), stat.clone());
-
-        // Limit stats growth (LRU-ish removal)
-        if self.stats.files.len() > 5000 {
-            let oldest = self
-                .stats
-                .files
-                .iter()
-                .min_by_key(|(_, s)| s.last_seen.map(|d| d.timestamp()).unwrap_or(0))
-                .map(|(p, _)| p.clone());
-            if let Some(p) = oldest {
-                self.stats.files.remove(&p);
-                self.pending_stats_updates.remove(&p);
-            }
-        }
+        // No manual eviction needed — LruCache handles it automatically
     }
 
     /// Flush pending stats updates to cache in a batch
@@ -778,9 +766,16 @@ impl SmartQueue {
 
     fn load_stats_from_cache(cache: &FileCache) -> Result<LoveitData> {
         // Load from redb cache
-        let files = cache.get_all_file_stats()?;
+        let files_map = cache.get_all_file_stats()?;
         let playlists = cache.get_all_playlists()?;
         let blacklist = cache.get_all_blacklisted()?;
+
+        // Build LruCache from loaded HashMap
+        let cap = NonZeroUsize::new(STATS_LRU_CAP).unwrap();
+        let mut files = lru::LruCache::new(cap);
+        for (path, stat) in files_map {
+            files.put(path, stat);
+        }
 
         Ok(LoveitData {
             files,
@@ -807,7 +802,10 @@ impl SmartQueue {
     }
 
     pub fn love_file(&mut self, path: PathBuf, multiplier: f32) -> Result<()> {
-        let stat = self.stats.files.entry(path).or_default();
+        let stat = self
+            .stats
+            .files
+            .get_or_insert_mut(path, || FileStats::default());
         stat.love_multiplier = multiplier;
         self.save_stats()
     }

@@ -60,7 +60,42 @@ static WGSL_CACHE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<String, String>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+use anyhow::Context;
+
 impl ShaderManager {
+    pub fn save_cache() -> anyhow::Result<()> {
+        let cache_dir = dirs::cache_dir().context("no cache dir")?.join("kaleidux");
+        std::fs::create_dir_all(&cache_dir)?;
+        let cache = WGSL_CACHE.lock();
+        let data = postcard::to_allocvec(&*cache)?;
+        // Atomic write: write to temp, then rename
+        let tmp = cache_dir.join("wgsl_cache.bin.tmp");
+        let dst = cache_dir.join("wgsl_cache.bin");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    }
+
+    pub fn load_cache() -> anyhow::Result<()> {
+        let path = dirs::cache_dir()
+            .context("no cache dir")?
+            .join("kaleidux")
+            .join("wgsl_cache.bin");
+        if path.exists() {
+            let data = std::fs::read(&path)?;
+            let loaded: std::collections::HashMap<String, String> = postcard::from_bytes(&data)?;
+            let mut cache = WGSL_CACHE.lock();
+            for (k, v) in loaded {
+                cache.entry(k).or_insert(v);
+            }
+            tracing::info!(
+                "[SHADER] Loaded {} cached WGSL shaders from disk",
+                cache.len()
+            );
+        }
+        Ok(())
+    }
+
     pub fn compile_glsl(
         name: &str,
         user_code: &str,
