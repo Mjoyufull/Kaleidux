@@ -243,15 +243,49 @@ impl MonitorManager {
 
     #[allow(dead_code)]
     pub fn update_config(&mut self, config: Config) {
+        // Snapshot old paths before overwriting config
+        let old_paths: HashMap<String, Option<PathBuf>> = self
+            .outputs
+            .iter()
+            .map(|(n, o)| (n.clone(), o.config.path.clone()))
+            .collect();
+
         self.config = config;
 
         // Refresh all output configurations
         for (name, orch) in &mut self.outputs {
             // Re-match config for this output using its stored description
             let output_config = self.config.get_config_for_output(name, &orch.description);
-            orch.config = output_config;
 
-            // TODO: Full queue refresh if path changes.
+            // Refresh queue when the wallpaper directory path changed
+            if old_paths.get(name).map(|op| op.as_deref()) != Some(output_config.path.as_deref()) {
+                if let Some(path) = &output_config.path {
+                    match SmartQueue::new_from_pool(
+                        path,
+                        Vec::new(),
+                        output_config.video_ratio,
+                        output_config.sorting,
+                        self.cache.clone(),
+                    ) {
+                        Ok(q) => orch.queue = Some(q),
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONFIG] Failed to refresh queue for {}: {}",
+                                name,
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    orch.queue = None;
+                }
+                orch.current_path = None;
+                orch.display_start_time = None;
+                orch.next_change = None;
+                tracing::info!("[CONFIG] {}: Path changed, queue refreshed", name);
+            }
+
+            orch.config = output_config;
         }
     }
 
@@ -440,6 +474,57 @@ impl MonitorManager {
             }
             info!("[MONITOR_MANAGER] Wallpaper cycling resumed (timers reset)");
         }
+    }
+
+    /// Returns true if any output is about to switch within the given look-ahead duration.
+    /// Used to pre-wake the event loop and avoid cold start latency on transitions (S-02).
+    pub fn has_imminent_switch(&self, look_ahead: std::time::Duration) -> bool {
+        if self.paused {
+            return false;
+        }
+        let now = Instant::now();
+        let deadline = now + look_ahead;
+
+        match &self.config.global.monitor_behavior {
+            MonitorBehavior::Independent => {
+                for orch in self.outputs.values() {
+                    if let Some(display_start) = orch.display_start_time {
+                        let switch_at = display_start + orch.config.duration;
+                        if switch_at <= deadline {
+                            return true;
+                        }
+                    }
+                }
+            }
+            MonitorBehavior::Synchronized => {
+                if let Some(shared_start) = self.shared_display_start_time {
+                    if let Some(first_orch) = self.outputs.values().next() {
+                        let switch_at = shared_start + first_orch.config.duration;
+                        if switch_at <= deadline {
+                            return true;
+                        }
+                    }
+                }
+            }
+            MonitorBehavior::Grouped(_) => {
+                for (gid, start) in &self.group_display_start_times {
+                    if let Some(first_name) = self
+                        .output_groups
+                        .iter()
+                        .find(|(_, g)| g == &gid)
+                        .map(|(n, _)| n)
+                    {
+                        if let Some(orch) = self.outputs.get(first_name) {
+                            let switch_at = *start + orch.config.duration;
+                            if switch_at <= deadline {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {

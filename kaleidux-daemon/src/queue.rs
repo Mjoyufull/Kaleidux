@@ -269,8 +269,15 @@ impl SmartQueue {
         if buffer[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
             return Some(ContentType::Video);
         }
-        // MP4: ....ftyp
+        // ISO BMFF container: ....ftyp (shared by MP4/MOV video and AVIF/HEIF images)
         if &buffer[4..8] == b"ftyp" {
+            // AVIF images use brands: avif, avis, mif1
+            if &buffer[8..12] == b"avif"
+                || &buffer[8..12] == b"avis"
+                || &buffer[8..12] == b"mif1"
+            {
+                return Some(ContentType::Image);
+            }
             return Some(ContentType::Video);
         }
 

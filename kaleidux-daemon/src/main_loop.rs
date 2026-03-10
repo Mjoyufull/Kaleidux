@@ -256,6 +256,8 @@ impl MainLoopContext {
                 || r.needs_redraw
                 || r.valid_content_type == queue::ContentType::Video
         })
+        // Pre-wake the loop before imminent transitions to avoid cold wake-up latency (S-02)
+        || self.monitor_manager.has_imminent_switch(std::time::Duration::from_millis(500))
     }
 
     /// Idle-wait using `tokio::select!` until any event source fires.
@@ -504,10 +506,12 @@ impl MainLoopContext {
 
     /// Record frame time, clean up texture pool, flush stats, process dir watcher,
     /// log metrics summary. Called at the end of each loop iteration.
-    pub async fn housekeeping(&mut self, loop_start: Instant) {
-        // Record frame time
-        let frame_time = loop_start.elapsed();
-        self.metrics.record_frame_time(frame_time);
+    pub async fn housekeeping(&mut self, loop_start: Instant, was_idle: bool) {
+        // Skip recording frame time for iterations that entered idle_wait (P-26)
+        if !was_idle {
+            let frame_time = loop_start.elapsed();
+            self.metrics.record_frame_time(frame_time);
+        }
 
         // Cleanup texture pool periodically (every 3 seconds)
         if self.last_pool_cleanup.elapsed().as_secs() >= 3 {

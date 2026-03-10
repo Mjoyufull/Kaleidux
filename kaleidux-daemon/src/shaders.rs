@@ -204,8 +204,8 @@ impl ShaderManager {
                 Self::compile_glsl(shader, &glsl, &mapping)
             }
             Transition::Random => {
-                // TODO: Pick a random builtin
-                Self::get_builtin_shader(&Transition::Fade)
+                let picked = Transition::pick_random();
+                Self::get_builtin_shader(&picked)
             }
             _ => Self::get_builtin_shader(transition),
         }

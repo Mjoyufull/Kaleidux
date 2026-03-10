@@ -504,7 +504,7 @@ pub async fn run(
 
         // ─── Housekeeping ───────────────────────────────────────────────
 
-        ctx.housekeeping(loop_start).await;
+        ctx.housekeeping(loop_start, !any_active).await;
         ctx.timing_and_poll(any_active, loop_start).await;
     }
 
