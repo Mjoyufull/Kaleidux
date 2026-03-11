@@ -340,13 +340,13 @@ impl ShaderManager {
                 "float rotation = getFromParams(0); float scale = getFromParams(1);"
             }
             Transition::Edge { .. } => {
-                "float thickness = getFromParams(0); float brightness = getFromParams(1);"
+                "float edge_thickness = getFromParams(0); float edge_brightness = getFromParams(1);"
             }
             Transition::FadeColor { .. } => {
                 "vec3 color = vec3(getFromParams(0), getFromParams(1), getFromParams(2)); float colorPhase = getFromParams(3);"
             }
             Transition::FadeGrayscale { .. } => "float intensity = getFromParams(0);",
-            Transition::FilmBurn { .. } => "float seed = getFromParams(0);",
+            Transition::FilmBurn { .. } => "float Seed = getFromParams(0);",
             Transition::FlyEye { .. } => {
                 "float size = getFromParams(0); float zoom = getFromParams(1); float colorSeparation = getFromParams(2);"
             }
@@ -450,6 +450,10 @@ impl ShaderManager {
             Transition::ZoomLeftWipe { .. } | Transition::ZoomRightWipe { .. } => {
                 "float zoom_quickness = getFromParams(0);"
             }
+            Transition::Overexposure => "float strength = getFromParams(0);",
+            Transition::SquaresWire { .. } => {
+                "ivec2 squares = ivec2(int(getFromParams(0)), int(getFromParams(1))); vec2 direction = vec2(getFromParams(2), getFromParams(3)); float smoothness = getFromParams(4);"
+            }
             _ => "",
         };
 
@@ -462,7 +466,7 @@ impl ShaderManager {
 
     pub fn get_builtin_glsl(name: &str) -> Option<&'static str> {
         match name {
-            "Angular" => Some(include_str!("shaders/transitions/angular.glsl")),
+            "angular" => Some(include_str!("shaders/transitions/angular.glsl")),
             "BookFlip" => Some(include_str!("shaders/transitions/BookFlip.glsl")),
             "Bounce" => Some(include_str!("shaders/transitions/Bounce.glsl")),
             "BowTieHorizontal" => Some(include_str!("shaders/transitions/BowTieHorizontal.glsl")),

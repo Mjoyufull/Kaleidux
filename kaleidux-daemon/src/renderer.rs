@@ -122,8 +122,8 @@ pub struct WgpuContext {
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_pipeline: wgpu::RenderPipeline,
-    // Texture pool: (width, height) -> Vec of available textures
-    pub texture_pool: parking_lot::Mutex<HashMap<(u32, u32), Vec<TexturePoolEntry>>>,
+    // Texture pool: (width, height, mip_level_count) -> Vec of available textures
+    pub texture_pool: parking_lot::Mutex<HashMap<(u32, u32, u32), Vec<TexturePoolEntry>>>,
     // Shared CUDA interop context (one per GPU, shared across all renderers)
     cuda_interop: parking_lot::Mutex<Option<crate::cuda_interop::CudaInterop>>,
     cuda_interop_failed: std::sync::atomic::AtomicBool,
@@ -494,8 +494,20 @@ impl WgpuContext {
         usage: wgpu::TextureUsages,
         metrics: Option<&crate::metrics::PerformanceMetrics>,
     ) -> wgpu::Texture {
+        self.get_texture_from_pool_with_mips(width, height, 1, usage, metrics)
+    }
+
+    /// Get a texture from the pool or create a new one, with specified mip level count
+    pub fn get_texture_from_pool_with_mips(
+        &self,
+        width: u32,
+        height: u32,
+        mip_level_count: u32,
+        usage: wgpu::TextureUsages,
+        metrics: Option<&crate::metrics::PerformanceMetrics>,
+    ) -> wgpu::Texture {
         let mut pool = self.texture_pool.lock();
-        let key = (width, height);
+        let key = (width, height, mip_level_count);
 
         // Try to find a texture in the pool
         if let Some(entries) = pool.get_mut(&key) {
@@ -522,7 +534,7 @@ impl WgpuContext {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -533,13 +545,8 @@ impl WgpuContext {
 
     /// Return a texture to the pool for reuse
     pub fn return_texture_to_pool(&self, texture: wgpu::Texture, width: u32, height: u32) {
-        if texture.mip_level_count() > 1 {
-            // Textures with mipmaps cannot be reused for video frames
-            return;
-        }
-
         let mut pool = self.texture_pool.lock();
-        let key = (width, height);
+        let key = (width, height, texture.mip_level_count());
 
         // Calculate total textures in pool
         let total_textures: usize = pool.values().map(|v| v.len()).sum();
@@ -577,7 +584,7 @@ impl WgpuContext {
         if total > MAX_TEXTURE_POOL_SIZE {
             let mut excess = total - MAX_TEXTURE_POOL_SIZE;
             // Collect (key, index, last_used) for sorting
-            let mut oldest: Vec<((u32, u32), usize, std::time::Instant)> = pool
+            let mut oldest: Vec<((u32, u32, u32), usize, std::time::Instant)> = pool
                 .iter()
                 .flat_map(|(&k, entries)| {
                     entries
@@ -589,7 +596,7 @@ impl WgpuContext {
             oldest.sort_by_key(|&(_, _, t)| t);
 
             // Remove oldest entries (iterate in age order, adjust indices)
-            let mut removed_per_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+            let mut removed_per_key: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
             for &(key, idx, _) in &oldest {
                 if excess == 0 {
                     break;
@@ -994,16 +1001,51 @@ impl Renderer {
             // Always precompile Fade (used as fallback on errors)
             let _ = crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade);
             // Precompile the user's configured transition (skip if it IS Fade or Random)
-            if !matches!(transition, Transition::Fade | Transition::Random) {
+            if matches!(transition, Transition::Random) {
+                // S-03: For Random mode, precompile WGSL text for common transitions
+                // so the GLSL→WGSL compilation (CPU-heavy) is cached before first use
+                let common = [
+                    Transition::CrossZoom { strength: 0.3 },
+                    Transition::Radial { smoothness: 0.5 },
+                    Transition::Circle,
+                    Transition::Directional { direction: [1.0, 0.0] },
+                    Transition::SimpleZoom { zoom_quickness: 0.5 },
+                    Transition::Ripple { amplitude: 0.1, speed: 1.0 },
+                    Transition::Swirl,
+                    Transition::Pixelize { squares_min: [10, 10], steps: 10 },
+                    Transition::Mosaic { endx: 20, endy: 20 },
+                    Transition::Burn,
+                    Transition::CrossWarp,
+                    Transition::Dreamy,
+                    Transition::Morph { strength: 0.1 },
+                    Transition::Wind { size: 0.2 },
+                    Transition::Dissolve { line_width: 0.1, spread_clr: [0.0, 0.0, 0.0], hot_clr: [0.9, 0.6, 0.1], pow: 5.0, intensity: 1.0 },
+                    Transition::FadeColor { color: [0.0, 0.0, 0.0], color_phase: 0.4 },
+                    Transition::Overexposure,
+                    Transition::FilmBurn { seed: 2.31 },
+                    Transition::Pinwheel { speed: 2.0 },
+                    Transition::Heart,
+                ];
+                for t in &common {
+                    let _ = crate::shaders::ShaderManager::get_builtin_shader(t);
+                }
+                let duration = start.elapsed();
+                tracing::info!(
+                    "[RENDER] {}: Background shader precompilation completed in {:.1}ms ({} common shaders for Random mode)",
+                    name_for_bg,
+                    duration.as_secs_f64() * 1000.0,
+                    common.len() + 1, // +1 for Fade
+                );
+            } else if !matches!(transition, Transition::Fade) {
                 let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
+                let duration = start.elapsed();
+                tracing::debug!(
+                    "[RENDER] {}: Background shader precompilation completed in {:.2}ms ({})",
+                    name_for_bg,
+                    duration.as_secs_f64() * 1000.0,
+                    transition.name()
+                );
             }
-            let duration = start.elapsed();
-            tracing::debug!(
-                "[RENDER] {}: Background shader precompilation completed in {:.2}ms ({})",
-                name_for_bg,
-                duration.as_secs_f64() * 1000.0,
-                transition.name()
-            );
         })
         .abort_handle();
         self.shader_precompile_handle = Some(shader_precompile_handle);
@@ -2017,6 +2059,9 @@ impl Renderer {
             self.transition_start_time = None;
             self.transition_progress = 0.0;
             self.transition_active = true;
+            // P-32: Reset batch_start_time so transition timer starts fresh from
+            // actual upload time, preventing decode latency from eating into duration
+            self.batch_start_time = None;
             info!(
                 "[TRANSITION] {}: Image data uploaded - transition will start on next render frame",
                 self.name

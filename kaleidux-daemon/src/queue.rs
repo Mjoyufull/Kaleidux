@@ -413,12 +413,11 @@ impl SmartQueue {
         Ok((files, ct_cache))
     }
 
-    /// Look up a path's ContentType from the in-memory cache, falling back to file I/O
+    /// Look up a path's ContentType from the in-memory cache (no file I/O fallback).
+    /// All files in the pool are pre-cached during discover_content, so a miss
+    /// means the file was added after discovery (handled on next refresh).
     fn cached_content_type(&self, path: &Path) -> Option<ContentType> {
-        if let Some(ct) = self.content_type_cache.get(path) {
-            return Some(*ct);
-        }
-        Self::get_content_type(path)
+        self.content_type_cache.get(path).copied()
     }
 
     /// Apply incremental pool events from the filesystem watcher
