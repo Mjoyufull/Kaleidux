@@ -13,10 +13,10 @@ const FILE_STATS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fi
 const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlists");
 const BLACKLIST_TABLE: TableDefinition<&[u8], bool> = TableDefinition::new("blacklist");
 const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("history");
-const POOL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_cache");
+const POOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_cache");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
-const CACHE_VERSION: u64 = 3;
+const CACHE_VERSION: u64 = 4;
 
 /// Filesystem events that affect the active file pool
 #[derive(Debug, Clone)]
@@ -141,13 +141,9 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(POOL_TABLE)?;
-            let key = dir.to_string_lossy();
-            let paths: Vec<String> = pool
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            let data = postcard::to_allocvec(&paths)?;
-            table.insert(key.as_ref(), data.as_slice())?;
+            let key = dir.as_os_str().as_encoded_bytes();
+            let data = postcard::to_allocvec(&pool)?;
+            table.insert(key, data.as_slice())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -157,11 +153,11 @@ impl FileCache {
     pub fn get_cached_pool(&self, dir: &Path) -> Result<Option<Vec<PathBuf>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(POOL_TABLE)?;
-        let key = dir.to_string_lossy();
-        match table.get(key.as_ref())? {
+        let key = dir.as_os_str().as_encoded_bytes();
+        match table.get(key)? {
             Some(data) => {
-                let paths: Vec<String> = postcard::from_bytes(data.value())?;
-                Ok(Some(paths.into_iter().map(PathBuf::from).collect()))
+                let paths: Vec<PathBuf> = postcard::from_bytes(data.value())?;
+                Ok(Some(paths))
             }
             _ => Ok(None),
         }
@@ -232,7 +228,9 @@ impl FileCache {
 
         for item in table.iter()? {
             let (key, value) = item?;
-            let path = PathBuf::from(String::from_utf8_lossy(key.value()).to_string());
+            // Safety: These bytes were provided by as_encoded_bytes
+            let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(key.value()) };
+            let path = PathBuf::from(os_str);
             let file_stats: crate::queue::FileStats = postcard::from_bytes(value.value())?;
             stats.insert(path, file_stats);
         }
@@ -324,7 +322,9 @@ impl FileCache {
 
         for item in table.iter()? {
             let (key, _) = item?;
-            let path = PathBuf::from(String::from_utf8_lossy(key.value()).to_string());
+            // Safety: These bytes were provided by as_encoded_bytes
+            let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(key.value()) };
+            let path = PathBuf::from(os_str);
             blacklist.insert(path);
         }
 
@@ -335,11 +335,7 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(HISTORY_TABLE)?;
-            let paths: Vec<String> = history
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            let data = postcard::to_allocvec(&paths)?;
+            let data = postcard::to_allocvec(&history)?;
             table.insert(output_name, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -351,8 +347,8 @@ impl FileCache {
         let table = read_txn.open_table(HISTORY_TABLE)?;
         match table.get(output_name)? {
             Some(data) => {
-                let paths: Vec<String> = postcard::from_bytes(data.value())?;
-                Ok(paths.into_iter().map(PathBuf::from).collect())
+                let paths: Vec<PathBuf> = postcard::from_bytes(data.value())?;
+                Ok(paths)
             }
             _ => Ok(Vec::new()),
         }
