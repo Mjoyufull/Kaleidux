@@ -1617,6 +1617,7 @@ impl Renderer {
 
         let wl_surface = layer_surface.wl_surface();
         wl_surface.frame(qh, wl_surface.clone());
+        wl_surface.commit(); // Commit to prompt compositor to send frame callback
         self.frame_callback_pending = true;
         self.last_frame_request = Some(std::time::Instant::now());
         tracing::debug!("[FRAME] {}: Requested frame callback (configured={}, needs_redraw={}, transition_progress={:.3})", 
