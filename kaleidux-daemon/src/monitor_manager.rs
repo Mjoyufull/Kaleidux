@@ -8,8 +8,15 @@ use kaleidux_common::{BlacklistCommand, KEntry, PlaylistCommand, Response};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+const MIN_CONTENT_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTENT_LOAD_GRACE: Duration = Duration::from_secs(5);
+
+fn content_load_timeout(display_duration: Duration) -> Duration {
+    (display_duration + CONTENT_LOAD_GRACE).max(MIN_CONTENT_LOAD_TIMEOUT)
+}
 
 pub struct OutputOrchestrator {
     pub _name: String,
@@ -132,9 +139,9 @@ impl OutputOrchestrator {
                 // Reset display start time - will be set when content actually starts displaying
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
-                // Set next_change as fallback (in case content never loads)
+                // Allow slow initial decodes to complete before treating the load as stuck.
                 self.next_change =
-                    Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
+                    Some(Instant::now() + content_load_timeout(self.config.duration));
 
                 // Pre-buffer next content
                 if let Some((next_p, next_t)) = self.peek_next() {
@@ -183,9 +190,8 @@ impl OutputOrchestrator {
                 self.current_path = Some(path.clone());
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
-                // Set next_change as fallback (in case content never loads)
                 self.next_change =
-                    Some(Instant::now() + self.config.duration + std::time::Duration::from_secs(5)); // Add 5s buffer for loading
+                    Some(Instant::now() + content_load_timeout(self.config.duration));
                 return Some((path, content_type));
             }
         }
@@ -269,11 +275,7 @@ impl MonitorManager {
                     ) {
                         Ok(q) => orch.queue = Some(q),
                         Err(e) => {
-                            tracing::warn!(
-                                "[CONFIG] Failed to refresh queue for {}: {}",
-                                name,
-                                e
-                            );
+                            tracing::warn!("[CONFIG] Failed to refresh queue for {}: {}", name, e);
                         }
                     }
                 } else {
@@ -587,9 +589,8 @@ impl MonitorManager {
                             for (name, orch) in &mut self.outputs {
                                 orch.current_path = Some(path.clone());
                                 orch.display_start_time = None;
-                                orch.next_change = Some(
-                                    now + orch.config.duration + std::time::Duration::from_secs(5),
-                                );
+                                orch.next_change =
+                                    Some(now + content_load_timeout(orch.config.duration));
 
                                 orch.next_path = next_p.clone();
                                 orch.next_content_type = next_t;
@@ -658,10 +659,8 @@ impl MonitorManager {
                                     if let Some(orch) = self.outputs.get_mut(name) {
                                         orch.current_path = Some(path.clone());
                                         orch.display_start_time = None;
-                                        orch.next_change = Some(
-                                            now + orch.config.duration
-                                                + std::time::Duration::from_secs(5),
-                                        );
+                                        orch.next_change =
+                                            Some(now + content_load_timeout(orch.config.duration));
 
                                         orch.next_path = next_p.clone();
                                         orch.next_content_type = next_t;
@@ -728,9 +727,8 @@ impl MonitorManager {
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
-                            orch.next_change = Some(
-                                now + orch.config.duration + std::time::Duration::from_secs(5),
-                            );
+                            orch.next_change =
+                                Some(now + content_load_timeout(orch.config.duration));
 
                             orch.next_path = next_p.clone();
                             orch.next_content_type = next_t;
@@ -765,8 +763,7 @@ impl MonitorManager {
                                             orch.display_start_time = None;
                                             orch.next_change = Some(
                                                 Instant::now()
-                                                    + orch.config.duration
-                                                    + std::time::Duration::from_secs(5),
+                                                    + content_load_timeout(orch.config.duration),
                                             );
 
                                             orch.next_path = next_p.clone();
@@ -805,8 +802,9 @@ impl MonitorManager {
                                                 orch.display_start_time = None;
                                                 orch.next_change = Some(
                                                     Instant::now()
-                                                        + orch.config.duration
-                                                        + std::time::Duration::from_secs(5),
+                                                        + content_load_timeout(
+                                                            orch.config.duration,
+                                                        ),
                                                 );
                                                 changes.insert(
                                                     n.clone(),
@@ -866,9 +864,8 @@ impl MonitorManager {
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
-                            orch.next_change = Some(
-                                now + orch.config.duration + std::time::Duration::from_secs(5),
-                            );
+                            orch.next_change =
+                                Some(now + content_load_timeout(orch.config.duration));
                             changes.insert(name.clone(), (path.clone(), content_type));
                         }
                     }
@@ -890,8 +887,7 @@ impl MonitorManager {
                                             orch.display_start_time = None;
                                             orch.next_change = Some(
                                                 Instant::now()
-                                                    + orch.config.duration
-                                                    + std::time::Duration::from_secs(5),
+                                                    + content_load_timeout(orch.config.duration),
                                             );
                                             changes
                                                 .insert(name.clone(), (path.clone(), content_type));
@@ -922,8 +918,9 @@ impl MonitorManager {
                                                 orch.display_start_time = None;
                                                 orch.next_change = Some(
                                                     Instant::now()
-                                                        + orch.config.duration
-                                                        + std::time::Duration::from_secs(5),
+                                                        + content_load_timeout(
+                                                            orch.config.duration,
+                                                        ),
                                                 );
                                                 changes.insert(
                                                     n.clone(),

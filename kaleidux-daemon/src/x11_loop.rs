@@ -135,8 +135,7 @@ pub async fn run(
         let any_active = ctx.any_active();
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) =
-            (None, None, None, None);
+        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) = (None, None, None, None);
         if !any_active {
             let result = ctx.idle_wait(&x11_fd).await;
             cmd_buf = result.0;

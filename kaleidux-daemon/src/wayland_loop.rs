@@ -7,7 +7,6 @@ use crate::main_loop::MainLoopContext;
 use crate::orchestration;
 use crate::renderer;
 
-
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -303,8 +302,7 @@ pub async fn run(
         let any_active = ctx.any_active();
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) =
-            (None, None, None, None);
+        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) = (None, None, None, None);
         if !any_active && !connection_dead {
             let result = ctx.idle_wait(&wayland_fd).await;
             cmd_buf = result.0;
@@ -434,7 +432,6 @@ pub async fn run(
                                 ctx.metrics.record_first_frame();
                                 ctx.first_frame_recorded = true;
                             }
-                            r.request_frame_callback(layer_surface, &qh);
                         }
                     }
                 }

@@ -20,12 +20,15 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
 
 // Global semaphore to limit concurrent image decode tasks (prevents memory spikes)
 // Limit to 2 concurrent decodes since each can be 35-40MB
@@ -35,10 +38,93 @@ static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
     pub name: String,
+    pub session_id: u64,
     pub data: Option<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    pub profile: Option<ImageLoadProfile>,
     pub _path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_resize_does_not_upscale_smaller_images() {
+        assert_eq!(
+            compute_downscaled_cover_dimensions(1280, 720, 3840, 2160),
+            None
+        );
+    }
+
+    #[test]
+    fn cover_resize_downscales_to_cover_target() {
+        assert_eq!(
+            compute_downscaled_cover_dimensions(8000, 4000, 3840, 2160),
+            Some((4320, 2160))
+        );
+    }
+
+    #[test]
+    fn resize_filter_prefers_bilinear_for_heavy_shrink() {
+        let filter = select_resize_filter(8000, 4000, 3840, 1920);
+        assert_eq!(filter, fast_image_resize::FilterType::Bilinear);
+    }
+
+    #[test]
+    fn resize_filter_prefers_catmull_rom_for_light_shrink() {
+        let filter = select_resize_filter(4200, 2400, 3840, 2194);
+        assert_eq!(filter, fast_image_resize::FilterType::CatmullRom);
+    }
+
+    #[test]
+    fn rgb_prep_expands_to_rgba_without_resize_when_not_needed() {
+        let rgb = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let (rgba, width, height, resize, _expand, filter) =
+            prepare_rgb_image(rgb, 2, 2, 3840, 2160).expect("rgb prep should succeed");
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(resize, Duration::ZERO);
+        assert_eq!(filter, None);
+        assert_eq!(
+            rgba,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+            ]
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImageLoadProfile {
+    pub format: String,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub permit_wait: Duration,
+    pub decode: Duration,
+    pub convert: Duration,
+    pub resize: Duration,
+    pub expand: Duration,
+    pub resize_filter: Option<String>,
+}
+
+impl ImageLoadProfile {
+    fn cpu_duration(&self) -> Duration {
+        self.decode + self.convert + self.resize + self.expand
+    }
+
+    fn total_duration(&self) -> Duration {
+        self.permit_wait + self.cpu_duration()
+    }
+}
+
+#[derive(Debug)]
+struct DecodedImagePayload {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    profile: ImageLoadProfile,
 }
 
 pub enum VideoPlayerResult {
@@ -101,8 +187,10 @@ impl MainLoopContext {
             sys_monitor.run().await;
         });
 
-        let monitor_manager =
-            monitor_manager::MonitorManager::new_with_metrics(config.clone(), Some(metrics.clone()))?;
+        let monitor_manager = monitor_manager::MonitorManager::new_with_metrics(
+            config.clone(),
+            Some(metrics.clone()),
+        )?;
 
         // Initialize directory watcher for cache invalidation
         let cache = monitor_manager.get_cache();
@@ -135,13 +223,11 @@ impl MainLoopContext {
         // Create channels
         // Frame channel: increased capacity to 32 to cushion against micro-stutters
         // when multiple video sources are active.
-        let (frame_tx, frame_rx) =
-            tokio::sync::mpsc::channel::<FrameMsg>(32);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<FrameMsg>(32);
         // Image channel: bounded to prevent memory spikes from large images accumulating
         let (image_tx, image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(16);
         let (player_tx, player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
-        let (cmd_tx, cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<CmdMsg>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<CmdMsg>();
 
         // IPC Socket Setup
         info!("[STARTUP] Setting up IPC socket");
@@ -328,11 +414,7 @@ impl MainLoopContext {
     }
 
     /// Drain and handle all pending commands.
-    pub async fn drain_commands(
-        &mut self,
-        cmd_buf: Option<CmdMsg>,
-        loop_start: Instant,
-    ) {
+    pub async fn drain_commands(&mut self, cmd_buf: Option<CmdMsg>, loop_start: Instant) {
         let cmd_iter = std::iter::once(cmd_buf)
             .flatten()
             .chain(std::iter::from_fn(|| self.cmd_rx.try_recv().ok()));
@@ -426,20 +508,65 @@ impl MainLoopContext {
         for msg in image_iter {
             images_received += 1;
             debug!(
-                "[IMAGE] Received image for {}: data={}, size={}x{}",
+                "[IMAGE] Received image for {}: session={}, data={}, size={}x{}",
                 msg.name,
+                msg.session_id,
                 msg.data.is_some(),
                 msg.width,
                 msg.height
             );
             if let Some(r) = self.renderers.get_mut(&msg.name) {
+                if r.valid_content_type != crate::queue::ContentType::Image
+                    || r.active_image_session_id != msg.session_id
+                {
+                    if let Some(profile) = &msg.profile {
+                        debug!(
+                            "[IMAGE] {}: stale image was prepared via {} in {:.1}ms (wait {:.1}ms, cpu {:.1}ms)",
+                            msg.name,
+                            profile.format,
+                            duration_ms(profile.total_duration()),
+                            duration_ms(profile.permit_wait),
+                            duration_ms(profile.cpu_duration())
+                        );
+                    }
+                    debug!(
+                        "[IMAGE] Dropping stale image for {}: session={} active_session={} content_type={:?}",
+                        msg.name, msg.session_id, r.active_image_session_id, r.valid_content_type
+                    );
+                    continue;
+                }
+
                 if let Some(data) = msg.data {
+                    if let Some(profile) = &msg.profile {
+                        debug!(
+                            "[IMAGE] {}: prepared {} {}x{} -> {}x{} in {:.1}ms (wait {:.1}ms, decode {:.1}ms, convert {:.1}ms, resize {:.1}ms, expand {:.1}ms, filter={})",
+                            msg.name,
+                            profile.format,
+                            profile.source_width,
+                            profile.source_height,
+                            msg.width,
+                            msg.height,
+                            duration_ms(profile.total_duration()),
+                            duration_ms(profile.permit_wait),
+                            duration_ms(profile.decode),
+                            duration_ms(profile.convert),
+                            duration_ms(profile.resize),
+                            duration_ms(profile.expand),
+                            profile.resize_filter.as_deref().unwrap_or("none")
+                        );
+                    }
                     debug!(
                         "[IMAGE] Uploading image data for {}: {} bytes",
                         msg.name,
                         data.len()
                     );
+                    let upload_start = Instant::now();
                     let _ = r.upload_image_data(data, msg.width, msg.height);
+                    debug!(
+                        "[IMAGE] Upload complete for {}: {:.1}ms",
+                        msg.name,
+                        duration_ms(upload_start.elapsed())
+                    );
                     debug!("[IMAGE] Rendering after upload for {}", msg.name);
                     render_fn(r, &msg.name, loop_start);
                     if !self.first_frame_recorded {
@@ -622,6 +749,351 @@ impl MainLoopContext {
 
 // ─── Standalone helpers ─────────────────────────────────────────────────────
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> String {
+    let label = match format {
+        Some(image::ImageFormat::Avif) => "avif",
+        Some(image::ImageFormat::Bmp) => "bmp",
+        Some(image::ImageFormat::Gif) => "gif",
+        Some(image::ImageFormat::Hdr) => "hdr",
+        Some(image::ImageFormat::Ico) => "ico",
+        Some(image::ImageFormat::Jpeg) => "jpeg",
+        Some(image::ImageFormat::OpenExr) => "openexr",
+        Some(image::ImageFormat::Png) => "png",
+        Some(image::ImageFormat::Pnm) => "pnm",
+        Some(image::ImageFormat::Qoi) => "qoi",
+        Some(image::ImageFormat::Tga) => "tga",
+        Some(image::ImageFormat::Tiff) => "tiff",
+        Some(image::ImageFormat::WebP) => "webp",
+        Some(image::ImageFormat::Dds) => "dds",
+        Some(image::ImageFormat::Farbfeld) => "farbfeld",
+        _ => "unknown",
+    };
+
+    if fast_path {
+        format!("{}-fast", label)
+    } else {
+        label.to_string()
+    }
+}
+
+fn compute_downscaled_cover_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Option<(u32, u32)> {
+    let cover_scale = (target_width as f32 / source_width as f32)
+        .max(target_height as f32 / source_height as f32)
+        .min(1.0);
+    if cover_scale >= 1.0 {
+        return None;
+    }
+
+    let resized_width = ((source_width as f32 * cover_scale).round() as u32).max(1);
+    let resized_height = ((source_height as f32 * cover_scale).round() as u32).max(1);
+    Some((resized_width, resized_height))
+}
+
+fn select_resize_filter(
+    source_width: u32,
+    source_height: u32,
+    resized_width: u32,
+    resized_height: u32,
+) -> fast_image_resize::FilterType {
+    let width_ratio = source_width as f32 / resized_width as f32;
+    let height_ratio = source_height as f32 / resized_height as f32;
+    if width_ratio >= 2.0 || height_ratio >= 2.0 {
+        fast_image_resize::FilterType::Bilinear
+    } else {
+        fast_image_resize::FilterType::CatmullRom
+    }
+}
+
+fn resize_filter_label(filter: fast_image_resize::FilterType) -> &'static str {
+    match filter {
+        fast_image_resize::FilterType::Box => "box",
+        fast_image_resize::FilterType::Bilinear => "bilinear",
+        fast_image_resize::FilterType::Hamming => "hamming",
+        fast_image_resize::FilterType::CatmullRom => "catmull-rom",
+        fast_image_resize::FilterType::Mitchell => "mitchell",
+        fast_image_resize::FilterType::Gaussian => "gaussian",
+        fast_image_resize::FilterType::Lanczos3 => "lanczos3",
+        fast_image_resize::FilterType::Custom(_) => "custom",
+        _ => "unknown",
+    }
+}
+
+fn resize_image_buffer(
+    source_data: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    resized_width: u32,
+    resized_height: u32,
+    pixel_type: fast_image_resize::PixelType,
+    filter: fast_image_resize::FilterType,
+) -> anyhow::Result<Vec<u8>> {
+    use fast_image_resize as fr;
+
+    let source =
+        fr::images::Image::from_vec_u8(source_width, source_height, source_data, pixel_type)
+            .map_err(|e| anyhow::anyhow!("invalid source image buffer: {}", e))?;
+    let mut resized = fr::images::Image::new(resized_width, resized_height, pixel_type);
+    let mut resizer = fr::Resizer::new();
+    resizer
+        .resize(
+            &source,
+            &mut resized,
+            &fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(filter)),
+        )
+        .map_err(|e| anyhow::anyhow!("image resize failed: {}", e))?;
+    Ok(resized.into_vec())
+}
+
+fn expand_rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((rgb.len() / 3) * 4);
+    for chunk in rgb.chunks_exact(3) {
+        rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+    }
+    rgba
+}
+
+fn prepare_rgb_image(
+    pixels: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
+    let mut resize_duration = Duration::ZERO;
+    let mut resize_filter = None;
+    let (rgb_data, width, height) = if let Some((resized_width, resized_height)) =
+        compute_downscaled_cover_dimensions(
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        ) {
+        let filter =
+            select_resize_filter(source_width, source_height, resized_width, resized_height);
+        let resize_start = Instant::now();
+        let resized = resize_image_buffer(
+            pixels,
+            source_width,
+            source_height,
+            resized_width,
+            resized_height,
+            fast_image_resize::PixelType::U8x3,
+            filter,
+        )?;
+        resize_duration = resize_start.elapsed();
+        resize_filter = Some(resize_filter_label(filter).to_string());
+        (resized, resized_width, resized_height)
+    } else {
+        (pixels, source_width, source_height)
+    };
+
+    let expand_start = Instant::now();
+    let rgba_data = expand_rgb_to_rgba(rgb_data);
+    let expand_duration = expand_start.elapsed();
+    Ok((
+        rgba_data,
+        width,
+        height,
+        resize_duration,
+        expand_duration,
+        resize_filter,
+    ))
+}
+
+fn prepare_rgba_image(
+    pixels: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Option<String>)> {
+    if let Some((resized_width, resized_height)) = compute_downscaled_cover_dimensions(
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+    ) {
+        let filter =
+            select_resize_filter(source_width, source_height, resized_width, resized_height);
+        let resize_start = Instant::now();
+        let resized = resize_image_buffer(
+            pixels,
+            source_width,
+            source_height,
+            resized_width,
+            resized_height,
+            fast_image_resize::PixelType::U8x4,
+            filter,
+        )?;
+        return Ok((
+            resized,
+            resized_width,
+            resized_height,
+            resize_start.elapsed(),
+            Some(resize_filter_label(filter).to_string()),
+        ));
+    }
+
+    Ok((pixels, source_width, source_height, Duration::ZERO, None))
+}
+
+fn decode_jpeg_fast(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<DecodedImagePayload> {
+    let decode_start = Instant::now();
+    let encoded = std::fs::read(path)?;
+    let options = DecoderOptions::new_fast()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(encoded.as_slice()), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("jpeg header decode failed: {}", e))?;
+    let (source_width, source_height) = decoder
+        .dimensions()
+        .ok_or_else(|| anyhow::anyhow!("jpeg dimensions missing after header decode"))?;
+    let source_width =
+        u32::try_from(source_width).map_err(|_| anyhow::anyhow!("jpeg width is too large"))?;
+    let source_height =
+        u32::try_from(source_height).map_err(|_| anyhow::anyhow!("jpeg height is too large"))?;
+    let decoded = decoder
+        .decode()
+        .map_err(|e| anyhow::anyhow!("jpeg decode failed: {}", e))?;
+    let decode_duration = decode_start.elapsed();
+
+    let (data, width, height, resize_duration, expand_duration, resize_filter) = prepare_rgb_image(
+        decoded,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+    )?;
+
+    Ok(DecodedImagePayload {
+        data,
+        width,
+        height,
+        profile: ImageLoadProfile {
+            format: "jpeg-fast".to_string(),
+            source_width,
+            source_height,
+            permit_wait: Duration::ZERO,
+            decode: decode_duration,
+            convert: Duration::ZERO,
+            resize: resize_duration,
+            expand: expand_duration,
+            resize_filter,
+        },
+    })
+}
+
+fn decode_image_generic(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+    format: Option<image::ImageFormat>,
+) -> anyhow::Result<DecodedImagePayload> {
+    let decode_start = Instant::now();
+    let image = image::open(path)?;
+    let decode_duration = decode_start.elapsed();
+    let source_width = image.width();
+    let source_height = image.height();
+    let has_alpha = image.has_alpha();
+
+    let convert_start = Instant::now();
+    let (data, width, height, resize_duration, expand_duration, resize_filter) = if has_alpha {
+        let rgba = image.into_rgba8().into_raw();
+        let (prepared, width, height, resize_duration, resize_filter) = prepare_rgba_image(
+            rgba,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        )?;
+        (
+            prepared,
+            width,
+            height,
+            resize_duration,
+            Duration::ZERO,
+            resize_filter,
+        )
+    } else {
+        let rgb = image.into_rgb8().into_raw();
+        let (prepared, width, height, resize_duration, expand_duration, resize_filter) =
+            prepare_rgb_image(
+                rgb,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+            )?;
+        (
+            prepared,
+            width,
+            height,
+            resize_duration,
+            expand_duration,
+            resize_filter,
+        )
+    };
+
+    let convert_duration = convert_start.elapsed();
+
+    Ok(DecodedImagePayload {
+        data,
+        width,
+        height,
+        profile: ImageLoadProfile {
+            format: image_format_label(format, false),
+            source_width,
+            source_height,
+            permit_wait: Duration::ZERO,
+            decode: decode_duration,
+            convert: convert_duration,
+            resize: resize_duration,
+            expand: expand_duration,
+            resize_filter,
+        },
+    })
+}
+
+fn decode_image_for_output(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<DecodedImagePayload> {
+    let format = image::ImageFormat::from_path(path).ok();
+    if matches!(format, Some(image::ImageFormat::Jpeg)) {
+        match decode_jpeg_fast(path, target_width, target_height) {
+            Ok(payload) => return Ok(payload),
+            Err(e) => {
+                warn!(
+                    "[ASSET] {}: Fast JPEG decode failed, falling back to generic image path: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    decode_image_generic(path, target_width, target_height, format)
+}
+
 /// Helper function to switch wallpaper content for an output.
 #[allow(clippy::too_many_arguments)]
 pub fn switch_wallpaper_content(
@@ -647,6 +1119,9 @@ pub fn switch_wallpaper_content(
         renderers.contains_key(name)
     );
 
+    let session_id = *next_session_id;
+    *next_session_id += 1;
+
     let was_playing_video = video_players.contains_key(name);
     if was_playing_video {
         if let Some(mut vp) = video_players.remove(name) {
@@ -664,11 +1139,19 @@ pub fn switch_wallpaper_content(
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time;
         r.set_content_type(content_type);
+        r.active_image_session_id = if content_type == queue::ContentType::Image {
+            session_id
+        } else {
+            0
+        };
+        if content_type != queue::ContentType::Video {
+            r.active_video_session_id = 0;
+        }
 
         // Resolve Random transition if configured for this output
         if let Some(orchestrator) = monitor_manager.outputs.get(name) {
             if matches!(orchestrator.config.transition, Transition::Random) {
-                let picked = Transition::pick_random();
+                let picked = crate::shaders::ShaderManager::pick_random_transition();
                 debug!(
                     "[TRANSITION] {}: Resolved Random transition to: {}",
                     name,
@@ -688,6 +1171,7 @@ pub fn switch_wallpaper_content(
             let path_clone = path.to_path_buf();
             let tx = image_tx.clone();
             let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
+            let image_session_id = session_id;
 
             debug!(
                 "[ASSET] {}: Offloading image decode: {}",
@@ -696,6 +1180,7 @@ pub fn switch_wallpaper_content(
             );
             tokio::spawn(async move {
                 // Acquire permit before decoding to limit concurrent tasks
+                let permit_wait_start = Instant::now();
                 let _permit = match semaphore.acquire().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -706,83 +1191,55 @@ pub fn switch_wallpaper_content(
                         return;
                     }
                 };
+                let permit_wait = permit_wait_start.elapsed();
+                if permit_wait > Duration::from_millis(10) {
+                    debug!(
+                        "[ASSET] {}: Waited {:.1}ms for image decode permit",
+                        name_clone,
+                        duration_ms(permit_wait)
+                    );
+                }
 
                 // Decode image in blocking task
-                let decode_result =
-                    tokio::task::spawn_blocking(move || match image::open(&path_clone) {
-                        Ok(img) => {
-                            let rgba = img.to_rgba8();
-                            let (orig_w, orig_h) = rgba.dimensions();
-
-                            let (image_data, width, height) = if orig_w > target_width
-                                || orig_h > target_height
-                            {
-                                let scale = (target_width as f32 / orig_w as f32)
-                                    .max(target_height as f32 / orig_h as f32);
-                                let new_w = ((orig_w as f32 * scale).round() as u32).max(1);
-                                let new_h = ((orig_h as f32 * scale).round() as u32).max(1);
-
-                                use fast_image_resize as fr;
-                                let src = fr::images::Image::from_vec_u8(
-                                    orig_w,
-                                    orig_h,
-                                    rgba.into_raw(),
-                                    fr::PixelType::U8x4,
-                                )
-                                .unwrap();
-                                let mut dst =
-                                    fr::images::Image::new(new_w, new_h, fr::PixelType::U8x4);
-                                let mut resizer = fr::Resizer::new();
-                                resizer
-                                    .resize(
-                                        &src,
-                                        &mut dst,
-                                        &fr::ResizeOptions::new().resize_alg(
-                                            fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
-                                        ),
-                                    )
-                                    .unwrap();
-                                (dst.into_vec(), new_w, new_h)
-                            } else {
-                                (rgba.into_raw(), orig_w, orig_h)
-                            };
-
-                            Ok((name_clone.clone(), image_data, width, height, path_clone))
-                        }
-                        Err(e) => {
-                            error!("Failed to decode image {}: {}", path_clone.display(), e);
-                            Err((name_clone, path_clone))
-                        }
-                    })
-                    .await;
+                let path_for_decode = path_clone.clone();
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    decode_image_for_output(&path_for_decode, target_width, target_height)
+                })
+                .await;
 
                 // Send decoded image (or error) to channel
                 match decode_result {
-                    Ok(Ok((name, image_data, width, height, path))) => {
+                    Ok(Ok(mut payload)) => {
+                        payload.profile.permit_wait = permit_wait;
                         if let Err(e) = tx
                             .send(LoadedImage {
-                                name: name.clone(),
-                                data: Some(image_data),
-                                width,
-                                height,
-                                _path: path,
+                                name: name_clone.clone(),
+                                session_id: image_session_id,
+                                data: Some(payload.data),
+                                width: payload.width,
+                                height: payload.height,
+                                profile: Some(payload.profile),
+                                _path: path_clone,
                             })
                             .await
                         {
                             debug!(
                                 "[ASSET] {}: Failed to send decoded image (channel closed): {}",
-                                name, e
+                                name_clone, e
                             );
                         }
                     }
-                    Ok(Err((name, path))) => {
+                    Ok(Err(e)) => {
+                        error!("Failed to decode image {}: {}", path_clone.display(), e);
                         let _ = tx
                             .send(LoadedImage {
-                                name,
+                                name: name_clone,
+                                session_id: image_session_id,
                                 data: None,
                                 width: 0,
                                 height: 0,
-                                _path: path,
+                                profile: None,
+                                _path: path_clone,
                             })
                             .await;
                     }
@@ -795,8 +1252,6 @@ pub fn switch_wallpaper_content(
     }
 
     if content_type == queue::ContentType::Video {
-        let session_id = *next_session_id;
-        *next_session_id += 1;
         debug!(
             "[TRANSITION] {}: Starting new video player (session_id={})",
             name, session_id

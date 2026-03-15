@@ -119,7 +119,7 @@ impl SmartQueue {
 
                     // We wrap the receiver so we can periodically check it or use it in an event loop
                     // But for the initial creation, we can't easily block here if we want to stay async.
-                    // Instead, we'll let the monitor_manager handle the swap when it receives the update.
+                    // Instead, idk we'll let the monitor_manager handle the swap when it receives the update.
                     // For now, let's at least populate the initial cache from disk to avoid the I/O bottleneck.
 
                     let mut init_map = HashMap::new();
@@ -272,10 +272,7 @@ impl SmartQueue {
         // ISO BMFF container: ....ftyp (shared by MP4/MOV video and AVIF/HEIF images)
         if &buffer[4..8] == b"ftyp" {
             // AVIF images use brands: avif, avis, mif1
-            if &buffer[8..12] == b"avif"
-                || &buffer[8..12] == b"avis"
-                || &buffer[8..12] == b"mif1"
-            {
+            if &buffer[8..12] == b"avif" || &buffer[8..12] == b"avis" || &buffer[8..12] == b"mif1" {
                 return Some(ContentType::Image);
             }
             return Some(ContentType::Video);

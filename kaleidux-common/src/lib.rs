@@ -509,10 +509,8 @@ pub enum Transition {
 }
 
 impl Transition {
-    pub fn pick_random() -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let variants = [
+    pub fn random_candidate_names() -> &'static [&'static str] {
+        &[
             "angular",
             "bookflip",
             "bounce",
@@ -613,7 +611,13 @@ impl Transition {
             "zoomincircles",
             "zoomleftwipe",
             "zoomrightwipe",
-        ];
+        ]
+    }
+
+    pub fn pick_random() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let variants = Self::random_candidate_names();
         let name = variants[rng.gen_range(0..variants.len())];
         Self::from_name(name)
     }

@@ -59,10 +59,25 @@ pub struct ShaderManager;
 static WGSL_CACHE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<String, String>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static BROKEN_TRANSITIONS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 use anyhow::Context;
 
 impl ShaderManager {
+    pub fn mark_transition_broken(name: &str) {
+        BROKEN_TRANSITIONS.lock().insert(name.to_string());
+    }
+
+    pub fn is_transition_broken(name: &str) -> bool {
+        BROKEN_TRANSITIONS.lock().contains(name)
+    }
+
+    pub fn is_shader_cached(name: &str) -> bool {
+        WGSL_CACHE.lock().contains_key(name)
+    }
+
     pub fn save_cache() -> anyhow::Result<()> {
         let cache_dir = dirs::cache_dir().context("no cache dir")?.join("kaleidux");
         std::fs::create_dir_all(&cache_dir)?;
@@ -94,6 +109,46 @@ impl ShaderManager {
             );
         }
         Ok(())
+    }
+
+    pub fn pick_random_transition() -> Transition {
+        use rand::seq::SliceRandom;
+
+        let mut candidates: Vec<Transition> = Transition::random_candidate_names()
+            .iter()
+            .map(|name| Transition::from_name(name))
+            .collect();
+        let mut rng = rand::thread_rng();
+
+        candidates.shuffle(&mut rng);
+        candidates.sort_by_key(|transition| {
+            let name = transition.name();
+            (
+                Self::is_transition_broken(&name),
+                !Self::is_shader_cached(&name),
+            )
+        });
+
+        for transition in candidates {
+            let name = transition.name();
+            if Self::is_transition_broken(&name) {
+                continue;
+            }
+            match Self::get_builtin_shader(&transition) {
+                Ok(_) => return transition,
+                Err(e) => {
+                    Self::mark_transition_broken(&name);
+                    tracing::warn!(
+                        "[SHADER] Skipping random transition {} after compile failure: {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::warn!("[SHADER] No working random transitions available, falling back to fade");
+        Transition::Fade
     }
 
     pub fn compile_glsl(
@@ -204,7 +259,7 @@ impl ShaderManager {
                 Self::compile_glsl(shader, &glsl, &mapping)
             }
             Transition::Random => {
-                let picked = Transition::pick_random();
+                let picked = Self::pick_random_transition();
                 Self::get_builtin_shader(&picked)
             }
             _ => Self::get_builtin_shader(transition),

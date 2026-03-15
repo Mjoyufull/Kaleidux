@@ -1596,6 +1596,8 @@ dependencies = [
  "wgpu",
  "wgpu-hal",
  "x11rb",
+ "zune-core 0.5.1",
+ "zune-jpeg 0.5.12",
 ]
 
 [[package]]

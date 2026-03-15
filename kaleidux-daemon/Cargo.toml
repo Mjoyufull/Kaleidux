@@ -55,3 +55,5 @@ notify = { workspace = true }
 nvml-wrapper = "0.10"
 lru = "0.14"
 fast_image_resize = { version = "5", features = ["image"] }
+zune-core = "0.5.1"
+zune-jpeg = "0.5.12"

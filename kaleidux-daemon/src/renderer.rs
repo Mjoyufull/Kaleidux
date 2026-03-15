@@ -130,7 +130,52 @@ pub struct WgpuContext {
 }
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
-const MAX_TEXTURE_POOL_SIZE: usize = 50; // Global limit on total textures in pool
+const MAX_TEXTURE_POOL_SIZE: usize = 24; // Global limit on total textures in pool
+const MAX_TEXTURE_POOL_BYTES: u64 = 128 * 1024 * 1024; // Keep pooled RGBA textures under 128 MiB
+const MAX_POOLED_TEXTURE_BYTES: u64 = 16 * 1024 * 1024; // Skip pooling huge 4K-class RGBA textures
+
+fn texture_byte_size(width: u32, height: u32, mip_level_count: u32) -> u64 {
+    let mut total = 0u64;
+    let mut mip_width = width.max(1);
+    let mut mip_height = height.max(1);
+    let levels = mip_level_count.max(1);
+
+    for _ in 0..levels {
+        total += mip_width as u64 * mip_height as u64 * 4;
+        if mip_width == 1 && mip_height == 1 {
+            break;
+        }
+        mip_width = (mip_width / 2).max(1);
+        mip_height = (mip_height / 2).max(1);
+    }
+
+    total
+}
+
+fn should_pool_texture(width: u32, height: u32, mip_level_count: u32) -> bool {
+    texture_byte_size(width, height, mip_level_count) <= MAX_POOLED_TEXTURE_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_size_matches_rgba_pixels_for_single_mip() {
+        assert_eq!(texture_byte_size(1920, 1080, 1), 1920 * 1080 * 4);
+    }
+
+    #[test]
+    fn texture_size_includes_additional_mips() {
+        assert!(texture_byte_size(1920, 1080, 4) > texture_byte_size(1920, 1080, 1));
+    }
+
+    #[test]
+    fn pool_policy_rejects_4k_rgba_textures() {
+        assert!(!should_pool_texture(3840, 2160, 1));
+        assert!(should_pool_texture(1920, 1080, 1));
+    }
+}
 
 impl WgpuContext {
     pub async fn with_surface(
@@ -546,13 +591,25 @@ impl WgpuContext {
     /// Return a texture to the pool for reuse
     pub fn return_texture_to_pool(&self, texture: wgpu::Texture, width: u32, height: u32) {
         let mut pool = self.texture_pool.lock();
-        let key = (width, height, texture.mip_level_count());
+        let mip_level_count = texture.mip_level_count();
+        let key = (width, height, mip_level_count);
+        let texture_bytes = texture_byte_size(width, height, mip_level_count);
+
+        if !should_pool_texture(width, height, mip_level_count) {
+            return;
+        }
 
         // Calculate total textures in pool
         let total_textures: usize = pool.values().map(|v| v.len()).sum();
+        let total_bytes: u64 = pool
+            .iter()
+            .map(|(&(w, h, mips), entries)| texture_byte_size(w, h, mips) * entries.len() as u64)
+            .sum();
 
         // Check global limit first
-        if total_textures >= MAX_TEXTURE_POOL_SIZE {
+        if total_textures >= MAX_TEXTURE_POOL_SIZE
+            || total_bytes.saturating_add(texture_bytes) > MAX_TEXTURE_POOL_BYTES
+        {
             // Pool is at global limit, drop this texture
             return;
         }
@@ -579,30 +636,34 @@ impl WgpuContext {
         }
         pool.retain(|_, v| !v.is_empty());
 
-        // If over global limit, trim oldest across all resolutions
-        let total: usize = pool.values().map(|v| v.len()).sum();
-        if total > MAX_TEXTURE_POOL_SIZE {
-            let mut excess = total - MAX_TEXTURE_POOL_SIZE;
-            // Collect (key, index, last_used) for sorting
-            let mut oldest: Vec<((u32, u32, u32), usize, std::time::Instant)> = pool
-                .iter()
-                .flat_map(|(&k, entries)| {
-                    entries
-                        .iter()
-                        .enumerate()
-                        .map(move |(i, e)| (k, i, e.last_used))
-                })
-                .collect();
-            oldest.sort_by_key(|&(_, _, t)| t);
+        // If over global limits, trim oldest across all resolutions.
+        let mut total_textures: usize = pool.values().map(|v| v.len()).sum();
+        let mut total_bytes: u64 = pool
+            .iter()
+            .map(|(&(w, h, mips), entries)| texture_byte_size(w, h, mips) * entries.len() as u64)
+            .sum();
+        if total_textures > MAX_TEXTURE_POOL_SIZE || total_bytes > MAX_TEXTURE_POOL_BYTES {
+            // Collect (key, index, last_used, bytes) for sorting
+            let mut oldest: Vec<((u32, u32, u32), usize, std::time::Instant, u64)> =
+                pool.iter()
+                    .flat_map(|(&k, entries)| {
+                        entries.iter().enumerate().map(move |(i, e)| {
+                            (k, i, e.last_used, texture_byte_size(k.0, k.1, k.2))
+                        })
+                    })
+                    .collect();
+            oldest.sort_by_key(|&(_, _, t, _)| t);
 
             // Remove oldest entries (iterate in age order, adjust indices)
             let mut removed_per_key: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
-            for &(key, idx, _) in &oldest {
-                if excess == 0 {
+            for &(key, idx, _, bytes) in &oldest {
+                if total_textures <= MAX_TEXTURE_POOL_SIZE && total_bytes <= MAX_TEXTURE_POOL_BYTES
+                {
                     break;
                 }
                 removed_per_key.entry(key).or_default().push(idx);
-                excess -= 1;
+                total_textures = total_textures.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(bytes);
             }
             for (key, mut indices) in removed_per_key {
                 indices.sort_unstable_by(|a, b| b.cmp(a)); // Remove from end first
@@ -664,6 +725,7 @@ pub struct Renderer {
     pub transition_start_time: Option<std::time::Instant>,
     pub transition_active: bool, // Explicit flag tracking if transition is active (following wpaperd pattern)
     pub transition_just_completed: bool, // Flag set when transition completes, cleared by main loop
+    content_swap_pending: bool,  // Keep current content visible until replacement upload is ready
 
     // Transition Settings
     pub active_transition: Transition,
@@ -685,6 +747,7 @@ pub struct Renderer {
 
     // Content Type state to prevent race conditions (stale video frames overwriting images)
     pub valid_content_type: crate::queue::ContentType,
+    pub active_image_session_id: u64,
     pub active_video_session_id: u64,
     pub active_batch_id: Option<u64>,
     pub batch_start_time: Option<std::time::Instant>, // Anchor for shared batch transitions
@@ -810,6 +873,7 @@ impl Renderer {
             transition_start_time: None,
             transition_active: false,
             transition_just_completed: false,
+            content_swap_pending: false,
             active_transition: Transition::Fade,
             transition_duration: 1.0,
             transition_stats: None,
@@ -823,6 +887,7 @@ impl Renderer {
             blit_source_is_prev: false,
             transition_rendered_this_frame: false,
             valid_content_type: crate::queue::ContentType::Image,
+            active_image_session_id: 0,
             active_video_session_id: 0,
             active_batch_id: None,
             batch_start_time: None,
@@ -1116,10 +1181,26 @@ impl Renderer {
         let name = transition.name();
 
         // Get compiled WGSL shader code using ShaderManager (fragment shader only)
-        let fragment_shader_code =
+        let fragment_shader_code = if crate::shaders::ShaderManager::is_transition_broken(&name) {
+            error!(
+                "Skipping known-broken shader for {}. Falling back to fade.",
+                name
+            );
+            match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
+                Ok(code) => code,
+                Err(fe) => {
+                    error!("FATAL: Failed to compile fallback fade shader: {}", fe);
+                    if let Some(m) = &self.metrics {
+                        m.record_error("shader_compile_fatal");
+                    }
+                    return None;
+                }
+            }
+        } else {
             match crate::shaders::ShaderManager::get_builtin_shader(transition) {
                 Ok(code) => code,
                 Err(e) => {
+                    crate::shaders::ShaderManager::mark_transition_broken(&name);
                     error!(
                         "Failed to compile shader for {}: {}. Falling back to fade.",
                         name, e
@@ -1139,7 +1220,8 @@ impl Renderer {
                         }
                     }
                 }
-            };
+            }
+        };
 
         // Create vertex shader module from the built-in quad.wgsl
         let vertex_shader = self
@@ -1219,10 +1301,14 @@ impl Renderer {
 
     pub fn render(
         &mut self,
-        context: BackendContext,
+        _context: BackendContext,
         frame_time: std::time::Instant,
     ) -> anyhow::Result<()> {
         let render_start = std::time::Instant::now();
+
+        if !self.transition_active && !self.content_swap_pending && self.prev_texture.is_some() {
+            self.release_prev_texture("render idle cleanup");
+        }
 
         // CRITICAL: Reset per-frame state at the start of each render cycle
         // This flag tracks whether a transition was rendered in THIS frame
@@ -1770,21 +1856,6 @@ impl Renderer {
             }
         } // render_pass dropped here
 
-        // Request frame callback BEFORE presenting/committing to ensure correct ordering
-        // CRITICAL FIX: Always force a fresh callback request when rendering.
-        // If we are rendering, we are committing a new frame, so we need a callback for the NEXT one.
-        // We reset pending=false to bypass the check in request_frame_callback and ensure we don't
-        // get stuck thinking a stale (lost) callback is still pending.
-        self.frame_callback_pending = false;
-        match context {
-            BackendContext::Wayland { surface, qh } => {
-                self.request_frame_callback(surface, qh);
-            }
-            BackendContext::X11 => {
-                // X11 doesn't use Wayland frame callbacks
-            }
-        }
-
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -1853,6 +1924,11 @@ impl Renderer {
     }
 
     pub fn set_content_type(&mut self, content_type: crate::queue::ContentType) {
+        if self.valid_content_type == crate::queue::ContentType::Video
+            && content_type != crate::queue::ContentType::Video
+        {
+            self.release_cuda_cache();
+        }
         self.valid_content_type = content_type;
     }
 
@@ -1902,42 +1978,31 @@ impl Renderer {
     ) -> anyhow::Result<()> {
         let upload_start = std::time::Instant::now();
 
-        // CRITICAL: Explicitly drop old image texture before creating new one
-        // This prevents memory leaks when switching images rapidly
-        // Image textures can't be pooled (they need mipmaps), so we must drop them
-        drop(self.current_texture.take());
-        drop(self.current_texture_view.take());
+        self.begin_content_swap();
 
-        // Cap mip levels to output resolution — levels below the output's pixel size are never sampled
-        let max_useful = ((self.config.width.max(self.config.height) as f32)
-            .log2()
-            .floor() as u32)
-            + 1;
-        let mip_level_count =
-            (((width.max(height) as f32).log2().floor() as u32) + 1).min(max_useful);
+        // If an image upload arrives without a pending swap, replace the current
+        // texture directly to avoid keeping unused image resources alive.
+        if self.current_texture.is_some() {
+            self.current_texture_view = None;
+            if let Some(curr) = self.current_texture.take() {
+                if let Some((w, h)) = self.current_texture_size.take() {
+                    self.ctx.return_texture_to_pool(curr, w, h);
+                }
+            }
+        }
 
-        // Use Rgba8UnormSrgb for proper color space
-        // Use texture pool for image textures (but note: images need mipmaps, so we can't fully pool them)
-        // For now, create new texture for images since they need mipmaps
-        // Video textures can use the pool since they don't need mipmaps
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Image Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
+        // Static images are pre-sized close to the output in the CPU prep path, so
+        // full mip chains mostly add upload cost and idle GPU memory without helping
+        // transition correctness. Keep them single-mip so they can reuse the texture pool.
+        let texture = self.ctx.get_texture_from_pool(
+            width,
+            height,
+            wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-        });
+            self.metrics.as_deref(),
+        );
 
-        // 1. Upload base level (0)
         self.ctx.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -1958,89 +2023,13 @@ impl Renderer {
             },
         );
 
-        // 2. Generate Mipmaps
-        if mip_level_count > 1 {
-            let mut encoder =
-                self.ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Mipmap Generation Encoder"),
-                    });
-
-            let pipeline = self
-                .ctx
-                .get_mipmap_pipeline(wgpu::TextureFormat::Rgba8UnormSrgb);
-
-            for i in 1..mip_level_count {
-                let src_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some(&format!("Mip Src Level {}", i - 1)),
-                    format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    aspect: wgpu::TextureAspect::All,
-                    base_mip_level: i - 1,
-                    mip_level_count: Some(1),
-                    base_array_layer: 0,
-                    array_layer_count: None,
-                });
-
-                let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some(&format!("Mip Dst Level {}", i)),
-                    format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    aspect: wgpu::TextureAspect::All,
-                    base_mip_level: i,
-                    mip_level_count: Some(1),
-                    base_array_layer: 0,
-                    array_layer_count: None,
-                });
-
-                let bind_group = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Mipmap Bind Group Level {}", i)),
-                        layout: &self.ctx.mipmap_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&src_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                            },
-                        ],
-                    });
-
-                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Mipmap Render Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &dst_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-
-                rpass.set_pipeline(&pipeline);
-                rpass.set_bind_group(0, &bind_group, &[]);
-                rpass.draw(0..3, 0..1);
-            }
-            self.ctx.queue.submit(Some(encoder.finish()));
-        }
-
         self.current_texture_view = Some(texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("Image Texture View"),
             format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
             dimension: Some(wgpu::TextureViewDimension::D2),
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0,
-            mip_level_count: Some(mip_level_count),
+            mip_level_count: Some(1),
             base_array_layer: 0,
             array_layer_count: None,
         }));
@@ -2083,6 +2072,10 @@ impl Renderer {
     }
 
     pub fn upload_frame(&mut self, frame: &crate::video::VideoFrame) {
+        if !self.transition_active && !self.content_swap_pending && self.prev_texture.is_some() {
+            self.release_prev_texture("video upload cleanup");
+        }
+
         if self.valid_content_type != crate::queue::ContentType::Video
             || frame.session_id != self.active_video_session_id
         {
@@ -2093,10 +2086,15 @@ impl Renderer {
             return;
         }
 
-        let is_first_frame_after_switch = self.current_texture.is_none();
+        let is_first_frame_after_switch =
+            self.content_swap_pending || self.current_texture.is_none();
 
         if is_first_frame_after_switch && self.video_first_frame_time.is_none() {
             self.video_first_frame_time = Some(std::time::Instant::now());
+        }
+
+        if is_first_frame_after_switch {
+            self.begin_content_swap();
         }
 
         let width = frame.width;
@@ -2997,12 +2995,10 @@ impl Renderer {
     }
 
     pub fn switch_content(&mut self) {
-        // Always initialize transition state, even if current_texture is None
-        // This ensures transitions work even when switching from empty state
         let had_current = self.current_texture.is_some();
 
-        // CRITICAL: If prev_texture already exists (from previous switch that didn't complete),
-        // return it to pool before setting new one. This prevents accumulation when switching rapidly.
+        // If a previous transition left a prev texture behind, release it before preparing
+        // the next swap. The current texture stays visible until replacement upload is ready.
         if let Some(old_prev) = self.prev_texture.take() {
             if let Some((w, h)) = self.prev_texture_size.take() {
                 debug!(
@@ -3015,47 +3011,40 @@ impl Renderer {
             drop(self.prev_texture_view.take());
         }
 
-        if let Some(curr) = self.current_texture.take() {
-            self.prev_texture_view = self.current_texture_view.take();
-            self.prev_texture = Some(curr);
-            self.prev_aspect = self.current_aspect;
-            // Track prev_texture size for returning to pool later
-            self.prev_texture_size = self.current_texture_size;
-        }
-
-        // Always reset transition state when switching content
-        // Note: transition_start_time will be reset when new content is actually uploaded
-        // transition_active will be set to true when new texture is ready (in upload_image/upload_frame)
-        self.transition_progress = 0.0;
+        self.content_swap_pending = true;
+        self.transition_progress = 1.0;
         self.transition_start_time = None; // Will be set when content is uploaded
-        self.transition_active = false; // Will be set to true when new texture is ready
+        self.transition_active = false; // Will be set to true when replacement content is ready
         self.transition_just_completed = false; // Reset completion flag
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None; // Invalidate
         self.batch_start_time = None; // Reset
-        self.video_first_frame_time = None; // Reset video timing for new session
+        self.video_first_frame_time = if self.valid_content_type == crate::queue::ContentType::Video
+        {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.needs_redraw = true;
 
-        // OPTIMIZATION: Don't reset current_texture_size immediately.
-        // We want to keep it around to see if next content (video frame) matches.
-        // upload_frame will check needs_new_texture against this size.
-
         debug!(
-            "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, transition_started, current_texture cleared",
+            "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, pending_swap={}",
             self.name,
             had_current,
-            self.prev_texture.is_some()
+            self.prev_texture.is_some(),
+            self.content_swap_pending
         );
     }
 
     pub fn abort_transition(&mut self) {
-        if self.transition_active || self.current_texture.is_none() {
+        if self.transition_active || self.content_swap_pending || self.current_texture.is_none() {
             if self.transition_active {
                 info!(
                     "[TRANSITION] {}: Aborting transition due to load failure",
                     self.name
                 );
             }
+            self.content_swap_pending = false;
             self.transition_active = false;
             self.transition_just_completed = false; // Reset flag
             self.transition_progress = 1.0;
@@ -3081,9 +3070,11 @@ impl Renderer {
         self.transition_progress = 1.0;
         self.transition_active = false;
         self.transition_just_completed = false; // Reset flag
+        self.content_swap_pending = false;
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None; // Invalidate
         self.needs_redraw = true;
+        self.release_cuda_cache();
         // Reclaim memory immediately - this ensures GPU resources are freed
         // rather than waiting for WGPU's automatic cleanup
         self.active_video_session_id = 0; // Invalidate current video session
@@ -3097,6 +3088,53 @@ impl Renderer {
         self.configured = false;
         self.needs_redraw = true;
     }
+
+    fn begin_content_swap(&mut self) {
+        if !self.content_swap_pending {
+            return;
+        }
+
+        if let Some(curr) = self.current_texture.take() {
+            self.prev_texture_view = self.current_texture_view.take();
+            self.prev_texture = Some(curr);
+            self.prev_aspect = self.current_aspect;
+            self.prev_texture_size = self.current_texture_size.take();
+        } else {
+            self.current_texture_view = None;
+            self.current_texture_size = None;
+        }
+
+        self.content_swap_pending = false;
+        self.transition_bind_group = None;
+        self.blit_bind_group = None;
+        self.blit_source_is_composition = false;
+        self.blit_source_is_prev = false;
+    }
+
+    fn release_cuda_cache(&mut self) {
+        if let Some(cuda_cache) = self.cuda_textures.take() {
+            if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
+                interop.free_exportable(cuda_cache.y_cuda_alloc);
+                interop.free_exportable(cuda_cache.uv_cuda_alloc);
+            }
+        }
+    }
+
+    fn release_prev_texture(&mut self, reason: &str) {
+        if let Some(prev_tex) = self.prev_texture.take() {
+            debug!(
+                "[TRANSITION] {}: Releasing stale prev_texture ({})",
+                self.name, reason
+            );
+            if let Some((w, h)) = self.prev_texture_size.take() {
+                self.ctx.return_texture_to_pool(prev_tex, w, h);
+            }
+        }
+        self.prev_texture_view = None;
+        self.transition_bind_group = None;
+        self.blit_bind_group = None;
+    }
+
     fn update_transition_bind_group(&mut self) {
         // Skip recreation if bind group already exists — it's invalidated to None
         // whenever textures change (upload_image_data, upload_frame, switch_content)
@@ -3572,7 +3610,7 @@ fn create_cuda_backed_texture(
                 }
             };
 
-            // Success: Vulkan now owns the FD. 
+            // Success: Vulkan now owns the FD.
             // DO NOT manually close it here (it causes intermittent double-close crashes).
             // The driver/Vulkan implementation is responsible for closing the imported FD.
 
