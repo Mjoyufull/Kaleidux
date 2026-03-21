@@ -15,12 +15,14 @@ use crate::scripting;
 use crate::video;
 
 use kaleidux_common::{Request, Response, Transition};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -34,6 +36,10 @@ use zune_core::options::DecoderOptions;
 // Limit to 2 concurrent decodes since each can be 35-40MB
 static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(2)));
+static IMAGE_PREFETCH_IN_FLIGHT: once_cell::sync::Lazy<Arc<Mutex<HashSet<PathBuf>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(HashSet::new())));
+
+type PendingVideoSessions = Arc<Mutex<HashMap<String, u64>>>;
 
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
@@ -51,31 +57,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cover_resize_does_not_upscale_smaller_images() {
+    fn upload_resize_does_not_touch_normal_images() {
+        assert_eq!(compute_upload_downscale_dimensions(1280, 720), None);
+    }
+
+    #[test]
+    fn upload_resize_downscales_only_oversized_sources() {
         assert_eq!(
-            compute_downscaled_cover_dimensions(1280, 720, 3840, 2160),
-            None
+            compute_upload_downscale_dimensions(MAX_IMAGE_UPLOAD_DIMENSION * 2, 4000),
+            Some((MAX_IMAGE_UPLOAD_DIMENSION, 2000))
         );
-    }
-
-    #[test]
-    fn cover_resize_downscales_to_cover_target() {
-        assert_eq!(
-            compute_downscaled_cover_dimensions(8000, 4000, 3840, 2160),
-            Some((4320, 2160))
-        );
-    }
-
-    #[test]
-    fn resize_filter_prefers_bilinear_for_heavy_shrink() {
-        let filter = select_resize_filter(8000, 4000, 3840, 1920);
-        assert_eq!(filter, fast_image_resize::FilterType::Bilinear);
-    }
-
-    #[test]
-    fn resize_filter_prefers_catmull_rom_for_light_shrink() {
-        let filter = select_resize_filter(4200, 2400, 3840, 2194);
-        assert_eq!(filter, fast_image_resize::FilterType::CatmullRom);
     }
 
     #[test]
@@ -93,6 +84,159 @@ mod tests {
                 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
             ]
         );
+    }
+
+    #[test]
+    fn rgb_prep_keeps_source_dimensions_even_when_target_is_smaller() {
+        let rgb = vec![64; 4 * 1 * 3];
+        let (rgba, width, height, resize, _expand, filter) =
+            prepare_rgb_image(rgb, 4, 1, 1, 1).expect("rgb prep should succeed");
+
+        assert_eq!((width, height), (4, 1));
+        assert_eq!(resize, Duration::ZERO);
+        assert_eq!(filter, None);
+        assert_eq!(rgba.len(), 4 * 1 * 4);
+    }
+
+    #[test]
+    fn luma_prep_expands_to_rgba_without_resize_when_not_needed() {
+        let luma = vec![10, 40, 70, 100];
+        let (rgba, width, height, resize, _expand, filter) =
+            prepare_luma_image(luma, 2, 2, 3840, 2160).expect("luma prep should succeed");
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(resize, Duration::ZERO);
+        assert_eq!(filter, None);
+        assert_eq!(
+            rgba,
+            vec![
+                10, 10, 10, 255, 40, 40, 40, 255, 70, 70, 70, 255, 100, 100, 100, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn lumaa_prep_preserves_alpha() {
+        let lumaa = vec![10, 11, 40, 41, 70, 71, 100, 101];
+        let (rgba, width, height, resize, _expand, filter) =
+            prepare_lumaa_image(lumaa, 2, 2, 3840, 2160).expect("lumaa prep should succeed");
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(resize, Duration::ZERO);
+        assert_eq!(filter, None);
+        assert_eq!(
+            rgba,
+            vec![
+                10, 10, 10, 11, 40, 40, 40, 41, 70, 70, 70, 71, 100, 100, 100, 101,
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_image_cache_roundtrip_preserves_rgba_payload() {
+        let unique = format!(
+            "kaleidux-cache-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let source_path = std::env::temp_dir().join(unique);
+        std::fs::write(&source_path, b"source").expect("temp source should be writable");
+
+        let payload = DecodedImagePayload {
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            width: 1,
+            height: 2,
+            profile: ImageLoadProfile {
+                format: "png-fast".to_string(),
+                source_width: 100,
+                source_height: 200,
+                permit_wait: Duration::ZERO,
+                decode: Duration::from_millis(1),
+                convert: Duration::ZERO,
+                resize: Duration::from_millis(2),
+                expand: Duration::ZERO,
+                resize_filter: Some("bilinear".to_string()),
+            },
+        };
+
+        store_prepared_image_cache(&source_path, 1920, 1080, &payload);
+        let cached = try_load_prepared_image_cache(&source_path, 1920, 1080)
+            .expect("prepared cache should load");
+
+        assert_eq!(cached.width, payload.width);
+        assert_eq!(cached.height, payload.height);
+        assert_eq!(cached.data, payload.data);
+        assert_eq!(cached.profile.source_width, payload.profile.source_width);
+        assert_eq!(cached.profile.source_height, payload.profile.source_height);
+        assert_eq!(cached.profile.format, "prepared-cache");
+
+        if let Some(cache_path) = prepared_image_cache_path(&source_path, 1920, 1080) {
+            let _ = std::fs::remove_file(cache_path);
+        }
+        let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn prepared_image_cache_is_shared_across_output_sizes() {
+        let unique = format!(
+            "kaleidux-cache-shared-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let source_path = std::env::temp_dir().join(unique);
+        std::fs::write(&source_path, b"source").expect("temp source should be writable");
+
+        let payload = DecodedImagePayload {
+            data: vec![9, 8, 7, 6],
+            width: 1,
+            height: 1,
+            profile: ImageLoadProfile {
+                format: "png-fast".to_string(),
+                source_width: 3840,
+                source_height: 2160,
+                permit_wait: Duration::ZERO,
+                decode: Duration::from_millis(1),
+                convert: Duration::ZERO,
+                resize: Duration::ZERO,
+                expand: Duration::ZERO,
+                resize_filter: None,
+            },
+        };
+
+        store_prepared_image_cache(&source_path, 1920, 1080, &payload);
+        let cached = try_load_prepared_image_cache(&source_path, 1366, 768)
+            .expect("prepared cache should load across output sizes");
+
+        assert_eq!(cached.width, payload.width);
+        assert_eq!(cached.height, payload.height);
+        assert_eq!(cached.data, payload.data);
+
+        if let Some(cache_path) = prepared_image_cache_path(&source_path, 1, 1) {
+            let _ = std::fs::remove_file(cache_path);
+        }
+        let _ = std::fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn pending_video_session_state_replaces_and_clears() {
+        let sessions: PendingVideoSessions = Arc::new(Mutex::new(HashMap::new()));
+
+        set_pending_video_session(&sessions, "DP-2", Some(7));
+        assert!(pending_video_session_matches(&sessions, "DP-2", 7));
+        assert!(!pending_video_session_matches(&sessions, "DP-2", 8));
+
+        set_pending_video_session(&sessions, "DP-2", Some(9));
+        assert!(!pending_video_session_matches(&sessions, "DP-2", 7));
+        assert!(pending_video_session_matches(&sessions, "DP-2", 9));
+
+        set_pending_video_session(&sessions, "DP-2", None);
+        assert!(!pending_video_session_matches(&sessions, "DP-2", 9));
     }
 }
 
@@ -128,8 +272,32 @@ struct DecodedImagePayload {
 }
 
 pub enum VideoPlayerResult {
-    Success(String, u64, video::VideoPlayer),
+    Success(String, u64, video::VideoPlayer, Option<video::VideoFrame>),
     Failure(String, u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingVideoSwitch {
+    pub session_id: u64,
+    pub batch_id: Option<u64>,
+    pub batch_trigger_time: Option<Instant>,
+    pub transition: Transition,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupPresentBarrier {
+    pub batch_id: u64,
+    pub outputs: HashSet<String>,
+    pub armed_at: Instant,
+    pub deadline: Instant,
+}
+
+pub(crate) fn stop_video_player_in_background(name: String, mut player: video::VideoPlayer) {
+    let _ = player.request_stop();
+    tokio::task::spawn_blocking(move || {
+        debug!("[VIDEO] {}: Finalizing player stop on blocking pool", name);
+        let _ = player.stop();
+    });
 }
 
 /// Type aliases to reduce verbosity in signatures
@@ -142,7 +310,11 @@ pub struct MainLoopContext {
     pub monitor_manager: monitor_manager::MonitorManager,
     pub renderers: HashMap<String, renderer::Renderer>,
     pub video_players: HashMap<String, video::VideoPlayer>,
+    pub pending_video_switches: HashMap<String, PendingVideoSwitch>,
+    pub pending_image_video_stops: HashMap<String, video::VideoPlayer>,
+    pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
+    pub startup_present_barrier: Option<StartupPresentBarrier>,
 
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<CmdMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<CmdMsg>,
@@ -310,7 +482,11 @@ impl MainLoopContext {
             monitor_manager,
             renderers: HashMap::new(),
             video_players: HashMap::new(),
+            pending_video_switches: HashMap::new(),
+            pending_image_video_stops: HashMap::new(),
+            pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
+            startup_present_barrier: None,
             cmd_rx,
             cmd_tx,
             frame_rx,
@@ -395,6 +571,9 @@ impl MainLoopContext {
                     &self.monitor_manager,
                     &mut self.renderers,
                     &mut self.video_players,
+                    &mut self.pending_video_switches,
+                    &mut self.pending_image_video_stops,
+                    &self.pending_video_sessions,
                     Some(batch_id),
                     Some(loop_start),
                     &self.image_tx,
@@ -424,6 +603,9 @@ impl MainLoopContext {
                 &mut self.monitor_manager,
                 &mut self.renderers,
                 &mut self.video_players,
+                &mut self.pending_video_switches,
+                &mut self.pending_image_video_stops,
+                &self.pending_video_sessions,
                 &self.frame_tx,
                 &self.image_tx,
                 &self.player_tx,
@@ -502,11 +684,19 @@ impl MainLoopContext {
         F: FnMut(&mut renderer::Renderer, &str, Instant),
     {
         let mut images_received = 0;
-        let image_iter = std::iter::once(image_buf)
-            .flatten()
-            .chain(std::iter::from_fn(|| self.image_rx.try_recv().ok()));
-        for msg in image_iter {
+        let mut pending_images = Vec::new();
+        if let Some(msg) = image_buf {
+            pending_images.push(msg);
+        }
+        while let Ok(msg) = self.image_rx.try_recv() {
+            pending_images.push(msg);
+        }
+
+        for msg in pending_images {
             images_received += 1;
+            let barrier_blocks = self.startup_barrier_blocks_output(&msg.name, loop_start);
+            let mut release_pending_video = false;
+            let mut transition_completed = false;
             debug!(
                 "[IMAGE] Received image for {}: session={}, data={}, size={}x{}",
                 msg.name,
@@ -538,6 +728,13 @@ impl MainLoopContext {
 
                 if let Some(data) = msg.data {
                     if let Some(profile) = &msg.profile {
+                        self.metrics.record_image_stage_timings(
+                            profile.permit_wait,
+                            profile.decode,
+                            profile.convert,
+                            profile.resize,
+                            profile.expand,
+                        );
                         debug!(
                             "[IMAGE] {}: prepared {} {}x{} -> {}x{} in {:.1}ms (wait {:.1}ms, decode {:.1}ms, convert {:.1}ms, resize {:.1}ms, expand {:.1}ms, filter={})",
                             msg.name,
@@ -562,24 +759,34 @@ impl MainLoopContext {
                     );
                     let upload_start = Instant::now();
                     let _ = r.upload_image_data(data, msg.width, msg.height);
+                    self.metrics
+                        .record_image_upload_cpu_time(upload_start.elapsed());
                     debug!(
                         "[IMAGE] Upload complete for {}: {:.1}ms",
                         msg.name,
                         duration_ms(upload_start.elapsed())
                     );
-                    debug!("[IMAGE] Rendering after upload for {}", msg.name);
-                    render_fn(r, &msg.name, loop_start);
-                    if !self.first_frame_recorded {
-                        self.metrics.record_first_frame();
-                        self.first_frame_recorded = true;
+                    if barrier_blocks {
+                        debug!(
+                            "[STARTUP] {}: First image ready, holding present for barrier release",
+                            msg.name
+                        );
+                    } else {
+                        debug!("[IMAGE] Rendering after upload for {}", msg.name);
+                        render_fn(r, &msg.name, loop_start);
+                        if !self.first_frame_recorded {
+                            self.metrics.record_first_frame();
+                            self.first_frame_recorded = true;
+                        }
                     }
-                    // Check if transition just completed and mark it
-                    if r.transition_just_completed {
+                    release_pending_video = true;
+                    transition_completed = r.transition_just_completed;
+                    if transition_completed {
                         r.transition_just_completed = false;
-                        self.monitor_manager.mark_transition_completed(&msg.name);
                     }
                 } else {
                     r.abort_transition();
+                    release_pending_video = true;
                 }
             } else {
                 warn!(
@@ -587,36 +794,132 @@ impl MainLoopContext {
                     msg.name
                 );
             }
+            if release_pending_video {
+                self.release_pending_image_video_stop(&msg.name);
+            }
+            if transition_completed {
+                self.monitor_manager.mark_transition_completed(&msg.name);
+            }
         }
         if images_received > 0 {
             self.metrics.record_image_channel_size(images_received);
         }
     }
 
-    /// Drain player results from channel and insert/stop as needed.
-    pub fn drain_players(&mut self, player_buf: Option<VideoPlayerResult>) {
-        let player_iter = std::iter::once(player_buf)
-            .flatten()
-            .chain(std::iter::from_fn(|| self.player_rx.try_recv().ok()));
-        for res in player_iter {
+    fn release_pending_image_video_stop(&mut self, name: &str) {
+        if let Some(player) = self.pending_image_video_stops.remove(name) {
+            stop_video_player_in_background(name.to_string(), player);
+        }
+    }
+
+    /// Drain player results from channel, activate deferred video switches, and
+    /// render immediately when a preroll frame is available.
+    pub fn drain_players<F>(
+        &mut self,
+        player_buf: Option<VideoPlayerResult>,
+        loop_start: Instant,
+        mut render_fn: F,
+    ) where
+        F: FnMut(&mut renderer::Renderer, &str, Instant),
+    {
+        let mut pending_players = Vec::new();
+        if let Some(res) = player_buf {
+            pending_players.push(res);
+        }
+        while let Ok(res) = self.player_rx.try_recv() {
+            pending_players.push(res);
+        }
+
+        for res in pending_players {
             match res {
-                VideoPlayerResult::Success(name, session_id, mut player) => {
-                    if self.renderers.get(&name).map(|r| r.active_video_session_id)
+                VideoPlayerResult::Success(name, session_id, mut player, preroll_frame) => {
+                    let barrier_blocks = self.startup_barrier_blocks_output(&name, loop_start);
+                    let pending = self.pending_video_switches.get(&name).cloned();
+                    if let Some(pending) = pending.filter(|p| p.session_id == session_id) {
+                        self.pending_video_switches.remove(&name);
+
+                        let mut should_render = false;
+                        if let Some(r) = self.renderers.get_mut(&name) {
+                            r.active_batch_id = pending.batch_id;
+                            r.batch_start_time = pending.batch_trigger_time;
+                            r.active_transition = pending.transition;
+                            r.set_content_type(crate::queue::ContentType::Video);
+                            r.active_image_session_id = 0;
+                            r.active_video_session_id = session_id;
+                            r.switch_content();
+
+                            if let Some(frame) = preroll_frame.as_ref() {
+                                let upload_start = Instant::now();
+                                r.upload_frame(frame);
+                                self.metrics.record_video_cpu_time(upload_start.elapsed());
+                                should_render = true;
+                            }
+                        } else {
+                            stop_video_player_in_background(name, player);
+                            continue;
+                        }
+
+                        if let Err(e) = player.start() {
+                            error!(
+                                "[VIDEO] {}: Failed to start deferred video player: {}",
+                                name, e
+                            );
+                            set_pending_video_session(&self.pending_video_sessions, &name, None);
+                            if let Some(r) = self.renderers.get_mut(&name) {
+                                r.abort_transition();
+                            }
+                            continue;
+                        }
+
+                        if let Some(old) = self.video_players.insert(name.clone(), player) {
+                            stop_video_player_in_background(name.clone(), old);
+                        }
+
+                        if should_render {
+                            if barrier_blocks {
+                                debug!(
+                                    "[STARTUP] {}: First video frame ready, holding present for barrier release",
+                                    name
+                                );
+                            } else if let Some(r) = self.renderers.get_mut(&name) {
+                                render_fn(r, &name, loop_start);
+                                if !self.first_frame_recorded {
+                                    self.metrics.record_first_frame();
+                                    self.first_frame_recorded = true;
+                                }
+                                if r.transition_just_completed {
+                                    r.transition_just_completed = false;
+                                    self.monitor_manager.mark_transition_completed(&name);
+                                }
+                            }
+                        }
+                    } else if self.renderers.get(&name).map(|r| r.active_video_session_id)
                         == Some(session_id)
                     {
-                        if let Some(mut old) = self.video_players.insert(name, player) {
-                            tokio::spawn(async move {
-                                let _ = old.stop();
-                            });
+                        if let Err(e) = player.start() {
+                            error!("[VIDEO] {}: Failed to start video player: {}", name, e);
+                            set_pending_video_session(&self.pending_video_sessions, &name, None);
+                            if let Some(r) = self.renderers.get_mut(&name) {
+                                r.abort_transition();
+                            }
+                            continue;
+                        }
+                        if let Some(old) = self.video_players.insert(name.clone(), player) {
+                            stop_video_player_in_background(name, old);
                         }
                     } else {
-                        // Stale player - stop in background
-                        tokio::spawn(async move {
-                            let _ = player.stop();
-                        });
+                        stop_video_player_in_background(name, player);
                     }
                 }
                 VideoPlayerResult::Failure(name, session_id) => {
+                    if self
+                        .pending_video_switches
+                        .get(&name)
+                        .is_some_and(|p| p.session_id == session_id)
+                    {
+                        self.pending_video_switches.remove(&name);
+                        set_pending_video_session(&self.pending_video_sessions, &name, None);
+                    }
                     if self.renderers.get(&name).map(|r| r.active_video_session_id)
                         == Some(session_id)
                     {
@@ -663,12 +966,46 @@ impl MainLoopContext {
         // Log metrics summary every 10 seconds
         if self.last_metrics_log.elapsed().as_secs() >= 10 {
             if let Some(ctx) = &self.wgpu_ctx {
-                let texture_count = ctx.texture_pool.lock().values().map(|v| v.len()).sum();
+                let (texture_count, texture_pool_bytes) = ctx.texture_pool_stats();
                 let pipeline_count = ctx.transition_pipelines.lock().len()
                     + ctx.blit_pipelines.lock().len()
                     + ctx.mipmap_pipelines.lock().len();
                 self.metrics.record_texture_count(texture_count);
                 self.metrics.record_pipeline_count(pipeline_count);
+
+                let mut retained = renderer::RetainedTextureFootprint::default();
+                let mut per_renderer = Vec::new();
+                let to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+                for (name, r) in &self.renderers {
+                    let fp = r.retained_texture_footprint();
+                    retained.current_bytes =
+                        retained.current_bytes.saturating_add(fp.current_bytes);
+                    retained.prev_bytes = retained.prev_bytes.saturating_add(fp.prev_bytes);
+                    retained.composition_bytes = retained
+                        .composition_bytes
+                        .saturating_add(fp.composition_bytes);
+                    retained.video_aux_bytes =
+                        retained.video_aux_bytes.saturating_add(fp.video_aux_bytes);
+                    per_renderer.push(format!(
+                        "{}={:.1}MB(c={:.1} p={:.1} comp={:.1} aux={:.1})",
+                        name,
+                        to_mb(fp.total_bytes()),
+                        to_mb(fp.current_bytes),
+                        to_mb(fp.prev_bytes),
+                        to_mb(fp.composition_bytes),
+                        to_mb(fp.video_aux_bytes)
+                    ));
+                }
+                info!(
+                    "[MEMORY] Renderer retained textures: total={:.1}MB current={:.1}MB prev={:.1}MB composition={:.1}MB video_aux={:.1}MB pool={:.1}MB | {}",
+                    to_mb(retained.total_bytes()),
+                    to_mb(retained.current_bytes),
+                    to_mb(retained.prev_bytes),
+                    to_mb(retained.composition_bytes),
+                    to_mb(retained.video_aux_bytes),
+                    to_mb(texture_pool_bytes),
+                    per_renderer.join(" | ")
+                );
             }
             self.metrics.log_summary();
             self.last_metrics_log = Instant::now();
@@ -709,6 +1046,7 @@ impl MainLoopContext {
             warn!("[STARTUP] No initial content changes - wallpapers may not load!");
         }
         let batch_id = rand::random::<u64>();
+        let mut startup_outputs = Vec::new();
         for (name, (path, content_type)) in initial_changes {
             if !self.renderers.contains_key(&name) {
                 warn!(
@@ -717,6 +1055,7 @@ impl MainLoopContext {
                 );
                 continue;
             }
+            startup_outputs.push(name.clone());
             switch_wallpaper_content(
                 &name,
                 &path,
@@ -726,6 +1065,9 @@ impl MainLoopContext {
                 &self.monitor_manager,
                 &mut self.renderers,
                 &mut self.video_players,
+                &mut self.pending_video_switches,
+                &mut self.pending_image_video_stops,
+                &self.pending_video_sessions,
                 Some(batch_id),
                 None,
                 &self.image_tx,
@@ -733,13 +1075,106 @@ impl MainLoopContext {
                 "STARTUP",
             );
         }
+        if startup_outputs.len() > 1 {
+            self.arm_startup_present_barrier(batch_id, startup_outputs);
+        }
+    }
+
+    pub fn arm_startup_present_barrier(&mut self, batch_id: u64, outputs: Vec<String>) {
+        let output_set: HashSet<_> = outputs
+            .into_iter()
+            .filter(|name| self.renderers.contains_key(name))
+            .collect();
+        if output_set.len() <= 1 {
+            return;
+        }
+
+        let now = Instant::now();
+        self.startup_present_barrier = Some(StartupPresentBarrier {
+            batch_id,
+            outputs: output_set,
+            armed_at: now,
+            deadline: now + Duration::from_secs(3),
+        });
+        info!(
+            "[STARTUP] First-present barrier armed for {} outputs (batch {:x})",
+            self.startup_present_barrier
+                .as_ref()
+                .map_or(0, |b| b.outputs.len()),
+            batch_id
+        );
+    }
+
+    pub fn startup_barrier_blocks_output(&self, name: &str, now: Instant) -> bool {
+        match &self.startup_present_barrier {
+            Some(barrier) if barrier.outputs.contains(name) => !self.startup_barrier_ready(now),
+            _ => false,
+        }
+    }
+
+    pub fn startup_barrier_ready(&self, now: Instant) -> bool {
+        let Some(barrier) = &self.startup_present_barrier else {
+            return true;
+        };
+
+        if now >= barrier.deadline {
+            return true;
+        }
+
+        barrier.outputs.iter().all(|name| {
+            self.renderers
+                .get(name)
+                .is_some_and(|r| r.has_current_texture())
+        })
+    }
+
+    pub fn release_startup_present_barrier<F>(&mut self, loop_start: Instant, mut render_fn: F)
+    where
+        F: FnMut(&mut renderer::Renderer, &str, Instant),
+    {
+        let Some(barrier) = self.startup_present_barrier.clone() else {
+            return;
+        };
+        if !self.startup_barrier_ready(loop_start) {
+            return;
+        }
+
+        let timed_out = loop_start >= barrier.deadline;
+        info!(
+            "[STARTUP] Releasing first-present barrier for batch {:x} after {:.1}ms{}",
+            barrier.batch_id,
+            duration_ms(loop_start.saturating_duration_since(barrier.armed_at)),
+            if timed_out { " (timeout)" } else { "" }
+        );
+
+        for name in &barrier.outputs {
+            if let Some(r) = self.renderers.get_mut(name) {
+                render_fn(r, name, loop_start);
+                if !self.first_frame_recorded {
+                    self.metrics.record_first_frame();
+                    self.first_frame_recorded = true;
+                }
+            }
+        }
+
+        self.startup_present_barrier = None;
     }
 
     /// Clean shutdown — stop all video players and save caches.
     pub fn shutdown(&mut self) {
-        for player in self.video_players.values_mut() {
+        for (_, mut player) in self.video_players.drain() {
             let _ = player.stop();
         }
+        for (_, mut player) in self.pending_image_video_stops.drain() {
+            let _ = player.stop();
+        }
+        self.pending_video_switches.clear();
+        if let Ok(mut sessions) = self.pending_video_sessions.lock() {
+            sessions.clear();
+        }
+        // Drop renderer-owned wgpu surfaces while the backend connection still exists.
+        self.renderers.clear();
+        self.wgpu_ctx = None;
         // Persist WGSL cache to disk on shutdown (P-15 cache layer 1)
         if let Err(e) = crate::shaders::ShaderManager::save_cache() {
             warn!("[SHADER] Failed to save WGSL cache: {}", e);
@@ -751,6 +1186,37 @@ impl MainLoopContext {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+pub(crate) fn set_pending_video_session(
+    pending_video_sessions: &PendingVideoSessions,
+    name: &str,
+    session_id: Option<u64>,
+) {
+    let Ok(mut sessions) = pending_video_sessions.lock() else {
+        return;
+    };
+
+    match session_id {
+        Some(session_id) => {
+            sessions.insert(name.to_string(), session_id);
+        }
+        None => {
+            sessions.remove(name);
+        }
+    }
+}
+
+fn pending_video_session_matches(
+    pending_video_sessions: &PendingVideoSessions,
+    name: &str,
+    session_id: u64,
+) -> bool {
+    pending_video_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(name).copied())
+        == Some(session_id)
 }
 
 fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> String {
@@ -780,21 +1246,134 @@ fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> St
     }
 }
 
-fn compute_downscaled_cover_dimensions(
-    source_width: u32,
-    source_height: u32,
+const PREPARED_IMAGE_CACHE_MAGIC: &[u8; 8] = b"KDXIMG01";
+
+fn prepared_image_cache_dir() -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("kaleidux").join("prepared-images");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn prepared_image_cache_key(
+    path: &Path,
+    _target_width: u32,
+    _target_height: u32,
+) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let modified = modified.duration_since(UNIX_EPOCH).ok()?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.as_os_str().as_encoded_bytes().hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    modified.as_secs().hash(&mut hasher);
+    modified.subsec_nanos().hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+fn prepared_image_cache_path(
+    path: &Path,
     target_width: u32,
     target_height: u32,
-) -> Option<(u32, u32)> {
-    let cover_scale = (target_width as f32 / source_width as f32)
-        .max(target_height as f32 / source_height as f32)
-        .min(1.0);
-    if cover_scale >= 1.0 {
+) -> Option<PathBuf> {
+    let dir = prepared_image_cache_dir()?;
+    let key = prepared_image_cache_key(path, target_width, target_height)?;
+    Some(dir.join(format!("{key}.rgba")))
+}
+
+fn try_load_prepared_image_cache(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> Option<DecodedImagePayload> {
+    let cache_path = prepared_image_cache_path(path, target_width, target_height)?;
+    let bytes = std::fs::read(cache_path).ok()?;
+    if bytes.len() < PREPARED_IMAGE_CACHE_MAGIC.len() + (4 * 4) {
+        return None;
+    }
+    if &bytes[..PREPARED_IMAGE_CACHE_MAGIC.len()] != PREPARED_IMAGE_CACHE_MAGIC {
         return None;
     }
 
-    let resized_width = ((source_width as f32 * cover_scale).round() as u32).max(1);
-    let resized_height = ((source_height as f32 * cover_scale).round() as u32).max(1);
+    let mut cursor = PREPARED_IMAGE_CACHE_MAGIC.len();
+    let read_u32 = |buf: &[u8], cursor: &mut usize| -> Option<u32> {
+        let end = *cursor + 4;
+        let slice = buf.get(*cursor..end)?;
+        *cursor = end;
+        Some(u32::from_le_bytes(slice.try_into().ok()?))
+    };
+
+    let width = read_u32(&bytes, &mut cursor)?;
+    let height = read_u32(&bytes, &mut cursor)?;
+    let source_width = read_u32(&bytes, &mut cursor)?;
+    let source_height = read_u32(&bytes, &mut cursor)?;
+    let data = bytes.get(cursor..)?.to_vec();
+    if data.len() != (width as usize * height as usize * 4) {
+        return None;
+    }
+
+    Some(DecodedImagePayload {
+        data,
+        width,
+        height,
+        profile: ImageLoadProfile {
+            format: "prepared-cache".to_string(),
+            source_width,
+            source_height,
+            permit_wait: Duration::ZERO,
+            decode: Duration::ZERO,
+            convert: Duration::ZERO,
+            resize: Duration::ZERO,
+            expand: Duration::ZERO,
+            resize_filter: None,
+        },
+    })
+}
+
+fn store_prepared_image_cache(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+    payload: &DecodedImagePayload,
+) {
+    let Some(cache_path) = prepared_image_cache_path(path, target_width, target_height) else {
+        return;
+    };
+
+    let expected_len = payload.width as usize * payload.height as usize * 4;
+    if payload.data.len() != expected_len {
+        return;
+    }
+
+    let mut bytes =
+        Vec::with_capacity(PREPARED_IMAGE_CACHE_MAGIC.len() + (4 * 4) + payload.data.len());
+    bytes.extend_from_slice(PREPARED_IMAGE_CACHE_MAGIC);
+    bytes.extend_from_slice(&payload.width.to_le_bytes());
+    bytes.extend_from_slice(&payload.height.to_le_bytes());
+    bytes.extend_from_slice(&payload.profile.source_width.to_le_bytes());
+    bytes.extend_from_slice(&payload.profile.source_height.to_le_bytes());
+    bytes.extend_from_slice(&payload.data);
+
+    let tmp_path = cache_path.with_extension("rgba.tmp");
+    if std::fs::write(&tmp_path, &bytes).is_ok() {
+        let _ = std::fs::rename(tmp_path, cache_path);
+    }
+}
+
+const MAX_IMAGE_UPLOAD_DIMENSION: u32 = 8192;
+
+fn compute_upload_downscale_dimensions(
+    source_width: u32,
+    source_height: u32,
+) -> Option<(u32, u32)> {
+    if source_width <= MAX_IMAGE_UPLOAD_DIMENSION && source_height <= MAX_IMAGE_UPLOAD_DIMENSION {
+        return None;
+    }
+
+    let longest_edge = source_width.max(source_height) as f32;
+    let scale = MAX_IMAGE_UPLOAD_DIMENSION as f32 / longest_edge;
+    let resized_width = ((source_width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((source_height as f32 * scale).round() as u32).max(1);
     Some((resized_width, resized_height))
 }
 
@@ -861,22 +1440,34 @@ fn expand_rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
     rgba
 }
 
+fn expand_luma_to_rgba(luma: Vec<u8>) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(luma.len() * 4);
+    for value in luma {
+        rgba.extend_from_slice(&[value, value, value, 255]);
+    }
+    rgba
+}
+
+fn expand_lumaa_to_rgba(lumaa: Vec<u8>) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((lumaa.len() / 2) * 4);
+    for chunk in lumaa.chunks_exact(2) {
+        rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+    }
+    rgba
+}
+
 fn prepare_rgb_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    target_width: u32,
-    target_height: u32,
+    _target_width: u32,
+    _target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
     let mut resize_duration = Duration::ZERO;
     let mut resize_filter = None;
     let (rgb_data, width, height) = if let Some((resized_width, resized_height)) =
-        compute_downscaled_cover_dimensions(
-            source_width,
-            source_height,
-            target_width,
-            target_height,
-        ) {
+        compute_upload_downscale_dimensions(source_width, source_height)
+    {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -913,15 +1504,12 @@ fn prepare_rgba_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    target_width: u32,
-    target_height: u32,
+    _target_width: u32,
+    _target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Option<String>)> {
-    if let Some((resized_width, resized_height)) = compute_downscaled_cover_dimensions(
-        source_width,
-        source_height,
-        target_width,
-        target_height,
-    ) {
+    if let Some((resized_width, resized_height)) =
+        compute_upload_downscale_dimensions(source_width, source_height)
+    {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -944,6 +1532,94 @@ fn prepare_rgba_image(
     }
 
     Ok((pixels, source_width, source_height, Duration::ZERO, None))
+}
+
+fn prepare_luma_image(
+    pixels: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    _target_width: u32,
+    _target_height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
+    let mut resize_duration = Duration::ZERO;
+    let mut resize_filter = None;
+    let (luma_data, width, height) = if let Some((resized_width, resized_height)) =
+        compute_upload_downscale_dimensions(source_width, source_height)
+    {
+        let filter =
+            select_resize_filter(source_width, source_height, resized_width, resized_height);
+        let resize_start = Instant::now();
+        let resized = resize_image_buffer(
+            pixels,
+            source_width,
+            source_height,
+            resized_width,
+            resized_height,
+            fast_image_resize::PixelType::U8,
+            filter,
+        )?;
+        resize_duration = resize_start.elapsed();
+        resize_filter = Some(resize_filter_label(filter).to_string());
+        (resized, resized_width, resized_height)
+    } else {
+        (pixels, source_width, source_height)
+    };
+
+    let expand_start = Instant::now();
+    let rgba_data = expand_luma_to_rgba(luma_data);
+    let expand_duration = expand_start.elapsed();
+    Ok((
+        rgba_data,
+        width,
+        height,
+        resize_duration,
+        expand_duration,
+        resize_filter,
+    ))
+}
+
+fn prepare_lumaa_image(
+    pixels: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
+    _target_width: u32,
+    _target_height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
+    let mut resize_duration = Duration::ZERO;
+    let mut resize_filter = None;
+    let (lumaa_data, width, height) = if let Some((resized_width, resized_height)) =
+        compute_upload_downscale_dimensions(source_width, source_height)
+    {
+        let filter =
+            select_resize_filter(source_width, source_height, resized_width, resized_height);
+        let resize_start = Instant::now();
+        let resized = resize_image_buffer(
+            pixels,
+            source_width,
+            source_height,
+            resized_width,
+            resized_height,
+            fast_image_resize::PixelType::U8x2,
+            filter,
+        )?;
+        resize_duration = resize_start.elapsed();
+        resize_filter = Some(resize_filter_label(filter).to_string());
+        (resized, resized_width, resized_height)
+    } else {
+        (pixels, source_width, source_height)
+    };
+
+    let expand_start = Instant::now();
+    let rgba_data = expand_lumaa_to_rgba(lumaa_data);
+    let expand_duration = expand_start.elapsed();
+    Ok((
+        rgba_data,
+        width,
+        height,
+        resize_duration,
+        expand_duration,
+        resize_filter,
+    ))
 }
 
 fn decode_jpeg_fast(
@@ -989,6 +1665,104 @@ fn decode_jpeg_fast(
         height,
         profile: ImageLoadProfile {
             format: "jpeg-fast".to_string(),
+            source_width,
+            source_height,
+            permit_wait: Duration::ZERO,
+            decode: decode_duration,
+            convert: Duration::ZERO,
+            resize: resize_duration,
+            expand: expand_duration,
+            resize_filter,
+        },
+    })
+}
+
+fn decode_png_fast(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<DecodedImagePayload> {
+    let decode_start = Instant::now();
+    let encoded = std::fs::read(path)?;
+    let options = DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .png_set_strip_to_8bit(true);
+    let mut decoder =
+        zune_png::PngDecoder::new_with_options(ZCursor::new(encoded.as_slice()), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("png header decode failed: {}", e))?;
+    let (source_width, source_height) = decoder
+        .dimensions()
+        .ok_or_else(|| anyhow::anyhow!("png dimensions missing after header decode"))?;
+    let source_width =
+        u32::try_from(source_width).map_err(|_| anyhow::anyhow!("png width is too large"))?;
+    let source_height =
+        u32::try_from(source_height).map_err(|_| anyhow::anyhow!("png height is too large"))?;
+    let colorspace = decoder
+        .colorspace()
+        .ok_or_else(|| anyhow::anyhow!("png colorspace missing after header decode"))?;
+    let decoded = decoder
+        .decode_raw()
+        .map_err(|e| anyhow::anyhow!("png decode failed: {}", e))?;
+    let decode_duration = decode_start.elapsed();
+
+    let (data, width, height, resize_duration, expand_duration, resize_filter) = match colorspace {
+        ColorSpace::RGB => prepare_rgb_image(
+            decoded,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        )?,
+        ColorSpace::RGBA => {
+            let (prepared, width, height, resize_duration, resize_filter) = prepare_rgba_image(
+                decoded,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+            )?;
+            (
+                prepared,
+                width,
+                height,
+                resize_duration,
+                Duration::ZERO,
+                resize_filter,
+            )
+        }
+        ColorSpace::Luma => prepare_luma_image(
+            decoded,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        )?,
+        ColorSpace::LumaA => prepare_lumaa_image(
+            decoded,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        )?,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported fast png colorspace {:?} for {}",
+                other,
+                path.display()
+            ));
+        }
+    };
+
+    Ok(DecodedImagePayload {
+        data,
+        width,
+        height,
+        profile: ImageLoadProfile {
+            format: "png-fast".to_string(),
             source_width,
             source_height,
             permit_wait: Duration::ZERO,
@@ -1077,21 +1851,120 @@ fn decode_image_for_output(
     target_width: u32,
     target_height: u32,
 ) -> anyhow::Result<DecodedImagePayload> {
+    if let Some(payload) = try_load_prepared_image_cache(path, target_width, target_height) {
+        return Ok(payload);
+    }
+
     let format = image::ImageFormat::from_path(path).ok();
-    if matches!(format, Some(image::ImageFormat::Jpeg)) {
-        match decode_jpeg_fast(path, target_width, target_height) {
-            Ok(payload) => return Ok(payload),
+    let payload = match format {
+        Some(image::ImageFormat::Jpeg) => match decode_jpeg_fast(path, target_width, target_height)
+        {
+            Ok(payload) => payload,
             Err(e) => {
                 warn!(
                     "[ASSET] {}: Fast JPEG decode failed, falling back to generic image path: {}",
                     path.display(),
                     e
                 );
+                decode_image_generic(path, target_width, target_height, format)?
             }
-        }
-    }
+        },
+        Some(image::ImageFormat::Png) => match decode_png_fast(path, target_width, target_height) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!(
+                    "[ASSET] {}: Fast PNG decode failed, falling back to generic image path: {}",
+                    path.display(),
+                    e
+                );
+                decode_image_generic(path, target_width, target_height, format)?
+            }
+        },
+        _ => decode_image_generic(path, target_width, target_height, format)?,
+    };
 
-    decode_image_generic(path, target_width, target_height, format)
+    store_prepared_image_cache(path, target_width, target_height, &payload);
+    Ok(payload)
+}
+
+fn schedule_image_prefetch(name: &str, path: &Path) {
+    let prefetch_path = path.to_path_buf();
+    let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() else {
+        return;
+    };
+    if !in_flight.insert(prefetch_path.clone()) {
+        return;
+    }
+    drop(in_flight);
+
+    let output_name = name.to_string();
+    let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
+    tokio::spawn(async move {
+        let _permit = match semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() {
+                    in_flight.remove(&prefetch_path);
+                }
+                return;
+            }
+        };
+
+        let decode_path = prefetch_path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || decode_image_for_output(&decode_path, 0, 0)).await;
+
+        match result {
+            Ok(Ok(payload)) => debug!(
+                "[PREFETCH] {}: Warmed {} as {} {}x{} in {:.1}ms",
+                output_name,
+                prefetch_path.display(),
+                payload.profile.format,
+                payload.width,
+                payload.height,
+                duration_ms(payload.profile.total_duration())
+            ),
+            Ok(Err(e)) => debug!(
+                "[PREFETCH] {}: Failed to warm {}: {}",
+                output_name,
+                prefetch_path.display(),
+                e
+            ),
+            Err(e) => debug!(
+                "[PREFETCH] {}: Prefetch task panicked for {}: {}",
+                output_name,
+                prefetch_path.display(),
+                e
+            ),
+        }
+
+        if let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() {
+            in_flight.remove(&prefetch_path);
+        }
+    });
+}
+
+fn resolve_transition_for_output(
+    monitor_manager: &monitor_manager::MonitorManager,
+    name: &str,
+) -> Transition {
+    monitor_manager
+        .outputs
+        .get(name)
+        .map(|orchestrator| {
+            if matches!(orchestrator.config.transition, Transition::Random) {
+                let picked = crate::shaders::ShaderManager::pick_random_transition();
+                debug!(
+                    "[TRANSITION] {}: Resolved Random transition to: {}",
+                    name,
+                    picked.name()
+                );
+                picked
+            } else {
+                orchestrator.config.transition.clone()
+            }
+        })
+        .unwrap_or_default()
 }
 
 /// Helper function to switch wallpaper content for an output.
@@ -1105,6 +1978,9 @@ pub fn switch_wallpaper_content(
     monitor_manager: &monitor_manager::MonitorManager,
     renderers: &mut HashMap<String, renderer::Renderer>,
     video_players: &mut HashMap<String, video::VideoPlayer>,
+    pending_video_switches: &mut HashMap<String, PendingVideoSwitch>,
+    pending_image_video_stops: &mut HashMap<String, video::VideoPlayer>,
+    pending_video_sessions: &PendingVideoSessions,
     batch_id: Option<u64>,
     batch_trigger_time: Option<std::time::Instant>,
     image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
@@ -1122,48 +1998,25 @@ pub fn switch_wallpaper_content(
     let session_id = *next_session_id;
     *next_session_id += 1;
 
-    let was_playing_video = video_players.contains_key(name);
-    if was_playing_video {
-        if let Some(mut vp) = video_players.remove(name) {
-            debug!(
-                "[TRANSITION] {}: Offloading video player stop to background",
-                name
-            );
-            tokio::spawn(async move {
-                let _ = vp.stop();
-            });
-        }
+    if let Some(old_pending_stop) = pending_image_video_stops.remove(name) {
+        stop_video_player_in_background(name.to_string(), old_pending_stop);
     }
+    let mut prior_video_player = video_players.remove(name);
 
+    let mut should_prepare_video = false;
     if let Some(r) = renderers.get_mut(name) {
+        let resolved_transition = resolve_transition_for_output(monitor_manager, name);
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time;
-        r.set_content_type(content_type);
-        r.active_image_session_id = if content_type == queue::ContentType::Image {
-            session_id
-        } else {
-            0
-        };
-        if content_type != queue::ContentType::Video {
-            r.active_video_session_id = 0;
-        }
-
-        // Resolve Random transition if configured for this output
-        if let Some(orchestrator) = monitor_manager.outputs.get(name) {
-            if matches!(orchestrator.config.transition, Transition::Random) {
-                let picked = crate::shaders::ShaderManager::pick_random_transition();
-                debug!(
-                    "[TRANSITION] {}: Resolved Random transition to: {}",
-                    name,
-                    picked.name()
-                );
-                r.active_transition = picked;
-            }
-        }
-
-        r.switch_content();
+        r.active_transition = resolved_transition.clone();
 
         if content_type == queue::ContentType::Image {
+            pending_video_switches.remove(name);
+            set_pending_video_session(pending_video_sessions, name, None);
+            r.set_content_type(content_type);
+            r.active_image_session_id = session_id;
+            r.active_video_session_id = 0;
+            r.switch_content();
             let target_width = r.config.width.clone();
             let target_height = r.config.height.clone();
 
@@ -1172,6 +2025,9 @@ pub fn switch_wallpaper_content(
             let tx = image_tx.clone();
             let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
             let image_session_id = session_id;
+            if let Some(old_video_player) = prior_video_player.take() {
+                pending_image_video_stops.insert(name.to_string(), old_video_player);
+            }
 
             debug!(
                 "[ASSET] {}: Offloading image decode: {}",
@@ -1248,23 +2104,60 @@ pub fn switch_wallpaper_content(
                     }
                 }
             });
+        } else {
+            r.active_image_session_id = 0;
+            r.active_video_session_id = session_id;
+            set_pending_video_session(pending_video_sessions, name, Some(session_id));
+            pending_video_switches.insert(
+                name.to_string(),
+                PendingVideoSwitch {
+                    session_id,
+                    batch_id,
+                    batch_trigger_time,
+                    transition: resolved_transition,
+                },
+            );
+            should_prepare_video = true;
         }
+    } else {
+        set_pending_video_session(pending_video_sessions, name, None);
+        pending_video_switches.remove(name);
+        if let Some(vp) = prior_video_player.take() {
+            stop_video_player_in_background(name.to_string(), vp);
+        }
+        warn!(
+            "[SWITCH] {}: Skipping content switch because renderer no longer exists",
+            name
+        );
     }
 
-    if content_type == queue::ContentType::Video {
+    if content_type == queue::ContentType::Video && should_prepare_video {
         debug!(
-            "[TRANSITION] {}: Starting new video player (session_id={})",
+            "[TRANSITION] {}: Preparing deferred video player (session_id={})",
             name, session_id
         );
         create_and_start_video_player(
             path,
             name,
             session_id,
+            monitor_manager
+                .outputs
+                .get(name)
+                .map(|o| o.config.volume as f64 / 100.0)
+                .unwrap_or(1.0),
             frame_tx,
-            monitor_manager,
-            renderers,
             player_tx,
+            pending_video_sessions.clone(),
+            prior_video_player,
         );
+    }
+
+    if let Some(orchestrator) = monitor_manager.outputs.get(name) {
+        if orchestrator.next_content_type == Some(queue::ContentType::Image) {
+            if let Some(next_path) = orchestrator.next_path.as_ref() {
+                schedule_image_prefetch(name, next_path);
+            }
+        }
     }
 }
 
@@ -1272,49 +2165,69 @@ fn create_and_start_video_player(
     path: &Path,
     name: &str,
     session_id: u64,
+    volume: f64,
     frame_tx: &tokio::sync::mpsc::Sender<FrameMsg>,
-    monitor_manager: &monitor_manager::MonitorManager,
-    renderers: &mut HashMap<String, renderer::Renderer>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
+    pending_video_sessions: PendingVideoSessions,
+    old_player: Option<video::VideoPlayer>,
 ) {
-    if let Some(r) = renderers.get_mut(name) {
-        r.active_video_session_id = session_id;
-    }
-
     let path_str = path.to_string_lossy().into_owned();
     let name_arc = Arc::new(name.to_string());
     let name_str = name.to_string();
     let frame_tx_clone = frame_tx.clone();
     let player_tx_clone = player_tx.clone();
 
-    let vol = monitor_manager
-        .outputs
-        .get(name)
-        .map(|o| o.config.volume as f64 / 100.0)
-        .unwrap_or(1.0);
-
     tokio::task::spawn_blocking(move || {
         let name_for_panic = name_str.clone();
         let player_tx_panic = player_tx_clone.clone();
         let session_id_panic = session_id;
+        let pending_video_sessions_for_task = pending_video_sessions.clone();
+
+        if let Some(mut old_player) = old_player {
+            let stop_start = Instant::now();
+            match old_player.stop() {
+                Ok(()) => debug!(
+                    "[VIDEO] {}: Previous player fully stopped in {:.1}ms before replacement",
+                    name_str,
+                    duration_ms(stop_start.elapsed())
+                ),
+                Err(e) => warn!(
+                    "[VIDEO] {}: Failed to stop previous player before replacement: {}",
+                    name_str, e
+                ),
+            }
+        }
+
+        if !pending_video_session_matches(&pending_video_sessions_for_task, &name_str, session_id) {
+            debug!(
+                "[VIDEO] {}: Skipping superseded video prepare task for session {} before player creation",
+                name_str, session_id
+            );
+            return;
+        }
 
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || match video::VideoPlayer::new(&path_str, name_arc, session_id, frame_tx_clone) {
+                || match video::VideoPlayer::new(
+                    &path_str,
+                    name_arc,
+                    session_id,
+                    volume,
+                    frame_tx_clone,
+                ) {
                     Ok(mut vp) => {
-                        vp.set_volume(vol);
-                        if let Err(e) = vp.prebuffer() {
-                            debug!(
-                                "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
-                                name_str, e
-                            );
-                        }
-                        if let Err(e) = vp.start() {
-                            error!("[VIDEO] {}: Failed to start video player: {}", name_str, e);
-                            Err(e.into())
-                        } else {
-                            Ok(vp)
-                        }
+                        vp.set_volume(volume);
+                        let preroll_frame = match vp.prebuffer() {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                debug!(
+                                    "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
+                                    name_str, e
+                                );
+                                None
+                            }
+                        };
+                        Ok((vp, preroll_frame))
                     }
                     Err(e) => {
                         error!("[VIDEO] {}: Failed to create video player: {}", name_str, e);
@@ -1324,10 +2237,21 @@ fn create_and_start_video_player(
             ));
 
         match result {
-            Ok(Ok(vp)) => {
-                if let Err(e) =
-                    player_tx_clone.send(VideoPlayerResult::Success(name_str, session_id, vp))
-                {
+            Ok(Ok((mut vp, preroll_frame))) => {
+                if !pending_video_session_matches(&pending_video_sessions, &name_str, session_id) {
+                    debug!(
+                        "[VIDEO] {}: Discarding superseded prepared player for session {}",
+                        name_str, session_id
+                    );
+                    let _ = vp.stop();
+                    return;
+                }
+                if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(
+                    name_str,
+                    session_id,
+                    vp,
+                    preroll_frame,
+                )) {
                     error!("[VIDEO] Failed to send video player back: {}", e);
                 }
             }
@@ -1349,6 +2273,9 @@ pub async fn handle_command(
     monitor_manager: &mut monitor_manager::MonitorManager,
     renderers: &mut HashMap<String, renderer::Renderer>,
     video_players: &mut HashMap<String, video::VideoPlayer>,
+    pending_video_switches: &mut HashMap<String, PendingVideoSwitch>,
+    pending_image_video_stops: &mut HashMap<String, video::VideoPlayer>,
+    pending_video_sessions: &PendingVideoSessions,
     frame_tx: &tokio::sync::mpsc::Sender<FrameMsg>,
     image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
@@ -1385,6 +2312,9 @@ pub async fn handle_command(
                     monitor_manager,
                     renderers,
                     video_players,
+                    pending_video_switches,
+                    pending_image_video_stops,
+                    pending_video_sessions,
                     Some(batch),
                     Some(loop_start),
                     image_tx,
@@ -1407,6 +2337,9 @@ pub async fn handle_command(
                     monitor_manager,
                     renderers,
                     video_players,
+                    pending_video_switches,
+                    pending_image_video_stops,
+                    pending_video_sessions,
                     Some(batch),
                     Some(loop_start),
                     image_tx,
@@ -1475,10 +2408,10 @@ pub async fn handle_command(
             info!("[CMD] Stopping all video players");
             let names: Vec<String> = video_players.keys().cloned().collect();
             for name in names {
-                if let Some(mut player) = video_players.remove(&name) {
-                    tokio::spawn(async move {
-                        let _ = player.stop();
-                    });
+                set_pending_video_session(pending_video_sessions, &name, None);
+                pending_video_switches.remove(&name);
+                if let Some(player) = video_players.remove(&name) {
+                    stop_video_player_in_background(name, player);
                 }
             }
             Response::Ok
@@ -1496,10 +2429,10 @@ pub async fn handle_command(
                 None => renderers.keys().cloned().collect(),
             };
             for name in targets {
-                if let Some(mut vp) = video_players.remove(&name) {
-                    tokio::spawn(async move {
-                        let _ = vp.stop();
-                    });
+                set_pending_video_session(pending_video_sessions, &name, None);
+                pending_video_switches.remove(&name);
+                if let Some(vp) = video_players.remove(&name) {
+                    stop_video_player_in_background(name.clone(), vp);
                 }
                 if let Some(r) = renderers.get_mut(&name) {
                     r.clear();

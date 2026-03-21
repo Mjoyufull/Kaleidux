@@ -645,6 +645,7 @@ impl Transition {
                 waves: 30.0,
                 color_separation: 0.3,
             },
+            "cannabisleaf" => Transition::CannabisLeaf,
             "circle" => Transition::Circle,
             "circlecrop" => Transition::CircleCrop {
                 bgcolor: [0.0, 0.0, 0.0, 1.0],
@@ -1405,6 +1406,25 @@ impl Transition {
             _ => {}
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Transition;
+
+    #[test]
+    fn random_candidate_names_roundtrip_via_parser() {
+        for name in Transition::random_candidate_names() {
+            let parsed = Transition::from_name(name);
+            if *name != "fade" {
+                assert_ne!(
+                    parsed,
+                    Transition::Fade,
+                    "transition `{name}` parsed as fallback Fade"
+                );
+            }
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler},
 };
 use std::ptr::NonNull;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     globals::GlobalList,

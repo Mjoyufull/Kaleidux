@@ -131,8 +131,25 @@ pub struct WgpuContext {
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
 const MAX_TEXTURE_POOL_SIZE: usize = 24; // Global limit on total textures in pool
-const MAX_TEXTURE_POOL_BYTES: u64 = 128 * 1024 * 1024; // Keep pooled RGBA textures under 128 MiB
+const MAX_TEXTURE_POOL_BYTES: u64 = 64 * 1024 * 1024; // Keep pooled RGBA textures under 64 MiB
 const MAX_POOLED_TEXTURE_BYTES: u64 = 16 * 1024 * 1024; // Skip pooling huge 4K-class RGBA textures
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedTextureFootprint {
+    pub current_bytes: u64,
+    pub prev_bytes: u64,
+    pub composition_bytes: u64,
+    pub video_aux_bytes: u64,
+}
+
+impl RetainedTextureFootprint {
+    pub fn total_bytes(self) -> u64 {
+        self.current_bytes
+            .saturating_add(self.prev_bytes)
+            .saturating_add(self.composition_bytes)
+            .saturating_add(self.video_aux_bytes)
+    }
+}
 
 fn texture_byte_size(width: u32, height: u32, mip_level_count: u32) -> u64 {
     let mut total = 0u64;
@@ -156,6 +173,17 @@ fn should_pool_texture(width: u32, height: u32, mip_level_count: u32) -> bool {
     texture_byte_size(width, height, mip_level_count) <= MAX_POOLED_TEXTURE_BYTES
 }
 
+fn select_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if present_modes.contains(&wgpu::PresentMode::Fifo) {
+        wgpu::PresentMode::Fifo
+    } else {
+        present_modes
+            .first()
+            .copied()
+            .unwrap_or(wgpu::PresentMode::Fifo)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +202,29 @@ mod tests {
     fn pool_policy_rejects_4k_rgba_textures() {
         assert!(!should_pool_texture(3840, 2160, 1));
         assert!(should_pool_texture(1920, 1080, 1));
+    }
+
+    #[test]
+    fn retained_footprint_total_sums_sections() {
+        let fp = RetainedTextureFootprint {
+            current_bytes: 10,
+            prev_bytes: 20,
+            composition_bytes: 30,
+            video_aux_bytes: 40,
+        };
+        assert_eq!(fp.total_bytes(), 100);
+    }
+
+    #[test]
+    fn present_mode_prefers_fifo_when_available() {
+        let selected = select_present_mode(&[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]);
+        assert_eq!(selected, wgpu::PresentMode::Fifo);
+    }
+
+    #[test]
+    fn present_mode_falls_back_to_first_supported_mode() {
+        let selected = select_present_mode(&[wgpu::PresentMode::Mailbox]);
+        assert_eq!(selected, wgpu::PresentMode::Mailbox);
     }
 }
 
@@ -208,7 +259,10 @@ impl WgpuContext {
                     label: Some("Kaleidux Shared Device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::default(),
+                    // Favor smaller allocator blocks over peak throughput. The retained
+                    // texture logs show renderer-visible textures are not the dominant
+                    // RSS anymore, so reducing allocator slack is the next useful lever.
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
                 },
                 None,
             )
@@ -684,6 +738,16 @@ impl WgpuContext {
             m.record_texture_pool_size(pool_size);
         }
     }
+
+    pub fn texture_pool_stats(&self) -> (usize, u64) {
+        let pool = self.texture_pool.lock();
+        let count = pool.values().map(|v| v.len()).sum();
+        let bytes = pool
+            .iter()
+            .map(|(&(w, h, mips), entries)| texture_byte_size(w, h, mips) * entries.len() as u64)
+            .sum();
+        (count, bytes)
+    }
 }
 
 struct CudaTextureCache {
@@ -805,19 +869,7 @@ impl Renderer {
             .first()
             .cloned()
             .unwrap_or(wgpu::CompositeAlphaMode::Auto);
-        // Prefer Mailbox for lower latency, fallback to Immediate, then Fifo
-        let present_mode = caps
-            .present_modes
-            .iter()
-            .find(|&&m| m == wgpu::PresentMode::Mailbox)
-            .copied()
-            .unwrap_or_else(|| {
-                caps.present_modes
-                    .iter()
-                    .find(|&&m| m == wgpu::PresentMode::Immediate)
-                    .copied()
-                    .unwrap_or(wgpu::PresentMode::Fifo)
-            });
+        let present_mode = select_present_mode(&caps.present_modes);
 
         if caps.formats.is_empty() {
             info!(
@@ -936,36 +988,9 @@ impl Renderer {
 
             info!("Configuring surface {} ({}x{})", self.name, width, height);
             self.surface.configure(&self.ctx.device, &self.config);
-
-            // Re-create composition texture
-            // If transition is active, log that it will continue with new size
-            if self.transition_active {
-                info!(
-                    "[TRANSITION] {}: Surface resized during transition, recreating composition texture ({}x{})",
-                    self.name, width, height
-                );
+            if self.composition_texture.is_some() || self.composition_texture_view.is_some() {
+                self.release_composition_texture("surface resize");
             }
-            let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Composition Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
-            self.composition_texture_view =
-                Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
-            self.composition_texture = Some(texture);
-            // Invalidate bind groups since texture changed
-            self.transition_bind_group = None;
-            self.blit_bind_group = None;
             self.configured = true;
             // Force redraw after resize
             self.needs_redraw = true;
@@ -1302,12 +1327,19 @@ impl Renderer {
     pub fn render(
         &mut self,
         _context: BackendContext,
-        frame_time: std::time::Instant,
+        _frame_time: std::time::Instant,
     ) -> anyhow::Result<()> {
         let render_start = std::time::Instant::now();
+        let frame_time = render_start;
 
         if !self.transition_active && !self.content_swap_pending && self.prev_texture.is_some() {
             self.release_prev_texture("render idle cleanup");
+        }
+        if !self.transition_active
+            && !self.content_swap_pending
+            && self.composition_texture.is_some()
+        {
+            self.release_composition_texture("render idle cleanup");
         }
 
         // CRITICAL: Reset per-frame state at the start of each render cycle
@@ -1455,33 +1487,12 @@ impl Renderer {
                     }
                 }
             } else {
-                // Transition is active but start time not set yet - this is the FIRST RENDER FRAME
-                // Initialize the timer using shared batch start time if available for synchronization
-                // BUT: If the batch start time is too old (e.g. because asset loading was slow),
-                // we cap it so we don't skip the transition entirely.
-                let now = frame_time;
-                let start = match self.batch_start_time {
-                    Some(batch_start) => {
-                        let age = now.saturating_duration_since(batch_start).as_secs_f32();
-                        if age > self.transition_duration * 0.8 {
-                            // Too old, start nearly from zero (0.1s in) to ensure transition is visible
-                            debug!(
-                                "[TRANSITION] {}: Batch start time too old ({:.3}s), capping drift to preserve transition",
-                                self.name, age
-                            );
-                            now.checked_sub(std::time::Duration::from_millis(100))
-                                .unwrap_or(now)
-                        } else {
-                            batch_start
-                        }
-                    }
-                    None => now,
-                };
+                // Start timing from the first render of ready content. This prevents decode or
+                // queue delay from consuming the transition before it is ever presented.
+                let start = frame_time;
                 self.transition_start_time = Some(start);
 
-                // Calculate initial progress based on frame_time vs start
-                let elapsed = frame_time.saturating_duration_since(start).as_secs_f32();
-                self.transition_progress = (elapsed / self.transition_duration).min(1.0);
+                self.transition_progress = 0.0;
 
                 // Initialize stats
                 self.transition_stats = Some(TransitionStats {
@@ -1612,6 +1623,7 @@ impl Renderer {
                 self.blit_bind_group = None;
                 self.transition_start_time = None;
                 self.transition_active = false;
+                self.release_composition_texture("transition completed");
             }
         }
 
@@ -1927,9 +1939,44 @@ impl Renderer {
         if self.valid_content_type == crate::queue::ContentType::Video
             && content_type != crate::queue::ContentType::Video
         {
-            self.release_cuda_cache();
+            self.release_video_backend_resources("leaving video content");
         }
         self.valid_content_type = content_type;
+    }
+
+    pub fn retained_texture_footprint(&self) -> RetainedTextureFootprint {
+        let current_bytes = match (self.current_texture.as_ref(), self.current_texture_size) {
+            (Some(texture), Some((w, h))) => texture_byte_size(w, h, texture.mip_level_count()),
+            _ => 0,
+        };
+        let prev_bytes = match (self.prev_texture.as_ref(), self.prev_texture_size) {
+            (Some(texture), Some((w, h))) => texture_byte_size(w, h, texture.mip_level_count()),
+            _ => 0,
+        };
+        let composition_bytes = if self.composition_texture.is_some() {
+            texture_byte_size(self.config.width.max(1), self.config.height.max(1), 1)
+        } else {
+            0
+        };
+
+        let mut video_aux_bytes = 0u64;
+        if let Some((w, h)) = self.nv12_staging_size {
+            video_aux_bytes = video_aux_bytes
+                .saturating_add(w as u64 * h as u64)
+                .saturating_add(w as u64 * (h as u64 / 2));
+        }
+        if let Some(cache) = &self.cuda_textures {
+            video_aux_bytes = video_aux_bytes
+                .saturating_add(cache.width as u64 * cache.height as u64)
+                .saturating_add(cache.width as u64 * (cache.height as u64 / 2));
+        }
+
+        RetainedTextureFootprint {
+            current_bytes,
+            prev_bytes,
+            composition_bytes,
+            video_aux_bytes,
+        }
     }
 
     /// Check if current_texture exists (used for throttling logic)
@@ -2147,6 +2194,21 @@ impl Renderer {
                 "[VIDEO] {}: Frame decode path: {} ({}x{})",
                 self.name, path_name, width, height
             );
+        }
+
+        match &frame.format {
+            crate::video::VideoFrameFormat::CudaNv12 { .. } => {
+                self.release_nv12_staging("cuda frame path");
+            }
+            crate::video::VideoFrameFormat::DmaBufNv12 { .. } => {
+                self.release_video_backend_resources("dmabuf frame path");
+            }
+            crate::video::VideoFrameFormat::Nv12 { .. } => {
+                self.release_cuda_cache();
+            }
+            crate::video::VideoFrameFormat::Rgba => {
+                self.release_video_backend_resources("rgba frame path");
+            }
         }
 
         match &frame.format {
@@ -3064,17 +3126,19 @@ impl Renderer {
         self.current_texture_view = None;
         self.prev_texture = None;
         self.prev_texture_view = None;
-        self.composition_texture = None;
-        self.composition_texture_view = None;
         self.current_texture_size = None;
+        self.prev_texture_size = None;
         self.transition_progress = 1.0;
         self.transition_active = false;
         self.transition_just_completed = false; // Reset flag
         self.content_swap_pending = false;
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None; // Invalidate
+        self.blit_source_is_composition = false;
+        self.blit_source_is_prev = false;
         self.needs_redraw = true;
-        self.release_cuda_cache();
+        self.release_composition_texture("clear");
+        self.release_video_backend_resources("clear");
         // Reclaim memory immediately - this ensures GPU resources are freed
         // rather than waiting for WGPU's automatic cleanup
         self.active_video_session_id = 0; // Invalidate current video session
@@ -3120,6 +3184,25 @@ impl Renderer {
         }
     }
 
+    fn release_nv12_staging(&mut self, reason: &str) {
+        if self.nv12_staging_size.is_some() {
+            debug!(
+                "[VIDEO] {}: Releasing NV12 staging textures ({})",
+                self.name, reason
+            );
+        }
+        self.nv12_y_texture = None;
+        self.nv12_uv_texture = None;
+        self.nv12_y_view = None;
+        self.nv12_uv_view = None;
+        self.nv12_staging_size = None;
+    }
+
+    fn release_video_backend_resources(&mut self, reason: &str) {
+        self.release_nv12_staging(reason);
+        self.release_cuda_cache();
+    }
+
     fn release_prev_texture(&mut self, reason: &str) {
         if let Some(prev_tex) = self.prev_texture.take() {
             debug!(
@@ -3133,6 +3216,22 @@ impl Renderer {
         self.prev_texture_view = None;
         self.transition_bind_group = None;
         self.blit_bind_group = None;
+    }
+
+    fn release_composition_texture(&mut self, reason: &str) {
+        if self.composition_texture.is_some() || self.composition_texture_view.is_some() {
+            debug!(
+                "[TRANSITION] {}: Releasing composition texture ({})",
+                self.name, reason
+            );
+        }
+        self.composition_texture = None;
+        self.composition_texture_view = None;
+        self.transition_bind_group = None;
+        if self.blit_source_is_composition {
+            self.blit_bind_group = None;
+            self.blit_source_is_composition = false;
+        }
     }
 
     fn update_transition_bind_group(&mut self) {
@@ -3197,6 +3296,11 @@ impl Drop for Renderer {
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
             }
         }
+        self.nv12_y_texture = None;
+        self.nv12_uv_texture = None;
+        self.nv12_y_view = None;
+        self.nv12_uv_view = None;
+        self.nv12_staging_size = None;
     }
 }
 
@@ -3569,7 +3673,7 @@ fn create_cuda_backed_texture(
                 Ok(img) => img,
                 Err(e) => {
                     error!("[CUDA-VK] Failed to create VkImage: {:?}", e);
-                    unsafe { libc::close(fd); }
+                    libc::close(fd);
                     return None;
                 }
             };
@@ -3581,7 +3685,7 @@ fn create_cuda_backed_texture(
                     error!("[CUDA-VK] No compatible memory type (image={:#x})",
                            mem_reqs.memory_type_bits);
                     raw_device.destroy_image(vk_image, None);
-                    unsafe { libc::close(fd); }
+                    libc::close(fd);
                     return None;
                 }
             };
@@ -3605,7 +3709,7 @@ fn create_cuda_backed_texture(
                 Err(e) => {
                     error!("[CUDA-VK] vkAllocateMemory (import fd={fd}, size={cuda_export_size}) failed: {:?}", e);
                     raw_device.destroy_image(vk_image, None);
-                    unsafe { libc::close(fd); }
+                    libc::close(fd);
                     return None;
                 }
             };

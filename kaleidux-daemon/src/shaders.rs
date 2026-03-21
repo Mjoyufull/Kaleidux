@@ -65,6 +65,85 @@ static BROKEN_TRANSITIONS: once_cell::sync::Lazy<
 
 use anyhow::Context;
 
+const CUBE_SAFE_GLSL: &str = r#"
+vec2 cube_project(vec2 p, float floating) {
+    return p * vec2(1.0, -1.2) + vec2(0.0, -floating / 100.0);
+}
+
+bool cube_in_bounds(vec2 p) {
+    return p.x > 0.0 && p.y > 0.0 && p.x < 1.0 && p.y < 1.0;
+}
+
+vec4 cube_bg_color(vec2 p, vec2 pfr, vec2 pto, float reflection, float floating) {
+    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 projected_from = cube_project(pfr, floating);
+    if (cube_in_bounds(projected_from)) {
+        c += mix(vec4(0.0), getFromColor(projected_from), reflection * (1.0 - projected_from.y));
+    }
+    vec2 projected_to = cube_project(pto, floating);
+    if (cube_in_bounds(projected_to)) {
+        c += mix(vec4(0.0), getToColor(projected_to), reflection * (1.0 - projected_to.y));
+    }
+    return c;
+}
+
+vec2 cube_xskew(vec2 p, float perspective, float center) {
+    float x = mix(p.x, 1.0 - p.x, center);
+    float edge_distance = max(abs(center - 0.5), 0.0001);
+    float center_side = step(0.5, center);
+    float direction = mix(1.0, -1.0, center_side);
+    return (
+        (
+            vec2(x, (p.y - 0.5 * (1.0 - perspective) * x) / (1.0 + (perspective - 1.0) * x))
+            - vec2(0.5 - edge_distance, 0.0)
+        ) * vec2(0.5 / edge_distance * direction, 1.0)
+        + vec2(center_side, 0.0)
+    );
+}
+
+vec4 transition(vec2 op) {
+    float perspective = getFromParams(0);
+    float unzoom = getFromParams(1);
+    float reflection = getFromParams(2);
+    float floating = getFromParams(3);
+
+    float uz = unzoom * 2.0 * (0.5 - abs(0.5 - progress));
+    vec2 p = -uz * 0.5 + (1.0 + uz) * op;
+
+    vec2 from_scale = vec2(max(1.0 - progress, 0.0001), 1.0);
+    vec2 to_scale = vec2(max(progress, 0.0001), 1.0);
+
+    vec2 from_p = cube_xskew(
+        (p - vec2(progress, 0.0)) / from_scale,
+        1.0 - mix(progress, 0.0, perspective),
+        0.0
+    );
+    vec2 to_p = cube_xskew(
+        p / to_scale,
+        mix(progress * progress, 1.0, perspective),
+        1.0
+    );
+
+    if (cube_in_bounds(from_p)) {
+        return getFromColor(from_p);
+    }
+    if (cube_in_bounds(to_p)) {
+        return getToColor(to_p);
+    }
+    return cube_bg_color(op, from_p, to_p, reflection, floating);
+}
+"#;
+
+const DISPLACEMENT_SAFE_GLSL: &str = r#"
+vec4 transition(vec2 uv) {
+    float strength = 0.5;
+    float displacement = getToColor(uv).r * strength;
+    vec2 uv_from = vec2(uv.x + progress * displacement, uv.y);
+    vec2 uv_to = vec2(uv.x - (1.0 - progress) * displacement, uv.y);
+    return mix(getFromColor(uv_from), getToColor(uv_to), progress);
+}
+"#;
+
 impl ShaderManager {
     pub fn mark_transition_broken(name: &str) {
         BROKEN_TRANSITIONS.lock().insert(name.to_string());
@@ -319,8 +398,12 @@ impl ShaderManager {
             return Ok(cached.clone());
         }
 
-        let glsl = Self::get_builtin_glsl(&name)
-            .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?;
+        let glsl = match transition {
+            Transition::Cube { .. } => CUBE_SAFE_GLSL,
+            Transition::Displacement => DISPLACEMENT_SAFE_GLSL,
+            _ => Self::get_builtin_glsl(&name)
+                .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?,
+        };
 
         // Note: We use getFromParams(i) which handles the aligned vec4 array access
         // We must map Rust struct fields to the EXACT uniform names used in the GLSL shaders.
@@ -362,9 +445,7 @@ impl ShaderManager {
             }
             Transition::CrossZoom { .. } => "float strength = getFromParams(0);",
             Transition::CrossWarp => "", // No params usually
-            Transition::Cube { .. } => {
-                "float persp = getFromParams(0); float unzoom = getFromParams(1); float reflection = getFromParams(2); float floating = getFromParams(3);"
-            }
+            Transition::Cube { .. } => "",
             Transition::Directional { .. } => {
                 "vec2 direction = vec2(getFromParams(0), getFromParams(1));"
             }
@@ -380,7 +461,7 @@ impl ShaderManager {
             Transition::DirectionalWipe { .. } => {
                 "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);"
             }
-            Transition::Displacement => "float strength = 0.5; #define displacementMap t_next", // Mock displacementMap with t_next
+            Transition::Displacement => "",
             Transition::Dissolve { .. } => {
                 "float uLineWidth = getFromParams(0); vec3 uSpreadClr = vec3(getFromParams(1), getFromParams(2), getFromParams(3)); vec3 uHotClr = vec3(getFromParams(4), getFromParams(5), getFromParams(6)); float uPow = getFromParams(7); float uIntensity = getFromParams(8);"
             }
@@ -406,7 +487,7 @@ impl ShaderManager {
                 "float size = getFromParams(0); float zoom = getFromParams(1); float colorSeparation = getFromParams(2);"
             }
             Transition::GridFlip { .. } => {
-                "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float pause = getFromParams(2); float divider_width = getFromParams(3); vec4 bgcolor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7)); float randomness = getFromParams(8);"
+                "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float pause = getFromParams(2); float dividerWidth = getFromParams(3); vec4 bgcolor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7)); float randomness = getFromParams(8);"
             }
             Transition::Hexagonalize { .. } => {
                 "int steps = int(getFromParams(0)); float horizontalHexagons = getFromParams(1);"
@@ -635,5 +716,29 @@ impl ShaderManager {
             "ZoomRigthWipe" => Some(include_str!("shaders/transitions/ZoomRigthWipe.glsl")),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShaderManager;
+    use kaleidux_common::Transition;
+
+    #[test]
+    fn all_random_candidate_shaders_compile() {
+        let mut failures = Vec::new();
+
+        for name in Transition::random_candidate_names() {
+            let transition = Transition::from_name(name);
+            if let Err(e) = ShaderManager::get_builtin_shader(&transition) {
+                failures.push(format!("{}: {}", name, e));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "builtin transition shader failures:\n{}",
+            failures.join("\n")
+        );
     }
 }

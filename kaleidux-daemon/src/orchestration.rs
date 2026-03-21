@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MonitorBehavior {
     #[default]
@@ -244,26 +244,10 @@ pub struct PartialOutputConfig {
 }
 
 impl Config {
-    pub async fn load() -> Result<Self> {
-        let config_dir = dirs::config_dir()
-            .context("Failed to get config directory")?
-            .join("kaleidux");
-        let config_path = config_dir.join("config.toml");
-
-        if !config_path.exists() {
-            tracing::warn!("No config file found at {:?}, using defaults", config_path);
-            return Ok(Self::default());
-        }
-
-        let content = tokio::fs::read_to_string(&config_path)
-            .await
-            .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
-
-        // Parse as raw TOML table first to work around serde(flatten) issues
+    pub(crate) fn parse_str(content: &str) -> Result<Self> {
         let table: toml::Table =
-            toml::from_str(&content).with_context(|| "Failed to parse config TOML")?;
+            toml::from_str(content).with_context(|| "Failed to parse config TOML")?;
 
-        // Extract reserved sections
         let global: GlobalConfig = if let Some(v) = table.get("global") {
             v.clone().try_into().unwrap_or_else(|e| {
                 tracing::error!("Failed to parse [global] config section: {}", e);
@@ -282,7 +266,6 @@ impl Config {
             PartialOutputConfig::default()
         };
 
-        // Collect remaining sections as per-output configs
         let mut outputs = HashMap::new();
         let mut config_errors = Vec::new();
         for (key, value) in &table {
@@ -317,6 +300,24 @@ impl Config {
         })
     }
 
+    pub async fn load() -> Result<Self> {
+        let config_dir = dirs::config_dir()
+            .context("Failed to get config directory")?
+            .join("kaleidux");
+        let config_path = config_dir.join("config.toml");
+
+        if !config_path.exists() {
+            tracing::warn!("No config file found at {:?}, using defaults", config_path);
+            return Ok(Self::default());
+        }
+
+        let content = tokio::fs::read_to_string(&config_path)
+            .await
+            .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+
+        Self::parse_str(&content)
+    }
+
     pub fn get_config_for_output(&self, name: &str, description: &str) -> OutputConfig {
         // 1. Start with global defaults
         let mut final_config = PartialOutputConfig {
@@ -334,19 +335,18 @@ impl Config {
         // 2. Merge [any] fallback
         final_config.merge(&self.any);
 
-        // 3. Match specific output
-        let mut matched = None;
-        for (key, val) in &self.outputs {
-            if let Some(stripped) = key.strip_prefix("re:") {
-                if let Ok(re) = Regex::new(stripped) {
-                    if re.is_match(description) {
-                        matched = Some(val);
-                        break;
+        // 3. Exact output names override regex matches.
+        let mut matched = self.outputs.get(name);
+        if matched.is_none() {
+            for (key, val) in &self.outputs {
+                if let Some(stripped) = key.strip_prefix("re:") {
+                    if let Ok(re) = Regex::new(stripped) {
+                        if re.is_match(description) {
+                            matched = Some(val);
+                            break;
+                        }
                     }
                 }
-            } else if key == name {
-                matched = Some(val);
-                break;
             }
         }
 
@@ -406,7 +406,7 @@ impl PartialOutputConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::PartialOutputConfig;
+    use super::{Config, MonitorBehavior, PartialOutputConfig, SortingStrategy};
     use crate::shaders::Transition;
 
     #[test]
@@ -458,5 +458,87 @@ mod tests {
                 smoothness: 0.25,
             })
         );
+    }
+
+    #[test]
+    fn parses_grouped_monitor_behavior_from_global() {
+        let cfg = Config::parse_str(
+            r#"
+            [global]
+            monitor-behavior = { grouped = [["DP-2", "DP-3"], ["HDMI-A-1"]] }
+
+            [any]
+            path = "/tmp/walls"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.global.monitor_behavior,
+            MonitorBehavior::Grouped(vec![
+                vec!["DP-2".to_string(), "DP-3".to_string()],
+                vec!["HDMI-A-1".to_string()],
+            ])
+        );
+    }
+
+    #[test]
+    fn merges_global_any_regex_and_specific_output_configs() {
+        let cfg = Config::parse_str(
+            r#"
+            [global]
+            monitor-behavior = "independent"
+            volume = 10
+            transition-time = 400
+            sorting = "ascending"
+
+            [any]
+            path = "/tmp/any"
+            duration = "45s"
+            transition = "fade"
+
+            ["re:Primary.*"]
+            path = "/tmp/regex"
+            volume = 20
+            transition = "circleopen"
+
+            [DP-2]
+            path = "/tmp/specific"
+            volume = 30
+            transition = "crosszoom"
+            sorting = "descending"
+            "#,
+        )
+        .unwrap();
+
+        let specific = cfg.get_config_for_output("DP-2", "Primary Display");
+        assert_eq!(
+            specific.path.unwrap(),
+            std::path::PathBuf::from("/tmp/specific")
+        );
+        assert_eq!(specific.volume, 30);
+        assert_eq!(specific.transition, Transition::CrossZoom { strength: 0.4 });
+        assert_eq!(specific.transition_time, 400);
+        assert_eq!(specific.sorting, SortingStrategy::Descending);
+
+        let regex = cfg.get_config_for_output("HDMI-A-1", "Primary Display");
+        assert_eq!(regex.path.unwrap(), std::path::PathBuf::from("/tmp/regex"));
+        assert_eq!(regex.volume, 20);
+        assert_eq!(
+            regex.transition,
+            Transition::CircleOpen {
+                smoothness: 0.3,
+                opening: true,
+            }
+        );
+        assert_eq!(regex.transition_time, 400);
+        assert_eq!(regex.sorting, SortingStrategy::Ascending);
+
+        let fallback = cfg.get_config_for_output("DP-3", "Side Display");
+        assert_eq!(fallback.path.unwrap(), std::path::PathBuf::from("/tmp/any"));
+        assert_eq!(fallback.volume, 10);
+        assert_eq!(fallback.transition, Transition::Fade);
+        assert_eq!(fallback.transition_time, 400);
+        assert_eq!(fallback.sorting, SortingStrategy::Ascending);
     }
 }

@@ -226,7 +226,13 @@ pub async fn run(
 
         // ─── Player results ─────────────────────────────────────────────
 
-        ctx.drain_players(player_buf);
+        ctx.drain_players(player_buf, loop_start, |r, _name, ls| {
+            let _ = r.render(renderer::BackendContext::X11, ls);
+        });
+
+        ctx.release_startup_present_barrier(loop_start, |r, _name, ls| {
+            let _ = r.render(renderer::BackendContext::X11, ls);
+        });
 
         // ─── X11 render loop ────────────────────────────────────────────
 

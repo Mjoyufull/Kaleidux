@@ -3,7 +3,7 @@
 //! Contains surface creation, Wayland event polling, frame callback rendering,
 //! and connection error recovery. All shared logic lives in `main_loop::MainLoopContext`.
 
-use crate::main_loop::MainLoopContext;
+use crate::main_loop::{MainLoopContext, stop_video_player_in_background};
 use crate::orchestration;
 use crate::renderer;
 
@@ -86,8 +86,32 @@ pub async fn run(
     if let Some((_, first_surface_arc)) = surface_infos.first() {
         info!("Initializing WGPU context with first surface as compatible...");
         let wgpu_start = Instant::now();
-        let (wgpu_ctx, surface) =
-            renderer::WgpuContext::with_surface(first_surface_arc.clone()).await?;
+        let mut last_error = None;
+        let mut init_result = None;
+        for attempt in 1..=3 {
+            match renderer::WgpuContext::with_surface(first_surface_arc.clone()).await {
+                Ok(result) => {
+                    init_result = Some(result);
+                    break;
+                }
+                Err(e) => {
+                    let error_text = e.to_string();
+                    warn!(
+                        "[STARTUP] WGPU initialization attempt {attempt}/3 failed: {}",
+                        error_text
+                    );
+                    last_error = Some(e);
+                    if !error_text.to_ascii_lowercase().contains("device is lost") || attempt == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        let (wgpu_ctx, surface) = match init_result {
+            Some(result) => result,
+            None => return Err(last_error.expect("wgpu init retry loop must capture an error")),
+        };
         let wgpu_duration = wgpu_start.elapsed();
         ctx.metrics.record_wgpu_init(wgpu_duration);
         let adapter_name = wgpu_ctx.adapter.get_info().name.clone();
@@ -358,11 +382,15 @@ pub async fn run(
                 .collect();
             ctx.renderers.retain(|name, _| {
                 if !active_output_names.contains(name) {
-                    if let Some(mut vp) = ctx.video_players.remove(name) {
-                        tokio::spawn(async move {
-                            let _ = vp.stop();
-                        });
+                    if let Some(vp) = ctx.video_players.remove(name) {
+                        stop_video_player_in_background(name.clone(), vp);
                     }
+                    ctx.pending_video_switches.remove(name);
+                    crate::main_loop::set_pending_video_session(
+                        &ctx.pending_video_sessions,
+                        name,
+                        None,
+                    );
                     false
                 } else {
                     true
@@ -401,6 +429,7 @@ pub async fn run(
 
         let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
         for (source_id, frame) in latest_frames {
+            let barrier_blocks = ctx.startup_barrier_blocks_output(source_id.as_str(), loop_start);
             if let Some(r) = ctx.renderers.get_mut(source_id.as_str()) {
                 let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
                     !r.has_current_texture() || !r.frame_callback_pending_too_long(1000)
@@ -420,7 +449,9 @@ pub async fn run(
 
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some(layer_surface) = backend.surfaces.get(source_id.as_str()) {
-                        if !r.frame_callback_pending || r.transition_progress == 0.0 {
+                        if (!r.frame_callback_pending || r.frame_callback_pending_too_long(1000))
+                            && !barrier_blocks
+                        {
                             let _ = r.render(
                                 renderer::BackendContext::Wayland {
                                     surface: layer_surface,
@@ -460,34 +491,69 @@ pub async fn run(
 
         // ─── Player results ─────────────────────────────────────────────
 
-        ctx.drain_players(player_buf);
-
-        // ─── Wayland frame callback rendering ───────────────────────────
-
-        let frame_ready_names: Vec<String> = backend.frame_callback_ready.drain().collect();
-        for name in frame_ready_names {
-            if let Some(r) = ctx.renderers.get_mut(&name) {
-                r.frame_callback_pending = false;
-                r.last_frame_request = None;
-                if let Some(layer_surface) = backend.surfaces.get(&name) {
+        ctx.drain_players(player_buf, loop_start, |r, name, ls| {
+            if r.configured {
+                if let Some(layer_surface) = surfaces.get(name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
                             qh: &qh,
                         },
-                        loop_start,
+                        ls,
                     );
-                    if !ctx.first_frame_recorded {
-                        ctx.metrics.record_first_frame();
-                        ctx.first_frame_recorded = true;
+                }
+            }
+        });
+
+        ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
+            if r.configured {
+                if let Some(layer_surface) = surfaces.get(name) {
+                    let _ = r.render(
+                        renderer::BackendContext::Wayland {
+                            surface: layer_surface,
+                            qh: &qh,
+                        },
+                        ls,
+                    );
+                }
+            }
+        });
+
+        // ─── Wayland frame callback rendering ───────────────────────────
+
+        let frame_ready_names: Vec<String> = backend.frame_callback_ready.drain().collect();
+        for name in frame_ready_names {
+            let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
+            if let Some(r) = ctx.renderers.get_mut(&name) {
+                r.frame_callback_pending = false;
+                r.last_frame_request = None;
+                if !barrier_blocks {
+                    if let Some(layer_surface) = backend.surfaces.get(&name) {
+                        let _ = r.render(
+                            renderer::BackendContext::Wayland {
+                                surface: layer_surface,
+                                qh: &qh,
+                            },
+                            loop_start,
+                        );
+                        if !ctx.first_frame_recorded {
+                            ctx.metrics.record_first_frame();
+                            ctx.first_frame_recorded = true;
+                        }
                     }
                 }
             }
         }
 
         // Request missing frames and check for transition completion
+        let barrier = ctx.startup_present_barrier.clone();
+        let barrier_ready = ctx.startup_barrier_ready(loop_start);
         for (name, r) in ctx.renderers.iter_mut() {
-            let should_request = r.has_any_content() && (r.needs_redraw || r.transition_active);
+            let barrier_blocks = barrier
+                .as_ref()
+                .is_some_and(|b| b.outputs.contains(name) && !barrier_ready);
+            let should_request =
+                r.has_any_content() && (r.needs_redraw || r.transition_active) && !barrier_blocks;
             if should_request {
                 if let Some(layer_surface) = backend.surfaces.get(name) {
                     r.request_frame_callback(layer_surface, &qh);

@@ -76,7 +76,7 @@ impl SmartQueue {
         );
 
         // Try loading cached pool from redb first (near-instant)
-        let mut ct_cache_init: Option<HashMap<PathBuf, ContentType>>;
+        let ct_cache_init: Option<HashMap<PathBuf, ContentType>>;
         let pool = match cache.get_cached_pool(path) {
             Ok(Some(cached_pool)) => {
                 // Validate cached pool: filter out files that no longer exist

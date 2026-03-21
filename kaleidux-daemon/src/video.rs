@@ -3,7 +3,7 @@ use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
@@ -20,6 +20,7 @@ pub enum VideoMode {
 }
 
 static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
+const BUS_WATCHER_POLL_MS: u64 = 25;
 
 pub fn set_video_mode(mode: VideoMode) {
     let val = match mode {
@@ -40,6 +41,35 @@ pub fn get_video_mode() -> VideoMode {
         3 => VideoMode::ForceRgba,
         4 => VideoMode::ForceCuda,
         _ => VideoMode::Auto,
+    }
+}
+
+fn audio_enabled_for_volume(volume: f64) -> bool {
+    volume > f64::EPSILON
+}
+
+fn playbin_flags_for_volume(volume: f64) -> &'static str {
+    if audio_enabled_for_volume(volume) {
+        "video+audio"
+    } else {
+        "video"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_volume_disables_audio_pipeline() {
+        assert!(!audio_enabled_for_volume(0.0));
+        assert_eq!(playbin_flags_for_volume(0.0), "video");
+    }
+
+    #[test]
+    fn positive_volume_keeps_audio_pipeline() {
+        assert!(audio_enabled_for_volume(0.01));
+        assert_eq!(playbin_flags_for_volume(0.01), "video+audio");
     }
 }
 
@@ -270,11 +300,14 @@ fn extract_dmabuf_nv12(
 
 pub struct VideoPlayer {
     pub pipeline: gst::Element,
+    pub appsink: gst_app::AppSink,
     is_running: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>, // Keep for compatibility, but will use thread pool
     frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>,
     source_id: Arc<String>,
+    session_id: u64,
     start_time: std::time::Instant,
+    first_frame_logged: Arc<AtomicBool>,
 }
 
 impl VideoPlayer {
@@ -283,12 +316,20 @@ impl VideoPlayer {
         uri: &str,
         source_id: Arc<String>,
         session_id: u64,
+        volume: f64,
         frame_tx: tokio::sync::mpsc::Sender<(Arc<String>, VideoEvent)>,
     ) -> anyhow::Result<Self> {
         let _video_start = std::time::Instant::now();
         let creation_start = std::time::Instant::now();
-        // Use playbin - the same high-level element that gSlapper uses
-        let pipeline = gst::ElementFactory::make("playbin")
+        // Prefer playbin3 on modern GStreamer for lower-latency URI changes and
+        // more efficient internal graph management. Fall back to playbin if it
+        // is unavailable on the host system.
+        let pipeline_name = if gst::ElementFactory::find("playbin3").is_some() {
+            "playbin3"
+        } else {
+            "playbin"
+        };
+        let pipeline = gst::ElementFactory::make(pipeline_name)
             .name("playbin")
             .build()?;
 
@@ -309,10 +350,15 @@ impl VideoPlayer {
         info!("Setting video URI: {}", full_uri);
         pipeline.set_property("uri", &full_uri);
 
-        // Set playbin flags to only video+audio (disable text/subtitles/soft-volume/buffering).
-        // This avoids creating unnecessary subtitle/text overlay elements at startup.
-        // Must use set_property_from_str since the flags property expects GstPlayFlags, not u32.
-        pipeline.set_property_from_str("flags", "video+audio");
+        // Disable subtitles/buffering unconditionally. Also skip audio decoding entirely
+        // when the configured volume is zero to avoid extra decoder/buffer state.
+        pipeline.set_property_from_str("flags", playbin_flags_for_volume(volume));
+        if !audio_enabled_for_volume(volume) {
+            pipeline.set_property("mute", true);
+        }
+        if pipeline_name == "playbin3" {
+            pipeline.set_property("instant-uri", true);
+        }
 
         // Create appsink for video frames - configure like gSlapper does
         let appsink = gst::ElementFactory::make("appsink")
@@ -388,6 +434,10 @@ impl VideoPlayer {
         appsink.set_sync(true); // Sync to clock
         appsink.set_drop(true); // Drop frames if late - CRITICAL for preventing buffer accumulation
         appsink.set_max_buffers(1); // Match gSlapper: 1 buffer to minimize latency and memory
+        appsink.set_property("enable-last-sample", false); // Don't retain a full decoded frame.
+        appsink.set_property("wait-on-eos", false); // Tear down without waiting on queued buffers.
+        appsink.set_property("qos", true); // Let upstream know we're latency-sensitive.
+        appsink.set_property_from_str("leaky-type", "downstream");
         // CRITICAL: Enable emit-signals to get callbacks, but ensure we handle them quickly
         // The new_sample callback will be called for each frame
 
@@ -397,6 +447,7 @@ impl VideoPlayer {
         // Set up new-sample callback
         let frame_tx_clone = frame_tx.clone();
         let first_frame_logged = Arc::new(AtomicBool::new(false));
+        let callback_first_frame_logged = first_frame_logged.clone();
         let creation_time_ref = creation_start;
 
         appsink.set_callbacks(
@@ -404,116 +455,19 @@ impl VideoPlayer {
                 .new_sample(move |sink| {
                     let source_id = cb_source_id.clone();
 
-                    if !first_frame_logged.load(Ordering::SeqCst) {
-                        first_frame_logged.store(true, Ordering::SeqCst);
+                    if !callback_first_frame_logged.load(Ordering::SeqCst) {
+                        callback_first_frame_logged.store(true, Ordering::SeqCst);
                         let duration = creation_time_ref.elapsed();
                         info!("[ASSET] {}: First video frame produced in {:.3}ms", source_id, duration.as_secs_f64() * 1000.0);
                     }
 
                     let session_id = session_id;
 
-                    // CRITICAL: Pull sample and extract buffer in explicit scope
-                    // This ensures sample is dropped immediately after buffer extraction
-                    let (buffer, width, height, stride, format) = {
-                        let sample = match sink.pull_sample() {
-                            Ok(s) => s,
-                            Err(_) => return Err(gst::FlowError::Error),
-                        };
-
-                        let buffer = match sample.buffer() {
-                            Some(b) => b.to_owned(),
-                            None => return Err(gst::FlowError::Error),
-                        };
-
-                        let caps = match sample.caps() {
-                            Some(c) => c,
-                            None => return Err(gst::FlowError::Error),
-                        };
-
-                        let video_info = match gst_video::VideoInfo::from_caps(caps) {
-                            Ok(vi) => vi,
-                            Err(_) => return Err(gst::FlowError::Error),
-                        };
-
-                        let width = video_info.width();
-                        let height = video_info.height();
-
-                        // Prefer GstVideoMeta stride/offset (reflects actual memory layout
-                        // from hardware decoders like nvh264dec), fall back to VideoInfo
-                        let (strides, offsets) = unsafe {
-                            let raw_meta = gst_video::ffi::gst_buffer_get_video_meta(
-                                buffer.as_ptr() as *mut gst::ffi::GstBuffer,
-                            );
-                            if !raw_meta.is_null() {
-                                let meta = &*raw_meta;
-                                (meta.stride, meta.offset)
-                            } else {
-                                let vi_strides = video_info.stride();
-                                let vi_offsets = video_info.offset();
-                                let mut s = [0i32; 4];
-                                let mut o = [0usize; 4];
-                                for i in 0..4 {
-                                    s[i] = vi_strides[i];
-                                    o[i] = vi_offsets[i] as usize;
-                                }
-                                (s, o)
-                            }
-                        };
-                        let y_stride = strides[0] as u32;
-
-                        // Check caps features for memory type
-                        let is_cuda = caps.features(0).map_or(false, |f| {
-                            f.contains("memory:CUDAMemory")
-                        });
-
-                        let format = match video_info.format() {
-                            gst_video::VideoFormat::Nv12 => {
-                                if is_cuda {
-                                    tracing::debug!(
-                                        "[VIDEO] CUDA NV12 layout: y_stride={}, uv_offset={}, uv_stride={} ({}x{})",
-                                        strides[0], offsets[1], strides[1], width, height
-                                    );
-                                    VideoFrameFormat::CudaNv12 {
-                                        y_stride,
-                                        uv_offset: offsets[1] as u32,
-                                        uv_stride: strides[1] as u32,
-                                    }
-                                } else {
-                                    let is_dmabuf = buffer.n_memory() > 0
-                                        && buffer
-                                            .peek_memory(0)
-                                            .downcast_memory_ref::<gst_alloc::DmaBufMemory>()
-                                            .is_some();
-
-                                    if is_dmabuf {
-                                        extract_dmabuf_nv12(&buffer, strides, offsets)
-                                    } else {
-                                        VideoFrameFormat::Nv12 {
-                                            y_stride,
-                                            uv_offset: offsets[1] as u32,
-                                            uv_stride: strides[1] as u32,
-                                        }
-                                    }
-                                }
-                            }
-                            gst_video::VideoFormat::Rgba => VideoFrameFormat::Rgba,
-                            other => {
-                                tracing::error!("[VIDEO] Unsupported format {:?}, negotiation failed", other);
-                                return Err(gst::FlowError::NotNegotiated);
-                            }
-                        };
-
-                        (buffer, width, height, y_stride, format)
+                    let sample = match sink.pull_sample() {
+                        Ok(s) => s,
+                        Err(_) => return Err(gst::FlowError::Error),
                     };
-
-                    let frame = VideoFrame {
-                        buffer,
-                        width,
-                        height,
-                        stride,
-                        format,
-                        session_id,
-                    };
+                    let frame = sample_to_video_frame(sample, session_id)?;
 
                     // Send frame - if channel is full, drop frame immediately to release gst::Buffer
                     match frame_tx_clone.try_send((source_id.clone(), VideoEvent::Frame(frame))) {
@@ -546,36 +500,77 @@ impl VideoPlayer {
         pipeline.set_property("video-sink", &appsink);
 
         info!(
-            "VideoPlayer created with playbin + appsink (mode={:?}, caps={})",
-            mode, caps
+            "VideoPlayer created with playbin + appsink (mode={:?}, audio={}, caps={})",
+            mode,
+            audio_enabled_for_volume(volume),
+            caps
         );
 
         Ok(Self {
             pipeline,
+            appsink,
             is_running: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
             frame_tx,
             source_id,
+            session_id,
             start_time: creation_start,
+            first_frame_logged,
         })
     }
 
-    /// Pre-buffer video by setting pipeline to READY state (buffers but doesn't play)
-    pub fn prebuffer(&mut self) -> anyhow::Result<()> {
+    /// Pre-buffer video by moving the pipeline to PAUSED and extracting the preroll sample.
+    pub fn prebuffer(&mut self) -> anyhow::Result<Option<VideoFrame>> {
         debug!("[VIDEO] {}: Pre-buffering video pipeline", self.source_id);
-        let ret = self.pipeline.set_state(gst::State::Ready)?;
+        let ret = self.pipeline.set_state(gst::State::Paused)?;
         match ret {
             gst::StateChangeSuccess::Success => debug!(
-                "[VIDEO] {}: Pipeline state -> Ready (pre-buffered)",
+                "[VIDEO] {}: Pipeline state -> Paused (pre-roll complete)",
                 self.source_id
             ),
             gst::StateChangeSuccess::Async => debug!(
-                "[VIDEO] {}: Pipeline state -> Ready (Async, pre-buffering)",
+                "[VIDEO] {}: Pipeline state -> Paused (Async, pre-buffering)",
                 self.source_id
             ),
             _ => {}
         }
-        Ok(())
+
+        let (state_result, current, pending) =
+            self.pipeline.state(gst::ClockTime::from_mseconds(1500));
+        match state_result {
+            Ok(_) => {
+                debug!(
+                    "[VIDEO] {}: Pre-buffer state settled at {:?} (pending {:?})",
+                    self.source_id, current, pending
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "[VIDEO] {}: Timed out waiting for pre-buffer state ({:?} -> {:?}): {:?}",
+                    self.source_id, current, pending, e
+                );
+            }
+        }
+
+        let preroll = self
+            .appsink
+            .try_pull_preroll(gst::ClockTime::from_mseconds(250))
+            .map(|sample| {
+                sample_to_video_frame(sample, self.session_id)
+                    .map_err(|e| anyhow::anyhow!("failed to decode preroll sample: {:?}", e))
+            })
+            .transpose()?;
+
+        if preroll.is_some() && !self.first_frame_logged.swap(true, Ordering::SeqCst) {
+            let duration = self.start_time.elapsed();
+            info!(
+                "[ASSET] {}: First video frame produced in {:.3}ms (preroll)",
+                self.source_id,
+                duration.as_secs_f64() * 1000.0
+            );
+        }
+
+        Ok(preroll)
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
@@ -650,8 +645,8 @@ impl VideoPlayer {
             };
 
             while is_running.load(Ordering::SeqCst) {
-                // Wait for up to 100ms for a message
-                match bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                // Keep stop/join latency short so stale pipelines release resources quickly.
+                match bus.timed_pop(gst::ClockTime::from_mseconds(BUS_WATCHER_POLL_MS)) {
                     Some(msg) => {
                         use gst::MessageView;
                         match msg.view() {
@@ -731,24 +726,7 @@ impl VideoPlayer {
         Ok(())
     }
     pub fn stop(&mut self) -> anyhow::Result<()> {
-        if !self.is_running.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        info!("Stopping video playback...");
-
-        // 1. Fade audio to prevent clicks/pops during transition
-        self.pipeline.set_property("volume", 0.0);
-
-        // 2. Signal thread to stop
-        self.is_running.store(false, Ordering::SeqCst);
-
-        // 3. Pause first (transition to Ready state first helps cleanup)
-        let _ = self.pipeline.set_state(gst::State::Paused);
-
-        // 4. Set pipeline to Null (this stops data flow)
-        //    Note: We removed the 50ms sleep as it was blocking the Wayland event loop
-        //    and causing compositor disconnects when multiple transitions happen quickly
-        self.pipeline.set_state(gst::State::Null)?;
+        self.request_stop()?;
 
         // 5. Join thread
         // NOTE: This can block if the bus watcher thread is stuck waiting on GStreamer messages.
@@ -769,6 +747,23 @@ impl VideoPlayer {
         Ok(())
     }
 
+    pub fn request_stop(&self) -> anyhow::Result<()> {
+        let was_running = self.is_running.swap(false, Ordering::SeqCst);
+        if was_running {
+            info!("Stopping video playback...");
+            // Fade audio before teardown to prevent clicks on audio-enabled pipelines.
+            self.pipeline.set_property("volume", 0.0);
+        }
+
+        // Pause first (transition to Ready state first helps cleanup).
+        let _ = self.pipeline.set_state(gst::State::Paused);
+
+        // Always force Null, even for players that never fully entered Playing.
+        // Prebuffered or failed-start pipelines can still hold decoder state.
+        self.pipeline.set_state(gst::State::Null)?;
+        Ok(())
+    }
+
     pub fn set_volume(&mut self, volume: f64) {
         self.pipeline.set_property("volume", volume);
     }
@@ -782,6 +777,105 @@ impl VideoPlayer {
         self.pipeline.set_state(gst::State::Playing)?;
         Ok(())
     }
+}
+
+fn sample_to_video_frame(
+    sample: gst::Sample,
+    session_id: u64,
+) -> Result<VideoFrame, gst::FlowError> {
+    let buffer = match sample.buffer() {
+        Some(b) => b.to_owned(),
+        None => return Err(gst::FlowError::Error),
+    };
+
+    let caps = match sample.caps() {
+        Some(c) => c,
+        None => return Err(gst::FlowError::Error),
+    };
+
+    let video_info = match gst_video::VideoInfo::from_caps(caps) {
+        Ok(vi) => vi,
+        Err(_) => return Err(gst::FlowError::Error),
+    };
+
+    let width = video_info.width();
+    let height = video_info.height();
+
+    // Prefer GstVideoMeta stride/offset (reflects actual memory layout from
+    // hardware decoders), fall back to VideoInfo when the meta is absent.
+    let (strides, offsets) = unsafe {
+        let raw_meta =
+            gst_video::ffi::gst_buffer_get_video_meta(buffer.as_ptr() as *mut gst::ffi::GstBuffer);
+        if !raw_meta.is_null() {
+            let meta = &*raw_meta;
+            (meta.stride, meta.offset)
+        } else {
+            let vi_strides = video_info.stride();
+            let vi_offsets = video_info.offset();
+            let mut s = [0i32; 4];
+            let mut o = [0usize; 4];
+            for i in 0..4 {
+                s[i] = vi_strides[i];
+                o[i] = vi_offsets[i] as usize;
+            }
+            (s, o)
+        }
+    };
+    let y_stride = strides[0] as u32;
+
+    let is_cuda = caps
+        .features(0)
+        .is_some_and(|f| f.contains("memory:CUDAMemory"));
+
+    let format = match video_info.format() {
+        gst_video::VideoFormat::Nv12 => {
+            if is_cuda {
+                tracing::debug!(
+                    "[VIDEO] CUDA NV12 layout: y_stride={}, uv_offset={}, uv_stride={} ({}x{})",
+                    strides[0],
+                    offsets[1],
+                    strides[1],
+                    width,
+                    height
+                );
+                VideoFrameFormat::CudaNv12 {
+                    y_stride,
+                    uv_offset: offsets[1] as u32,
+                    uv_stride: strides[1] as u32,
+                }
+            } else {
+                let is_dmabuf = buffer.n_memory() > 0
+                    && buffer
+                        .peek_memory(0)
+                        .downcast_memory_ref::<gst_alloc::DmaBufMemory>()
+                        .is_some();
+
+                if is_dmabuf {
+                    extract_dmabuf_nv12(&buffer, strides, offsets)
+                } else {
+                    VideoFrameFormat::Nv12 {
+                        y_stride,
+                        uv_offset: offsets[1] as u32,
+                        uv_stride: strides[1] as u32,
+                    }
+                }
+            }
+        }
+        gst_video::VideoFormat::Rgba => VideoFrameFormat::Rgba,
+        other => {
+            tracing::error!("[VIDEO] Unsupported format {:?}, negotiation failed", other);
+            return Err(gst::FlowError::NotNegotiated);
+        }
+    };
+
+    Ok(VideoFrame {
+        buffer,
+        width,
+        height,
+        stride: y_stride,
+        format,
+        session_id,
+    })
 }
 
 impl Drop for VideoPlayer {

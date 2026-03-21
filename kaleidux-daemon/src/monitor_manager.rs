@@ -116,7 +116,6 @@ impl OutputOrchestrator {
             }
         } else if self.current_path.is_none() {
             if self.queue.is_none() {
-                warn!("[TICK] {}: Queue is None, cannot pick content", self._name);
                 return None;
             }
             info!(
