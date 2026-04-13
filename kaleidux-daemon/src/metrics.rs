@@ -49,6 +49,11 @@ pub struct PerformanceMetrics {
     error_count: Arc<AtomicU64>,
     error_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, String)>>>, // (timestamp, error_type)
 
+    // Wayland pacing diagnostics
+    wayland_idle_loops: Arc<AtomicU64>,
+    wayland_hot_loops: Arc<AtomicU64>,
+    wayland_callback_wakes: Arc<AtomicU64>,
+
     // Component CPU tracking (time spent in each component in milliseconds)
     renderer_cpu_time: Arc<AtomicU64>, // Total CPU time in microseconds
     video_cpu_time: Arc<AtomicU64>,    // Total CPU time in microseconds
@@ -121,6 +126,9 @@ impl PerformanceMetrics {
             gpu_util_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             error_count: Arc::new(AtomicU64::new(0)),
             error_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            wayland_idle_loops: Arc::new(AtomicU64::new(0)),
+            wayland_hot_loops: Arc::new(AtomicU64::new(0)),
+            wayland_callback_wakes: Arc::new(AtomicU64::new(0)),
             renderer_cpu_time: Arc::new(AtomicU64::new(0)),
             video_cpu_time: Arc::new(AtomicU64::new(0)),
             file_discovery_cpu_time: Arc::new(AtomicU64::new(0)),
@@ -158,6 +166,18 @@ impl PerformanceMetrics {
         if samples.len() > 100 {
             samples.pop_front();
         }
+    }
+
+    pub fn record_wayland_idle_loop(&self) {
+        self.wayland_idle_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_wayland_hot_loop(&self) {
+        self.wayland_hot_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_wayland_callback_wake(&self) {
+        self.wayland_callback_wakes.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_error_rate(&self) -> f64 {
@@ -312,8 +332,9 @@ impl PerformanceMetrics {
         convert: Duration,
         resize: Duration,
         expand: Duration,
+        upload: Duration,
     ) {
-        let total = permit_wait + decode + convert + resize + expand;
+        let total = permit_wait + decode + convert + resize + expand + upload;
         Self::push_sample(&self.image_total_samples, total.as_secs_f64() * 1000.0, 100);
         Self::push_sample(
             &self.image_wait_samples,
@@ -338,6 +359,11 @@ impl PerformanceMetrics {
         Self::push_sample(
             &self.image_expand_samples,
             expand.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_upload_samples,
+            upload.as_secs_f64() * 1000.0,
             100,
         );
     }
@@ -788,6 +814,12 @@ impl PerformanceMetrics {
             "renderer={:.2}ms video={:.2}ms image={:.2}ms file_disc={:.2}ms shader={:.2}ms",
             renderer_avg, video_avg, image_avg, file_disc_avg, shader_avg
         );
+        let wayland_info = format!(
+            " wayland=idle:{} hot:{} callbacks:{}",
+            self.wayland_idle_loops.load(Ordering::Relaxed),
+            self.wayland_hot_loops.load(Ordering::Relaxed),
+            self.wayland_callback_wakes.load(Ordering::Relaxed)
+        );
 
         let hits = self.texture_pool_hits.load(Ordering::Relaxed);
         let misses = self.texture_pool_misses.load(Ordering::Relaxed);
@@ -808,7 +840,7 @@ impl PerformanceMetrics {
         };
 
         tracing::info!(
-            "[METRICS] Uptime: {} | Memory: {} | GPU: {} | Errors: {} | Frame time: avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms | Texture pool: hit_rate={:.1}% ({}/{}) | Cache: hit_rate={:.1}% ({}/{}) | Transitions: {} | Component CPU: {}{}",
+            "[METRICS] Uptime: {} | Memory: {} | GPU: {} | Errors: {} | Frame time: avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms | Texture pool: hit_rate={:.1}% ({}/{}) | Cache: hit_rate={:.1}% ({}/{}) | Transitions: {} | Component CPU: {}{}{}",
             uptime_str,
             memory_info,
             gpu_info,
@@ -825,7 +857,8 @@ impl PerformanceMetrics {
             c_total,
             self.transition_count.load(Ordering::Relaxed),
             component_cpu,
-            leak_msg
+            leak_msg,
+            wayland_info
         );
 
         if image_avg > 0.0 || self.get_recent_avg_image_upload_ms() > 0.0 {
@@ -872,8 +905,8 @@ mod tests {
             Duration::from_millis(30),
             Duration::from_millis(40),
             Duration::from_millis(50),
+            Duration::from_millis(60),
         );
-        metrics.record_image_upload_cpu_time(Duration::from_millis(60));
 
         assert_eq!(metrics.get_recent_avg_image_wait_ms(), 10.0);
         assert_eq!(metrics.get_recent_avg_image_decode_ms(), 20.0);
@@ -881,6 +914,6 @@ mod tests {
         assert_eq!(metrics.get_recent_avg_image_resize_ms(), 40.0);
         assert_eq!(metrics.get_recent_avg_image_expand_ms(), 50.0);
         assert_eq!(metrics.get_recent_avg_image_upload_ms(), 60.0);
-        assert_eq!(metrics.get_recent_avg_image_total_ms(), 150.0);
+        assert_eq!(metrics.get_recent_avg_image_total_ms(), 210.0);
     }
 }

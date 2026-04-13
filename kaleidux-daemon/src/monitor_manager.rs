@@ -5,7 +5,7 @@ use crate::queue::Playlist;
 use crate::queue::SmartQueue;
 use anyhow::Result;
 use kaleidux_common::{BlacklistCommand, KEntry, PlaylistCommand, Response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +16,29 @@ const CONTENT_LOAD_GRACE: Duration = Duration::from_secs(5);
 
 fn content_load_timeout(display_duration: Duration) -> Duration {
     (display_duration + CONTENT_LOAD_GRACE).max(MIN_CONTENT_LOAD_TIMEOUT)
+}
+
+fn stable_output_hash(name: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn independent_phase_offset(name: &str, base_duration: Duration) -> Duration {
+    let cap = (base_duration / 12).min(Duration::from_millis(120));
+    if cap < Duration::from_millis(8) {
+        return Duration::ZERO;
+    }
+
+    let cap_nanos = cap.as_nanos();
+    let offset_nanos = u128::from(stable_output_hash(name)) % (cap_nanos + 1);
+    Duration::from_nanos(offset_nanos as u64)
 }
 
 pub struct OutputOrchestrator {
@@ -31,9 +54,22 @@ pub struct OutputOrchestrator {
     pub next_content_type: Option<crate::queue::ContentType>, // Type of next content
     pub next_change: Option<Instant>,
     pub display_start_time: Option<Instant>, // When content actually started displaying
+    pub phase_offset: Duration,
 }
 
 impl OutputOrchestrator {
+    fn cycle_duration(&self) -> Duration {
+        self.config.duration.saturating_add(self.phase_offset)
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        if let Some(display_start) = self.display_start_time {
+            Some(display_start + self.cycle_duration())
+        } else {
+            self.next_change
+        }
+    }
+
     pub async fn new(
         name: String,
         description: String,
@@ -74,6 +110,8 @@ impl OutputOrchestrator {
             None
         };
 
+        let phase_offset = independent_phase_offset(&name, config.duration);
+
         Self {
             _name: name,
             description,
@@ -84,6 +122,7 @@ impl OutputOrchestrator {
             next_content_type: None,
             next_change: None,
             display_start_time: None,
+            phase_offset,
         }
     }
 
@@ -93,12 +132,12 @@ impl OutputOrchestrator {
         // If content is displaying, check if duration has elapsed based on actual display start time
         if let Some(display_start) = self.display_start_time {
             let elapsed = now.saturating_duration_since(display_start);
-            if elapsed >= self.config.duration {
+            if elapsed >= self.cycle_duration() {
                 debug!(
                     "Duration expired for {}: {} elapsed (target: {:?})",
                     self._name,
                     format!("{:.2}s", elapsed.as_secs_f64()),
-                    self.config.duration
+                    self.cycle_duration()
                 );
                 let result = self.pick_next();
                 return result;
@@ -132,32 +171,24 @@ impl OutputOrchestrator {
         if let Some(queue) = &mut self.queue {
             info!("[PICK] {}: Calling queue.pick_next()", self._name);
             if let Some(path) = queue.pick_next() {
-                info!("[PICK] {}: Selected path: {:?}", self._name, path);
-                let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap(); // Already validated in discovery
-                self.current_path = Some(path.clone());
-                // Reset display start time - will be set when content actually starts displaying
-                // Reset display start time - will be set when content actually starts displaying
-                self.display_start_time = None;
-                // Allow slow initial decodes to complete before treating the load as stuck.
-                self.next_change =
-                    Some(Instant::now() + content_load_timeout(self.config.duration));
+                return self.apply_selected_path(path);
+            }
+        }
+        None
+    }
 
-                // Pre-buffer next content
-                if let Some((next_p, next_t)) = self.peek_next() {
-                    self.next_path = Some(next_p);
-                    self.next_content_type = Some(next_t);
-                } else {
-                    self.next_path = None;
-                    self.next_content_type = None;
-                }
-
-                debug!(
-                    "Scheduled next change for {} in {:?} (path: {})",
-                    self._name,
-                    self.config.duration,
-                    path.display()
-                );
-                return Some((path, content_type));
+    pub fn pick_next_excluding(
+        &mut self,
+        excluded: &HashSet<PathBuf>,
+    ) -> Option<(PathBuf, crate::queue::ContentType)> {
+        if let Some(queue) = &mut self.queue {
+            info!(
+                "[PICK] {}: Calling queue.pick_next_excluding() with {} excluded",
+                self._name,
+                excluded.len()
+            );
+            if let Some(path) = queue.pick_next_excluding(excluded) {
+                return self.apply_selected_path(path);
             }
         }
         None
@@ -176,8 +207,9 @@ impl OutputOrchestrator {
         if self.display_start_time.is_none() && self.current_path.is_some() {
             self.display_start_time = Some(Instant::now());
             debug!(
-                "Transition completed for {} - duration timer now active (2s of content display starts now)",
-                self._name
+                "Transition completed for {} - duration timer now active ({:.2}s of content display starts now)",
+                self._name,
+                self.cycle_duration().as_secs_f64()
             );
         }
     }
@@ -190,11 +222,38 @@ impl OutputOrchestrator {
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
                 self.next_change =
-                    Some(Instant::now() + content_load_timeout(self.config.duration));
+                    Some(Instant::now() + content_load_timeout(self.cycle_duration()));
                 return Some((path, content_type));
             }
         }
         None
+    }
+
+    fn apply_selected_path(
+        &mut self,
+        path: PathBuf,
+    ) -> Option<(PathBuf, crate::queue::ContentType)> {
+        info!("[PICK] {}: Selected path: {:?}", self._name, path);
+        let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+        self.current_path = Some(path.clone());
+        self.display_start_time = None;
+        self.next_change = Some(Instant::now() + content_load_timeout(self.cycle_duration()));
+
+        if let Some((next_p, next_t)) = self.peek_next() {
+            self.next_path = Some(next_p);
+            self.next_content_type = Some(next_t);
+        } else {
+            self.next_path = None;
+            self.next_content_type = None;
+        }
+
+        debug!(
+            "Scheduled next change for {} in {:?} (path: {})",
+            self._name,
+            self.cycle_duration(),
+            path.display()
+        );
+        Some((path, content_type))
     }
 }
 
@@ -215,6 +274,15 @@ pub struct MonitorManager {
 }
 
 impl MonitorManager {
+    fn earlier_deadline(current: &mut Option<Instant>, candidate: Option<Instant>) {
+        if let Some(candidate) = candidate {
+            match current {
+                Some(current_deadline) if *current_deadline <= candidate => {}
+                _ => *current = Some(candidate),
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn new(config: Config) -> Result<Self> {
         Self::new_with_metrics(config, None)
@@ -327,6 +395,7 @@ impl MonitorManager {
                         OutputOrchestrator {
                             _name: name.to_string(),
                             description: description.to_string(),
+                            phase_offset: independent_phase_offset(name, output_config.duration),
                             config: output_config,
                             queue,
                             current_path: None,
@@ -467,7 +536,7 @@ impl MonitorManager {
             let now = Instant::now();
             for orch in self.outputs.values_mut() {
                 orch.display_start_time = Some(now);
-                orch.next_change = Some(now + orch.config.duration);
+                orch.next_change = Some(now + orch.cycle_duration());
             }
             self.shared_display_start_time = Some(now);
             for start in self.group_display_start_times.values_mut() {
@@ -477,55 +546,69 @@ impl MonitorManager {
         }
     }
 
-    /// Returns true if any output is about to switch within the given look-ahead duration.
-    /// Used to pre-wake the event loop and avoid cold start latency on transitions (S-02).
-    pub fn has_imminent_switch(&self, look_ahead: std::time::Duration) -> bool {
+    pub fn next_switch_deadline(&self) -> Option<Instant> {
         if self.paused {
-            return false;
+            return None;
         }
-        let now = Instant::now();
-        let deadline = now + look_ahead;
+
+        let mut next_deadline = None;
 
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for orch in self.outputs.values() {
-                    if let Some(display_start) = orch.display_start_time {
-                        let switch_at = display_start + orch.config.duration;
-                        if switch_at <= deadline {
-                            return true;
-                        }
-                    }
+                    Self::earlier_deadline(&mut next_deadline, orch.next_deadline());
                 }
             }
             MonitorBehavior::Synchronized => {
                 if let Some(shared_start) = self.shared_display_start_time {
                     if let Some(first_orch) = self.outputs.values().next() {
-                        let switch_at = shared_start + first_orch.config.duration;
-                        if switch_at <= deadline {
-                            return true;
-                        }
+                        next_deadline = Some(shared_start + first_orch.config.duration);
                     }
+                } else if let Some(first_orch) = self.outputs.values().next() {
+                    next_deadline = if let Some(display_start) = first_orch.display_start_time {
+                        Some(display_start + first_orch.config.duration)
+                    } else {
+                        first_orch.next_change
+                    };
                 }
             }
             MonitorBehavior::Grouped(_) => {
-                for (gid, start) in &self.group_display_start_times {
-                    if let Some(first_name) = self
-                        .output_groups
-                        .iter()
-                        .find(|(_, g)| g == &gid)
-                        .map(|(n, _)| n)
-                    {
-                        if let Some(orch) = self.outputs.get(first_name) {
-                            let switch_at = *start + orch.config.duration;
-                            if switch_at <= deadline {
-                                return true;
+                let mut groups_to_check: HashMap<usize, Vec<String>> = HashMap::new();
+                for (name, gid) in &self.output_groups {
+                    groups_to_check.entry(*gid).or_default().push(name.clone());
+                }
+
+                for (gid, output_names) in groups_to_check {
+                    if let Some(group_start) = self.group_display_start_times.get(&gid) {
+                        if let Some(first_name) = output_names.first() {
+                            if let Some(orch) = self.outputs.get(first_name) {
+                                Self::earlier_deadline(
+                                    &mut next_deadline,
+                                    Some(*group_start + orch.config.duration),
+                                );
                             }
                         }
+                    } else if let Some(first_name) = output_names.first() {
+                        if let Some(orch) = self.outputs.get(first_name) {
+                            let candidate = if let Some(display_start) = orch.display_start_time {
+                                Some(display_start + orch.config.duration)
+                            } else {
+                                orch.next_change
+                            };
+                            Self::earlier_deadline(&mut next_deadline, candidate);
+                        }
+                    }
+                }
+
+                for (name, orch) in &self.outputs {
+                    if !self.output_groups.contains_key(name) {
+                        Self::earlier_deadline(&mut next_deadline, orch.next_deadline());
                     }
                 }
             }
         }
-        false
+
+        next_deadline
     }
 
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
@@ -678,6 +761,85 @@ impl MonitorManager {
                         if let Some(res) = orch.tick() {
                             changes.insert(name.clone(), res);
                         }
+                    }
+                }
+            }
+        }
+
+        changes
+    }
+
+    pub fn pick_startup_replacement(
+        &mut self,
+        output_name: &str,
+        excluded: &HashSet<PathBuf>,
+    ) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
+        let mut changes = HashMap::new();
+        let now = Instant::now();
+
+        match &self.config.global.monitor_behavior {
+            MonitorBehavior::Independent => {
+                if let Some(orch) = self.outputs.get_mut(output_name) {
+                    if let Some(res) = orch.pick_next_excluding(excluded) {
+                        changes.insert(output_name.to_string(), res);
+                    }
+                }
+            }
+            MonitorBehavior::Synchronized => {
+                if let Some(queue) = &mut self.shared_queue {
+                    if let Some(path) = queue.pick_next_excluding(excluded) {
+                        let content_type =
+                            crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                        let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                            (Some(np), Some(nt))
+                        } else {
+                            (None, None)
+                        };
+
+                        self.shared_display_start_time = None;
+                        for (name, orch) in &mut self.outputs {
+                            orch.current_path = Some(path.clone());
+                            orch.display_start_time = None;
+                            orch.next_change =
+                                Some(now + content_load_timeout(orch.config.duration));
+                            orch.next_path = next_p.clone();
+                            orch.next_content_type = next_t;
+                            changes.insert(name.clone(), (path.clone(), content_type));
+                        }
+                    }
+                }
+            }
+            MonitorBehavior::Grouped(_) => {
+                if let Some(gid) = self.output_groups.get(output_name).copied() {
+                    if let Some(queue) = self.group_queues.get_mut(&gid) {
+                        if let Some(path) = queue.pick_next_excluding(excluded) {
+                            let content_type =
+                                crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                            let (next_p, next_t) = if let Some((np, nt)) = queue.peek_next() {
+                                (Some(np), Some(nt))
+                            } else {
+                                (None, None)
+                            };
+
+                            self.group_display_start_times.remove(&gid);
+                            for (name, orch_gid) in &self.output_groups {
+                                if *orch_gid == gid {
+                                    if let Some(orch) = self.outputs.get_mut(name) {
+                                        orch.current_path = Some(path.clone());
+                                        orch.display_start_time = None;
+                                        orch.next_change =
+                                            Some(now + content_load_timeout(orch.config.duration));
+                                        orch.next_path = next_p.clone();
+                                        orch.next_content_type = next_t;
+                                        changes.insert(name.clone(), (path.clone(), content_type));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(orch) = self.outputs.get_mut(output_name) {
+                    if let Some(res) = orch.pick_next_excluding(excluded) {
+                        changes.insert(output_name.to_string(), res);
                     }
                 }
             }
@@ -1337,5 +1499,36 @@ impl MonitorManager {
             }
         }
         history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_phase_offset_is_stable_for_same_output_name() {
+        let base = Duration::from_secs(60);
+        let first = independent_phase_offset("DP-2", base);
+        let second = independent_phase_offset("DP-2", base);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn independent_phase_offset_stays_within_cap() {
+        let base = Duration::from_secs(120);
+        let offset = independent_phase_offset("HDMI-A-1", base);
+
+        assert!(offset <= Duration::from_millis(120));
+        assert!(offset <= base / 12);
+    }
+
+    #[test]
+    fn independent_phase_offset_is_zero_for_short_durations() {
+        assert_eq!(
+            independent_phase_offset("DP-3", Duration::from_millis(80)),
+            Duration::ZERO
+        );
     }
 }

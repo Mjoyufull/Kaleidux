@@ -4,6 +4,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smithay_client_toolkit::shell::{WaylandSurface, wlr_layer::LayerSurface};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use wayland_client::QueueHandle;
@@ -122,6 +123,10 @@ pub struct WgpuContext {
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_pipeline: wgpu::RenderPipeline,
+    pub i420_bind_group_layout: wgpu::BindGroupLayout,
+    pub i420_pipeline: wgpu::RenderPipeline,
+    pub pipeline_cache: Option<wgpu::PipelineCache>,
+    pipeline_cache_path: Option<PathBuf>,
     // Texture pool: (width, height, mip_level_count) -> Vec of available textures
     pub texture_pool: parking_lot::Mutex<HashMap<(u32, u32, u32), Vec<TexturePoolEntry>>>,
     // Shared CUDA interop context (one per GPU, shared across all renderers)
@@ -130,8 +135,8 @@ pub struct WgpuContext {
 }
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
-const MAX_TEXTURE_POOL_SIZE: usize = 24; // Global limit on total textures in pool
-const MAX_TEXTURE_POOL_BYTES: u64 = 64 * 1024 * 1024; // Keep pooled RGBA textures under 64 MiB
+const MAX_TEXTURE_POOL_SIZE: usize = 16; // Global limit on total textures in pool
+const MAX_TEXTURE_POOL_BYTES: u64 = 32 * 1024 * 1024; // Keep pooled RGBA textures under 32 MiB
 const MAX_POOLED_TEXTURE_BYTES: u64 = 16 * 1024 * 1024; // Skip pooling huge 4K-class RGBA textures
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +174,35 @@ fn texture_byte_size(width: u32, height: u32, mip_level_count: u32) -> u64 {
     total
 }
 
+fn chroma_plane_extent(width: u32, height: u32) -> (u32, u32) {
+    (width.div_ceil(2), height.div_ceil(2))
+}
+
+fn yuv420_aux_byte_size(width: u32, height: u32) -> u64 {
+    let (chroma_width, chroma_height) = chroma_plane_extent(width, height);
+    width as u64 * height as u64 + 2 * chroma_width as u64 * chroma_height as u64
+}
+
+pub(crate) fn compute_cover_target_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return (source_width.max(1), source_height.max(1));
+    }
+
+    let width_scale = target_width as f32 / source_width as f32;
+    let height_scale = target_height as f32 / source_height as f32;
+    let scale = width_scale.max(height_scale).min(1.0);
+    let prepared_width =
+        ((source_width as f32 * scale).round() as u32).clamp(1, source_width.max(1));
+    let prepared_height =
+        ((source_height as f32 * scale).round() as u32).clamp(1, source_height.max(1));
+    (prepared_width, prepared_height)
+}
+
 fn should_pool_texture(width: u32, height: u32, mip_level_count: u32) -> bool {
     texture_byte_size(width, height, mip_level_count) <= MAX_POOLED_TEXTURE_BYTES
 }
@@ -181,6 +215,91 @@ fn select_present_mode(present_modes: &[wgpu::PresentMode]) -> wgpu::PresentMode
             .first()
             .copied()
             .unwrap_or(wgpu::PresentMode::Fifo)
+    }
+}
+
+fn sanitize_cache_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+    for ch in component.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else if !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
+    }
+    sanitized.trim_matches('-').to_string()
+}
+
+fn pipeline_cache_path_for_adapter(adapter: &Adapter) -> Option<PathBuf> {
+    let info = adapter.get_info();
+    let cache_dir = dirs::cache_dir()?.join("kaleidux").join("wgpu");
+    let adapter_name = sanitize_cache_component(info.name.as_str());
+    Some(cache_dir.join(format!(
+        "pipeline-cache-v2-{:?}-{:04x}-{:04x}-{}.bin",
+        info.backend, info.vendor, info.device, adapter_name
+    )))
+}
+
+fn load_pipeline_cache_seed(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(data) if !data.is_empty() => Some(data),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+fn random_transition_prewarm_set() -> Vec<Transition> {
+    vec![
+        Transition::Fade,
+        Transition::CrossZoom { strength: 0.3 },
+        Transition::Radial { smoothness: 0.5 },
+        Transition::Circle,
+        Transition::Directional {
+            direction: [1.0, 0.0],
+        },
+        Transition::SimpleZoom {
+            zoom_quickness: 0.5,
+        },
+        Transition::Ripple {
+            amplitude: 0.1,
+            speed: 1.0,
+        },
+        Transition::Swirl,
+        Transition::Pixelize {
+            squares_min: [10, 10],
+            steps: 10,
+        },
+        Transition::Mosaic { endx: 20, endy: 20 },
+        Transition::Burn,
+        Transition::CrossWarp,
+        Transition::Dreamy,
+        Transition::Morph { strength: 0.1 },
+        Transition::Wind { size: 0.2 },
+        Transition::Dissolve {
+            line_width: 0.1,
+            spread_clr: [0.0, 0.0, 0.0],
+            hot_clr: [0.9, 0.6, 0.1],
+            pow: 5.0,
+            intensity: 1.0,
+        },
+        Transition::FadeColor {
+            color: [0.0, 0.0, 0.0],
+            color_phase: 0.4,
+        },
+        Transition::Overexposure,
+        Transition::FilmBurn { seed: 2.31 },
+        Transition::Pinwheel { speed: 2.0 },
+        Transition::Heart,
+    ]
+}
+
+fn transition_prewarm_candidates(transition: &Transition) -> Vec<Transition> {
+    if matches!(transition, Transition::Random) {
+        random_transition_prewarm_set()
+    } else if matches!(transition, Transition::Fade) {
+        vec![Transition::Fade]
+    } else {
+        vec![Transition::Fade, transition.clone()]
     }
 }
 
@@ -216,6 +335,22 @@ mod tests {
     }
 
     #[test]
+    fn cover_target_preserves_minimum_cover_without_upscaling() {
+        assert_eq!(
+            compute_cover_target_dimensions(3840, 2160, 1366, 768),
+            (1366, 768)
+        );
+        assert_eq!(
+            compute_cover_target_dimensions(3840, 2160, 1280, 1024),
+            (1820, 1024)
+        );
+        assert_eq!(
+            compute_cover_target_dimensions(800, 600, 1920, 1080),
+            (800, 600)
+        );
+    }
+
+    #[test]
     fn present_mode_prefers_fifo_when_available() {
         let selected = select_present_mode(&[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]);
         assert_eq!(selected, wgpu::PresentMode::Fifo);
@@ -225,6 +360,38 @@ mod tests {
     fn present_mode_falls_back_to_first_supported_mode() {
         let selected = select_present_mode(&[wgpu::PresentMode::Mailbox]);
         assert_eq!(selected, wgpu::PresentMode::Mailbox);
+    }
+
+    #[test]
+    fn transition_prewarm_candidates_include_fade_fallback() {
+        let transitions = transition_prewarm_candidates(&Transition::Circle);
+        assert!(transitions.iter().any(|t| matches!(t, Transition::Fade)));
+        assert!(transitions.iter().any(|t| matches!(t, Transition::Circle)));
+    }
+
+    #[test]
+    fn random_transition_prewarm_contains_multiple_variants() {
+        let transitions = transition_prewarm_candidates(&Transition::Random);
+        assert!(transitions.len() > 5);
+        assert!(transitions.iter().any(|t| matches!(t, Transition::Fade)));
+    }
+
+    #[test]
+    fn chroma_plane_extent_rounds_up_for_odd_sizes() {
+        assert_eq!(chroma_plane_extent(1920, 1080), (960, 540));
+        assert_eq!(chroma_plane_extent(1919, 1079), (960, 540));
+    }
+
+    #[test]
+    fn yuv420_aux_bytes_match_planar_layout() {
+        assert_eq!(
+            yuv420_aux_byte_size(1920, 1080),
+            1920 * 1080 + 2 * 960 * 540
+        );
+        assert_eq!(
+            yuv420_aux_byte_size(1919, 1079),
+            1919 * 1079 + 2 * 960 * 540
+        );
     }
 }
 
@@ -253,11 +420,16 @@ impl WgpuContext {
             adapter.get_info().backend
         );
 
+        let mut required_features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            required_features |= wgpu::Features::PIPELINE_CACHE;
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Kaleidux Shared Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: adapter.limits(),
                     // Favor smaller allocator blocks over peak throughput. The retained
                     // texture logs show renderer-visible textures are not the dominant
@@ -267,6 +439,30 @@ impl WgpuContext {
                 None,
             )
             .await?;
+
+        let pipeline_cache_path = pipeline_cache_path_for_adapter(&adapter);
+        let pipeline_cache_seed = pipeline_cache_path
+            .as_ref()
+            .and_then(|path| load_pipeline_cache_seed(path));
+        let pipeline_cache = if required_features.contains(wgpu::Features::PIPELINE_CACHE) {
+            Some(unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("Kaleidux Pipeline Cache"),
+                    data: pipeline_cache_seed.as_deref(),
+                    fallback: true,
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(path) = &pipeline_cache_path {
+            debug!(
+                "[RENDER] Pipeline cache initialized at {} (enabled={}, seed_bytes={})",
+                path.display(),
+                pipeline_cache.is_some(),
+                pipeline_cache_seed.as_ref().map_or(0, |data| data.len())
+            );
+        }
 
         // --- Shared Bind Group Layouts ---
         let transition_bind_group_layout =
@@ -439,7 +635,90 @@ impl WgpuContext {
                 compilation_options: Default::default(),
             }),
             multiview: None,
-            cache: None,
+            cache: pipeline_cache.as_ref(),
+        });
+
+        let i420_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("I420 Convert Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let i420_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("I420 Convert Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/i420_convert.wgsl").into()),
+        });
+
+        let i420_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("I420 Convert Pipeline Layout"),
+            bind_group_layouts: &[&i420_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let i420_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("I420 Convert Pipeline"),
+            layout: Some(&i420_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &i420_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &i420_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: pipeline_cache.as_ref(),
         });
 
         Ok((
@@ -458,12 +737,112 @@ impl WgpuContext {
                 mipmap_bind_group_layout,
                 nv12_bind_group_layout,
                 nv12_pipeline,
+                i420_bind_group_layout,
+                i420_pipeline,
+                pipeline_cache,
+                pipeline_cache_path,
                 texture_pool: parking_lot::Mutex::new(HashMap::new()),
                 cuda_interop: parking_lot::Mutex::new(None),
                 cuda_interop_failed: std::sync::atomic::AtomicBool::new(false),
             }),
             compatible_surface,
         ))
+    }
+
+    pub fn warmup_cuda_interop(&self) {
+        if self
+            .cuda_interop_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        let warmup_start = std::time::Instant::now();
+        let mut created_context = false;
+        {
+            let mut ci_lock = self.cuda_interop.lock();
+            if ci_lock.is_none() {
+                match crate::cuda_interop::CudaInterop::new() {
+                    Ok(interop) => {
+                        *ci_lock = Some(interop);
+                        created_context = true;
+                    }
+                    Err(e) => {
+                        warn!("[CUDA] Warmup failed to create interop context: {}", e);
+                        self.cuda_interop_failed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let alloc_start = std::time::Instant::now();
+        let alloc_duration = {
+            let ci_guard = self.cuda_interop.lock();
+            ci_guard
+                .as_ref()
+                .and_then(|interop| match interop.allocate_exportable(4096) {
+                    Ok((alloc, fd)) => {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        interop.free_exportable(alloc);
+                        Some(alloc_start.elapsed())
+                    }
+                    Err(e) => {
+                        debug!("[CUDA] Warmup exportable allocation skipped: {}", e);
+                        None
+                    }
+                })
+        };
+
+        info!(
+            "[CUDA] Warmup complete in {:.1}ms (created_context={}, exportable_alloc_ms={})",
+            warmup_start.elapsed().as_secs_f64() * 1000.0,
+            created_context,
+            alloc_duration
+                .map(|d| format!("{:.1}", d.as_secs_f64() * 1000.0))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+    }
+
+    pub fn persist_pipeline_cache(&self) {
+        let Some(cache) = &self.pipeline_cache else {
+            return;
+        };
+        let Some(path) = &self.pipeline_cache_path else {
+            return;
+        };
+        let Some(data) = cache.get_data() else {
+            return;
+        };
+        if data.is_empty() {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(
+                    "[RENDER] Failed to create pipeline-cache directory {}: {}",
+                    parent.display(),
+                    e
+                );
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(path, &data) {
+            warn!(
+                "[RENDER] Failed to persist pipeline cache {}: {}",
+                path.display(),
+                e
+            );
+            return;
+        }
+        debug!(
+            "[RENDER] Persisted pipeline cache to {} ({} bytes)",
+            path.display(),
+            data.len()
+        );
     }
 
     pub fn get_blit_pipeline(&self, format: wgpu::TextureFormat) -> Arc<wgpu::RenderPipeline> {
@@ -513,7 +892,7 @@ impl WgpuContext {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             });
 
         let pipeline_arc = Arc::new(pipeline);
@@ -575,7 +954,7 @@ impl WgpuContext {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             });
 
         let pipeline_arc = Arc::new(pipeline);
@@ -670,7 +1049,7 @@ impl WgpuContext {
 
         // Limit pool size per resolution to prevent unbounded growth
         let entries = pool.entry(key).or_default();
-        if entries.len() < 3 {
+        if entries.is_empty() {
             entries.push(TexturePoolEntry {
                 texture,
                 last_used: std::time::Instant::now(),
@@ -706,7 +1085,7 @@ impl WgpuContext {
                         })
                     })
                     .collect();
-            oldest.sort_by_key(|&(_, _, t, _)| t);
+            oldest.sort_by(|a, b| b.3.cmp(&a.3).then(a.2.cmp(&b.2)));
 
             // Remove oldest entries (iterate in age order, adjust indices)
             let mut removed_per_key: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
@@ -815,10 +1194,14 @@ pub struct Renderer {
     pub active_video_session_id: u64,
     pub active_batch_id: Option<u64>,
     pub batch_start_time: Option<std::time::Instant>, // Anchor for shared batch transitions
+    display_timer_pending: bool,
+    display_timer_ready: bool,
 
     // Metrics tracking
     metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
     video_first_frame_time: Option<std::time::Instant>, // Track when video session starts
+    last_video_source_size: Option<(u32, u32)>,
+    last_video_presentation_size: Option<(u32, u32)>,
 
     // Background task handle for shader precompilation (aborted on drop)
     shader_precompile_handle: Option<tokio::task::AbortHandle>,
@@ -836,6 +1219,14 @@ pub struct Renderer {
     nv12_uv_view: Option<wgpu::TextureView>,
     nv12_staging_size: Option<(u32, u32)>,
 
+    i420_y_texture: Option<wgpu::Texture>,
+    i420_u_texture: Option<wgpu::Texture>,
+    i420_v_texture: Option<wgpu::Texture>,
+    i420_y_view: Option<wgpu::TextureView>,
+    i420_u_view: Option<wgpu::TextureView>,
+    i420_v_view: Option<wgpu::TextureView>,
+    i420_staging_size: Option<(u32, u32)>,
+
     // Per-renderer CUDA texture cache (shared CudaInterop lives in WgpuContext)
     cuda_textures: Option<CudaTextureCache>,
 }
@@ -851,6 +1242,13 @@ impl Renderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Sync + Send + 'static,
     {
+        let desired_maximum_frame_latency = match window.window_handle().map(|h| h.as_raw()) {
+            // Wayland/Vulkan can hit swapchain semaphore reuse validation with 3-image
+            // surfaces under animated multi-output workloads. Prefer a 2-image class here.
+            Ok(raw_window_handle::RawWindowHandle::Wayland(_)) => 1,
+            _ => 2,
+        };
+
         // Reuse the first surface if provided to avoid protocol errors (multiple roles on wl_surface)
         let surface = if let Some(s) = first_surface {
             s
@@ -886,7 +1284,7 @@ impl Renderer {
             present_mode,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency,
         };
 
         let r = Self {
@@ -943,8 +1341,12 @@ impl Renderer {
             active_video_session_id: 0,
             active_batch_id: None,
             batch_start_time: None,
+            display_timer_pending: false,
+            display_timer_ready: false,
             metrics,
             video_first_frame_time: None,
+            last_video_source_size: None,
+            last_video_presentation_size: None,
             shader_precompile_handle: None,
             stride_temp_buffer: Vec::new(),
             prev_texture_size: None,
@@ -953,6 +1355,13 @@ impl Renderer {
             nv12_y_view: None,
             nv12_uv_view: None,
             nv12_staging_size: None,
+            i420_y_texture: None,
+            i420_u_texture: None,
+            i420_v_texture: None,
+            i420_y_view: None,
+            i420_u_view: None,
+            i420_v_view: None,
+            i420_staging_size: None,
             cuda_textures: None,
         };
         // Shader precompilation is deferred to apply_config() which knows
@@ -1004,9 +1413,12 @@ impl Renderer {
         self.surface.get_capabilities(&self.ctx.adapter)
     }
 
-    /// Ensures composition texture exists and matches current surface dimensions
-    /// Creates it if missing or if dimensions don't match
-    fn ensure_composition_texture(&mut self) -> anyhow::Result<()> {
+    /// Ensures composition texture exists and matches current surface dimensions.
+    /// Returns true when a new texture had to be created.
+    fn ensure_composition_texture_internal(
+        &mut self,
+        warn_if_active: bool,
+    ) -> anyhow::Result<bool> {
         // Check if we need to create or recreate the composition texture
         let needs_creation =
             self.composition_texture.is_none() || self.composition_texture_view.is_none();
@@ -1020,7 +1432,8 @@ impl Renderer {
             false
         };
 
-        if needs_creation || size_mismatch {
+        let created = needs_creation || size_mismatch;
+        if created {
             if self.config.width == 0 || self.config.height == 0 {
                 // Can't create texture without valid dimensions
                 return Err(anyhow::anyhow!(
@@ -1030,7 +1443,7 @@ impl Renderer {
                 ));
             }
 
-            if self.transition_active {
+            if warn_if_active && self.transition_active {
                 warn!(
                     "[TRANSITION] {}: Composition texture missing during active transition, creating now ({}x{})",
                     self.name, self.config.width, self.config.height
@@ -1059,7 +1472,8 @@ impl Renderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             self.composition_texture_view =
@@ -1071,13 +1485,60 @@ impl Renderer {
             self.blit_bind_group = None;
         }
 
-        Ok(())
+        Ok(created)
+    }
+
+    /// Ensures composition texture exists and matches current surface dimensions
+    /// Creates it if missing or if dimensions don't match
+    fn ensure_composition_texture(&mut self) -> anyhow::Result<()> {
+        self.ensure_composition_texture_internal(true).map(|_| ())
+    }
+
+    fn prewarm_transition_resources(&mut self) {
+        if !self.configured
+            || self.config.width == 0
+            || self.config.height == 0
+            || self.prev_texture.is_none()
+            || self.current_texture.is_none()
+        {
+            return;
+        }
+
+        let warm_start = std::time::Instant::now();
+        match self.ensure_composition_texture_internal(false) {
+            Ok(true) => {
+                debug!(
+                    "[TRANSITION] {}: Prewarmed composition texture in {:.1}ms",
+                    self.name,
+                    warm_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "[TRANSITION] {}: Failed to prewarm composition texture: {}",
+                    self.name, e
+                );
+            }
+        }
     }
 
     pub fn apply_config(&mut self, config: &crate::orchestration::OutputConfig) {
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
         self.needs_redraw = true;
+
+        let pipeline_prewarm_start = std::time::Instant::now();
+        let prewarm_targets = transition_prewarm_candidates(&self.active_transition);
+        for transition in &prewarm_targets {
+            let _ = self.get_transition_pipeline(transition);
+        }
+        debug!(
+            "[RENDER] {}: Transition pipeline prewarm completed in {:.1}ms ({} target(s))",
+            self.name,
+            pipeline_prewarm_start.elapsed().as_secs_f64() * 1000.0,
+            prewarm_targets.len()
+        );
 
         // Pre-compile only the configured transition in background (+ Fade as fallback).
         // This replaces the old approach of blindly precompiling 10 hardcoded transitions.
@@ -1092,30 +1553,7 @@ impl Renderer {
             let _ = crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade);
             // Precompile the user's configured transition (skip if it IS Fade or Random)
             if matches!(transition, Transition::Random) {
-                // S-03: For Random mode, precompile WGSL text for common transitions
-                // so the GLSL→WGSL compilation (CPU-heavy) is cached before first use
-                let common = [
-                    Transition::CrossZoom { strength: 0.3 },
-                    Transition::Radial { smoothness: 0.5 },
-                    Transition::Circle,
-                    Transition::Directional { direction: [1.0, 0.0] },
-                    Transition::SimpleZoom { zoom_quickness: 0.5 },
-                    Transition::Ripple { amplitude: 0.1, speed: 1.0 },
-                    Transition::Swirl,
-                    Transition::Pixelize { squares_min: [10, 10], steps: 10 },
-                    Transition::Mosaic { endx: 20, endy: 20 },
-                    Transition::Burn,
-                    Transition::CrossWarp,
-                    Transition::Dreamy,
-                    Transition::Morph { strength: 0.1 },
-                    Transition::Wind { size: 0.2 },
-                    Transition::Dissolve { line_width: 0.1, spread_clr: [0.0, 0.0, 0.0], hot_clr: [0.9, 0.6, 0.1], pow: 5.0, intensity: 1.0 },
-                    Transition::FadeColor { color: [0.0, 0.0, 0.0], color_phase: 0.4 },
-                    Transition::Overexposure,
-                    Transition::FilmBurn { seed: 2.31 },
-                    Transition::Pinwheel { speed: 2.0 },
-                    Transition::Heart,
-                ];
+                let common = random_transition_prewarm_set();
                 for t in &common {
                     let _ = crate::shaders::ShaderManager::get_builtin_shader(t);
                 }
@@ -1124,7 +1562,7 @@ impl Renderer {
                     "[RENDER] {}: Background shader precompilation completed in {:.1}ms ({} common shaders for Random mode)",
                     name_for_bg,
                     duration.as_secs_f64() * 1000.0,
-                    common.len() + 1, // +1 for Fade
+                    common.len(),
                 );
             } else if !matches!(transition, Transition::Fade) {
                 let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
@@ -1304,7 +1742,7 @@ impl Renderer {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview: None,
-                cache: None,
+                cache: self.ctx.pipeline_cache.as_ref(),
             });
 
         let pipeline_arc = Arc::new(pipeline);
@@ -1368,6 +1806,7 @@ impl Renderer {
         // This ensures transitions complete smoothly without getting stuck
         // Note: Don't reset needs_redraw here - do it AFTER we've actually rendered and presented
 
+        let surface_acquire_start = std::time::Instant::now();
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost) => {
@@ -1404,6 +1843,14 @@ impl Renderer {
                 return Ok(());
             }
         };
+        let surface_acquire_duration = surface_acquire_start.elapsed();
+        if surface_acquire_duration > std::time::Duration::from_millis(8) {
+            debug!(
+                "[FRAME] {}: Surface acquisition took {:.1}ms",
+                self.name,
+                surface_acquire_duration.as_secs_f64() * 1000.0
+            );
+        }
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1447,6 +1894,7 @@ impl Renderer {
                     if self.transition_active {
                         self.transition_active = false;
                         self.transition_just_completed = true;
+                        self.arm_display_timer_on_present();
 
                         // Log Audit Report and record metrics
                         if let Some(stats) = self.transition_stats.take() {
@@ -1870,6 +2318,10 @@ impl Renderer {
 
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        if self.display_timer_pending {
+            self.display_timer_pending = false;
+            self.display_timer_ready = true;
+        }
 
         // Note: frame_callback_pending is reset by the main loop when callback is received
         // Don't reset it here to avoid race conditions
@@ -1901,7 +2353,7 @@ impl Renderer {
         &mut self,
         layer_surface: &LayerSurface,
         qh: &QueueHandle<crate::wayland::WaylandBackend>,
-    ) {
+    ) -> bool {
         if self.frame_callback_pending {
             // Check failsafe: if pending for > 500ms, assume lost and allow re-request
             if let Some(r) = self.last_frame_request {
@@ -1912,7 +2364,7 @@ impl Renderer {
                     );
                     self.frame_callback_pending = false; // Reset to allow re-request
                 } else {
-                    return; // Truly pending
+                    return false; // Truly pending
                 }
             }
         }
@@ -1926,13 +2378,14 @@ impl Renderer {
 
         self.frame_callback_pending = true;
         self.last_frame_request = Some(std::time::Instant::now());
-        tracing::debug!(
+        tracing::trace!(
             "[FRAME] {}: Requested frame callback (configured={}, needs_redraw={}, transition_progress={:.3})",
             self.name,
             self.configured,
             self.needs_redraw,
             self.transition_progress
         );
+        true
     }
 
     pub fn set_content_type(&mut self, content_type: crate::queue::ContentType) {
@@ -1940,6 +2393,8 @@ impl Renderer {
             && content_type != crate::queue::ContentType::Video
         {
             self.release_video_backend_resources("leaving video content");
+            self.last_video_source_size = None;
+            self.last_video_presentation_size = None;
         }
         self.valid_content_type = content_type;
     }
@@ -1961,14 +2416,14 @@ impl Renderer {
 
         let mut video_aux_bytes = 0u64;
         if let Some((w, h)) = self.nv12_staging_size {
-            video_aux_bytes = video_aux_bytes
-                .saturating_add(w as u64 * h as u64)
-                .saturating_add(w as u64 * (h as u64 / 2));
+            video_aux_bytes = video_aux_bytes.saturating_add(yuv420_aux_byte_size(w, h));
+        }
+        if let Some((w, h)) = self.i420_staging_size {
+            video_aux_bytes = video_aux_bytes.saturating_add(yuv420_aux_byte_size(w, h));
         }
         if let Some(cache) = &self.cuda_textures {
-            video_aux_bytes = video_aux_bytes
-                .saturating_add(cache.width as u64 * cache.height as u64)
-                .saturating_add(cache.width as u64 * (cache.height as u64 / 2));
+            video_aux_bytes =
+                video_aux_bytes.saturating_add(yuv420_aux_byte_size(cache.width, cache.height));
         }
 
         RetainedTextureFootprint {
@@ -1987,6 +2442,38 @@ impl Renderer {
     /// Check if any renderable content exists (current or previous texture)
     pub fn has_any_content(&self) -> bool {
         self.current_texture.is_some() || self.prev_texture.is_some()
+    }
+
+    pub fn needs_wayland_immediate_work(&self) -> bool {
+        self.transition_active
+            || (self.needs_redraw
+                && (!self.frame_callback_pending || self.frame_callback_pending_too_long(500)))
+    }
+
+    pub fn next_wayland_retry_deadline(
+        &self,
+        retry_after: std::time::Duration,
+    ) -> Option<std::time::Instant> {
+        if self.needs_redraw && self.frame_callback_pending {
+            self.last_frame_request.map(|t| t + retry_after)
+        } else {
+            None
+        }
+    }
+
+    pub fn trim_idle_retained_resources(&mut self) {
+        if !self.transition_active && !self.content_swap_pending {
+            if self.prev_texture.is_some() {
+                self.release_prev_texture("idle trim");
+            }
+            if self.composition_texture.is_some() {
+                self.release_composition_texture("idle trim");
+            }
+        }
+
+        if !self.has_any_content() || self.valid_content_type != crate::queue::ContentType::Video {
+            self.release_video_backend_resources("idle trim");
+        }
     }
 
     /// Get the duration that the frame callback has been pending, if any
@@ -2084,6 +2571,8 @@ impl Renderer {
         self.current_texture = Some(texture);
         self.current_aspect = width as f32 / height as f32;
         self.current_texture_size = Some((width, height));
+        self.last_video_source_size = None;
+        self.last_video_presentation_size = None;
         self.needs_redraw = true;
         self.valid_content_type = crate::queue::ContentType::Image;
         self.transition_bind_group = None;
@@ -2098,6 +2587,7 @@ impl Renderer {
             // P-32: Reset batch_start_time so transition timer starts fresh from
             // actual upload time, preventing decode latency from eating into duration
             self.batch_start_time = None;
+            self.prewarm_transition_resources();
             info!(
                 "[TRANSITION] {}: Image data uploaded - transition will start on next render frame",
                 self.name
@@ -2106,6 +2596,7 @@ impl Renderer {
             self.transition_active = false;
             self.transition_progress = 1.0;
             self.transition_just_completed = true; // Signal completion for instant switch
+            self.arm_display_timer_on_present();
             info!(
                 "[TRANSITION] {}: Image data uploaded (Instant) - transition signaled as complete",
                 self.name
@@ -2144,13 +2635,23 @@ impl Renderer {
             self.begin_content_swap();
         }
 
-        let width = frame.width;
-        let height = frame.height;
+        let source_width = frame.width;
+        let source_height = frame.height;
+        let (presentation_width, presentation_height) = match frame.format {
+            crate::video::VideoFrameFormat::Rgba => (source_width, source_height),
+            _ => compute_cover_target_dimensions(
+                source_width,
+                source_height,
+                self.config.width.max(1),
+                self.config.height.max(1),
+            ),
+        };
 
         // Get or reuse the RGBA output texture (same size AND single mip level = reuse)
         let needs_new_texture = match self.current_texture.as_ref() {
             Some(curr) => {
-                self.current_texture_size != Some((width, height)) || curr.mip_level_count() > 1
+                self.current_texture_size != Some((presentation_width, presentation_height))
+                    || curr.mip_level_count() > 1
             }
             None => true,
         };
@@ -2164,8 +2665,8 @@ impl Renderer {
                         self.ctx.return_texture_to_pool(curr, w, h);
                     }
                     self.ctx.get_texture_from_pool(
-                        width,
-                        height,
+                        presentation_width,
+                        presentation_height,
                         wgpu::TextureUsages::TEXTURE_BINDING
                             | wgpu::TextureUsages::COPY_DST
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2174,8 +2675,8 @@ impl Renderer {
                 }
             }
             _ => self.ctx.get_texture_from_pool(
-                width,
-                height,
+                presentation_width,
+                presentation_height,
                 wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2188,22 +2689,37 @@ impl Renderer {
                 crate::video::VideoFrameFormat::CudaNv12 { .. } => "CUDA zero-copy NV12",
                 crate::video::VideoFrameFormat::DmaBufNv12 { .. } => "DMA-BUF zero-copy NV12",
                 crate::video::VideoFrameFormat::Nv12 { .. } => "NV12 CPU upload",
+                crate::video::VideoFrameFormat::I420 { .. } => "I420 CPU upload",
                 crate::video::VideoFrameFormat::Rgba => "RGBA CPU upload (legacy)",
             };
             info!(
-                "[VIDEO] {}: Frame decode path: {} ({}x{})",
-                self.name, path_name, width, height
+                "[VIDEO] {}: Frame decode path: {} source={}x{} presentation={}x{}",
+                self.name,
+                path_name,
+                source_width,
+                source_height,
+                presentation_width,
+                presentation_height
             );
         }
+
+        self.last_video_source_size = Some((source_width, source_height));
+        self.last_video_presentation_size = Some((presentation_width, presentation_height));
 
         match &frame.format {
             crate::video::VideoFrameFormat::CudaNv12 { .. } => {
                 self.release_nv12_staging("cuda frame path");
+                self.release_i420_staging("cuda frame path");
             }
             crate::video::VideoFrameFormat::DmaBufNv12 { .. } => {
                 self.release_video_backend_resources("dmabuf frame path");
             }
             crate::video::VideoFrameFormat::Nv12 { .. } => {
+                self.release_i420_staging("nv12 frame path");
+                self.release_cuda_cache();
+            }
+            crate::video::VideoFrameFormat::I420 { .. } => {
+                self.release_nv12_staging("i420 frame path");
                 self.release_cuda_cache();
             }
             crate::video::VideoFrameFormat::Rgba => {
@@ -2218,11 +2734,36 @@ impl Renderer {
                 uv_stride,
             } => {
                 self.upload_frame_nv12(
-                    frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
+                    frame,
+                    &texture,
+                    source_width,
+                    source_height,
+                    *y_stride,
+                    *uv_offset,
+                    *uv_stride,
+                );
+            }
+            crate::video::VideoFrameFormat::I420 {
+                y_stride,
+                u_offset,
+                u_stride,
+                v_offset,
+                v_stride,
+            } => {
+                self.upload_frame_i420(
+                    frame,
+                    &texture,
+                    source_width,
+                    source_height,
+                    *y_stride,
+                    *u_offset,
+                    *u_stride,
+                    *v_offset,
+                    *v_stride,
                 );
             }
             crate::video::VideoFrameFormat::Rgba => {
-                self.upload_frame_rgba(frame, &texture, width, height);
+                self.upload_frame_rgba(frame, &texture, source_width, source_height);
             }
             crate::video::VideoFrameFormat::DmaBufNv12 {
                 y_fd,
@@ -2234,8 +2775,8 @@ impl Renderer {
             } => {
                 if !self.upload_frame_dmabuf_nv12(
                     &texture,
-                    width,
-                    height,
+                    source_width,
+                    source_height,
                     y_fd.as_raw_fd(),
                     *y_stride,
                     *y_offset,
@@ -2245,7 +2786,13 @@ impl Renderer {
                 ) {
                     warn!("[VIDEO] DMA-BUF import failed, falling back to NV12 CPU path");
                     self.upload_frame_nv12(
-                        frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
+                        frame,
+                        &texture,
+                        source_width,
+                        source_height,
+                        *y_stride,
+                        *uv_offset,
+                        *uv_stride,
                     );
                 }
             }
@@ -2255,14 +2802,26 @@ impl Renderer {
                 uv_stride,
             } => {
                 if !self.upload_frame_cuda_nv12(
-                    frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
+                    frame,
+                    &texture,
+                    source_width,
+                    source_height,
+                    *y_stride,
+                    *uv_offset,
+                    *uv_stride,
                 ) {
                     error!(
                         "[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload",
                         self.name
                     );
                     self.upload_frame_nv12(
-                        frame, &texture, width, height, *y_stride, *uv_offset, *uv_stride,
+                        frame,
+                        &texture,
+                        source_width,
+                        source_height,
+                        *y_stride,
+                        *uv_offset,
+                        *uv_stride,
                     );
                 }
             }
@@ -2286,8 +2845,8 @@ impl Renderer {
         }
 
         self.current_texture = Some(texture);
-        self.current_texture_size = Some((width, height));
-        self.current_aspect = width as f32 / height as f32;
+        self.current_texture_size = Some((presentation_width, presentation_height));
+        self.current_aspect = source_width as f32 / source_height as f32;
         self.needs_redraw = true;
 
         if is_first_frame_after_switch {
@@ -2307,6 +2866,7 @@ impl Renderer {
                 self.transition_start_time = None;
                 self.transition_progress = 0.0;
                 self.transition_active = true;
+                self.prewarm_transition_resources();
             } else {
                 info!(
                     "[TRANSITION] {}: First video frame after switch (Instant) - transition signaled as complete",
@@ -2315,10 +2875,11 @@ impl Renderer {
                 self.transition_active = false;
                 self.transition_progress = 1.0;
                 self.transition_just_completed = true;
+                self.arm_display_timer_on_present();
             }
         }
 
-        debug!(
+        tracing::trace!(
             "[TRANSITION] {}: Video frame uploaded - current_texture={}, prev_texture={}, transition_progress={:.3}, transition_start_time={:?}",
             self.name,
             self.current_texture.is_some(),
@@ -2328,6 +2889,110 @@ impl Renderer {
         );
 
         // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
+    }
+
+    fn upload_plane_texture(
+        queue: &wgpu::Queue,
+        stride_temp_buffer: &mut Vec<u8>,
+        renderer_name: &str,
+        texture: &wgpu::Texture,
+        src: &[u8],
+        src_offset: usize,
+        src_stride: u32,
+        copy_width: u32,
+        copy_height: u32,
+        bytes_per_pixel: u32,
+        plane_name: &str,
+    ) -> bool {
+        if copy_width == 0 || copy_height == 0 {
+            return true;
+        }
+
+        let bytes_per_row = copy_width.saturating_mul(bytes_per_pixel);
+        let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
+
+        if src_stride.is_multiple_of(256) && src_stride >= bytes_per_row {
+            let end = src_offset.saturating_add((src_stride * copy_height) as usize);
+            if end > src.len() {
+                error!(
+                    "[RENDERER] {} {} plane truncated upload (expected {} bytes, have {})",
+                    renderer_name,
+                    plane_name,
+                    end,
+                    src.len()
+                );
+                return false;
+            }
+
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &src[src_offset..end],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(src_stride),
+                    rows_per_image: Some(copy_height),
+                },
+                wgpu::Extent3d {
+                    width: copy_width,
+                    height: copy_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            return true;
+        }
+
+        stride_temp_buffer.clear();
+        let required = (aligned_bytes_per_row * copy_height) as usize;
+        if stride_temp_buffer.capacity() < required {
+            stride_temp_buffer.reserve(required - stride_temp_buffer.capacity());
+        }
+
+        for row in 0..copy_height {
+            let start = src_offset + (row * src_stride) as usize;
+            let end = start + bytes_per_row as usize;
+            if end > src.len() {
+                error!(
+                    "[RENDERER] {} {} plane truncated row (expected {} bytes, have {})",
+                    renderer_name,
+                    plane_name,
+                    end,
+                    src.len()
+                );
+                return false;
+            }
+            stride_temp_buffer.extend_from_slice(&src[start..end]);
+            let pad = aligned_bytes_per_row - bytes_per_row;
+            if pad > 0 {
+                stride_temp_buffer.extend(std::iter::repeat_n(0u8, pad as usize));
+            }
+        }
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            stride_temp_buffer,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(aligned_bytes_per_row),
+                rows_per_image: Some(copy_height),
+            },
+            wgpu::Extent3d {
+                width: copy_width,
+                height: copy_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        true
     }
 
     /// Upload an NV12 frame: write Y and UV planes to staging textures, then
@@ -2342,10 +3007,8 @@ impl Renderer {
         uv_offset: u32,
         uv_stride: u32,
     ) {
-        let uv_width = width / 2;
-        let uv_height = height / 2;
+        let (uv_width, uv_height) = chroma_plane_extent(width, height);
 
-        // (Re)create staging textures when dimensions change
         if self.nv12_staging_size != Some((width, height)) {
             self.nv12_y_view = None;
             self.nv12_uv_view = None;
@@ -2389,7 +3052,6 @@ impl Renderer {
         let y_tex = self.nv12_y_texture.as_ref().unwrap();
         let uv_tex = self.nv12_uv_texture.as_ref().unwrap();
 
-        // Map GStreamer buffer and upload planes
         {
             let map = match frame.buffer.map_readable() {
                 Ok(m) => m,
@@ -2400,155 +3062,38 @@ impl Renderer {
             };
             let src = map.as_slice();
 
-            // ---- Y plane (1 byte per pixel) ----
-            let y_bytes_per_row = width; // R8Unorm = 1 byte/pixel
-            let y_aligned = (y_bytes_per_row + 255) & !255;
-
-            if y_stride == y_aligned {
-                self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: y_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &src[..(y_stride * height) as usize],
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(y_stride),
-                        rows_per_image: Some(height),
-                    },
-                    wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            } else {
-                self.stride_temp_buffer.clear();
-                let required = (y_aligned * height) as usize;
-                if self.stride_temp_buffer.capacity() < required {
-                    self.stride_temp_buffer
-                        .reserve(required - self.stride_temp_buffer.capacity());
-                }
-                for row in 0..height {
-                    let start = (row * y_stride) as usize;
-                    let end = start + y_bytes_per_row as usize;
-                    if end <= src.len() {
-                        self.stride_temp_buffer.extend_from_slice(&src[start..end]);
-                    } else {
-                        error!(
-                            "[RENDERER] Y plane truncated row detected (expected {} bytes, have {}). Aborting upload.",
-                            end,
-                            src.len()
-                        );
-                        return;
-                    }
-                    let pad = y_aligned - y_bytes_per_row;
-                    if pad > 0 {
-                        self.stride_temp_buffer
-                            .extend(std::iter::repeat_n(0u8, pad as usize));
-                    }
-                }
-                self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: y_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &self.stride_temp_buffer,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(y_aligned),
-                        rows_per_image: Some(height),
-                    },
-                    wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                );
+            if !Self::upload_plane_texture(
+                &self.ctx.queue,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                y_tex,
+                src,
+                0,
+                y_stride,
+                width,
+                height,
+                1,
+                "NV12 Y",
+            ) {
+                return;
             }
-
-            // ---- UV plane (2 bytes per pixel, half resolution) ----
-            let uv_bytes_per_row = uv_width * 2; // Rg8Unorm = 2 bytes/pixel
-            let uv_aligned = (uv_bytes_per_row + 255) & !255;
-            let uv_src_offset = uv_offset as usize;
-
-            if uv_stride == uv_aligned {
-                let uv_end = uv_src_offset + (uv_stride * uv_height) as usize;
-                if uv_end <= src.len() {
-                    self.ctx.queue.write_texture(
-                        wgpu::ImageCopyTexture {
-                            texture: uv_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &src[uv_src_offset..uv_end],
-                        wgpu::ImageDataLayout {
-                            offset: 0,
-                            bytes_per_row: Some(uv_stride),
-                            rows_per_image: Some(uv_height),
-                        },
-                        wgpu::Extent3d {
-                            width: uv_width,
-                            height: uv_height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                }
-            } else {
-                self.stride_temp_buffer.clear();
-                let required = (uv_aligned * uv_height) as usize;
-                if self.stride_temp_buffer.capacity() < required {
-                    self.stride_temp_buffer
-                        .reserve(required - self.stride_temp_buffer.capacity());
-                }
-                for row in 0..uv_height {
-                    let start = uv_src_offset + (row * uv_stride) as usize;
-                    let end = start + uv_bytes_per_row as usize;
-                    if end <= src.len() {
-                        self.stride_temp_buffer.extend_from_slice(&src[start..end]);
-                    } else {
-                        error!(
-                            "[RENDERER] UV plane truncated row detected (expected {} bytes, have {}). Aborting upload.",
-                            end,
-                            src.len()
-                        );
-                        return;
-                    }
-                    let pad = uv_aligned - uv_bytes_per_row;
-                    if pad > 0 {
-                        self.stride_temp_buffer
-                            .extend(std::iter::repeat_n(0u8, pad as usize));
-                    }
-                }
-                self.ctx.queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: uv_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &self.stride_temp_buffer,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(uv_aligned),
-                        rows_per_image: Some(uv_height),
-                    },
-                    wgpu::Extent3d {
-                        width: uv_width,
-                        height: uv_height,
-                        depth_or_array_layers: 1,
-                    },
-                );
+            if !Self::upload_plane_texture(
+                &self.ctx.queue,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                uv_tex,
+                src,
+                uv_offset as usize,
+                uv_stride,
+                uv_width,
+                uv_height,
+                2,
+                "NV12 UV",
+            ) {
+                return;
             }
-            // map dropped here, releasing the GStreamer buffer
         }
 
-        // Run NV12→RGBA conversion render pass
         let y_view = self.nv12_y_view.as_ref().unwrap();
         let uv_view = self.nv12_uv_view.as_ref().unwrap();
 
@@ -2608,6 +3153,205 @@ impl Renderer {
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Upload an I420 frame: write Y/U/V planes to staging textures, then
+    /// run the I420→RGBA conversion render pass into the output texture.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_frame_i420(
+        &mut self,
+        frame: &crate::video::VideoFrame,
+        output: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        u_offset: u32,
+        u_stride: u32,
+        v_offset: u32,
+        v_stride: u32,
+    ) {
+        let (chroma_width, chroma_height) = chroma_plane_extent(width, height);
+
+        if self.i420_staging_size != Some((width, height)) {
+            self.i420_y_view = None;
+            self.i420_u_view = None;
+            self.i420_v_view = None;
+
+            let y_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("I420 Y Plane"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let u_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("I420 U Plane"),
+                size: wgpu::Extent3d {
+                    width: chroma_width,
+                    height: chroma_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("I420 V Plane"),
+                size: wgpu::Extent3d {
+                    width: chroma_width,
+                    height: chroma_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            self.i420_y_view = Some(y_tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.i420_u_view = Some(u_tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.i420_v_view = Some(v_tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.i420_y_texture = Some(y_tex);
+            self.i420_u_texture = Some(u_tex);
+            self.i420_v_texture = Some(v_tex);
+            self.i420_staging_size = Some((width, height));
+        }
+
+        let y_tex = self.i420_y_texture.as_ref().unwrap();
+        let u_tex = self.i420_u_texture.as_ref().unwrap();
+        let v_tex = self.i420_v_texture.as_ref().unwrap();
+
+        {
+            let map = match frame.buffer.map_readable() {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to map I420 video buffer: {}", e);
+                    return;
+                }
+            };
+            let src = map.as_slice();
+
+            if !Self::upload_plane_texture(
+                &self.ctx.queue,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                y_tex,
+                src,
+                0,
+                y_stride,
+                width,
+                height,
+                1,
+                "I420 Y",
+            ) {
+                return;
+            }
+            if !Self::upload_plane_texture(
+                &self.ctx.queue,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                u_tex,
+                src,
+                u_offset as usize,
+                u_stride,
+                chroma_width,
+                chroma_height,
+                1,
+                "I420 U",
+            ) {
+                return;
+            }
+            if !Self::upload_plane_texture(
+                &self.ctx.queue,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                v_tex,
+                src,
+                v_offset as usize,
+                v_stride,
+                chroma_width,
+                chroma_height,
+                1,
+                "I420 V",
+            ) {
+                return;
+            }
+        }
+
+        let y_view = self.i420_y_view.as_ref().unwrap();
+        let u_view = self.i420_u_view.as_ref().unwrap();
+        let v_view = self.i420_v_view.as_ref().unwrap();
+
+        let output_view = output.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("I420 Convert Output View"),
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
+
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("I420 Convert Bind Group"),
+                layout: &self.ctx.i420_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(u_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(v_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                    },
+                ],
+            });
+
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("I420 Convert Encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("I420 Convert Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.ctx.i420_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Upload an RGBA frame directly to the output texture (legacy fallback path).
     fn upload_frame_rgba(
         &mut self,
@@ -2619,7 +3363,7 @@ impl Renderer {
         let src_stride = frame.stride;
         let expected_stride = width * 4;
 
-        if src_stride.is_multiple_of(256) {
+        if src_stride.is_multiple_of(256) && src_stride >= expected_stride {
             let map = match frame.buffer.map_readable() {
                 Ok(m) => m,
                 Err(e) => {
@@ -2721,8 +3465,7 @@ impl Renderer {
         uv_stride: u32,
         uv_offset: u32,
     ) -> bool {
-        let uv_width = width / 2;
-        let uv_height = height / 2;
+        let (uv_width, uv_height) = chroma_plane_extent(width, height);
 
         // Import Y plane
         let y_tex = match import_dmabuf_as_texture(
@@ -2856,8 +3599,7 @@ impl Renderer {
             }
         }
 
-        let uv_width = width / 2;
-        let uv_height = height / 2;
+        let (uv_width, uv_height) = chroma_plane_extent(width, height);
 
         // (Re)create shared CUDA↔Vulkan textures when dimensions change
         let need_new = self
@@ -2977,12 +3719,13 @@ impl Renderer {
             }
 
             // GPU-side copy: UV plane
+            let uv_row_bytes = (uv_width * 2) as usize;
             if let Err(e) = ci.copy_2d(
                 base_ptr + uv_offset as u64,
                 uv_stride as usize,
                 cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64,
                 cache.uv_pitch,
-                width as usize,
+                uv_row_bytes,
                 uv_height as usize,
             ) {
                 error!("[VIDEO] {}: CUDA UV copy failed: {e}", self.name);
@@ -3058,19 +3801,21 @@ impl Renderer {
 
     pub fn switch_content(&mut self) {
         let had_current = self.current_texture.is_some();
+        let flattened_active_transition = self.freeze_active_transition_to_current();
 
         // If a previous transition left a prev texture behind, release it before preparing
         // the next swap. The current texture stays visible until replacement upload is ready.
-        if let Some(old_prev) = self.prev_texture.take() {
-            if let Some((w, h)) = self.prev_texture_size.take() {
-                debug!(
-                    "[TRANSITION] {}: Replacing incomplete prev_texture, returning old one to pool",
-                    self.name
-                );
-                self.ctx.return_texture_to_pool(old_prev, w, h);
+        if !flattened_active_transition {
+            if let Some(old_prev) = self.prev_texture.take() {
+                if let Some((w, h)) = self.prev_texture_size.take() {
+                    debug!(
+                        "[TRANSITION] {}: Releasing carry-over prev_texture before new switch",
+                        self.name
+                    );
+                    self.ctx.return_texture_to_pool(old_prev, w, h);
+                }
+                drop(self.prev_texture_view.take());
             }
-            // Drop view as well
-            drop(self.prev_texture_view.take());
         }
 
         self.content_swap_pending = true;
@@ -3078,6 +3823,8 @@ impl Renderer {
         self.transition_start_time = None; // Will be set when content is uploaded
         self.transition_active = false; // Will be set to true when replacement content is ready
         self.transition_just_completed = false; // Reset completion flag
+        self.display_timer_pending = false;
+        self.display_timer_ready = false;
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None; // Invalidate
         self.batch_start_time = None; // Reset
@@ -3090,11 +3837,12 @@ impl Renderer {
         self.needs_redraw = true;
 
         debug!(
-            "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, pending_swap={}",
+            "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, pending_swap={}, flattened_active_transition={}",
             self.name,
             had_current,
             self.prev_texture.is_some(),
-            self.content_swap_pending
+            self.content_swap_pending,
+            flattened_active_transition
         );
     }
 
@@ -3109,6 +3857,8 @@ impl Renderer {
             self.content_swap_pending = false;
             self.transition_active = false;
             self.transition_just_completed = false; // Reset flag
+            self.display_timer_pending = false;
+            self.display_timer_ready = false;
             self.transition_progress = 1.0;
             self.transition_start_time = None;
             self.needs_redraw = true;
@@ -3128,10 +3878,14 @@ impl Renderer {
         self.prev_texture_view = None;
         self.current_texture_size = None;
         self.prev_texture_size = None;
+        self.last_video_source_size = None;
+        self.last_video_presentation_size = None;
         self.transition_progress = 1.0;
         self.transition_active = false;
         self.transition_just_completed = false; // Reset flag
         self.content_swap_pending = false;
+        self.display_timer_pending = false;
+        self.display_timer_ready = false;
         self.transition_bind_group = None; // Invalidate
         self.blit_bind_group = None; // Invalidate
         self.blit_source_is_composition = false;
@@ -3175,6 +3929,46 @@ impl Renderer {
         self.blit_source_is_prev = false;
     }
 
+    fn freeze_active_transition_to_current(&mut self) -> bool {
+        if !self.transition_active {
+            return false;
+        }
+        let Some(composition_texture) = self.composition_texture.take() else {
+            return false;
+        };
+        let Some(composition_view) = self.composition_texture_view.take() else {
+            self.composition_texture = Some(composition_texture);
+            return false;
+        };
+
+        debug!(
+            "[TRANSITION] {}: Flattening active transition into a stable snapshot before new switch",
+            self.name
+        );
+
+        if let Some(curr) = self.current_texture.take() {
+            if let Some((w, h)) = self.current_texture_size.take() {
+                self.ctx.return_texture_to_pool(curr, w, h);
+            }
+        }
+
+        self.release_prev_texture("flatten active transition");
+        self.current_texture = Some(composition_texture);
+        self.current_texture_view = Some(composition_view);
+        self.current_texture_size = Some((self.config.width.max(1), self.config.height.max(1)));
+        self.current_aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
+        self.transition_active = false;
+        self.transition_just_completed = false;
+        self.transition_progress = 1.0;
+        self.transition_start_time = None;
+        self.transition_stats = None;
+        self.transition_bind_group = None;
+        self.blit_bind_group = None;
+        self.blit_source_is_composition = false;
+        self.blit_source_is_prev = false;
+        true
+    }
+
     fn release_cuda_cache(&mut self) {
         if let Some(cuda_cache) = self.cuda_textures.take() {
             if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
@@ -3182,6 +3976,15 @@ impl Renderer {
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
             }
         }
+    }
+
+    fn arm_display_timer_on_present(&mut self) {
+        self.display_timer_pending = true;
+        self.display_timer_ready = false;
+    }
+
+    pub fn take_display_timer_ready(&mut self) -> bool {
+        std::mem::take(&mut self.display_timer_ready)
     }
 
     fn release_nv12_staging(&mut self, reason: &str) {
@@ -3198,8 +4001,25 @@ impl Renderer {
         self.nv12_staging_size = None;
     }
 
+    fn release_i420_staging(&mut self, reason: &str) {
+        if self.i420_staging_size.is_some() {
+            debug!(
+                "[VIDEO] {}: Releasing I420 staging textures ({})",
+                self.name, reason
+            );
+        }
+        self.i420_y_texture = None;
+        self.i420_u_texture = None;
+        self.i420_v_texture = None;
+        self.i420_y_view = None;
+        self.i420_u_view = None;
+        self.i420_v_view = None;
+        self.i420_staging_size = None;
+    }
+
     fn release_video_backend_resources(&mut self, reason: &str) {
         self.release_nv12_staging(reason);
+        self.release_i420_staging(reason);
         self.release_cuda_cache();
     }
 
@@ -3301,6 +4121,13 @@ impl Drop for Renderer {
         self.nv12_y_view = None;
         self.nv12_uv_view = None;
         self.nv12_staging_size = None;
+        self.i420_y_texture = None;
+        self.i420_u_texture = None;
+        self.i420_v_texture = None;
+        self.i420_y_view = None;
+        self.i420_u_view = None;
+        self.i420_v_view = None;
+        self.i420_staging_size = None;
     }
 }
 

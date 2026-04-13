@@ -46,14 +46,24 @@ impl FileCache {
         let cache_dir = dirs::cache_dir()
             .context("Failed to get cache directory")?
             .join("kaleidux");
-        std::fs::create_dir_all(&cache_dir)?;
+        Self::new_in_dir(cache_dir)
+    }
 
-        let db_path = cache_dir.join("cache.redb");
-        let mut db = Database::create(&db_path)?;
+    pub fn new_in_dir<P: AsRef<Path>>(cache_dir: P) -> Result<Self> {
+        let cache_dir = cache_dir.as_ref();
+        std::fs::create_dir_all(cache_dir)?;
+        Self::open_at(&cache_dir.join("cache.redb"))
+    }
+
+    fn open_at(db_path: &Path) -> Result<Self> {
+        let db_preexisting = std::fs::metadata(db_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
+        let mut db = Database::create(db_path)?;
 
         // Check version
         let mut needs_wipe = false;
-        {
+        if db_preexisting {
             let read_txn = db.begin_read()?;
             if let Ok(table) = read_txn.open_table(META_TABLE) {
                 if let Some(v) = table.get("version")? {
@@ -90,6 +100,14 @@ impl FileCache {
         write_txn.commit()?;
 
         Ok(Self { db })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_test(db_path: &Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::open_at(db_path)
     }
 
     pub fn get_file_metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {

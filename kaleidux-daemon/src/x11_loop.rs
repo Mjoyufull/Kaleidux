@@ -3,11 +3,12 @@
 //! Contains X11 backend init, RandR event polling, and immediate rendering.
 //! All shared logic lives in `main_loop::MainLoopContext`.
 
+use crate::background::{self, BackgroundWorkKind};
 use crate::main_loop::MainLoopContext;
 use crate::orchestration;
 use crate::renderer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -76,15 +77,23 @@ pub async fn run(
 
             info!("[STARTUP-X11] Initializing renderer for {}", name);
             let name_for_bg = name.clone();
-            let spawn_handler = tokio::task::spawn_blocking(move || {
-                renderer::Renderer::new(
-                    name_for_bg,
-                    ctx_clone,
-                    surface_arc,
-                    init_surf,
-                    Some(metrics_clone),
-                )
-            });
+            let Some(spawn_handler) =
+                background::spawn_blocking_tracked(BackgroundWorkKind::RendererInit, move || {
+                    renderer::Renderer::new(
+                        name_for_bg,
+                        ctx_clone,
+                        surface_arc,
+                        init_surf,
+                        Some(metrics_clone),
+                    )
+                })
+            else {
+                error!(
+                    "[STARTUP-X11] Renderer initialization skipped for {}: shutdown in progress",
+                    name
+                );
+                continue;
+            };
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
                 Ok(join_res) => match join_res {
@@ -104,6 +113,23 @@ pub async fn run(
                     "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
                     name
                 ),
+            }
+        }
+
+        let should_warmup_cuda = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok()
+            && ctx
+                .monitor_manager
+                .outputs
+                .values()
+                .any(|orch| orch.config.video_ratio > 0);
+        if should_warmup_cuda {
+            let warmup_ctx = wgpu_ctx.clone();
+            if let Some(handle) =
+                background::spawn_blocking_tracked(BackgroundWorkKind::CudaWarmup, move || {
+                    warmup_ctx.warmup_cuda_interop()
+                })
+            {
+                drop(handle);
             }
         }
 
@@ -128,20 +154,23 @@ pub async fn run(
     loop {
         let loop_start = Instant::now();
         if ctx.shutdown_flag.load(Ordering::SeqCst) {
-            ctx.shutdown();
+            ctx.shutdown().await;
             break;
         }
 
         let any_active = ctx.any_active();
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) = (None, None, None, None);
+        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf, mut player_event_buf) =
+            (None, None, None, None, None);
         if !any_active {
-            let result = ctx.idle_wait(&x11_fd).await;
+            let idle_deadline = ctx.next_common_idle_deadline(loop_start);
+            let result = ctx.idle_wait(&x11_fd, idle_deadline).await;
             cmd_buf = result.0;
             frame_buf = result.1;
             image_buf = result.2;
             player_buf = result.3;
+            player_event_buf = result.4;
         }
 
         // ─── X11 event polling ──────────────────────────────────────────
@@ -180,11 +209,15 @@ pub async fn run(
         ctx.process_script_tick();
         ctx.process_scheduled(loop_start);
         ctx.drain_commands(cmd_buf, loop_start).await;
+        ctx.drain_player_events(player_event_buf, loop_start);
 
         // ─── Frame handling (X11: immediate render) ─────────────────────
 
         let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
         for (src, frame) in latest_frames {
+            let barrier_blocks = ctx.startup_barrier_blocks_output(src.as_str(), loop_start);
+            let mut mark_presented = false;
+            let mut mark_ready = false;
             if let Some(r) = ctx.renderers.get_mut(src.as_str()) {
                 let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
                     // Video: always upload (X11 has no callback mechanism)
@@ -198,23 +231,29 @@ pub async fn run(
                     r.upload_frame(&frame);
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
+                    mark_ready = true;
                     drop(frame);
                 } else {
                     drop(frame);
                 }
 
-                // X11: Render immediately
-                let _ = r.render(renderer::BackendContext::X11, loop_start);
-                if !ctx.first_frame_recorded {
-                    ctx.metrics.record_first_frame();
-                    ctx.first_frame_recorded = true;
-                }
-                if r.transition_just_completed {
-                    r.transition_just_completed = false;
-                    ctx.monitor_manager.mark_transition_completed(src.as_str());
+                // X11: Render immediately unless startup barrier is still holding this output.
+                if !barrier_blocks {
+                    let _ = r.render(renderer::BackendContext::X11, loop_start);
+                    if !ctx.first_frame_recorded {
+                        ctx.metrics.record_first_frame();
+                        ctx.first_frame_recorded = true;
+                    }
+                    mark_presented = true;
                 }
             } else {
                 drop(frame);
+            }
+            if mark_ready {
+                ctx.mark_startup_output_ready(src.as_str(), loop_start);
+            }
+            if mark_presented {
+                ctx.mark_output_presented_if_ready(src.as_str());
             }
         }
 
@@ -236,21 +275,41 @@ pub async fn run(
 
         // ─── X11 render loop ────────────────────────────────────────────
 
+        let blocked_outputs: HashSet<String> = ctx
+            .startup_present_barrier
+            .as_ref()
+            .map(|barrier| {
+                barrier
+                    .outputs
+                    .iter()
+                    .filter_map(|(name, state)| {
+                        if state.can_block && barrier.release_reason.is_none() {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut presented_outputs = Vec::new();
         for (name, r) in ctx.renderers.iter_mut() {
-            if r.needs_redraw
+            let barrier_blocks = blocked_outputs.contains(name);
+            if (r.needs_redraw
                 || r.transition_active
-                || r.valid_content_type == crate::queue::ContentType::Video
+                || r.valid_content_type == crate::queue::ContentType::Video)
+                && !barrier_blocks
             {
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
                 if !ctx.first_frame_recorded {
                     ctx.metrics.record_first_frame();
                     ctx.first_frame_recorded = true;
                 }
-                if r.transition_just_completed {
-                    r.transition_just_completed = false;
-                    ctx.monitor_manager.mark_transition_completed(name);
-                }
+                presented_outputs.push(name.clone());
             }
+        }
+        for name in presented_outputs {
+            ctx.mark_output_presented_if_ready(&name);
         }
 
         // Flush X11 commands only if something was rendered

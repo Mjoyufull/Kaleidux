@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, Registry, prelude::*};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod background;
 mod cache;
 mod cuda_interop;
 mod main_loop;
@@ -50,8 +51,17 @@ struct Args {
     video_mode: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kaleidux-main")
+        .build()?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // 1. Initialize Logging
@@ -124,15 +134,16 @@ async fn main() -> anyhow::Result<()> {
 
     // 1b. Set video decode mode from CLI flag
     if let Some(ref mode_str) = args.video_mode {
+        let deprecated_cuda_alias = mode_str.eq_ignore_ascii_case("cuda-strict");
         let mode = match mode_str.to_lowercase().as_str() {
-            "cuda" | "nvdec" | "nvidia" => crate::video::VideoMode::ForceCuda,
+            "cuda" | "nvdec" | "nvidia" | "cuda-strict" => crate::video::VideoMode::StrictCuda,
             "dmabuf" | "dma-buf" | "zero-copy" => crate::video::VideoMode::ForceDmaBuf,
             "nv12" => crate::video::VideoMode::ForceNv12,
             "rgba" => crate::video::VideoMode::ForceRgba,
             "auto" => crate::video::VideoMode::Auto,
             other => {
                 let msg = format!(
-                    "ERROR: Unknown --video-mode '{}', valid: auto, cuda, dmabuf, nv12, rgba",
+                    "ERROR: Unknown --video-mode '{}', valid: auto, cuda, cuda-strict, dmabuf, nv12, rgba",
                     other
                 );
                 eprintln!("{}", msg);
@@ -140,6 +151,11 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         };
+        if deprecated_cuda_alias {
+            warn!(
+                "[VIDEO] --video-mode cuda-strict is deprecated; use --video-mode cuda for strict CUDA-only negotiation"
+            );
+        }
         crate::video::set_video_mode(mode);
     }
 
@@ -166,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
     let gstreamer_start = Instant::now();
     gstreamer::init()?;
     crate::video::configure_hw_decoders();
+    crate::video::validate_selected_video_mode(crate::video::get_video_mode())?;
     let gstreamer_duration = gstreamer_start.elapsed();
     info!("GStreamer initialized.");
 

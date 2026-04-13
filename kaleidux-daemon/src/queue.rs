@@ -1,10 +1,11 @@
+use crate::background::{self, BackgroundWorkKind};
 use crate::cache::FileCache;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use jwalk::WalkDir;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +46,7 @@ pub struct SmartQueue {
     pub video_ratio: u8,
     pub strategy: crate::orchestration::SortingStrategy,
     pub current_index: usize,
+    planned_sequential_type: Option<ContentType>,
     pub history: VecDeque<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
@@ -54,13 +56,60 @@ pub struct SmartQueue {
     content_type_cache: HashMap<PathBuf, ContentType>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
     Image,
     Video,
 }
 
+impl ContentType {
+    fn other(self) -> Self {
+        match self {
+            Self::Image => Self::Video,
+            Self::Video => Self::Image,
+        }
+    }
+}
+
 impl SmartQueue {
+    fn content_type_from_metadata(meta: crate::cache::FileMetadata) -> ContentType {
+        if meta.content_type == 0 {
+            ContentType::Image
+        } else {
+            ContentType::Video
+        }
+    }
+
+    fn populate_content_type_cache_from_pool(
+        cache: &Arc<FileCache>,
+        pool: &[PathBuf],
+    ) -> HashMap<PathBuf, ContentType> {
+        let mut init_map = HashMap::with_capacity(pool.len());
+        for path in pool {
+            let content_type = cache
+                .get_file_metadata(path)
+                .ok()
+                .flatten()
+                .map(Self::content_type_from_metadata)
+                .or_else(|| Self::get_content_type(path));
+            if let Some(content_type) = content_type {
+                init_map.insert(path.clone(), content_type);
+            }
+        }
+        init_map
+    }
+
+    fn fallback_current_index(
+        strategy: crate::orchestration::SortingStrategy,
+        pool_len: usize,
+    ) -> usize {
+        if strategy == crate::orchestration::SortingStrategy::Descending {
+            pool_len.saturating_sub(1)
+        } else {
+            0
+        }
+    }
+
     pub async fn new_with_cache(
         path: &Path,
         video_ratio: u8,
@@ -83,12 +132,34 @@ impl SmartQueue {
                 let valid_pool = {
                     let cp = cached_pool.clone();
                     let bl = stats.blacklist.clone();
-                    tokio::task::spawn_blocking(move || {
-                        cp.into_iter()
-                            .filter(|p| p.exists() && !bl.contains(p))
-                            .collect::<Vec<PathBuf>>()
-                    })
-                    .await?
+                    let Some(handle) = background::spawn_blocking_tracked(
+                        BackgroundWorkKind::QueueDiscovery,
+                        move || {
+                            cp.into_iter()
+                                .filter(|p| p.exists() && !bl.contains(p))
+                                .collect::<Vec<PathBuf>>()
+                        },
+                    ) else {
+                        tracing::warn!(
+                            "[QUEUE] Skipping cached pool validation for {:?}: shutdown in progress",
+                            path
+                        );
+                        return Ok(Self {
+                            pool: Vec::new(),
+                            stats,
+                            video_ratio,
+                            strategy,
+                            current_index: Self::fallback_current_index(strategy, 0),
+                            planned_sequential_type: None,
+                            history: VecDeque::new(),
+                            root_path: path.to_path_buf(),
+                            active_playlist: None,
+                            cache,
+                            pending_stats_updates: HashMap::new(),
+                            content_type_cache: HashMap::new(),
+                        });
+                    };
+                    handle.await?
                 };
 
                 if !valid_pool.is_empty() {
@@ -105,35 +176,39 @@ impl SmartQueue {
                     let bg_metrics = metrics.clone();
                     let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
-                    tokio::task::spawn_blocking(move || {
-                        match Self::discover_content(&bg_path, &bg_blacklist, bg_cache, bg_metrics)
-                        {
+                    if background::spawn_blocking_tracked(
+                        BackgroundWorkKind::QueueDiscovery,
+                        move || match Self::discover_content(
+                            &bg_path,
+                            &bg_blacklist,
+                            bg_cache,
+                            bg_metrics,
+                        ) {
                             Ok(res) => {
                                 let _ = tx.blocking_send(res);
                             }
                             Err(e) => {
                                 tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
                             }
-                        }
-                    });
+                        },
+                    )
+                    .is_none()
+                    {
+                        tracing::debug!(
+                            "[QUEUE] Skipping background pool refresh for {:?}: shutdown in progress",
+                            path
+                        );
+                    }
 
                     // We wrap the receiver so we can periodically check it or use it in an event loop
                     // But for the initial creation, we can't easily block here if we want to stay async.
                     // Instead, idk we'll let the monitor_manager handle the swap when it receives the update.
                     // For now, let's at least populate the initial cache from disk to avoid the I/O bottleneck.
 
-                    let mut init_map = HashMap::new();
-                    for path in &valid_pool {
-                        if let Ok(Some(meta)) = cache.get_file_metadata(path) {
-                            let ct = if meta.content_type == 0 {
-                                ContentType::Image
-                            } else {
-                                ContentType::Video
-                            };
-                            init_map.insert(path.clone(), ct);
-                        }
-                    }
-                    ct_cache_init = Some(init_map);
+                    ct_cache_init = Some(Self::populate_content_type_cache_from_pool(
+                        &cache,
+                        &valid_pool,
+                    ));
 
                     valid_pool
                 } else {
@@ -168,11 +243,7 @@ impl SmartQueue {
         // Sort the pool initially for sequential strategies
         pool.sort();
 
-        let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
-            pool.len().saturating_sub(1)
-        } else {
-            0
-        };
+        let current_index = Self::fallback_current_index(strategy, pool.len());
 
         Ok(Self {
             pool,
@@ -180,6 +251,7 @@ impl SmartQueue {
             video_ratio,
             strategy,
             current_index,
+            planned_sequential_type: None,
             history: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
@@ -198,10 +270,14 @@ impl SmartQueue {
     ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
         let path_buf = path.to_path_buf();
         let blacklist_clone = blacklist.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::discover_content(&path_buf, &blacklist_clone, cache, metrics)
-        })
-        .await?
+        let Some(handle) =
+            background::spawn_blocking_tracked(BackgroundWorkKind::QueueDiscovery, move || {
+                Self::discover_content(&path_buf, &blacklist_clone, cache, metrics)
+            })
+        else {
+            return Ok((Vec::new(), HashMap::new()));
+        };
+        handle.await?
     }
 
     /// Create a queue from a pre-discovered file list (avoids re-scanning the directory)
@@ -216,24 +292,21 @@ impl SmartQueue {
         let mut pool = pool;
         pool.sort();
 
-        let current_index = if strategy == crate::orchestration::SortingStrategy::Descending {
-            pool.len().saturating_sub(1)
-        } else {
-            0
-        };
+        let current_index = Self::fallback_current_index(strategy, pool.len());
 
         Ok(Self {
+            content_type_cache: Self::populate_content_type_cache_from_pool(&cache, &pool),
             pool,
             stats,
             video_ratio,
             strategy,
             current_index,
+            planned_sequential_type: None,
             history: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
             pending_stats_updates: HashMap::new(),
-            content_type_cache: HashMap::new(),
         })
     }
 
@@ -414,7 +487,10 @@ impl SmartQueue {
     /// All files in the pool are pre-cached during discover_content, so a miss
     /// means the file was added after discovery (handled on next refresh).
     fn cached_content_type(&self, path: &Path) -> Option<ContentType> {
-        self.content_type_cache.get(path).copied()
+        self.content_type_cache
+            .get(path)
+            .copied()
+            .or_else(|| Self::get_content_type(path))
     }
 
     /// Apply incremental pool events from the filesystem watcher
@@ -522,6 +598,8 @@ impl SmartQueue {
 
         if added > 0 || removed > 0 {
             self.pool.sort();
+            self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
+            self.planned_sequential_type = None;
             // Update the cached pool
             let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
             tracing::info!(
@@ -535,26 +613,27 @@ impl SmartQueue {
 
     #[inline]
     pub fn pick_next(&mut self) -> Option<PathBuf> {
+        self.pick_next_excluding(&HashSet::new())
+    }
+
+    pub fn pick_next_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
         if self.pool.is_empty() {
             return None;
         }
 
         let picked = match self.strategy {
-            crate::orchestration::SortingStrategy::Loveit => self.pick_loveit(),
-            crate::orchestration::SortingStrategy::Random => self.pick_random(),
-            crate::orchestration::SortingStrategy::Ascending => self.pick_sequential(false),
-            crate::orchestration::SortingStrategy::Descending => self.pick_sequential(true),
+            crate::orchestration::SortingStrategy::Loveit => self.pick_loveit_excluding(excluded),
+            crate::orchestration::SortingStrategy::Random => self.pick_random_excluding(excluded),
+            crate::orchestration::SortingStrategy::Ascending => {
+                self.pick_sequential_excluding(false, excluded)
+            }
+            crate::orchestration::SortingStrategy::Descending => {
+                self.pick_sequential_excluding(true, excluded)
+            }
         };
 
         if let Some(ref p) = picked {
-            self.update_stats(p);
-            // Add to history (limit to 50 items)
-            if self.history.back() != Some(p) {
-                self.history.push_back(p.clone());
-                if self.history.len() > 50 {
-                    self.history.pop_front();
-                }
-            }
+            self.record_pick(p);
         }
 
         picked
@@ -566,24 +645,23 @@ impl SmartQueue {
         match self.strategy {
             crate::orchestration::SortingStrategy::Ascending
             | crate::orchestration::SortingStrategy::Descending => {
-                let next_idx = match self.strategy {
-                    crate::orchestration::SortingStrategy::Ascending => {
-                        (self.current_index + 1) % self.pool.len()
-                    }
-                    crate::orchestration::SortingStrategy::Descending => {
-                        if self.current_index == 0 {
-                            self.pool.len().saturating_sub(1)
-                        } else {
-                            self.current_index - 1
-                        }
-                    }
-                    _ => return None,
-                };
-
-                if next_idx < self.pool.len() {
-                    let path = self.pool[next_idx].clone();
-                    if let Some(content_type) = Self::get_content_type(&path) {
+                let descending = matches!(
+                    self.strategy,
+                    crate::orchestration::SortingStrategy::Descending
+                );
+                let planned_type = self.planned_sequential_type.or_else(|| {
+                    self.pool
+                        .get(self.current_index)
+                        .and_then(|path| self.cached_content_type(path))
+                });
+                if let Some(content_type) = planned_type {
+                    if let Some(path) = self.peek_sequential_for_type(descending, content_type) {
                         return Some((path, content_type));
+                    }
+                    if let Some(path) =
+                        self.peek_sequential_for_type(descending, content_type.other())
+                    {
+                        return Some((path, content_type.other()));
                     }
                 }
             }
@@ -607,7 +685,7 @@ impl SmartQueue {
                     self.strategy,
                     crate::orchestration::SortingStrategy::Descending
                 );
-                self.pick_sequential(!descending) // Reversed
+                self.pick_sequential_raw(!descending)
             }
             _ => {
                 // For non-sequential, use history
@@ -627,60 +705,90 @@ impl SmartQueue {
         picked
     }
 
-    fn pick_random(&mut self) -> Option<PathBuf> {
+    fn record_pick(&mut self, path: &PathBuf) {
+        self.update_stats(path);
+        if self.history.back() != Some(path) {
+            self.history.push_back(path.clone());
+            if self.history.len() > 50 {
+                self.history.pop_front();
+            }
+        }
+    }
+
+    fn pick_random_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
-        let is_video_cycle = rng.gen_range(0..100) < self.video_ratio;
+        let is_video_cycle = self.choose_cycle_content_type(&mut rng) == ContentType::Video;
 
         let sub_pool: Vec<&PathBuf> = self
             .pool
             .iter()
             .filter(|p| {
+                if excluded.contains(p.as_path()) {
+                    return false;
+                }
                 let is_video = matches!(self.cached_content_type(p), Some(ContentType::Video));
                 is_video == is_video_cycle
             })
             .collect();
 
         let active_pool = if sub_pool.is_empty() {
-            self.pool.iter().collect::<Vec<_>>()
+            self.pool
+                .iter()
+                .filter(|p| !excluded.contains(p.as_path()))
+                .collect::<Vec<_>>()
         } else {
             sub_pool
         };
+
+        if active_pool.is_empty() {
+            return None;
+        }
 
         let idx = rng.gen_range(0..active_pool.len());
         Some(active_pool[idx].clone())
     }
 
-    fn pick_sequential(&mut self, descending: bool) -> Option<PathBuf> {
+    fn pick_sequential_excluding(
+        &mut self,
+        descending: bool,
+        excluded: &HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
         if self.pool.is_empty() {
             return None;
         }
 
-        let pool_len = self.pool.len();
-        let picked = self.pool[self.current_index].clone();
-
-        if descending {
-            if self.current_index == 0 {
-                self.current_index = pool_len - 1;
-            } else {
-                self.current_index -= 1;
-            }
-        } else {
-            self.current_index = (self.current_index + 1) % pool_len;
-        }
-
-        Some(picked)
+        let mut rng = rand::thread_rng();
+        let requested_type = self
+            .planned_sequential_type
+            .take()
+            .unwrap_or_else(|| self.choose_cycle_content_type(&mut rng));
+        let picked = self
+            .pick_sequential_for_type_excluding(descending, requested_type, excluded)
+            .or_else(|| {
+                self.pick_sequential_for_type_excluding(
+                    descending,
+                    requested_type.other(),
+                    excluded,
+                )
+            })
+            .or_else(|| self.pick_sequential_raw_excluding(descending, excluded));
+        self.planned_sequential_type = Some(self.choose_cycle_content_type(&mut rng));
+        picked
     }
 
-    fn pick_loveit(&mut self) -> Option<PathBuf> {
+    fn pick_loveit_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
 
         // 1. Filter by video_ratio probability
-        let is_video_cycle = rng.gen_range(0..100) < self.video_ratio;
+        let is_video_cycle = self.choose_cycle_content_type(&mut rng) == ContentType::Video;
 
         let sub_pool: Vec<&PathBuf> = self
             .pool
             .iter()
             .filter(|p| {
+                if excluded.contains(p.as_path()) {
+                    return false;
+                }
                 let content_type = self.cached_content_type(p);
                 let is_video = matches!(content_type, Some(ContentType::Video));
                 is_video == is_video_cycle
@@ -689,10 +797,17 @@ impl SmartQueue {
 
         // Fallback if sub_pool is empty
         let active_pool = if sub_pool.is_empty() {
-            self.pool.iter().collect::<Vec<_>>()
+            self.pool
+                .iter()
+                .filter(|p| !excluded.contains(p.as_path()))
+                .collect::<Vec<_>>()
         } else {
             sub_pool
         };
+
+        if active_pool.is_empty() {
+            return None;
+        }
 
         // 2. Weighted Random Selection (Loveit + Recency)
         let mut weights = Vec::new();
@@ -733,6 +848,124 @@ impl SmartQueue {
         }
 
         Some(active_pool[0].clone())
+    }
+
+    fn choose_cycle_content_type<R: Rng + ?Sized>(&self, rng: &mut R) -> ContentType {
+        if rng.gen_range(0..100) < self.video_ratio {
+            ContentType::Video
+        } else {
+            ContentType::Image
+        }
+    }
+
+    fn peek_sequential_for_type(
+        &self,
+        descending: bool,
+        requested_type: ContentType,
+    ) -> Option<PathBuf> {
+        let idx = self.find_next_index_of_type(self.current_index, descending, requested_type)?;
+        self.pool.get(idx).cloned()
+    }
+
+    fn pick_sequential_for_type_excluding(
+        &mut self,
+        descending: bool,
+        requested_type: ContentType,
+        excluded: &HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        let idx = self.find_next_index_of_type_excluding(
+            self.current_index,
+            descending,
+            requested_type,
+            excluded,
+        )?;
+        let picked = self.pool.get(idx).cloned();
+        self.current_index = self.advance_index(idx, descending);
+        picked
+    }
+
+    fn pick_sequential_raw_excluding(
+        &mut self,
+        descending: bool,
+        excluded: &HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        if self.pool.is_empty() {
+            return None;
+        }
+
+        let start_idx = self.current_index.min(self.pool.len().saturating_sub(1));
+        let mut idx = start_idx;
+        let mut picked = None;
+        for _ in 0..self.pool.len() {
+            let candidate = &self.pool[idx];
+            if !excluded.contains(candidate.as_path()) {
+                picked = Some(candidate.clone());
+                break;
+            }
+            idx = self.advance_index(idx, descending);
+        }
+        let picked = picked?;
+        self.current_index = self.advance_index(idx, descending);
+        Some(picked)
+    }
+
+    fn pick_sequential_raw(&mut self, descending: bool) -> Option<PathBuf> {
+        self.pick_sequential_raw_excluding(descending, &HashSet::new())
+    }
+
+    fn advance_index(&self, idx: usize, descending: bool) -> usize {
+        if self.pool.is_empty() {
+            return 0;
+        }
+
+        if descending {
+            if idx == 0 {
+                self.pool.len() - 1
+            } else {
+                idx - 1
+            }
+        } else {
+            (idx + 1) % self.pool.len()
+        }
+    }
+
+    fn find_next_index_of_type_excluding(
+        &self,
+        start_idx: usize,
+        descending: bool,
+        requested_type: ContentType,
+        excluded: &HashSet<PathBuf>,
+    ) -> Option<usize> {
+        if self.pool.is_empty() {
+            return None;
+        }
+
+        let pool_len = self.pool.len();
+        let mut idx = start_idx.min(pool_len.saturating_sub(1));
+        for _ in 0..pool_len {
+            let path = &self.pool[idx];
+            if !excluded.contains(path.as_path())
+                && self.cached_content_type(path) == Some(requested_type)
+            {
+                return Some(idx);
+            }
+            idx = self.advance_index(idx, descending);
+        }
+        None
+    }
+
+    fn find_next_index_of_type(
+        &self,
+        start_idx: usize,
+        descending: bool,
+        requested_type: ContentType,
+    ) -> Option<usize> {
+        self.find_next_index_of_type_excluding(
+            start_idx,
+            descending,
+            requested_type,
+            &HashSet::new(),
+        )
     }
 
     fn update_stats(&mut self, path: &Path) {
@@ -845,7 +1078,8 @@ impl SmartQueue {
 
         self.active_playlist = name;
         self.pool.sort(); // Always sort generic pool
-        self.current_index = 0; // Reset index
+        self.current_index = Self::fallback_current_index(self.strategy, self.pool.len());
+        self.planned_sequential_type = None;
         Ok(())
     }
 
@@ -864,5 +1098,166 @@ impl SmartQueue {
             self.save_stats()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn empty_stats() -> LoveitData {
+        LoveitData {
+            files: lru::LruCache::new(NonZeroUsize::new(STATS_LRU_CAP).unwrap()),
+            playlists: HashMap::new(),
+            blacklist: std::collections::HashSet::new(),
+        }
+    }
+
+    fn make_test_queue(
+        pool: Vec<PathBuf>,
+        strategy: crate::orchestration::SortingStrategy,
+        video_ratio: u8,
+        content_type_cache: HashMap<PathBuf, ContentType>,
+    ) -> SmartQueue {
+        SmartQueue {
+            current_index: SmartQueue::fallback_current_index(strategy, pool.len()),
+            planned_sequential_type: None,
+            pool,
+            stats: empty_stats(),
+            video_ratio,
+            strategy,
+            history: VecDeque::new(),
+            root_path: PathBuf::from("/tmp"),
+            active_playlist: None,
+            cache: test_cache(),
+            pending_stats_updates: HashMap::new(),
+            content_type_cache,
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-queue-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_cache() -> Arc<FileCache> {
+        let db_path = unique_test_dir("cache-db").join("cache.redb");
+        Arc::new(FileCache::new_test(&db_path).unwrap())
+    }
+
+    #[test]
+    fn new_from_pool_populates_content_type_cache_for_reused_pool() {
+        let dir = unique_test_dir("content-cache");
+        let image = dir.join("a.jpg");
+        let video = dir.join("b.mp4");
+
+        let mut jpeg = [0u8; 16];
+        jpeg[..3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        let mut mp4 = [0u8; 16];
+        mp4[4..8].copy_from_slice(b"ftyp");
+        mp4[8..12].copy_from_slice(b"isom");
+        fs::write(&image, jpeg).unwrap();
+        fs::write(&video, mp4).unwrap();
+
+        let queue = SmartQueue::new_from_pool(
+            &dir,
+            vec![image.clone(), video.clone()],
+            75,
+            crate::orchestration::SortingStrategy::Loveit,
+            test_cache(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            queue.content_type_cache.get(&image),
+            Some(&ContentType::Image)
+        );
+        assert_eq!(
+            queue.content_type_cache.get(&video),
+            Some(&ContentType::Video)
+        );
+    }
+
+    #[test]
+    fn ascending_sequential_honors_images_only_ratio() {
+        let img_a = PathBuf::from("a.jpg");
+        let img_b = PathBuf::from("b.jpg");
+        let vid_a = PathBuf::from("c.mp4");
+        let vid_b = PathBuf::from("d.mp4");
+        let pool = vec![img_a.clone(), img_b.clone(), vid_a, vid_b];
+        let content_type_cache = HashMap::from([
+            (img_a.clone(), ContentType::Image),
+            (img_b.clone(), ContentType::Image),
+            (PathBuf::from("c.mp4"), ContentType::Video),
+            (PathBuf::from("d.mp4"), ContentType::Video),
+        ]);
+        let mut queue = make_test_queue(
+            pool,
+            crate::orchestration::SortingStrategy::Ascending,
+            0,
+            content_type_cache,
+        );
+
+        assert_eq!(queue.pick_next(), Some(img_a));
+        assert_eq!(queue.pick_next(), Some(img_b));
+    }
+
+    #[test]
+    fn ascending_sequential_honors_videos_only_ratio() {
+        let pool = vec![
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.mp4"),
+            PathBuf::from("d.mp4"),
+        ];
+        let content_type_cache = HashMap::from([
+            (PathBuf::from("a.jpg"), ContentType::Image),
+            (PathBuf::from("b.jpg"), ContentType::Image),
+            (PathBuf::from("c.mp4"), ContentType::Video),
+            (PathBuf::from("d.mp4"), ContentType::Video),
+        ]);
+        let mut queue = make_test_queue(
+            pool,
+            crate::orchestration::SortingStrategy::Ascending,
+            100,
+            content_type_cache,
+        );
+
+        assert_eq!(queue.pick_next(), Some(PathBuf::from("c.mp4")));
+        assert_eq!(queue.pick_next(), Some(PathBuf::from("d.mp4")));
+    }
+
+    #[test]
+    fn descending_sequential_honors_videos_only_ratio() {
+        let pool = vec![
+            PathBuf::from("a.jpg"),
+            PathBuf::from("b.jpg"),
+            PathBuf::from("c.mp4"),
+            PathBuf::from("d.mp4"),
+        ];
+        let content_type_cache = HashMap::from([
+            (PathBuf::from("a.jpg"), ContentType::Image),
+            (PathBuf::from("b.jpg"), ContentType::Image),
+            (PathBuf::from("c.mp4"), ContentType::Video),
+            (PathBuf::from("d.mp4"), ContentType::Video),
+        ]);
+        let mut queue = make_test_queue(
+            pool,
+            crate::orchestration::SortingStrategy::Descending,
+            100,
+            content_type_cache,
+        );
+
+        assert_eq!(queue.pick_next(), Some(PathBuf::from("d.mp4")));
+        assert_eq!(queue.pick_next(), Some(PathBuf::from("c.mp4")));
     }
 }

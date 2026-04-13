@@ -210,7 +210,7 @@ impl CompositorHandler for WaylandBackend {
             .unwrap_or_else(|| "unknown".to_string());
 
         if name != "unknown" {
-            tracing::debug!("[FRAME] Frame callback received for output: {}", name);
+            tracing::trace!("[FRAME] Frame callback received for output: {}", name);
             // Signal that this renderer should render now
             self.frame_callback_ready.insert(name);
         }

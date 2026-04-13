@@ -4,6 +4,7 @@
 //! between backend loops, along with helper methods that deduplicate the
 //! channel-drain, scheduling, command-handling, and housekeeping logic.
 
+use crate::background::{self, BackgroundWorkKind};
 use crate::cache;
 use crate::metrics;
 use crate::monitor;
@@ -14,6 +15,7 @@ use crate::renderer;
 use crate::scripting;
 use crate::video;
 
+use gstreamer as gst;
 use kaleidux_common::{Request, Response, Transition};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -58,14 +60,34 @@ mod tests {
 
     #[test]
     fn upload_resize_does_not_touch_normal_images() {
-        assert_eq!(compute_upload_downscale_dimensions(1280, 720), None);
+        assert_eq!(
+            compute_upload_downscale_dimensions(1280, 720, 1920, 1080),
+            None
+        );
     }
 
     #[test]
     fn upload_resize_downscales_only_oversized_sources() {
         assert_eq!(
-            compute_upload_downscale_dimensions(MAX_IMAGE_UPLOAD_DIMENSION * 2, 4000),
+            compute_upload_downscale_dimensions(
+                MAX_IMAGE_UPLOAD_DIMENSION * 2,
+                4000,
+                MAX_IMAGE_UPLOAD_DIMENSION * 2,
+                4000,
+            ),
             Some((MAX_IMAGE_UPLOAD_DIMENSION, 2000))
+        );
+    }
+
+    #[test]
+    fn cover_target_downscales_to_minimum_cover_size() {
+        assert_eq!(
+            compute_upload_downscale_dimensions(6000, 4000, 1920, 1080),
+            Some((1920, 1280))
+        );
+        assert_eq!(
+            compute_upload_downscale_dimensions(3000, 4500, 1920, 1080),
+            Some((1920, 2880))
         );
     }
 
@@ -180,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_cache_is_shared_across_output_sizes() {
+    fn prepared_image_cache_is_scoped_to_output_target() {
         let unique = format!(
             "kaleidux-cache-shared-test-{}-{}.bin",
             std::process::id(),
@@ -210,14 +232,9 @@ mod tests {
         };
 
         store_prepared_image_cache(&source_path, 1920, 1080, &payload);
-        let cached = try_load_prepared_image_cache(&source_path, 1366, 768)
-            .expect("prepared cache should load across output sizes");
+        assert!(try_load_prepared_image_cache(&source_path, 1366, 768).is_none());
 
-        assert_eq!(cached.width, payload.width);
-        assert_eq!(cached.height, payload.height);
-        assert_eq!(cached.data, payload.data);
-
-        if let Some(cache_path) = prepared_image_cache_path(&source_path, 1, 1) {
+        if let Some(cache_path) = prepared_image_cache_path(&source_path, 1920, 1080) {
             let _ = std::fs::remove_file(cache_path);
         }
         let _ = std::fs::remove_file(source_path);
@@ -237,6 +254,139 @@ mod tests {
 
         set_pending_video_session(&sessions, "DP-2", None);
         assert!(!pending_video_session_matches(&sessions, "DP-2", 9));
+    }
+
+    #[test]
+    fn video_frames_are_rejected_for_non_video_outputs() {
+        assert!(!should_accept_video_frame(
+            queue::ContentType::Image,
+            42,
+            42
+        ));
+    }
+
+    #[test]
+    fn video_frames_are_rejected_for_stale_sessions() {
+        assert!(!should_accept_video_frame(
+            queue::ContentType::Video,
+            42,
+            41
+        ));
+    }
+
+    #[test]
+    fn video_frames_are_accepted_for_active_sessions() {
+        assert!(should_accept_video_frame(queue::ContentType::Video, 42, 42));
+    }
+
+    #[test]
+    fn next_idle_wake_prefers_pending_switch_deadline() {
+        let now = Instant::now();
+        let periodic = Duration::from_secs(1);
+        let switch_deadline = now + Duration::from_millis(250);
+
+        assert_eq!(
+            next_idle_wake_deadline(now, periodic, Some(switch_deadline)),
+            switch_deadline
+        );
+    }
+
+    #[test]
+    fn next_idle_wake_falls_back_to_periodic_when_switch_is_later() {
+        let now = Instant::now();
+        let periodic = Duration::from_secs(1);
+        let switch_deadline = now + Duration::from_secs(3);
+
+        assert_eq!(
+            next_idle_wake_deadline(now, periodic, Some(switch_deadline)),
+            now + periodic
+        );
+    }
+
+    #[test]
+    fn next_idle_wake_uses_periodic_when_no_switch_is_pending() {
+        let now = Instant::now();
+        let periodic = Duration::from_secs(1);
+
+        assert_eq!(next_idle_wake_deadline(now, periodic, None), now + periodic);
+    }
+
+    #[test]
+    fn startup_barrier_releases_after_bounded_skew() {
+        let now = Instant::now();
+        let barrier = StartupPresentBarrier {
+            batch_id: 1,
+            armed_at: now,
+            first_ready_at: Some(now),
+            release_reason: None,
+            outputs: HashMap::from([
+                (
+                    String::from("DP-2"),
+                    StartupOutputState {
+                        phase: StartupOutputPhase::Ready,
+                        first_ready_at: Some(now),
+                        first_present_at: None,
+                        retry_count: 0,
+                        can_block: true,
+                        failed_paths: HashSet::new(),
+                    },
+                ),
+                (String::from("DP-3"), StartupOutputState::pending()),
+            ]),
+        };
+
+        assert_eq!(
+            startup_barrier_release_candidate(&barrier, now + Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            startup_barrier_release_candidate(&barrier, now + STARTUP_BARRIER_SKEW_RELEASE),
+            Some("bounded_skew")
+        );
+    }
+
+    #[test]
+    fn startup_barrier_releases_failed_outputs_without_waiting() {
+        let now = Instant::now();
+        let barrier = StartupPresentBarrier {
+            batch_id: 1,
+            armed_at: now,
+            first_ready_at: None,
+            release_reason: None,
+            outputs: HashMap::from([(
+                String::from("DP-2"),
+                StartupOutputState {
+                    phase: StartupOutputPhase::Failed,
+                    first_ready_at: None,
+                    first_present_at: None,
+                    retry_count: STARTUP_RETRY_LIMIT,
+                    can_block: false,
+                    failed_paths: HashSet::new(),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            startup_barrier_release_candidate(&barrier, now),
+            Some("failed_outputs")
+        );
+    }
+
+    #[test]
+    fn startup_barrier_times_out_after_one_second() {
+        let now = Instant::now();
+        let barrier = StartupPresentBarrier {
+            batch_id: 1,
+            armed_at: now,
+            first_ready_at: None,
+            release_reason: None,
+            outputs: HashMap::from([(String::from("DP-2"), StartupOutputState::pending())]),
+        };
+
+        assert_eq!(
+            startup_barrier_release_candidate(&barrier, now + STARTUP_BARRIER_TIMEOUT),
+            Some("timeout")
+        );
     }
 }
 
@@ -284,25 +434,166 @@ pub struct PendingVideoSwitch {
     pub transition: Transition,
 }
 
+const STARTUP_BARRIER_SKEW_RELEASE: Duration = Duration::from_millis(150);
+const STARTUP_BARRIER_TIMEOUT: Duration = Duration::from_millis(1000);
+const STARTUP_RETRY_LIMIT: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupOutputPhase {
+    Pending,
+    Ready,
+    Failed,
+    Presented,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupOutputState {
+    pub phase: StartupOutputPhase,
+    pub first_ready_at: Option<Instant>,
+    pub first_present_at: Option<Instant>,
+    pub retry_count: u8,
+    pub can_block: bool,
+    pub failed_paths: HashSet<PathBuf>,
+}
+
+impl StartupOutputState {
+    fn pending() -> Self {
+        Self {
+            phase: StartupOutputPhase::Pending,
+            first_ready_at: None,
+            first_present_at: None,
+            retry_count: 0,
+            can_block: true,
+            failed_paths: HashSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StartupPresentBarrier {
     pub batch_id: u64,
-    pub outputs: HashSet<String>,
     pub armed_at: Instant,
-    pub deadline: Instant,
+    pub first_ready_at: Option<Instant>,
+    pub release_reason: Option<&'static str>,
+    pub outputs: HashMap<String, StartupOutputState>,
 }
 
 pub(crate) fn stop_video_player_in_background(name: String, mut player: video::VideoPlayer) {
     let _ = player.request_stop();
-    tokio::task::spawn_blocking(move || {
-        debug!("[VIDEO] {}: Finalizing player stop on blocking pool", name);
-        let _ = player.stop();
-    });
+    if let Some(handle) =
+        background::spawn_blocking_tracked(BackgroundWorkKind::PlayerStop, move || {
+            debug!("[VIDEO] {}: Finalizing player stop on blocking pool", name);
+            let _ = player.stop();
+        })
+    {
+        drop(handle);
+    }
+}
+
+fn should_accept_video_frame(
+    valid_content_type: queue::ContentType,
+    active_video_session_id: u64,
+    frame_session_id: u64,
+) -> bool {
+    valid_content_type == queue::ContentType::Video
+        && active_video_session_id != 0
+        && active_video_session_id == frame_session_id
+}
+
+fn next_idle_wake_deadline(
+    now: Instant,
+    periodic_interval: Duration,
+    switch_deadline: Option<Instant>,
+) -> Instant {
+    let periodic_deadline = now + periodic_interval;
+    switch_deadline
+        .map(|deadline| deadline.min(periodic_deadline))
+        .unwrap_or(periodic_deadline)
+}
+
+fn min_optional_deadline(current: Option<Instant>, candidate: Option<Instant>) -> Option<Instant> {
+    match (current, candidate) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn startup_barrier_counts(barrier: &StartupPresentBarrier) -> (usize, usize, usize) {
+    let mut pending = 0usize;
+    let mut ready = 0usize;
+    let mut failed = 0usize;
+
+    for state in barrier.outputs.values() {
+        match state.phase {
+            StartupOutputPhase::Pending if state.can_block => pending += 1,
+            StartupOutputPhase::Ready | StartupOutputPhase::Presented if state.can_block => {
+                ready += 1;
+            }
+            StartupOutputPhase::Failed => failed += 1,
+            _ => {}
+        }
+    }
+
+    (pending, ready, failed)
+}
+
+fn startup_barrier_release_candidate(
+    barrier: &StartupPresentBarrier,
+    now: Instant,
+) -> Option<&'static str> {
+    if let Some(reason) = barrier.release_reason {
+        return Some(reason);
+    }
+
+    let (pending, _ready, failed) = startup_barrier_counts(barrier);
+    if pending == 0 {
+        return Some(if failed > 0 {
+            "failed_outputs"
+        } else {
+            "all_ready"
+        });
+    }
+    if let Some(first_ready_at) = barrier.first_ready_at {
+        if now >= first_ready_at + STARTUP_BARRIER_SKEW_RELEASE {
+            return Some("bounded_skew");
+        }
+    }
+    if now >= barrier.armed_at + STARTUP_BARRIER_TIMEOUT {
+        return Some("timeout");
+    }
+
+    None
+}
+
+fn startup_barrier_next_deadline(barrier: &StartupPresentBarrier, now: Instant) -> Option<Instant> {
+    if startup_barrier_release_candidate(barrier, now).is_some() {
+        return Some(now);
+    }
+
+    let mut deadline = Some(barrier.armed_at + STARTUP_BARRIER_TIMEOUT);
+    if let Some(first_ready_at) = barrier.first_ready_at {
+        deadline = min_optional_deadline(
+            deadline,
+            Some(first_ready_at + STARTUP_BARRIER_SKEW_RELEASE),
+        );
+    }
+    deadline
+}
+
+fn startup_barrier_is_terminal(barrier: &StartupPresentBarrier) -> bool {
+    barrier.outputs.values().all(|state| match state.phase {
+        StartupOutputPhase::Presented => true,
+        StartupOutputPhase::Failed => !state.can_block && state.retry_count >= STARTUP_RETRY_LIMIT,
+        StartupOutputPhase::Pending | StartupOutputPhase::Ready => false,
+    })
 }
 
 /// Type aliases to reduce verbosity in signatures
 pub type CmdMsg = (Request, tokio::sync::oneshot::Sender<Response>);
-pub type FrameMsg = (Arc<String>, video::VideoEvent);
+pub type FrameMsg = video::FrameSignal;
+pub type PlayerEventMsg = video::PlayerEvent;
 
 /// Shared state for both Wayland and X11 main loops.
 pub struct MainLoopContext {
@@ -315,6 +606,7 @@ pub struct MainLoopContext {
     pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
     pub startup_present_barrier: Option<StartupPresentBarrier>,
+    pub latest_video_frames: video::LatestFrameMailbox,
 
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<CmdMsg>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<CmdMsg>,
@@ -324,6 +616,8 @@ pub struct MainLoopContext {
     pub image_tx: tokio::sync::mpsc::Sender<LoadedImage>,
     pub player_rx: tokio::sync::mpsc::UnboundedReceiver<VideoPlayerResult>,
     pub player_tx: tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
+    pub player_event_rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEventMsg>,
+    pub player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
 
     pub dir_watcher: Option<cache::DirectoryWatcher>,
     pub script_manager: scripting::ScriptManager,
@@ -395,10 +689,13 @@ impl MainLoopContext {
         // Create channels
         // Frame channel: increased capacity to 32 to cushion against micro-stutters
         // when multiple video sources are active.
+        let latest_video_frames = video::LatestFrameMailbox::new();
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<FrameMsg>(32);
         // Image channel: bounded to prevent memory spikes from large images accumulating
         let (image_tx, image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(16);
         let (player_tx, player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
+        let (player_event_tx, player_event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PlayerEventMsg>();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<CmdMsg>();
 
         // IPC Socket Setup
@@ -487,6 +784,7 @@ impl MainLoopContext {
             pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
             startup_present_barrier: None,
+            latest_video_frames,
             cmd_rx,
             cmd_tx,
             frame_rx,
@@ -495,6 +793,8 @@ impl MainLoopContext {
             image_tx,
             player_rx,
             player_tx,
+            player_event_rx,
+            player_event_tx,
             dir_watcher,
             script_manager,
             shutdown_flag,
@@ -518,8 +818,37 @@ impl MainLoopContext {
                 || r.needs_redraw
                 || r.valid_content_type == queue::ContentType::Video
         })
-        // Pre-wake the loop before imminent transitions to avoid cold wake-up latency (S-02)
-        || self.monitor_manager.has_imminent_switch(std::time::Duration::from_millis(500))
+    }
+
+    pub fn wayland_hot_loop_active(&self) -> bool {
+        self.renderers
+            .values()
+            .any(renderer::Renderer::needs_wayland_immediate_work)
+    }
+
+    pub fn next_common_idle_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut deadline = self.monitor_manager.next_switch_deadline();
+        let script_deadline =
+            Some(self.last_script_tick + Duration::from_secs(self.script_tick_interval));
+        deadline = min_optional_deadline(deadline, script_deadline);
+        deadline = min_optional_deadline(
+            deadline,
+            self.startup_present_barrier
+                .as_ref()
+                .and_then(|barrier| startup_barrier_next_deadline(barrier, now)),
+        );
+        deadline
+    }
+
+    pub fn next_wayland_idle_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut deadline = self.next_common_idle_deadline(now);
+        for renderer in self.renderers.values() {
+            deadline = min_optional_deadline(
+                deadline,
+                renderer.next_wayland_retry_deadline(Duration::from_millis(500)),
+            );
+        }
+        deadline
     }
 
     /// Idle-wait using `tokio::select!` until any event source fires.
@@ -527,31 +856,47 @@ impl MainLoopContext {
     pub async fn idle_wait(
         &mut self,
         fd: &AsyncFd<RawFd>,
+        wake_deadline: Option<Instant>,
     ) -> (
         Option<CmdMsg>,
         Option<FrameMsg>,
         Option<LoadedImage>,
         Option<VideoPlayerResult>,
+        Option<PlayerEventMsg>,
     ) {
         let mut cmd_buf = None;
         let mut frame_buf = None;
         let mut image_buf = None;
         let mut player_buf = None;
+        let mut player_event_buf = None;
+
+        let now = Instant::now();
+        if wake_deadline.is_some_and(|deadline| deadline <= now) {
+            return (cmd_buf, frame_buf, image_buf, player_buf, player_event_buf);
+        }
+        let wake_deadline =
+            next_idle_wake_deadline(now, std::time::Duration::from_secs(1), wake_deadline);
+        let wake_deadline = tokio::time::Instant::from_std(wake_deadline);
 
         tokio::select! {
             cmd = self.cmd_rx.recv() => { if let Some(c) = cmd { cmd_buf = Some(c); } }
             frame = self.frame_rx.recv() => { if let Some(f) = frame { frame_buf = Some(f); } }
             image = self.image_rx.recv() => { if let Some(i) = image { image_buf = Some(i); } }
             player = self.player_rx.recv() => { if let Some(p) = player { player_buf = Some(p); } }
+            player_event = self.player_event_rx.recv() => {
+                if let Some(event) = player_event {
+                    player_event_buf = Some(event);
+                }
+            }
             result = fd.readable() => {
                 if let Ok(mut guard) = result {
                     guard.clear_ready();
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            _ = tokio::time::sleep_until(wake_deadline) => {}
         }
 
-        (cmd_buf, frame_buf, image_buf, player_buf)
+        (cmd_buf, frame_buf, image_buf, player_buf, player_event_buf)
     }
 
     // ─── Channel draining ───────────────────────────────────────────────
@@ -568,6 +913,7 @@ impl MainLoopContext {
                     content_type,
                     &mut self.next_session_id,
                     &self.frame_tx,
+                    &self.latest_video_frames,
                     &self.monitor_manager,
                     &mut self.renderers,
                     &mut self.video_players,
@@ -578,6 +924,8 @@ impl MainLoopContext {
                     Some(loop_start),
                     &self.image_tx,
                     &self.player_tx,
+                    &self.player_event_tx,
+                    &self.shutdown_flag,
                     "SCHEDULED",
                 );
             }
@@ -607,8 +955,10 @@ impl MainLoopContext {
                 &mut self.pending_image_video_stops,
                 &self.pending_video_sessions,
                 &self.frame_tx,
+                &self.latest_video_frames,
                 &self.image_tx,
                 &self.player_tx,
+                &self.player_event_tx,
                 &mut self.next_session_id,
                 loop_start,
                 &self.shutdown_flag,
@@ -622,47 +972,52 @@ impl MainLoopContext {
     pub fn drain_frames(
         &mut self,
         frame_buf: Option<FrameMsg>,
-    ) -> (HashMap<Arc<String>, video::VideoFrame>, usize, usize) {
-        let mut latest_frames: HashMap<Arc<String>, video::VideoFrame> = HashMap::new();
+    ) -> (HashMap<String, video::VideoFrame>, usize, usize) {
+        let mut latest_frames: HashMap<String, video::VideoFrame> = HashMap::new();
         let mut frames_received = 0;
         let mut frames_discarded = 0;
+        let mut stale_session_discards = 0;
+        let superseded_source_discards = self.latest_video_frames.take_overwrite_count() as usize;
 
-        if let Some((source_id, event)) = frame_buf {
-            frames_received += 1;
-            match event {
-                video::VideoEvent::Frame(frame) => {
-                    if latest_frames.insert(source_id.clone(), frame).is_some() {
-                        frames_discarded += 1;
-                    }
-                }
-                video::VideoEvent::Error(msg) => {
-                    error!("Video error {}: {}", source_id, msg);
-                    self.metrics.record_error("video_decode");
+        let mut handle_signal = |this: &mut Self, signal: FrameMsg| match signal {
+            video::FrameSignal::Ready(source_id) => {
+                let Some(frame) = this.latest_video_frames.take_frame(&source_id) else {
+                    return;
+                };
+                frames_received += 1;
+                let should_accept = this.renderers.get(source_id.as_str()).is_some_and(|r| {
+                    should_accept_video_frame(
+                        r.valid_content_type,
+                        r.active_video_session_id,
+                        frame.session_id,
+                    )
+                });
+                if !should_accept {
+                    frames_discarded += 1;
+                    stale_session_discards += 1;
+                } else {
+                    latest_frames.insert(source_id, frame);
                 }
             }
+        };
+
+        if let Some(signal) = frame_buf {
+            handle_signal(self, signal);
         }
-        while let Ok((source_id, event)) = self.frame_rx.try_recv() {
-            frames_received += 1;
-            match event {
-                video::VideoEvent::Frame(frame) => {
-                    if latest_frames.insert(source_id.clone(), frame).is_some() {
-                        frames_discarded += 1;
-                    }
-                }
-                video::VideoEvent::Error(msg) => {
-                    error!("Video error {}: {}", source_id, msg);
-                    self.metrics.record_error("video_decode");
-                }
-            }
+        while let Ok(signal) = self.frame_rx.try_recv() {
+            handle_signal(self, signal);
         }
 
         // Track frame channel usage for memory leak detection
-        if frames_received > 0 {
-            self.metrics.record_frame_channel_size(frames_received);
-            if frames_discarded > 0 {
+        if frames_received > 0 || superseded_source_discards > 0 {
+            self.metrics
+                .record_frame_channel_size(frames_received + self.latest_video_frames.occupancy());
+            if frames_discarded > 0 || superseded_source_discards > 0 {
                 debug!(
-                    "[VIDEO] Discarded {} older frames (keeping latest per source)",
-                    frames_discarded
+                    "[VIDEO] Discarded {} frames (stale_session={}, superseded_by_newer_same_source={})",
+                    frames_discarded + superseded_source_discards,
+                    stale_session_discards,
+                    superseded_source_discards
                 );
             }
         }
@@ -696,7 +1051,8 @@ impl MainLoopContext {
             images_received += 1;
             let barrier_blocks = self.startup_barrier_blocks_output(&msg.name, loop_start);
             let mut release_pending_video = false;
-            let mut transition_completed = false;
+            let mut startup_ready = false;
+            let mut startup_failure_reason: Option<String> = None;
             debug!(
                 "[IMAGE] Received image for {}: session={}, data={}, size={}x{}",
                 msg.name,
@@ -727,31 +1083,6 @@ impl MainLoopContext {
                 }
 
                 if let Some(data) = msg.data {
-                    if let Some(profile) = &msg.profile {
-                        self.metrics.record_image_stage_timings(
-                            profile.permit_wait,
-                            profile.decode,
-                            profile.convert,
-                            profile.resize,
-                            profile.expand,
-                        );
-                        debug!(
-                            "[IMAGE] {}: prepared {} {}x{} -> {}x{} in {:.1}ms (wait {:.1}ms, decode {:.1}ms, convert {:.1}ms, resize {:.1}ms, expand {:.1}ms, filter={})",
-                            msg.name,
-                            profile.format,
-                            profile.source_width,
-                            profile.source_height,
-                            msg.width,
-                            msg.height,
-                            duration_ms(profile.total_duration()),
-                            duration_ms(profile.permit_wait),
-                            duration_ms(profile.decode),
-                            duration_ms(profile.convert),
-                            duration_ms(profile.resize),
-                            duration_ms(profile.expand),
-                            profile.resize_filter.as_deref().unwrap_or("none")
-                        );
-                    }
                     debug!(
                         "[IMAGE] Uploading image data for {}: {} bytes",
                         msg.name,
@@ -759,13 +1090,40 @@ impl MainLoopContext {
                     );
                     let upload_start = Instant::now();
                     let _ = r.upload_image_data(data, msg.width, msg.height);
-                    self.metrics
-                        .record_image_upload_cpu_time(upload_start.elapsed());
+                    let upload_duration = upload_start.elapsed();
+                    if let Some(profile) = &msg.profile {
+                        self.metrics.record_image_stage_timings(
+                            profile.permit_wait,
+                            profile.decode,
+                            profile.convert,
+                            profile.resize,
+                            profile.expand,
+                            upload_duration,
+                        );
+                        debug!(
+                            "[IMAGE] {}: prepared {} {}x{} -> {}x{} in {:.1}ms (wait {:.1}ms, decode {:.1}ms, convert {:.1}ms, resize {:.1}ms, expand {:.1}ms, upload {:.1}ms, filter={})",
+                            msg.name,
+                            profile.format,
+                            profile.source_width,
+                            profile.source_height,
+                            msg.width,
+                            msg.height,
+                            duration_ms(profile.total_duration() + upload_duration),
+                            duration_ms(profile.permit_wait),
+                            duration_ms(profile.decode),
+                            duration_ms(profile.convert),
+                            duration_ms(profile.resize),
+                            duration_ms(profile.expand),
+                            duration_ms(upload_duration),
+                            profile.resize_filter.as_deref().unwrap_or("none")
+                        );
+                    }
                     debug!(
                         "[IMAGE] Upload complete for {}: {:.1}ms",
                         msg.name,
-                        duration_ms(upload_start.elapsed())
+                        duration_ms(upload_duration)
                     );
+                    startup_ready = true;
                     if barrier_blocks {
                         debug!(
                             "[STARTUP] {}: First image ready, holding present for barrier release",
@@ -778,14 +1136,12 @@ impl MainLoopContext {
                             self.metrics.record_first_frame();
                             self.first_frame_recorded = true;
                         }
+                        self.mark_output_presented_if_ready(&msg.name);
                     }
                     release_pending_video = true;
-                    transition_completed = r.transition_just_completed;
-                    if transition_completed {
-                        r.transition_just_completed = false;
-                    }
                 } else {
                     r.abort_transition();
+                    startup_failure_reason = Some("image_decode_failed".to_string());
                     release_pending_video = true;
                 }
             } else {
@@ -794,11 +1150,14 @@ impl MainLoopContext {
                     msg.name
                 );
             }
+            if startup_ready {
+                self.mark_startup_output_ready(&msg.name, loop_start);
+            }
+            if let Some(reason) = startup_failure_reason {
+                self.handle_startup_content_failure(&msg.name, &reason, loop_start);
+            }
             if release_pending_video {
                 self.release_pending_image_video_stop(&msg.name);
-            }
-            if transition_completed {
-                self.monitor_manager.mark_transition_completed(&msg.name);
             }
         }
         if images_received > 0 {
@@ -809,6 +1168,21 @@ impl MainLoopContext {
     fn release_pending_image_video_stop(&mut self, name: &str) {
         if let Some(player) = self.pending_image_video_stops.remove(name) {
             stop_video_player_in_background(name.to_string(), player);
+        }
+    }
+
+    pub fn mark_output_presented_if_ready(&mut self, name: &str) {
+        let should_mark = self.renderers.get_mut(name).is_some_and(|renderer| {
+            let ready = renderer.take_display_timer_ready();
+            if ready {
+                renderer.transition_just_completed = false;
+            }
+            ready
+        });
+        if should_mark {
+            self.monitor_manager.mark_transition_completed(name);
+            self.mark_startup_output_presented(name, Instant::now());
+            self.maybe_clear_startup_present_barrier();
         }
     }
 
@@ -839,6 +1213,7 @@ impl MainLoopContext {
                         self.pending_video_switches.remove(&name);
 
                         let mut should_render = false;
+                        let mut startup_ready = false;
                         if let Some(r) = self.renderers.get_mut(&name) {
                             r.active_batch_id = pending.batch_id;
                             r.batch_start_time = pending.batch_trigger_time;
@@ -852,11 +1227,15 @@ impl MainLoopContext {
                                 let upload_start = Instant::now();
                                 r.upload_frame(frame);
                                 self.metrics.record_video_cpu_time(upload_start.elapsed());
+                                startup_ready = true;
                                 should_render = true;
                             }
                         } else {
                             stop_video_player_in_background(name, player);
                             continue;
+                        }
+                        if startup_ready {
+                            self.mark_startup_output_ready(&name, loop_start);
                         }
 
                         if let Err(e) = player.start() {
@@ -868,6 +1247,11 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
+                            self.handle_startup_content_failure(
+                                &name,
+                                &format!("player_start: {}", e),
+                                loop_start,
+                            );
                             continue;
                         }
 
@@ -887,11 +1271,8 @@ impl MainLoopContext {
                                     self.metrics.record_first_frame();
                                     self.first_frame_recorded = true;
                                 }
-                                if r.transition_just_completed {
-                                    r.transition_just_completed = false;
-                                    self.monitor_manager.mark_transition_completed(&name);
-                                }
                             }
+                            self.mark_output_presented_if_ready(&name);
                         }
                     } else if self.renderers.get(&name).map(|r| r.active_video_session_id)
                         == Some(session_id)
@@ -902,6 +1283,11 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
+                            self.handle_startup_content_failure(
+                                &name,
+                                &format!("player_start: {}", e),
+                                loop_start,
+                            );
                             continue;
                         }
                         if let Some(old) = self.video_players.insert(name.clone(), player) {
@@ -927,9 +1313,208 @@ impl MainLoopContext {
                             r.abort_transition();
                         }
                     }
+                    self.handle_startup_content_failure(&name, "player_prepare_failed", loop_start);
                 }
             }
         }
+    }
+
+    pub fn drain_player_events(
+        &mut self,
+        player_event_buf: Option<PlayerEventMsg>,
+        loop_start: Instant,
+    ) {
+        let mut events = Vec::new();
+        if let Some(event) = player_event_buf {
+            events.push(event);
+        }
+        while let Ok(event) = self.player_event_rx.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
+            let is_pending = self
+                .pending_video_switches
+                .get(&event.source_id)
+                .is_some_and(|pending| pending.session_id == event.session_id);
+            let is_active = self
+                .renderers
+                .get(&event.source_id)
+                .is_some_and(|renderer| renderer.active_video_session_id == event.session_id);
+
+            if !is_pending && !is_active {
+                debug!(
+                    "[VIDEO] Ignoring stale player event {} session={} kind={:?} reason={}",
+                    event.source_id, event.session_id, event.kind, event.reason
+                );
+                continue;
+            }
+
+            match event.kind {
+                video::PlayerEventKind::Eos => {
+                    debug!(
+                        "[VIDEO] {} session={} reported EOS ({})",
+                        event.source_id, event.session_id, event.reason
+                    );
+                }
+                video::PlayerEventKind::Error | video::PlayerEventKind::FatalLifecycle => {
+                    error!(
+                        "[VIDEO] {} session={} runtime {:?}: {}",
+                        event.source_id, event.session_id, event.kind, event.reason
+                    );
+                    self.metrics.record_error("video_runtime");
+
+                    self.pending_video_switches.remove(&event.source_id);
+                    set_pending_video_session(&self.pending_video_sessions, &event.source_id, None);
+
+                    if let Some(player) = self.video_players.remove(&event.source_id) {
+                        stop_video_player_in_background(event.source_id.clone(), player);
+                    }
+
+                    if let Some(renderer) = self.renderers.get_mut(&event.source_id) {
+                        if renderer.active_video_session_id == event.session_id {
+                            renderer.abort_transition();
+                        }
+                    }
+
+                    self.handle_startup_content_failure(
+                        &event.source_id,
+                        &event.reason,
+                        loop_start,
+                    );
+                }
+            }
+        }
+    }
+
+    fn reset_startup_output_pending(&mut self, name: &str) {
+        let Some(barrier) = self.startup_present_barrier.as_mut() else {
+            return;
+        };
+        let Some(state) = barrier.outputs.get_mut(name) else {
+            return;
+        };
+        if state.can_block && state.phase != StartupOutputPhase::Presented {
+            state.phase = StartupOutputPhase::Pending;
+        }
+    }
+
+    fn handle_startup_content_failure(
+        &mut self,
+        name: &str,
+        reason: &str,
+        loop_start: Instant,
+    ) -> bool {
+        let tracked = self.startup_present_barrier.as_ref().and_then(|barrier| {
+            barrier
+                .outputs
+                .get(name)
+                .map(|state| (barrier.batch_id, state.phase))
+        });
+        let Some((batch_id, phase)) = tracked else {
+            return false;
+        };
+
+        if phase == StartupOutputPhase::Presented {
+            return false;
+        }
+
+        let failed_path = self
+            .monitor_manager
+            .outputs
+            .get(name)
+            .and_then(|orch| orch.current_path.clone());
+        self.mark_startup_output_failed(name, reason, failed_path.as_deref());
+
+        let retry_number = self
+            .startup_present_barrier
+            .as_mut()
+            .and_then(|barrier| barrier.outputs.get_mut(name))
+            .and_then(|state| {
+                if state.retry_count >= STARTUP_RETRY_LIMIT {
+                    None
+                } else {
+                    state.retry_count += 1;
+                    Some(state.retry_count)
+                }
+            });
+
+        let Some(retry_number) = retry_number else {
+            warn!(
+                "[STARTUP] {}: retries exhausted after failure ({})",
+                name, reason
+            );
+            if let Some(state) = self
+                .startup_present_barrier
+                .as_mut()
+                .and_then(|barrier| barrier.outputs.get_mut(name))
+            {
+                state.retry_count = STARTUP_RETRY_LIMIT;
+            }
+            self.maybe_clear_startup_present_barrier();
+            return true;
+        };
+
+        let failed_paths = self
+            .startup_present_barrier
+            .as_ref()
+            .and_then(|barrier| barrier.outputs.get(name))
+            .map(|state| state.failed_paths.clone())
+            .unwrap_or_default();
+        let changes = self
+            .monitor_manager
+            .pick_startup_replacement(name, &failed_paths);
+
+        if changes.is_empty() {
+            warn!(
+                "[STARTUP] {}: no replacement candidate after failure ({})",
+                name, reason
+            );
+            if let Some(state) = self
+                .startup_present_barrier
+                .as_mut()
+                .and_then(|barrier| barrier.outputs.get_mut(name))
+            {
+                state.retry_count = STARTUP_RETRY_LIMIT;
+            }
+            self.maybe_clear_startup_present_barrier();
+            return true;
+        }
+
+        info!(
+            "[STARTUP] {}: retry {}/{} after failure ({})",
+            name, retry_number, STARTUP_RETRY_LIMIT, reason
+        );
+
+        for changed_name in changes.keys() {
+            self.reset_startup_output_pending(changed_name);
+        }
+
+        for (changed_name, (path, content_type)) in changes {
+            switch_wallpaper_content(
+                &changed_name,
+                &path,
+                content_type,
+                &mut self.next_session_id,
+                &self.frame_tx,
+                &self.latest_video_frames,
+                &self.monitor_manager,
+                &mut self.renderers,
+                &mut self.video_players,
+                &mut self.pending_video_switches,
+                &mut self.pending_image_video_stops,
+                &self.pending_video_sessions,
+                Some(batch_id),
+                Some(loop_start),
+                &self.image_tx,
+                &self.player_tx,
+                &self.player_event_tx,
+                &self.shutdown_flag,
+                "STARTUP-RETRY",
+            );
+        }
+
+        true
     }
 
     // ─── Housekeeping ───────────────────────────────────────────────────
@@ -941,6 +1526,10 @@ impl MainLoopContext {
         if !was_idle {
             let frame_time = loop_start.elapsed();
             self.metrics.record_frame_time(frame_time);
+        }
+
+        for renderer in self.renderers.values_mut() {
+            renderer.trim_idle_retained_resources();
         }
 
         // Cleanup texture pool periodically (every 3 seconds)
@@ -972,6 +1561,24 @@ impl MainLoopContext {
                     + ctx.mipmap_pipelines.lock().len();
                 self.metrics.record_texture_count(texture_count);
                 self.metrics.record_pipeline_count(pipeline_count);
+                let active_video_players = self.video_players.len();
+                let pending_video_stops = self.pending_image_video_stops.len();
+                let pending_video_switches = self.pending_video_switches.len();
+                let latest_frame_slots = self.latest_video_frames.occupancy();
+                let background_snapshot = background::snapshot();
+                let mut appsink_queue_levels = video::AppsinkQueueLevels::default();
+                let mut appsink_queue_players = 0usize;
+                for player in self.video_players.values() {
+                    if let Some(levels) = player.appsink_queue_levels() {
+                        appsink_queue_players += 1;
+                        appsink_queue_levels.buffers =
+                            appsink_queue_levels.buffers.saturating_add(levels.buffers);
+                        appsink_queue_levels.bytes =
+                            appsink_queue_levels.bytes.saturating_add(levels.bytes);
+                        appsink_queue_levels.time_ns =
+                            appsink_queue_levels.time_ns.saturating_add(levels.time_ns);
+                    }
+                }
 
                 let mut retained = renderer::RetainedTextureFootprint::default();
                 let mut per_renderer = Vec::new();
@@ -997,13 +1604,22 @@ impl MainLoopContext {
                     ));
                 }
                 info!(
-                    "[MEMORY] Renderer retained textures: total={:.1}MB current={:.1}MB prev={:.1}MB composition={:.1}MB video_aux={:.1}MB pool={:.1}MB | {}",
+                    "[MEMORY] Renderer retained textures: total={:.1}MB current={:.1}MB prev={:.1}MB composition={:.1}MB video_aux={:.1}MB pool={:.1}MB | video_players={} pending_switches={} pending_stops={} latest_frame_slots={} appsink={}q/{}b/{:.1}ms@{}p | background={} | {}",
                     to_mb(retained.total_bytes()),
                     to_mb(retained.current_bytes),
                     to_mb(retained.prev_bytes),
                     to_mb(retained.composition_bytes),
                     to_mb(retained.video_aux_bytes),
                     to_mb(texture_pool_bytes),
+                    active_video_players,
+                    pending_video_switches,
+                    pending_video_stops,
+                    latest_frame_slots,
+                    appsink_queue_levels.buffers,
+                    appsink_queue_levels.bytes,
+                    appsink_queue_levels.time_ns as f64 / 1_000_000.0,
+                    appsink_queue_players,
+                    background_snapshot.format_compact(),
                     per_renderer.join(" | ")
                 );
             }
@@ -1062,6 +1678,7 @@ impl MainLoopContext {
                 content_type,
                 &mut self.next_session_id,
                 &self.frame_tx,
+                &self.latest_video_frames,
                 &self.monitor_manager,
                 &mut self.renderers,
                 &mut self.video_players,
@@ -1072,6 +1689,8 @@ impl MainLoopContext {
                 None,
                 &self.image_tx,
                 &self.player_tx,
+                &self.player_event_tx,
+                &self.shutdown_flag,
                 "STARTUP",
             );
         }
@@ -1081,20 +1700,26 @@ impl MainLoopContext {
     }
 
     pub fn arm_startup_present_barrier(&mut self, batch_id: u64, outputs: Vec<String>) {
-        let output_set: HashSet<_> = outputs
+        let output_states: HashMap<_, _> = outputs
             .into_iter()
-            .filter(|name| self.renderers.contains_key(name))
+            .filter(|name| {
+                self.renderers
+                    .get(name)
+                    .is_some_and(|renderer| !renderer.has_any_content())
+            })
+            .map(|name| (name, StartupOutputState::pending()))
             .collect();
-        if output_set.len() <= 1 {
+        if output_states.len() <= 1 {
             return;
         }
 
         let now = Instant::now();
         self.startup_present_barrier = Some(StartupPresentBarrier {
             batch_id,
-            outputs: output_set,
             armed_at: now,
-            deadline: now + Duration::from_secs(3),
+            first_ready_at: None,
+            release_reason: None,
+            outputs: output_states,
         });
         info!(
             "[STARTUP] First-present barrier armed for {} outputs (batch {:x})",
@@ -1106,79 +1731,215 @@ impl MainLoopContext {
     }
 
     pub fn startup_barrier_blocks_output(&self, name: &str, now: Instant) -> bool {
-        match &self.startup_present_barrier {
-            Some(barrier) if barrier.outputs.contains(name) => !self.startup_barrier_ready(now),
-            _ => false,
-        }
-    }
-
-    pub fn startup_barrier_ready(&self, now: Instant) -> bool {
         let Some(barrier) = &self.startup_present_barrier else {
-            return true;
+            return false;
         };
 
-        if now >= barrier.deadline {
-            return true;
+        let Some(state) = barrier.outputs.get(name) else {
+            return false;
+        };
+
+        if !state.can_block {
+            return false;
         }
 
-        barrier.outputs.iter().all(|name| {
-            self.renderers
-                .get(name)
-                .is_some_and(|r| r.has_current_texture())
-        })
+        startup_barrier_release_candidate(barrier, now).is_none()
     }
 
     pub fn release_startup_present_barrier<F>(&mut self, loop_start: Instant, mut render_fn: F)
     where
         F: FnMut(&mut renderer::Renderer, &str, Instant),
     {
-        let Some(barrier) = self.startup_present_barrier.clone() else {
+        let Some(reason) = self
+            .startup_present_barrier
+            .as_ref()
+            .and_then(|barrier| startup_barrier_release_candidate(barrier, loop_start))
+        else {
             return;
         };
-        if !self.startup_barrier_ready(loop_start) {
-            return;
+
+        if let Some(barrier) = self.startup_present_barrier.as_mut() {
+            if barrier.release_reason.is_none() {
+                let (pending, ready, failed) = startup_barrier_counts(barrier);
+                barrier.release_reason = Some(reason);
+                info!(
+                    "[STARTUP] First-present barrier released for batch {:x} after {:.1}ms reason={} pending={} ready={} failed={}",
+                    barrier.batch_id,
+                    duration_ms(loop_start.saturating_duration_since(barrier.armed_at)),
+                    reason,
+                    pending,
+                    ready,
+                    failed
+                );
+            }
         }
 
-        let timed_out = loop_start >= barrier.deadline;
-        info!(
-            "[STARTUP] Releasing first-present barrier for batch {:x} after {:.1}ms{}",
-            barrier.batch_id,
-            duration_ms(loop_start.saturating_duration_since(barrier.armed_at)),
-            if timed_out { " (timeout)" } else { "" }
-        );
+        let outputs_to_release: Vec<String> = self
+            .startup_present_barrier
+            .as_ref()
+            .map(|barrier| {
+                barrier
+                    .outputs
+                    .iter()
+                    .filter_map(|(name, state)| {
+                        if state.can_block && state.phase == StartupOutputPhase::Ready {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        for name in &barrier.outputs {
-            if let Some(r) = self.renderers.get_mut(name) {
-                render_fn(r, name, loop_start);
+        for name in outputs_to_release {
+            if let Some(r) = self.renderers.get_mut(&name) {
+                render_fn(r, &name, loop_start);
                 if !self.first_frame_recorded {
                     self.metrics.record_first_frame();
                     self.first_frame_recorded = true;
                 }
+                self.mark_output_presented_if_ready(&name);
             }
         }
 
-        self.startup_present_barrier = None;
+        self.maybe_clear_startup_present_barrier();
     }
 
-    /// Clean shutdown — stop all video players and save caches.
-    pub fn shutdown(&mut self) {
-        for (_, mut player) in self.video_players.drain() {
-            let _ = player.stop();
+    pub(crate) fn mark_startup_output_ready(&mut self, name: &str, now: Instant) {
+        let Some(barrier) = self.startup_present_barrier.as_mut() else {
+            return;
+        };
+        let Some(state) = barrier.outputs.get_mut(name) else {
+            return;
+        };
+
+        if state.phase == StartupOutputPhase::Presented {
+            return;
         }
-        for (_, mut player) in self.pending_image_video_stops.drain() {
-            let _ = player.stop();
+
+        if state.first_ready_at.is_none() {
+            state.first_ready_at = Some(now);
+            info!(
+                "[STARTUP] {} first-ready {:.1}ms (batch {:x})",
+                name,
+                duration_ms(now.saturating_duration_since(barrier.armed_at)),
+                barrier.batch_id
+            );
         }
+
+        if barrier.first_ready_at.is_none() {
+            barrier.first_ready_at = Some(now);
+        }
+
+        state.phase = StartupOutputPhase::Ready;
+    }
+
+    fn mark_startup_output_failed(&mut self, name: &str, reason: &str, failed_path: Option<&Path>) {
+        let Some(barrier) = self.startup_present_barrier.as_mut() else {
+            return;
+        };
+        let Some(state) = barrier.outputs.get_mut(name) else {
+            return;
+        };
+
+        if let Some(path) = failed_path {
+            state.failed_paths.insert(path.to_path_buf());
+        }
+        state.phase = StartupOutputPhase::Failed;
+        state.can_block = false;
+
+        info!(
+            "[STARTUP] {} failed after {:.1}ms reason={} retries={} batch {:x}",
+            name,
+            duration_ms(Instant::now().saturating_duration_since(barrier.armed_at)),
+            reason,
+            state.retry_count,
+            barrier.batch_id
+        );
+    }
+
+    fn mark_startup_output_presented(&mut self, name: &str, now: Instant) {
+        let Some(barrier) = self.startup_present_barrier.as_mut() else {
+            return;
+        };
+        let Some(state) = barrier.outputs.get_mut(name) else {
+            return;
+        };
+
+        if state.first_present_at.is_none() {
+            state.first_present_at = Some(now);
+            info!(
+                "[STARTUP] {} first-present {:.1}ms (batch {:x})",
+                name,
+                duration_ms(now.saturating_duration_since(barrier.armed_at)),
+                barrier.batch_id
+            );
+        }
+
+        state.phase = StartupOutputPhase::Presented;
+        state.can_block = false;
+    }
+
+    fn maybe_clear_startup_present_barrier(&mut self) {
+        if self
+            .startup_present_barrier
+            .as_ref()
+            .is_some_and(startup_barrier_is_terminal)
+        {
+            self.startup_present_barrier = None;
+        }
+    }
+
+    /// Clean shutdown — stop all video players, quiesce background work, and save caches.
+    pub async fn shutdown(&mut self) {
+        let shutdown_start = Instant::now();
         self.pending_video_switches.clear();
         if let Ok(mut sessions) = self.pending_video_sessions.lock() {
             sessions.clear();
         }
+
+        background::close_global_work();
+
+        let stop_players_start = Instant::now();
+        for (_, mut player) in self.video_players.drain() {
+            let _ = player.request_stop();
+        }
+        for (_, mut player) in self.pending_image_video_stops.drain() {
+            let _ = player.request_stop();
+        }
+        let stop_players_duration = stop_players_start.elapsed();
+
+        let background_wait_start = Instant::now();
+        let background_quiet = background::wait_for_global_quiet(Duration::from_millis(250)).await;
+        let background_wait_duration = background_wait_start.elapsed();
+
+        let bus_shutdown_start = Instant::now();
+        crate::video::shutdown_bus_dispatcher(Duration::from_millis(250));
+        let bus_shutdown_duration = bus_shutdown_start.elapsed();
+
+        let cache_start = Instant::now();
         // Drop renderer-owned wgpu surfaces while the backend connection still exists.
         self.renderers.clear();
+        if let Some(ctx) = &self.wgpu_ctx {
+            ctx.persist_pipeline_cache();
+        }
         self.wgpu_ctx = None;
         // Persist WGSL cache to disk on shutdown (P-15 cache layer 1)
         if let Err(e) = crate::shaders::ShaderManager::save_cache() {
             warn!("[SHADER] Failed to save WGSL cache: {}", e);
         }
+
+        info!(
+            "[SHUTDOWN] stop_players={:.1}ms background_wait={:.1}ms background_quiet={} bus={:.1}ms caches={:.1}ms total={:.1}ms background={}",
+            duration_ms(stop_players_duration),
+            duration_ms(background_wait_duration),
+            background_quiet,
+            duration_ms(bus_shutdown_duration),
+            duration_ms(cache_start.elapsed()),
+            duration_ms(shutdown_start.elapsed()),
+            background::snapshot().format_compact()
+        );
     }
 }
 
@@ -1246,7 +2007,7 @@ fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> St
     }
 }
 
-const PREPARED_IMAGE_CACHE_MAGIC: &[u8; 8] = b"KDXIMG01";
+const PREPARED_IMAGE_CACHE_MAGIC: &[u8; 8] = b"KDXIMG02";
 
 fn prepared_image_cache_dir() -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kaleidux").join("prepared-images");
@@ -1254,11 +2015,7 @@ fn prepared_image_cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-fn prepared_image_cache_key(
-    path: &Path,
-    _target_width: u32,
-    _target_height: u32,
-) -> Option<String> {
+fn prepared_image_cache_key(path: &Path, target_width: u32, target_height: u32) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let modified = modified.duration_since(UNIX_EPOCH).ok()?;
@@ -1268,6 +2025,8 @@ fn prepared_image_cache_key(
     meta.len().hash(&mut hasher);
     modified.as_secs().hash(&mut hasher);
     modified.subsec_nanos().hash(&mut hasher);
+    target_width.hash(&mut hasher);
+    target_height.hash(&mut hasher);
     Some(format!("{:016x}", hasher.finish()))
 }
 
@@ -1362,10 +2121,21 @@ fn store_prepared_image_cache(
 
 const MAX_IMAGE_UPLOAD_DIMENSION: u32 = 8192;
 
-fn compute_upload_downscale_dimensions(
+fn compute_cover_target_dimensions(
     source_width: u32,
     source_height: u32,
-) -> Option<(u32, u32)> {
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    renderer::compute_cover_target_dimensions(
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+    )
+}
+
+fn apply_upload_dimension_clamp(source_width: u32, source_height: u32) -> Option<(u32, u32)> {
     if source_width <= MAX_IMAGE_UPLOAD_DIMENSION && source_height <= MAX_IMAGE_UPLOAD_DIMENSION {
         return None;
     }
@@ -1375,6 +2145,24 @@ fn compute_upload_downscale_dimensions(
     let resized_width = ((source_width as f32 * scale).round() as u32).max(1);
     let resized_height = ((source_height as f32 * scale).round() as u32).max(1);
     Some((resized_width, resized_height))
+}
+
+fn compute_upload_downscale_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Option<(u32, u32)> {
+    let (cover_width, cover_height) =
+        compute_cover_target_dimensions(source_width, source_height, target_width, target_height);
+    let (prepared_width, prepared_height) = apply_upload_dimension_clamp(cover_width, cover_height)
+        .unwrap_or((cover_width, cover_height));
+
+    if prepared_width == source_width && prepared_height == source_height {
+        None
+    } else {
+        Some((prepared_width, prepared_height))
+    }
 }
 
 fn select_resize_filter(
@@ -1460,14 +2248,18 @@ fn prepare_rgb_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    _target_width: u32,
-    _target_height: u32,
+    target_width: u32,
+    target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
     let mut resize_duration = Duration::ZERO;
     let mut resize_filter = None;
     let (rgb_data, width, height) = if let Some((resized_width, resized_height)) =
-        compute_upload_downscale_dimensions(source_width, source_height)
-    {
+        compute_upload_downscale_dimensions(
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        ) {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -1504,12 +2296,15 @@ fn prepare_rgba_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    _target_width: u32,
-    _target_height: u32,
+    target_width: u32,
+    target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Option<String>)> {
-    if let Some((resized_width, resized_height)) =
-        compute_upload_downscale_dimensions(source_width, source_height)
-    {
+    if let Some((resized_width, resized_height)) = compute_upload_downscale_dimensions(
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+    ) {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -1538,14 +2333,18 @@ fn prepare_luma_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    _target_width: u32,
-    _target_height: u32,
+    target_width: u32,
+    target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
     let mut resize_duration = Duration::ZERO;
     let mut resize_filter = None;
     let (luma_data, width, height) = if let Some((resized_width, resized_height)) =
-        compute_upload_downscale_dimensions(source_width, source_height)
-    {
+        compute_upload_downscale_dimensions(
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        ) {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -1582,14 +2381,18 @@ fn prepare_lumaa_image(
     pixels: Vec<u8>,
     source_width: u32,
     source_height: u32,
-    _target_width: u32,
-    _target_height: u32,
+    target_width: u32,
+    target_height: u32,
 ) -> anyhow::Result<(Vec<u8>, u32, u32, Duration, Duration, Option<String>)> {
     let mut resize_duration = Duration::ZERO;
     let mut resize_filter = None;
     let (lumaa_data, width, height) = if let Some((resized_width, resized_height)) =
-        compute_upload_downscale_dimensions(source_width, source_height)
-    {
+        compute_upload_downscale_dimensions(
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        ) {
         let filter =
             select_resize_filter(source_width, source_height, resized_width, resized_height);
         let resize_start = Instant::now();
@@ -1851,8 +2654,23 @@ fn decode_image_for_output(
     target_width: u32,
     target_height: u32,
 ) -> anyhow::Result<DecodedImagePayload> {
-    if let Some(payload) = try_load_prepared_image_cache(path, target_width, target_height) {
-        return Ok(payload);
+    let cache_target = image::image_dimensions(path)
+        .ok()
+        .map(|(source_width, source_height)| {
+            let (cover_width, cover_height) = compute_cover_target_dimensions(
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+            );
+            apply_upload_dimension_clamp(cover_width, cover_height)
+                .unwrap_or((cover_width, cover_height))
+        });
+
+    if let Some((cache_width, cache_height)) = cache_target {
+        if let Some(payload) = try_load_prepared_image_cache(path, cache_width, cache_height) {
+            return Ok(payload);
+        }
     }
 
     let format = image::ImageFormat::from_path(path).ok();
@@ -1883,12 +2701,16 @@ fn decode_image_for_output(
         _ => decode_image_generic(path, target_width, target_height, format)?,
     };
 
-    store_prepared_image_cache(path, target_width, target_height, &payload);
+    let (cache_width, cache_height) = cache_target.unwrap_or((payload.width, payload.height));
+    store_prepared_image_cache(path, cache_width, cache_height, &payload);
     Ok(payload)
 }
 
-fn schedule_image_prefetch(name: &str, path: &Path) {
+fn schedule_image_prefetch(name: &str, path: &Path, target_width: u32, target_height: u32) {
     let prefetch_path = path.to_path_buf();
+    if !background::is_accepting_new_work() {
+        return;
+    }
     let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() else {
         return;
     };
@@ -1900,6 +2722,13 @@ fn schedule_image_prefetch(name: &str, path: &Path) {
     let output_name = name.to_string();
     let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
     tokio::spawn(async move {
+        if !background::is_accepting_new_work() {
+            if let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() {
+                in_flight.remove(&prefetch_path);
+            }
+            return;
+        }
+
         let _permit = match semaphore.acquire().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1910,9 +2739,25 @@ fn schedule_image_prefetch(name: &str, path: &Path) {
             }
         };
 
+        if !background::is_accepting_new_work() {
+            if let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() {
+                in_flight.remove(&prefetch_path);
+            }
+            return;
+        }
+
         let decode_path = prefetch_path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || decode_image_for_output(&decode_path, 0, 0)).await;
+        let Some(handle) =
+            background::spawn_blocking_tracked(BackgroundWorkKind::ImagePrefetch, move || {
+                decode_image_for_output(&decode_path, target_width, target_height)
+            })
+        else {
+            if let Ok(mut in_flight) = IMAGE_PREFETCH_IN_FLIGHT.lock() {
+                in_flight.remove(&prefetch_path);
+            }
+            return;
+        };
+        let result = handle.await;
 
         match result {
             Ok(Ok(payload)) => debug!(
@@ -1975,6 +2820,7 @@ pub fn switch_wallpaper_content(
     content_type: queue::ContentType,
     next_session_id: &mut u64,
     frame_tx: &tokio::sync::mpsc::Sender<FrameMsg>,
+    frame_mailbox: &video::LatestFrameMailbox,
     monitor_manager: &monitor_manager::MonitorManager,
     renderers: &mut HashMap<String, renderer::Renderer>,
     video_players: &mut HashMap<String, video::VideoPlayer>,
@@ -1985,6 +2831,8 @@ pub fn switch_wallpaper_content(
     batch_trigger_time: Option<std::time::Instant>,
     image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
+    player_event_tx: &tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
+    shutdown_flag: &Arc<AtomicBool>,
     log_prefix: &str,
 ) {
     info!("{}: {} -> {:?}", log_prefix, name, path.display());
@@ -1998,11 +2846,10 @@ pub fn switch_wallpaper_content(
     let session_id = *next_session_id;
     *next_session_id += 1;
 
+    frame_mailbox.clear_source(name);
     if let Some(old_pending_stop) = pending_image_video_stops.remove(name) {
         stop_video_player_in_background(name.to_string(), old_pending_stop);
     }
-    let mut prior_video_player = video_players.remove(name);
-
     let mut should_prepare_video = false;
     if let Some(r) = renderers.get_mut(name) {
         let resolved_transition = resolve_transition_for_output(monitor_manager, name);
@@ -2011,6 +2858,7 @@ pub fn switch_wallpaper_content(
         r.active_transition = resolved_transition.clone();
 
         if content_type == queue::ContentType::Image {
+            let mut prior_video_player = video_players.remove(name);
             pending_video_switches.remove(name);
             set_pending_video_session(pending_video_sessions, name, None);
             r.set_content_type(content_type);
@@ -2025,6 +2873,7 @@ pub fn switch_wallpaper_content(
             let tx = image_tx.clone();
             let semaphore = IMAGE_DECODE_SEMAPHORE.clone();
             let image_session_id = session_id;
+            let shutdown_flag = shutdown_flag.clone();
             if let Some(old_video_player) = prior_video_player.take() {
                 pending_image_video_stops.insert(name.to_string(), old_video_player);
             }
@@ -2035,6 +2884,14 @@ pub fn switch_wallpaper_content(
                 path.display()
             );
             tokio::spawn(async move {
+                if shutdown_flag.load(Ordering::SeqCst) || !background::is_accepting_new_work() {
+                    debug!(
+                        "[ASSET] {}: Skipping image decode because shutdown is in progress",
+                        name_clone
+                    );
+                    return;
+                }
+
                 // Acquire permit before decoding to limit concurrent tasks
                 let permit_wait_start = Instant::now();
                 let _permit = match semaphore.acquire().await {
@@ -2047,6 +2904,13 @@ pub fn switch_wallpaper_content(
                         return;
                     }
                 };
+                if shutdown_flag.load(Ordering::SeqCst) || !background::is_accepting_new_work() {
+                    debug!(
+                        "[ASSET] {}: Image decode aborted before blocking task spawn",
+                        name_clone
+                    );
+                    return;
+                }
                 let permit_wait = permit_wait_start.elapsed();
                 if permit_wait > Duration::from_millis(10) {
                     debug!(
@@ -2058,10 +2922,25 @@ pub fn switch_wallpaper_content(
 
                 // Decode image in blocking task
                 let path_for_decode = path_clone.clone();
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    decode_image_for_output(&path_for_decode, target_width, target_height)
-                })
-                .await;
+                let Some(handle) = background::spawn_blocking_tracked(
+                    BackgroundWorkKind::ImageDecode,
+                    move || decode_image_for_output(&path_for_decode, target_width, target_height),
+                ) else {
+                    debug!(
+                        "[ASSET] {}: Image decode skipped because shutdown is in progress",
+                        name_clone
+                    );
+                    return;
+                };
+                let decode_result = handle.await;
+
+                if shutdown_flag.load(Ordering::SeqCst) || !background::is_accepting_new_work() {
+                    debug!(
+                        "[ASSET] {}: Discarding decoded image because shutdown is in progress",
+                        name_clone
+                    );
+                    return;
+                }
 
                 // Send decoded image (or error) to channel
                 match decode_result {
@@ -2105,8 +2984,6 @@ pub fn switch_wallpaper_content(
                 }
             });
         } else {
-            r.active_image_session_id = 0;
-            r.active_video_session_id = session_id;
             set_pending_video_session(pending_video_sessions, name, Some(session_id));
             pending_video_switches.insert(
                 name.to_string(),
@@ -2122,7 +2999,7 @@ pub fn switch_wallpaper_content(
     } else {
         set_pending_video_session(pending_video_sessions, name, None);
         pending_video_switches.remove(name);
-        if let Some(vp) = prior_video_player.take() {
+        if let Some(vp) = video_players.remove(name) {
             stop_video_player_in_background(name.to_string(), vp);
         }
         warn!(
@@ -2146,16 +3023,25 @@ pub fn switch_wallpaper_content(
                 .map(|o| o.config.volume as f64 / 100.0)
                 .unwrap_or(1.0),
             frame_tx,
+            frame_mailbox,
             player_tx,
+            player_event_tx,
             pending_video_sessions.clone(),
-            prior_video_player,
+            shutdown_flag.clone(),
         );
     }
 
     if let Some(orchestrator) = monitor_manager.outputs.get(name) {
         if orchestrator.next_content_type == Some(queue::ContentType::Image) {
             if let Some(next_path) = orchestrator.next_path.as_ref() {
-                schedule_image_prefetch(name, next_path);
+                if let Some(renderer) = renderers.get(name) {
+                    schedule_image_prefetch(
+                        name,
+                        next_path,
+                        renderer.config.width,
+                        renderer.config.height,
+                    );
+                }
             }
         }
     }
@@ -2167,103 +3053,168 @@ fn create_and_start_video_player(
     session_id: u64,
     volume: f64,
     frame_tx: &tokio::sync::mpsc::Sender<FrameMsg>,
+    frame_mailbox: &video::LatestFrameMailbox,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
+    player_event_tx: &tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
     pending_video_sessions: PendingVideoSessions,
-    old_player: Option<video::VideoPlayer>,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
     let path_str = path.to_string_lossy().into_owned();
     let name_arc = Arc::new(name.to_string());
     let name_str = name.to_string();
     let frame_tx_clone = frame_tx.clone();
+    let frame_mailbox_clone = frame_mailbox.clone();
     let player_tx_clone = player_tx.clone();
+    let player_event_tx_clone = player_event_tx.clone();
+    let Some(handle) = background::spawn_blocking_tracked(
+        BackgroundWorkKind::VideoPrepare,
+        move || {
+            let name_for_panic = name_str.clone();
+            let player_tx_panic = player_tx_clone.clone();
+            let session_id_panic = session_id;
+            let pending_video_sessions_for_task = pending_video_sessions.clone();
+            let should_abort = || {
+                shutdown_flag.load(Ordering::SeqCst)
+                    || !pending_video_session_matches(
+                        &pending_video_sessions_for_task,
+                        &name_str,
+                        session_id,
+                    )
+            };
 
-    tokio::task::spawn_blocking(move || {
-        let name_for_panic = name_str.clone();
-        let player_tx_panic = player_tx_clone.clone();
-        let session_id_panic = session_id;
-        let pending_video_sessions_for_task = pending_video_sessions.clone();
-
-        if let Some(mut old_player) = old_player {
-            let stop_start = Instant::now();
-            match old_player.stop() {
-                Ok(()) => debug!(
-                    "[VIDEO] {}: Previous player fully stopped in {:.1}ms before replacement",
-                    name_str,
-                    duration_ms(stop_start.elapsed())
-                ),
-                Err(e) => warn!(
-                    "[VIDEO] {}: Failed to stop previous player before replacement: {}",
-                    name_str, e
-                ),
+            if should_abort() {
+                debug!(
+                    "[VIDEO] {}: Skipping superseded video prepare task for session {} before player creation",
+                    name_str, session_id
+                );
+                return;
             }
-        }
 
-        if !pending_video_session_matches(&pending_video_sessions_for_task, &name_str, session_id) {
-            debug!(
-                "[VIDEO] {}: Skipping superseded video prepare task for session {} before player creation",
-                name_str, session_id
-            );
-            return;
-        }
+            let prepare_start = Instant::now();
 
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || match video::VideoPlayer::new(
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match video::VideoPlayer::new(
                     &path_str,
                     name_arc,
                     session_id,
                     volume,
                     frame_tx_clone,
+                    frame_mailbox_clone,
+                    player_event_tx_clone,
                 ) {
                     Ok(mut vp) => {
+                        let create_duration = prepare_start.elapsed();
                         vp.set_volume(volume);
-                        let preroll_frame = match vp.prebuffer() {
-                            Ok(frame) => frame,
+                        if should_abort() {
+                            let _ = vp.stop();
+                            return Ok(None);
+                        }
+                        let prebuffer_start = Instant::now();
+                        let prebuffer = match vp.prebuffer(&should_abort) {
+                            Ok(result) => result,
                             Err(e) => {
+                                if should_abort() {
+                                    debug!(
+                                        "[VIDEO] {}: Aborting pre-buffer for superseded/shutdown session {}",
+                                        name_str, session_id
+                                    );
+                                    let _ = vp.stop();
+                                    return Ok(None);
+                                }
                                 debug!(
                                     "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
                                     name_str, e
                                 );
-                                None
+                                video::VideoPrebufferResult {
+                                    frame: None,
+                                    profile: video::VideoPrebufferProfile {
+                                        set_state: Duration::ZERO,
+                                        state_wait: Duration::ZERO,
+                                        pull_preroll: Duration::ZERO,
+                                        set_state_result: "error",
+                                        state_wait_settled: false,
+                                        current_state: gst::State::Null,
+                                        pending_state: gst::State::VoidPending,
+                                    },
+                                }
                             }
                         };
-                        Ok((vp, preroll_frame))
+                        let prebuffer_duration = prebuffer_start.elapsed();
+                        debug!(
+                            "[VIDEO] {}: Player prepared in {:.1}ms (create {:.1}ms + prebuffer {:.1}ms, set_state {:.1}ms/{} + wait_state {:.1}ms settled={} current={:?} pending={:?} + pull_preroll {:.1}ms, preroll_frame={})",
+                            name_str,
+                            duration_ms(prepare_start.elapsed()),
+                            duration_ms(create_duration),
+                            duration_ms(prebuffer_duration),
+                            duration_ms(prebuffer.profile.set_state),
+                            prebuffer.profile.set_state_result,
+                            duration_ms(prebuffer.profile.state_wait),
+                            prebuffer.profile.state_wait_settled,
+                            prebuffer.profile.current_state,
+                            prebuffer.profile.pending_state,
+                            duration_ms(prebuffer.profile.pull_preroll),
+                            prebuffer.frame.is_some()
+                        );
+                        if should_abort() {
+                            let _ = vp.stop();
+                            Ok(None)
+                        } else {
+                            Ok(Some((vp, prebuffer.frame)))
+                        }
                     }
                     Err(e) => {
                         error!("[VIDEO] {}: Failed to create video player: {}", name_str, e);
                         Err(e)
                     }
-                },
-            ));
+                }
+            }));
 
-        match result {
-            Ok(Ok((mut vp, preroll_frame))) => {
-                if !pending_video_session_matches(&pending_video_sessions, &name_str, session_id) {
-                    debug!(
-                        "[VIDEO] {}: Discarding superseded prepared player for session {}",
-                        name_str, session_id
-                    );
-                    let _ = vp.stop();
-                    return;
+            match result {
+                Ok(Ok(Some((mut vp, preroll_frame)))) => {
+                    if shutdown_flag.load(Ordering::SeqCst)
+                        || !pending_video_session_matches(
+                            &pending_video_sessions,
+                            &name_str,
+                            session_id,
+                        )
+                    {
+                        debug!(
+                            "[VIDEO] {}: Discarding superseded prepared player for session {}",
+                            name_str, session_id
+                        );
+                        let _ = vp.stop();
+                        return;
+                    }
+                    if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(
+                        name_str,
+                        session_id,
+                        vp,
+                        preroll_frame,
+                    )) {
+                        error!("[VIDEO] Failed to send video player back: {}", e);
+                    }
                 }
-                if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(
-                    name_str,
-                    session_id,
-                    vp,
-                    preroll_frame,
-                )) {
-                    error!("[VIDEO] Failed to send video player back: {}", e);
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if result.is_err() {
+                        error!("[VIDEO] {}: Video player task panicked!", name_for_panic);
+                    }
+                    let _ = player_tx_panic
+                        .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
                 }
             }
-            Ok(Err(_)) | Err(_) => {
-                if result.is_err() {
-                    error!("[VIDEO] {}: Video player task panicked!", name_for_panic);
-                }
-                let _ = player_tx_panic
-                    .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
-            }
-        }
-    });
+        },
+    ) else {
+        debug!(
+            "[VIDEO] {}: Skipping video prepare task because shutdown is in progress",
+            name
+        );
+        return;
+    };
+    drop(handle);
 }
 
 /// Handle an IPC command request.
@@ -2277,8 +3228,10 @@ pub async fn handle_command(
     pending_image_video_stops: &mut HashMap<String, video::VideoPlayer>,
     pending_video_sessions: &PendingVideoSessions,
     frame_tx: &tokio::sync::mpsc::Sender<FrameMsg>,
+    frame_mailbox: &video::LatestFrameMailbox,
     image_tx: &tokio::sync::mpsc::Sender<LoadedImage>,
     player_tx: &tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
+    player_event_tx: &tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
     next_session_id: &mut u64,
     loop_start: Instant,
     shutdown_flag: &Arc<AtomicBool>,
@@ -2309,6 +3262,7 @@ pub async fn handle_command(
                     content_type,
                     next_session_id,
                     frame_tx,
+                    frame_mailbox,
                     monitor_manager,
                     renderers,
                     video_players,
@@ -2319,6 +3273,8 @@ pub async fn handle_command(
                     Some(loop_start),
                     image_tx,
                     player_tx,
+                    player_event_tx,
+                    shutdown_flag,
                     "NEXT",
                 );
             }
@@ -2334,6 +3290,7 @@ pub async fn handle_command(
                     content_type,
                     next_session_id,
                     frame_tx,
+                    frame_mailbox,
                     monitor_manager,
                     renderers,
                     video_players,
@@ -2344,6 +3301,8 @@ pub async fn handle_command(
                     Some(loop_start),
                     image_tx,
                     player_tx,
+                    player_event_tx,
+                    shutdown_flag,
                     "PREV",
                 );
             }
@@ -2410,6 +3369,7 @@ pub async fn handle_command(
             for name in names {
                 set_pending_video_session(pending_video_sessions, &name, None);
                 pending_video_switches.remove(&name);
+                frame_mailbox.clear_source(&name);
                 if let Some(player) = video_players.remove(&name) {
                     stop_video_player_in_background(name, player);
                 }
@@ -2431,6 +3391,7 @@ pub async fn handle_command(
             for name in targets {
                 set_pending_video_session(pending_video_sessions, &name, None);
                 pending_video_switches.remove(&name);
+                frame_mailbox.clear_source(&name);
                 if let Some(vp) = video_players.remove(&name) {
                     stop_video_player_in_background(name.clone(), vp);
                 }

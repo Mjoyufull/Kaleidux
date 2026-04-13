@@ -3,10 +3,12 @@
 //! Contains surface creation, Wayland event polling, frame callback rendering,
 //! and connection error recovery. All shared logic lives in `main_loop::MainLoopContext`.
 
+use crate::background::{self, BackgroundWorkKind};
 use crate::main_loop::{MainLoopContext, stop_video_player_in_background};
 use crate::orchestration;
 use crate::renderer;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -138,15 +140,24 @@ pub async fn run(
                 info!("[STARTUP] Initializing renderer for {}", name);
 
                 let name_for_bg = name.clone();
-                let spawn_handler = tokio::task::spawn_blocking(move || {
-                    renderer::Renderer::new(
-                        name_for_bg,
-                        ctx_clone,
-                        surface_arc,
-                        init_surf,
-                        Some(metrics_clone),
-                    )
-                });
+                let Some(spawn_handler) = background::spawn_blocking_tracked(
+                    BackgroundWorkKind::RendererInit,
+                    move || {
+                        renderer::Renderer::new(
+                            name_for_bg,
+                            ctx_clone,
+                            surface_arc,
+                            init_surf,
+                            Some(metrics_clone),
+                        )
+                    },
+                ) else {
+                    error!(
+                        "[STARTUP] Renderer initialization skipped for {}: shutdown in progress",
+                        name
+                    );
+                    continue;
+                };
 
                 match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
                     Ok(join_res) => match join_res {
@@ -180,6 +191,24 @@ pub async fn run(
                 }
                 wgpu_ctx.device.poll(wgpu::Maintain::Poll);
             }
+
+            let should_warmup_cuda = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok()
+                && ctx
+                    .monitor_manager
+                    .outputs
+                    .values()
+                    .any(|orch| orch.config.video_ratio > 0);
+            if should_warmup_cuda {
+                let warmup_ctx = wgpu_ctx.clone();
+                if let Some(handle) =
+                    background::spawn_blocking_tracked(BackgroundWorkKind::CudaWarmup, move || {
+                        warmup_ctx.warmup_cuda_interop()
+                    })
+                {
+                    drop(handle);
+                }
+            }
+
             ctx.metrics.record_full_init();
             if log_level.map(|l| l >= 3).unwrap_or(false) {
                 ctx.metrics.log_startup_summary();
@@ -269,6 +298,7 @@ pub async fn run(
     }
 
     // Force initial renders for unconfigured renderers
+    let mut initial_callback_flush_needed = false;
     for (name, r) in ctx.renderers.iter_mut() {
         if !r.configured && r.config.width > 0 && r.config.height > 0 {
             if let Some(layer_surface) = backend.surfaces.get(name) {
@@ -281,10 +311,13 @@ pub async fn run(
                         },
                         Instant::now(),
                     );
-                    r.request_frame_callback(layer_surface, &qh);
+                    initial_callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                 }
             }
         }
+    }
+    if initial_callback_flush_needed {
+        let _ = conn.flush();
     }
 
     // ─── Initial load ───────────────────────────────────────────────────
@@ -309,9 +342,10 @@ pub async fn run(
     loop {
         let loop_start = Instant::now();
         if ctx.shutdown_flag.load(Ordering::SeqCst) {
-            ctx.shutdown();
+            ctx.shutdown().await;
             break;
         }
+        let mut callback_flush_needed = false;
 
         if connection_dead {
             if last_error_time.elapsed().as_secs() > 5 {
@@ -323,16 +357,26 @@ pub async fn run(
             }
         }
 
-        let any_active = ctx.any_active();
+        let hot_loop_active = ctx.wayland_hot_loop_active();
+        if hot_loop_active {
+            ctx.metrics.record_wayland_hot_loop();
+        } else {
+            ctx.metrics.record_wayland_idle_loop();
+        }
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf) = (None, None, None, None);
-        if !any_active && !connection_dead {
-            let result = ctx.idle_wait(&wayland_fd).await;
+        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf, mut player_event_buf) =
+            (None, None, None, None, None);
+        let mut entered_idle_wait = false;
+        if !hot_loop_active && !connection_dead {
+            let idle_deadline = ctx.next_wayland_idle_deadline(loop_start);
+            let result = ctx.idle_wait(&wayland_fd, idle_deadline).await;
             cmd_buf = result.0;
             frame_buf = result.1;
             image_buf = result.2;
             player_buf = result.3;
+            player_event_buf = result.4;
+            entered_idle_wait = true;
         }
 
         // ─── Wayland event polling ──────────────────────────────────────
@@ -412,7 +456,7 @@ pub async fn run(
                                 },
                                 loop_start,
                             );
-                            r.request_frame_callback(layer_surface, &qh);
+                            callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                         }
                     }
                 }
@@ -424,12 +468,15 @@ pub async fn run(
         ctx.process_scheduled(loop_start);
         ctx.process_script_tick();
         ctx.drain_commands(cmd_buf, loop_start).await;
+        ctx.drain_player_events(player_event_buf, loop_start);
 
         // ─── Frame handling (Wayland-specific upload + render) ───────────
 
         let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
         for (source_id, frame) in latest_frames {
             let barrier_blocks = ctx.startup_barrier_blocks_output(source_id.as_str(), loop_start);
+            let mut mark_presented = false;
+            let mut mark_ready = false;
             if let Some(r) = ctx.renderers.get_mut(source_id.as_str()) {
                 let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
                     !r.has_current_texture() || !r.frame_callback_pending_too_long(1000)
@@ -442,6 +489,7 @@ pub async fn run(
                     r.upload_frame(&frame);
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
+                    mark_ready = true;
                     drop(frame);
                 } else {
                     drop(frame);
@@ -449,25 +497,37 @@ pub async fn run(
 
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some(layer_surface) = backend.surfaces.get(source_id.as_str()) {
-                        if (!r.frame_callback_pending || r.frame_callback_pending_too_long(1000))
-                            && !barrier_blocks
-                        {
-                            let _ = r.render(
-                                renderer::BackendContext::Wayland {
-                                    surface: layer_surface,
-                                    qh: &qh,
-                                },
-                                loop_start,
-                            );
-                            if !ctx.first_frame_recorded {
-                                ctx.metrics.record_first_frame();
-                                ctx.first_frame_recorded = true;
+                        if !barrier_blocks {
+                            if r.frame_callback_pending_too_long(1000) {
+                                let _ = r.render(
+                                    renderer::BackendContext::Wayland {
+                                        surface: layer_surface,
+                                        qh: &qh,
+                                    },
+                                    loop_start,
+                                );
+                                if !ctx.first_frame_recorded {
+                                    ctx.metrics.record_first_frame();
+                                    ctx.first_frame_recorded = true;
+                                }
+                                mark_presented = true;
+                                callback_flush_needed |=
+                                    r.request_frame_callback(layer_surface, &qh);
+                            } else if !r.frame_callback_pending {
+                                callback_flush_needed |=
+                                    r.request_frame_callback(layer_surface, &qh);
                             }
                         }
                     }
                 }
             } else {
                 drop(frame);
+            }
+            if mark_ready {
+                ctx.mark_startup_output_ready(source_id.as_str(), loop_start);
+            }
+            if mark_presented {
+                ctx.mark_output_presented_if_ready(source_id.as_str());
             }
         }
 
@@ -523,8 +583,25 @@ pub async fn run(
 
         let frame_ready_names: Vec<String> = backend.frame_callback_ready.drain().collect();
         for name in frame_ready_names {
+            ctx.metrics.record_wayland_callback_wake();
             let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
+            let mut mark_presented = false;
             if let Some(r) = ctx.renderers.get_mut(&name) {
+                if let Some(wait_duration) = r.frame_callback_pending_duration() {
+                    if wait_duration > std::time::Duration::from_millis(250) {
+                        tracing::warn!(
+                            "[FRAME] {}: Wayland frame callback stalled for {:.1}ms",
+                            name,
+                            wait_duration.as_secs_f64() * 1000.0
+                        );
+                    } else if wait_duration > std::time::Duration::from_millis(16) {
+                        tracing::trace!(
+                            "[FRAME] {}: Wayland frame callback waited {:.1}ms",
+                            name,
+                            wait_duration.as_secs_f64() * 1000.0
+                        );
+                    }
+                }
                 r.frame_callback_pending = false;
                 r.last_frame_request = None;
                 if !barrier_blocks {
@@ -540,35 +617,51 @@ pub async fn run(
                             ctx.metrics.record_first_frame();
                             ctx.first_frame_recorded = true;
                         }
+                        mark_presented = true;
                     }
                 }
             }
+            if mark_presented {
+                ctx.mark_output_presented_if_ready(&name);
+            }
         }
 
-        // Request missing frames and check for transition completion
-        let barrier = ctx.startup_present_barrier.clone();
-        let barrier_ready = ctx.startup_barrier_ready(loop_start);
+        // Request missing frames
+        let blocked_outputs: HashSet<String> = ctx
+            .startup_present_barrier
+            .as_ref()
+            .map(|barrier| {
+                barrier
+                    .outputs
+                    .iter()
+                    .filter_map(|(name, state)| {
+                        if state.can_block && barrier.release_reason.is_none() {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         for (name, r) in ctx.renderers.iter_mut() {
-            let barrier_blocks = barrier
-                .as_ref()
-                .is_some_and(|b| b.outputs.contains(name) && !barrier_ready);
+            let barrier_blocks = blocked_outputs.contains(name);
             let should_request =
                 r.has_any_content() && (r.needs_redraw || r.transition_active) && !barrier_blocks;
             if should_request {
                 if let Some(layer_surface) = backend.surfaces.get(name) {
-                    r.request_frame_callback(layer_surface, &qh);
+                    callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                 }
             }
-            if r.transition_just_completed {
-                r.transition_just_completed = false;
-                ctx.monitor_manager.mark_transition_completed(name);
-            }
+        }
+        if callback_flush_needed && !connection_dead {
+            let _ = conn.flush();
         }
 
         // ─── Housekeeping ───────────────────────────────────────────────
 
-        ctx.housekeeping(loop_start, !any_active).await;
-        ctx.timing_and_poll(any_active, loop_start).await;
+        ctx.housekeeping(loop_start, entered_idle_wait).await;
+        ctx.timing_and_poll(hot_loop_active, loop_start).await;
     }
 
     Ok(())
