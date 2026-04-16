@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,18 @@ const POOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_cac
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 const CACHE_VERSION: u64 = 4;
+
+fn path_from_redb_key(key: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(key)));
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(key).ok().map(PathBuf::from)
+    }
+}
 
 /// Filesystem events that affect the active file pool
 #[derive(Debug, Clone)]
@@ -81,7 +93,19 @@ impl FileCache {
         if needs_wipe {
             tracing::info!("[CACHE] Cache version mismatch or missing, wiping database...");
             drop(db);
-            let _ = std::fs::remove_file(&db_path);
+            match std::fs::remove_file(&db_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).context("Failed to remove stale cache database before recreate");
+                }
+            }
+            if std::fs::metadata(&db_path).is_ok() {
+                bail!(
+                    "Stale cache file {:?} still exists after remove_file; refusing to recreate to avoid corruption",
+                    db_path
+                );
+            }
             db = Database::create(&db_path)?;
         }
 
@@ -156,11 +180,15 @@ impl FileCache {
 
     /// Persist a discovered file pool for a directory (keyed by directory path)
     pub fn set_cached_pool(&self, dir: &Path, pool: &[PathBuf]) -> Result<()> {
+        let encoded: Vec<Vec<u8>> = pool
+            .iter()
+            .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+            .collect();
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(POOL_TABLE)?;
             let key = dir.as_os_str().as_encoded_bytes();
-            let data = postcard::to_allocvec(&pool)?;
+            let data = postcard::to_allocvec(&encoded)?;
             table.insert(key, data.as_slice())?;
         }
         write_txn.commit()?;
@@ -174,7 +202,17 @@ impl FileCache {
         let key = dir.as_os_str().as_encoded_bytes();
         match table.get(key)? {
             Some(data) => {
-                let paths: Vec<PathBuf> = postcard::from_bytes(data.value())?;
+                let bytes = data.value();
+                let paths = if let Ok(encoded) = postcard::from_bytes::<Vec<Vec<u8>>>(bytes) {
+                    encoded
+                        .into_iter()
+                        .filter_map(|b| path_from_redb_key(&b))
+                        .collect()
+                } else if let Ok(legacy) = postcard::from_bytes::<Vec<PathBuf>>(bytes) {
+                    legacy
+                } else {
+                    Vec::new()
+                };
                 Ok(Some(paths))
             }
             _ => Ok(None),
@@ -246,9 +284,10 @@ impl FileCache {
 
         for item in table.iter()? {
             let (key, value) = item?;
-            // Safety: These bytes were provided by as_encoded_bytes
-            let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(key.value()) };
-            let path = PathBuf::from(os_str);
+            let Some(path) = path_from_redb_key(key.value()) else {
+                tracing::warn!("[CACHE] Skipping file_stats row with invalid path encoding");
+                continue;
+            };
             let file_stats: crate::queue::FileStats = postcard::from_bytes(value.value())?;
             stats.insert(path, file_stats);
         }
@@ -340,9 +379,10 @@ impl FileCache {
 
         for item in table.iter()? {
             let (key, _) = item?;
-            // Safety: These bytes were provided by as_encoded_bytes
-            let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(key.value()) };
-            let path = PathBuf::from(os_str);
+            let Some(path) = path_from_redb_key(key.value()) else {
+                tracing::warn!("[CACHE] Skipping blacklist row with invalid path encoding");
+                continue;
+            };
             blacklist.insert(path);
         }
 

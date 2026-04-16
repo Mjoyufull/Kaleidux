@@ -395,13 +395,23 @@ pub async fn run(
             }
         }
 
-        if let Err(e) = event_queue.dispatch_pending(&mut backend) {
-            let error_str = e.to_string();
-            if error_str.contains("Broken pipe") {
+        match event_queue.dispatch_pending(&mut backend) {
+            Ok(_) => {
+                connection_error_count = 0;
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                error!("Failed to dispatch Wayland events in main loop: {}", e);
                 connection_error_count += 1;
                 last_error_time = Instant::now();
                 if connection_error_count >= MAX_CONSECUTIVE_ERRORS {
                     connection_dead = true;
+                }
+                if !error_str.contains("Broken pipe") {
+                    tracing::debug!(
+                        "[WAYLAND] Non-broken-pipe dispatch error (count={})",
+                        connection_error_count
+                    );
                 }
             }
         }

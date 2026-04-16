@@ -43,7 +43,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, about, long_about = None)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     log: Option<u8>,
     #[arg(long)]
     demo: bool,
@@ -72,8 +72,8 @@ async fn async_main() -> anyhow::Result<()> {
             Some(2) => LevelFilter::INFO,
             Some(3) => LevelFilter::DEBUG,
             Some(4) => LevelFilter::TRACE,
-            None => LevelFilter::OFF,
-            _ => LevelFilter::INFO,
+            None => LevelFilter::WARN,
+            Some(_) => LevelFilter::INFO,
         };
 
         let env_filter = EnvFilter::builder()
@@ -122,7 +122,13 @@ async fn async_main() -> anyhow::Result<()> {
             );
             (Some(file_guard), Some(stdout_guard))
         } else {
-            // Default: No logging initialized to improve performance
+            let stderr_layer = subscriber_fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_timer(CustomTimer);
+            Registry::default()
+                .with(env_filter)
+                .with(stderr_layer)
+                .init();
             (None, None)
         }
     };

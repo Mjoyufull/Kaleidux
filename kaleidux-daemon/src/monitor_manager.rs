@@ -333,9 +333,41 @@ impl MonitorManager {
             // Refresh queue when the wallpaper directory path changed
             if old_paths.get(name).map(|op| op.as_deref()) != Some(output_config.path.as_deref()) {
                 if let Some(path) = &output_config.path {
+                    let blacklist = self
+                        .cache
+                        .get_all_blacklisted()
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("[CONFIG] Failed to read blacklist while refreshing queue: {}", e);
+                            HashSet::new()
+                        });
+                    let mut pool = self
+                        .cache
+                        .get_cached_pool(path)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    pool.retain(|p| p.exists() && !blacklist.contains(p));
+                    if pool.is_empty() {
+                        pool = match SmartQueue::discover_content(
+                            path,
+                            &blacklist,
+                            self.cache.clone(),
+                            self.metrics.clone(),
+                        ) {
+                            Ok((p, _)) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[CONFIG] Could not discover files for new path {:?}: {}",
+                                    path,
+                                    e
+                                );
+                                Vec::new()
+                            }
+                        };
+                    }
                     match SmartQueue::new_from_pool(
                         path,
-                        Vec::new(),
+                        pool,
                         output_config.video_ratio,
                         output_config.sorting,
                         self.cache.clone(),

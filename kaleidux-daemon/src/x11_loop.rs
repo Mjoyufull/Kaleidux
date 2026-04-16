@@ -105,14 +105,23 @@ pub async fn run(
                             }
                             ctx.renderers.insert(name, r);
                         }
-                        Err(e) => error!("Failed to create renderer for {}: {}", name, e),
+                        Err(e) => {
+                            error!("Failed to create renderer for {}: {}", name, e);
+                            ctx.metrics.record_error("renderer_creation");
+                        }
                     },
-                    Err(e) => error!("Thread join error for output {}: {}", name, e),
+                    Err(e) => {
+                        error!("Thread join error for output {}: {}", name, e);
+                        ctx.metrics.record_error("renderer_thread_error");
+                    }
                 },
-                Err(_) => error!(
-                    "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
-                    name
-                ),
+                Err(_) => {
+                    error!(
+                        "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
+                        name
+                    );
+                    ctx.metrics.record_error("renderer_creation_timeout");
+                }
             }
         }
 
@@ -237,8 +246,8 @@ pub async fn run(
                     drop(frame);
                 }
 
-                // X11: Render immediately unless startup barrier is still holding this output.
-                if !barrier_blocks {
+                // X11: render non-video here; video is handled in the shared render loop below.
+                if !barrier_blocks && r.valid_content_type != crate::queue::ContentType::Video {
                     let _ = r.render(renderer::BackendContext::X11, loop_start);
                     if !ctx.first_frame_recorded {
                         ctx.metrics.record_first_frame();
@@ -313,10 +322,11 @@ pub async fn run(
         }
 
         // Flush X11 commands only if something was rendered
-        let needs_flush = ctx
-            .renderers
-            .values()
-            .any(|r| r.needs_redraw || r.transition_active);
+        let needs_flush = ctx.renderers.values().any(|r| {
+            r.needs_redraw
+                || r.transition_active
+                || r.valid_content_type == crate::queue::ContentType::Video
+        });
         if needs_flush {
             let _ = backend.conn.flush();
         }

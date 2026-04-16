@@ -2591,45 +2591,49 @@ fn decode_image_generic(
     let source_height = image.height();
     let has_alpha = image.has_alpha();
 
-    let convert_start = Instant::now();
-    let (data, width, height, resize_duration, expand_duration, resize_filter) = if has_alpha {
-        let rgba = image.into_rgba8().into_raw();
-        let (prepared, width, height, resize_duration, resize_filter) = prepare_rgba_image(
-            rgba,
-            source_width,
-            source_height,
-            target_width,
-            target_height,
-        )?;
-        (
-            prepared,
-            width,
-            height,
-            resize_duration,
-            Duration::ZERO,
-            resize_filter,
-        )
-    } else {
-        let rgb = image.into_rgb8().into_raw();
-        let (prepared, width, height, resize_duration, expand_duration, resize_filter) =
-            prepare_rgb_image(
-                rgb,
+    let (data, width, height, resize_duration, expand_duration, resize_filter, convert_duration) =
+        if has_alpha {
+            let convert_start = Instant::now();
+            let rgba = image.into_rgba8().into_raw();
+            let convert_duration = convert_start.elapsed();
+            let (prepared, width, height, resize_duration, resize_filter) = prepare_rgba_image(
+                rgba,
                 source_width,
                 source_height,
                 target_width,
                 target_height,
             )?;
-        (
-            prepared,
-            width,
-            height,
-            resize_duration,
-            expand_duration,
-            resize_filter,
-        )
-    };
-
-    let convert_duration = convert_start.elapsed();
+            (
+                prepared,
+                width,
+                height,
+                resize_duration,
+                Duration::ZERO,
+                resize_filter,
+                convert_duration,
+            )
+        } else {
+            let convert_start = Instant::now();
+            let rgb = image.into_rgb8().into_raw();
+            let convert_duration = convert_start.elapsed();
+            let (prepared, width, height, resize_duration, expand_duration, resize_filter) =
+                prepare_rgb_image(
+                    rgb,
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                )?;
+            (
+                prepared,
+                width,
+                height,
+                resize_duration,
+                expand_duration,
+                resize_filter,
+                convert_duration,
+            )
+        };
 
     Ok(DecodedImagePayload {
         data,

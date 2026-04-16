@@ -54,6 +54,14 @@ vec4 getToColor(vec2 uv) {
 
 pub struct ShaderManager;
 
+const WGSL_DISK_CACHE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WgslDiskCache {
+    version: u32,
+    entries: std::collections::HashMap<String, String>,
+}
+
 // Process-wide cache of compiled WGSL shader strings (P-21)
 // Keyed by transition name — avoids duplicate GLSL→WGSL compilation across renderers
 static WGSL_CACHE: once_cell::sync::Lazy<
@@ -160,9 +168,13 @@ impl ShaderManager {
     pub fn save_cache() -> anyhow::Result<()> {
         let cache_dir = dirs::cache_dir().context("no cache dir")?.join("kaleidux");
         std::fs::create_dir_all(&cache_dir)?;
-        let cache = WGSL_CACHE.lock();
-        let data = postcard::to_allocvec(&*cache)?;
-        // Atomic write: write to temp, then rename
+        let data = {
+            let cache = WGSL_CACHE.lock();
+            postcard::to_allocvec(&WgslDiskCache {
+                version: WGSL_DISK_CACHE_VERSION,
+                entries: cache.clone(),
+            })?
+        };
         let tmp = cache_dir.join("wgsl_cache.bin.tmp");
         let dst = cache_dir.join("wgsl_cache.bin");
         std::fs::write(&tmp, &data)?;
@@ -177,8 +189,25 @@ impl ShaderManager {
             .join("wgsl_cache.bin");
         if path.exists() {
             let data = std::fs::read(&path)?;
-            let loaded: std::collections::HashMap<String, String> = postcard::from_bytes(&data)?;
             let mut cache = WGSL_CACHE.lock();
+            let loaded: std::collections::HashMap<String, String> =
+                match postcard::from_bytes::<WgslDiskCache>(&data) {
+                    Ok(blob) if blob.version == WGSL_DISK_CACHE_VERSION => blob.entries,
+                    Ok(blob) => {
+                        tracing::info!(
+                            "[SHADER] Ignoring WGSL disk cache (file version {} != {})",
+                            blob.version,
+                            WGSL_DISK_CACHE_VERSION
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            "[SHADER] Ignoring legacy WGSL disk cache (missing version header)"
+                        );
+                        return Ok(());
+                    }
+                };
             for (k, v) in loaded {
                 cache.entry(k).or_insert(v);
             }
@@ -204,7 +233,7 @@ impl ShaderManager {
             let name = transition.name();
             (
                 Self::is_transition_broken(&name),
-                !Self::is_shader_cached(&name),
+                Self::is_shader_cached(&name),
             )
         });
 

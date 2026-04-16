@@ -4193,7 +4193,10 @@ fn import_dmabuf_as_texture(
     // and perform all Vulkan operations inside.
     let hal_texture: Option<wgpu_hal::vulkan::Texture> = unsafe {
         device.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_device_opt| {
-            let hal_device = hal_device_opt?;
+            let Some(hal_device) = hal_device_opt else {
+                libc::close(owned_fd);
+                return None;
+            };
             let raw_device = hal_device.raw_device();
 
             // 1. Create VkImage with external memory support
@@ -4332,12 +4335,7 @@ fn import_dmabuf_as_texture(
 
     let hal_texture = match hal_texture {
         Some(t) => t,
-        None => {
-            unsafe {
-                libc::close(owned_fd);
-            }
-            return None;
-        }
+        None => return None,
     };
 
     // 8. Wrap the HAL texture as a wgpu::Texture
@@ -4477,7 +4475,10 @@ fn create_cuda_backed_texture(
     // Step 3: import the CUDA fd into Vulkan and bind to a new VkImage
     let hal_texture: Option<wgpu_hal::vulkan::Texture> = unsafe {
         device.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_device_opt| {
-            let hal_device = hal_device_opt?;
+            let Some(hal_device) = hal_device_opt else {
+                libc::close(fd);
+                return None;
+            };
             let raw_device = hal_device.raw_device();
 
             let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()

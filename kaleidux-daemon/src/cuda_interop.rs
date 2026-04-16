@@ -142,7 +142,9 @@ pub struct CudaInterop {
 }
 
 unsafe impl Send for CudaInterop {}
-// Sync removed (Audit Point 1): Context operations require internal serialization.
+/// CUDA driver APIs used here are not thread-safe, but every exported entry point on
+/// `CudaInterop` is serialized with `op_lock`, so sharing via `Arc` across threads is sound.
+unsafe impl Sync for CudaInterop {}
 
 fn cuda_err(name: &str, res: CUresult) -> String {
     format!("[CUDA] {name} failed with error code {res}")

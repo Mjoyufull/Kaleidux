@@ -4,7 +4,7 @@ use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::collections::{HashMap, HashSet};
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -605,10 +605,10 @@ impl Clone for VideoFrameFormat {
                 uv_stride,
                 uv_offset,
             } => Self::DmaBufNv12 {
-                y_fd: y_fd.try_clone().expect("Failed to clone y_fd"),
+                y_fd: dup_plane_fd_for_clone(y_fd),
                 y_stride: *y_stride,
                 y_offset: *y_offset,
-                uv_fd: uv_fd.try_clone().expect("Failed to clone uv_fd"),
+                uv_fd: dup_plane_fd_for_clone(uv_fd),
                 uv_stride: *uv_stride,
                 uv_offset: *uv_offset,
             },
@@ -831,6 +831,30 @@ pub fn shutdown_bus_dispatcher(timeout: std::time::Duration) {
     BUS_DISPATCHER.shutdown(timeout);
 }
 
+fn dup_dma_fd(raw: std::os::unix::io::RawFd) -> Option<OwnedFd> {
+    if raw < 0 {
+        return None;
+    }
+    let duped = unsafe { libc::dup(raw) };
+    if duped < 0 {
+        tracing::warn!(
+            "[VIDEO] dup_dma_fd: libc::dup failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    Some(unsafe { OwnedFd::from_raw_fd(duped) })
+}
+
+fn dup_plane_fd_for_clone(fd: &OwnedFd) -> OwnedFd {
+    fd.try_clone().unwrap_or_else(|e| {
+        dup_dma_fd(fd.as_raw_fd()).unwrap_or_else(|| {
+            tracing::error!("[VIDEO] plane fd clone failed (try_clone err: {e})");
+            panic!("failed to duplicate DMA-BUF plane fd for clone");
+        })
+    })
+}
+
 /// Extract DMA-BUF file descriptors and plane info from an NV12 GStreamer buffer.
 ///
 /// NV12 buffers may carry 1 or 2 memory blocks:
@@ -865,30 +889,66 @@ fn extract_dmabuf_nv12(
             y_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
             uv_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
         ) {
-            let y_fd = unsafe { OwnedFd::from_raw_fd(y_dmabuf.fd()) };
-            let uv_fd = unsafe { OwnedFd::from_raw_fd(uv_dmabuf.fd()) };
-            return VideoFrameFormat::DmaBufNv12 {
-                y_fd,
-                y_stride: strides[0] as u32,
-                y_offset: offsets[0] as u32,
-                uv_fd,
-                uv_stride: strides[1] as u32,
-                uv_offset: offsets[1] as u32,
-            };
+            match (
+                dup_dma_fd(y_dmabuf.fd()),
+                dup_dma_fd(uv_dmabuf.fd()),
+            ) {
+                (Some(y_fd), Some(uv_fd)) => {
+                    return VideoFrameFormat::DmaBufNv12 {
+                        y_fd,
+                        y_stride: strides[0] as u32,
+                        y_offset: offsets[0] as u32,
+                        uv_fd,
+                        uv_stride: strides[1] as u32,
+                        uv_offset: offsets[1] as u32,
+                    };
+                }
+                (Some(y_fd), None) => {
+                    drop(y_fd);
+                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                }
+                (None, Some(uv_fd)) => {
+                    drop(uv_fd);
+                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                }
+                (None, None) => {
+                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                }
+            }
         }
     } else if buffer.n_memory() == 1 {
         // Single DMA-BUF with both planes at different offsets
         let mem = buffer.peek_memory(0);
         if let Some(dmabuf) = mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>() {
-            let fd = unsafe { OwnedFd::from_raw_fd(dmabuf.fd()) };
-            let fd_uv = fd
-                .try_clone()
-                .unwrap_or_else(|_| unsafe { OwnedFd::from_raw_fd(dmabuf.fd()) });
+            let Some(y_fd) = dup_dma_fd(dmabuf.fd()) else {
+                tracing::warn!("[VIDEO] dup failed for single-plane DMA-BUF, falling back to CPU path");
+                return VideoFrameFormat::Nv12 {
+                    y_stride: strides[0] as u32,
+                    uv_offset: offsets[1] as u32,
+                    uv_stride: strides[1] as u32,
+                };
+            };
+            let uv_fd = match y_fd.try_clone() {
+                Ok(fd) => fd,
+                Err(_) => match dup_dma_fd(y_fd.as_raw_fd()) {
+                    Some(fd) => fd,
+                    None => {
+                        tracing::warn!(
+                            "[VIDEO] could not dup UV view of single DMA-BUF, falling back to CPU path"
+                        );
+                        return VideoFrameFormat::Nv12 {
+                            y_stride: strides[0] as u32,
+                            uv_offset: offsets[1] as u32,
+                            uv_stride: strides[1] as u32,
+                        };
+                    }
+                },
+            };
             return VideoFrameFormat::DmaBufNv12 {
-                y_fd: fd,
+                y_fd,
                 y_stride: strides[0] as u32,
                 y_offset: offsets[0] as u32,
-                uv_fd: fd_uv,
+                uv_fd,
                 uv_stride: strides[1] as u32,
                 uv_offset: offsets[1] as u32,
             };

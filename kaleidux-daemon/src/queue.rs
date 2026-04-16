@@ -174,7 +174,6 @@ impl SmartQueue {
                     let bg_blacklist = stats.blacklist.clone();
                     let bg_cache = cache.clone();
                     let bg_metrics = metrics.clone();
-                    let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
                     if background::spawn_blocking_tracked(
                         BackgroundWorkKind::QueueDiscovery,
@@ -184,8 +183,12 @@ impl SmartQueue {
                             bg_cache,
                             bg_metrics,
                         ) {
-                            Ok(res) => {
-                                let _ = tx.blocking_send(res);
+                            Ok((pool, _)) => {
+                                tracing::info!(
+                                    "[QUEUE] Background pool refresh finished ({} files) for {:?}",
+                                    pool.len(),
+                                    bg_path
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
@@ -199,11 +202,6 @@ impl SmartQueue {
                             path
                         );
                     }
-
-                    // We wrap the receiver so we can periodically check it or use it in an event loop
-                    // But for the initial creation, we can't easily block here if we want to stay async.
-                    // Instead, idk we'll let the monitor_manager handle the swap when it receives the update.
-                    // For now, let's at least populate the initial cache from disk to avoid the I/O bottleneck.
 
                     ct_cache_init = Some(Self::populate_content_type_cache_from_pool(
                         &cache,
@@ -354,7 +352,7 @@ impl SmartQueue {
         None
     }
 
-    fn discover_content(
+    pub(crate) fn discover_content(
         path: &Path,
         blacklist: &std::collections::HashSet<PathBuf>,
         cache: Arc<FileCache>,
@@ -1006,10 +1004,16 @@ impl SmartQueue {
         let playlists = cache.get_all_playlists()?;
         let blacklist = cache.get_all_blacklisted()?;
 
-        // Build LruCache from loaded HashMap
         let cap = NonZeroUsize::new(STATS_LRU_CAP).unwrap();
         let mut files = lru::LruCache::new(cap);
-        for (path, stat) in files_map {
+        let mut entries: Vec<(PathBuf, FileStats)> = files_map.into_iter().collect();
+        entries.sort_by(|a, b| match (&a.1.last_seen, &b.1.last_seen) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(aa), Some(bb)) => aa.cmp(bb),
+        });
+        for (path, stat) in entries {
             files.put(path, stat);
         }
 
