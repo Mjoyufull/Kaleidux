@@ -112,13 +112,13 @@ The daemon supports several video frame paths. Use `--video-mode <MODE>` to forc
 
 | Mode     | Description                                                                                                                             |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `auto`   | **(Default)** Automatically picks the fastest available mode (e.g., `dmabuf` for Intel/AMD/NVIDIA). Replaces the old `zero-copy` alias. |
+| `auto`   | **(Default)** Automatically picks the fastest available mode (e.g., `dmabuf` for Intel/AMD/NVIDIA). Prefer this if you just want the best zero-copy path. |
 | `cuda`   | Force NVIDIA CUDA memory + CUDA--Vulkan interop (true zero-copy). Requires NVIDIA drivers 535+.                                         |
-| `dmabuf` | Force DMA-BUF zero-copy path. Supported on Intel, AMD, and NVIDIA (requires NVIDIA 550+).                                               |
+| `dmabuf` | Force DMA-BUF zero-copy path. Supported on Intel, AMD, and NVIDIA (requires NVIDIA 550+). The legacy `zero-copy` alias is still accepted for this mode. |
 | `nv12`   | Request NV12 from the decoder; frames are uploaded to the GPU via CPU (no zero-copy).                                                   |
 | `rgba`   | Legacy: decoder outputs RGBA; frames are uploaded via CPU (slowest).                                                                    |
 
-The zero-copy alias is no longer accepted; using --video-mode zero-copy will error. Users should switch to --video-mode auto for the best available zero-copy path.
+`--video-mode zero-copy` is deprecated but still accepted as an alias for `--video-mode dmabuf`. Prefer `--video-mode auto` for automatic selection, or `--video-mode dmabuf` if you want to force the DMA-BUF path.
 
 `kaleidux-daemon` (the daemon binary, typically started as a background service)
 provides the core engine, while `kldctl` is the command-line interface for controlling it.

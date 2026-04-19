@@ -141,6 +141,7 @@ async fn async_main() -> anyhow::Result<()> {
     // 1b. Set video decode mode from CLI flag
     if let Some(ref mode_str) = args.video_mode {
         let deprecated_cuda_alias = mode_str.eq_ignore_ascii_case("cuda-strict");
+        let deprecated_dmabuf_alias = mode_str.eq_ignore_ascii_case("zero-copy");
         let mode = match mode_str.to_lowercase().as_str() {
             "cuda" | "nvdec" | "nvidia" | "cuda-strict" => crate::video::VideoMode::StrictCuda,
             "dmabuf" | "dma-buf" | "zero-copy" => crate::video::VideoMode::ForceDmaBuf,
@@ -160,6 +161,11 @@ async fn async_main() -> anyhow::Result<()> {
         if deprecated_cuda_alias {
             warn!(
                 "[VIDEO] --video-mode cuda-strict is deprecated; use --video-mode cuda for strict CUDA-only negotiation"
+            );
+        }
+        if deprecated_dmabuf_alias {
+            warn!(
+                "[VIDEO] --video-mode zero-copy is deprecated; use --video-mode dmabuf to force the DMA-BUF path or --video-mode auto to let Kaleidux choose the fastest zero-copy path"
             );
         }
         crate::video::set_video_mode(mode);

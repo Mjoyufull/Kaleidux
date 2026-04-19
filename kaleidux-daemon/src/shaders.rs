@@ -54,18 +54,24 @@ vec4 getToColor(vec2 uv) {
 
 pub struct ShaderManager;
 
-const WGSL_DISK_CACHE_VERSION: u32 = 1;
+const WGSL_DISK_CACHE_VERSION: u32 = 2;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedWgslEntry {
+    fingerprint: u64,
+    wgsl: String,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WgslDiskCache {
     version: u32,
-    entries: std::collections::HashMap<String, String>,
+    entries: std::collections::HashMap<String, CachedWgslEntry>,
 }
 
 // Process-wide cache of compiled WGSL shader strings (P-21)
 // Keyed by transition name — avoids duplicate GLSL→WGSL compilation across renderers
 static WGSL_CACHE: once_cell::sync::Lazy<
-    parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    parking_lot::Mutex<std::collections::HashMap<String, CachedWgslEntry>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 static BROKEN_TRANSITIONS: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -152,6 +158,20 @@ vec4 transition(vec2 uv) {
 }
 "#;
 
+fn stable_shader_fingerprint(parts: &[&str]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
 impl ShaderManager {
     pub fn mark_transition_broken(name: &str) {
         BROKEN_TRANSITIONS.lock().insert(name.to_string());
@@ -161,8 +181,12 @@ impl ShaderManager {
         BROKEN_TRANSITIONS.lock().contains(name)
     }
 
-    pub fn is_shader_cached(name: &str) -> bool {
-        WGSL_CACHE.lock().contains_key(name)
+    pub fn is_shader_cached(transition: &Transition) -> bool {
+        let name = transition.name();
+        WGSL_CACHE
+            .lock()
+            .get(&name)
+            .is_some_and(|entry| Self::cache_entry_matches_transition(transition, entry))
     }
 
     pub fn save_cache() -> anyhow::Result<()> {
@@ -190,7 +214,7 @@ impl ShaderManager {
         if path.exists() {
             let data = std::fs::read(&path)?;
             let mut cache = WGSL_CACHE.lock();
-            let loaded: std::collections::HashMap<String, String> =
+            let loaded: std::collections::HashMap<String, CachedWgslEntry> =
                 match postcard::from_bytes::<WgslDiskCache>(&data) {
                     Ok(blob) if blob.version == WGSL_DISK_CACHE_VERSION => blob.entries,
                     Ok(blob) => {
@@ -233,7 +257,7 @@ impl ShaderManager {
             let name = transition.name();
             (
                 Self::is_transition_broken(&name),
-                Self::is_shader_cached(&name),
+                !Self::is_shader_cached(transition),
             )
         });
 
@@ -421,22 +445,68 @@ impl ShaderManager {
 
     pub fn get_builtin_shader(transition: &Transition) -> anyhow::Result<String> {
         let name = transition.name();
+        let glsl = Self::builtin_shader_source(transition, &name)?;
+        let mapping = Self::builtin_shader_mapping(transition);
+        let fingerprint = Self::builtin_shader_cache_fingerprint(&name, glsl, mapping);
 
         // Check process-wide cache first (P-21)
         if let Some(cached) = WGSL_CACHE.lock().get(&name) {
-            return Ok(cached.clone());
+            if cached.fingerprint == fingerprint {
+                return Ok(cached.wgsl.clone());
+            }
         }
-
-        let glsl = match transition {
-            Transition::Cube { .. } => CUBE_SAFE_GLSL,
-            Transition::Displacement => DISPLACEMENT_SAFE_GLSL,
-            _ => Self::get_builtin_glsl(&name)
-                .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?,
-        };
 
         // Note: We use getFromParams(i) which handles the aligned vec4 array access
         // We must map Rust struct fields to the EXACT uniform names used in the GLSL shaders.
-        let mapping = match transition {
+        let wgsl = Self::compile_glsl(&name, glsl, mapping)?;
+
+        // Store in process-wide cache (P-21)
+        WGSL_CACHE.lock().insert(
+            name,
+            CachedWgslEntry {
+                fingerprint,
+                wgsl: wgsl.clone(),
+            },
+        );
+        Ok(wgsl)
+    }
+
+    fn cache_entry_matches_transition(transition: &Transition, entry: &CachedWgslEntry) -> bool {
+        match Self::builtin_shader_cache_fingerprint_for_transition(transition) {
+            Ok(fingerprint) => entry.fingerprint == fingerprint,
+            Err(_) => false,
+        }
+    }
+
+    fn builtin_shader_cache_fingerprint_for_transition(
+        transition: &Transition,
+    ) -> anyhow::Result<u64> {
+        let name = transition.name();
+        let glsl = Self::builtin_shader_source(transition, &name)?;
+        let mapping = Self::builtin_shader_mapping(transition);
+        Ok(Self::builtin_shader_cache_fingerprint(&name, glsl, mapping))
+    }
+
+    fn builtin_shader_cache_fingerprint(name: &str, glsl: &str, mapping: &str) -> u64 {
+        stable_shader_fingerprint(&[name, GLSL_PRELUDE, glsl, mapping])
+    }
+
+    fn builtin_shader_source<'a>(
+        transition: &Transition,
+        name: &'a str,
+    ) -> anyhow::Result<&'static str> {
+        match transition {
+            Transition::Cube { .. } => Ok(CUBE_SAFE_GLSL),
+            Transition::Displacement => Ok(DISPLACEMENT_SAFE_GLSL),
+            Transition::Luma => Self::get_builtin_glsl("fade")
+                .ok_or_else(|| anyhow::anyhow!("Failed to find fallback shader 'fade'")),
+            _ => Self::get_builtin_glsl(name)
+                .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name)),
+        }
+    }
+
+    fn builtin_shader_mapping(transition: &Transition) -> &'static str {
+        match transition {
             Transition::Angular { .. } => "float startingAngle = getFromParams(0);",
             Transition::Bounce { .. } => {
                 "vec4 shadow_colour = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3)); float shadow_height = getFromParams(4); float bounces = getFromParams(5);"
@@ -448,10 +518,6 @@ impl ShaderManager {
             Transition::ButterflyWaveScrawler { .. } => {
                 "float amplitude = getFromParams(0); float waves = getFromParams(1); float colorSeparation = getFromParams(2);"
             }
-            // Actually, ButterflyWaveScrawler.glsl standard is usually `colorSeparation`. Let's guess camelCase to be safe or check?
-            // Most gl-transitions use camelCase. I'll define BOTH to be safe if that works? No, redefinition error.
-            // Let's stick to what we had unless proven wrong (User didn't complain about Butterfly). Use original:
-            // "float amplitude = getFromParams(0); float waves = getFromParams(1); float color_separation = getFromParams(2);"
             Transition::Circle => {
                 "vec2 center = vec2(0.5, 0.5); vec3 backColor = vec3(0.1, 0.1, 0.1);"
             }
@@ -473,7 +539,7 @@ impl ShaderManager {
                 "vec2 center = vec2(0.5); float threshold = 3.0; float fadeEdge = 0.1;"
             }
             Transition::CrossZoom { .. } => "float strength = getFromParams(0);",
-            Transition::CrossWarp => "", // No params usually
+            Transition::CrossWarp => "",
             Transition::Cube { .. } => "",
             Transition::Directional { .. } => {
                 "vec2 direction = vec2(getFromParams(0), getFromParams(1));"
@@ -486,7 +552,7 @@ impl ShaderManager {
             }
             Transition::DirectionalWarp { .. } => {
                 "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);"
-            } // Wait, verify `directionalwarp` uses smoothness? grep said: `uniform float smoothness;`.
+            }
             Transition::DirectionalWipe { .. } => {
                 "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);"
             }
@@ -496,8 +562,7 @@ impl ShaderManager {
             }
             Transition::Doom { .. } => {
                 "int bars = int(getFromParams(0)); float amplitude = getFromParams(1); float noise = getFromParams(2); float frequency = getFromParams(3); float dripScale = getFromParams(4);"
-            } // grep didn't show dripScale name but camelCase is safer guess.
-            // Wait, previous code used `drip_scale`. I'll trust previous code unless I see error.
+            }
             Transition::Doorway { .. } => {
                 "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);"
             }
@@ -528,16 +593,7 @@ impl ShaderManager {
             Transition::LuminanceMelt { .. } => {
                 "bool direction = getFromParams(0) > 0.5; float l_threshold = getFromParams(1); bool above = false;"
             }
-            Transition::Luma => {
-                // FALLBACK: Use fade for now, but ensure it's cached correctly.
-                // Luma crashes without secondary texture in current implementation.
-                let name = transition.name();
-                let glsl = Self::get_builtin_glsl("fade")
-                    .ok_or_else(|| anyhow::anyhow!("Failed to find fallback shader 'fade'"))?;
-                let wgsl = Self::compile_glsl("fade", glsl, "")?;
-                WGSL_CACHE.lock().insert(name.to_lowercase(), wgsl.clone());
-                return Ok(wgsl);
-            }
+            Transition::Luma => "",
             Transition::Morph { .. } => "float strength = getFromParams(0);",
             Transition::Mosaic { .. } => {
                 "int endx = int(getFromParams(0)); int endy = int(getFromParams(1));"
@@ -615,18 +671,12 @@ impl ShaderManager {
             Transition::ZoomLeftWipe { .. } | Transition::ZoomRightWipe { .. } => {
                 "float zoom_quickness = getFromParams(0);"
             }
-            Transition::Overexposure => "float strength = getFromParams(0);",
+            Transition::Overexposure => "float strength = 0.6;",
             Transition::SquaresWire { .. } => {
                 "ivec2 squares = ivec2(int(getFromParams(0)), int(getFromParams(1))); vec2 direction = vec2(getFromParams(2), getFromParams(3)); float smoothness = getFromParams(4);"
             }
             _ => "",
-        };
-
-        let wgsl = Self::compile_glsl(&name, glsl, mapping)?;
-
-        // Store in process-wide cache (P-21)
-        WGSL_CACHE.lock().insert(name, wgsl.clone());
-        Ok(wgsl)
+        }
     }
 
     pub fn get_builtin_glsl(name: &str) -> Option<&'static str> {
@@ -750,7 +800,7 @@ impl ShaderManager {
 
 #[cfg(test)]
 mod tests {
-    use super::ShaderManager;
+    use super::{CachedWgslEntry, ShaderManager};
     use kaleidux_common::Transition;
 
     #[test]
@@ -768,6 +818,40 @@ mod tests {
             failures.is_empty(),
             "builtin transition shader failures:\n{}",
             failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn stale_cache_entry_is_rejected() {
+        let transition = Transition::Fade;
+        let fingerprint =
+            ShaderManager::builtin_shader_cache_fingerprint_for_transition(&transition)
+                .expect("fade fingerprint should be available");
+
+        let matching = CachedWgslEntry {
+            fingerprint,
+            wgsl: "cached".to_string(),
+        };
+        let stale = CachedWgslEntry {
+            fingerprint: fingerprint ^ 1,
+            wgsl: "cached".to_string(),
+        };
+
+        assert!(ShaderManager::cache_entry_matches_transition(
+            &transition,
+            &matching
+        ));
+        assert!(!ShaderManager::cache_entry_matches_transition(
+            &transition,
+            &stale
+        ));
+    }
+
+    #[test]
+    fn overexposure_uses_shader_default_strength() {
+        assert_eq!(
+            ShaderManager::builtin_shader_mapping(&Transition::Overexposure),
+            "float strength = 0.6;"
         );
     }
 }

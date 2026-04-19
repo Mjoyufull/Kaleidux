@@ -604,13 +604,47 @@ impl Clone for VideoFrameFormat {
                 uv_fd,
                 uv_stride,
                 uv_offset,
-            } => Self::DmaBufNv12 {
-                y_fd: dup_plane_fd_for_clone(y_fd),
-                y_stride: *y_stride,
-                y_offset: *y_offset,
-                uv_fd: dup_plane_fd_for_clone(uv_fd),
-                uv_stride: *uv_stride,
-                uv_offset: *uv_offset,
+            } => match (dup_plane_fd_for_clone(y_fd), dup_plane_fd_for_clone(uv_fd)) {
+                (Some(y_fd), Some(uv_fd)) => Self::DmaBufNv12 {
+                    y_fd,
+                    y_stride: *y_stride,
+                    y_offset: *y_offset,
+                    uv_fd,
+                    uv_stride: *uv_stride,
+                    uv_offset: *uv_offset,
+                },
+                (Some(y_fd), None) => {
+                    drop(y_fd);
+                    tracing::warn!(
+                        "[VIDEO] Falling back to CPU NV12 clone after UV DMA-BUF fd duplication failed"
+                    );
+                    Self::Nv12 {
+                        y_stride: *y_stride,
+                        uv_offset: *uv_offset,
+                        uv_stride: *uv_stride,
+                    }
+                }
+                (None, Some(uv_fd)) => {
+                    drop(uv_fd);
+                    tracing::warn!(
+                        "[VIDEO] Falling back to CPU NV12 clone after Y DMA-BUF fd duplication failed"
+                    );
+                    Self::Nv12 {
+                        y_stride: *y_stride,
+                        uv_offset: *uv_offset,
+                        uv_stride: *uv_stride,
+                    }
+                }
+                (None, None) => {
+                    tracing::warn!(
+                        "[VIDEO] Falling back to CPU NV12 clone after DMA-BUF fd duplication failed"
+                    );
+                    Self::Nv12 {
+                        y_stride: *y_stride,
+                        uv_offset: *uv_offset,
+                        uv_stride: *uv_stride,
+                    }
+                }
             },
         }
     }
@@ -846,13 +880,17 @@ fn dup_dma_fd(raw: std::os::unix::io::RawFd) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(duped) })
 }
 
-fn dup_plane_fd_for_clone(fd: &OwnedFd) -> OwnedFd {
-    fd.try_clone().unwrap_or_else(|e| {
-        dup_dma_fd(fd.as_raw_fd()).unwrap_or_else(|| {
-            tracing::error!("[VIDEO] plane fd clone failed (try_clone err: {e})");
-            panic!("failed to duplicate DMA-BUF plane fd for clone");
-        })
-    })
+fn dup_plane_fd_for_clone(fd: &OwnedFd) -> Option<OwnedFd> {
+    match fd.try_clone() {
+        Ok(cloned) => Some(cloned),
+        Err(e) => {
+            let duplicated = dup_dma_fd(fd.as_raw_fd());
+            if duplicated.is_none() {
+                tracing::warn!("[VIDEO] plane fd clone failed: {e}");
+            }
+            duplicated
+        }
+    }
 }
 
 /// Extract DMA-BUF file descriptors and plane info from an NV12 GStreamer buffer.
@@ -889,10 +927,7 @@ fn extract_dmabuf_nv12(
             y_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
             uv_mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>(),
         ) {
-            match (
-                dup_dma_fd(y_dmabuf.fd()),
-                dup_dma_fd(uv_dmabuf.fd()),
-            ) {
+            match (dup_dma_fd(y_dmabuf.fd()), dup_dma_fd(uv_dmabuf.fd())) {
                 (Some(y_fd), Some(uv_fd)) => {
                     return VideoFrameFormat::DmaBufNv12 {
                         y_fd,
@@ -905,14 +940,20 @@ fn extract_dmabuf_nv12(
                 }
                 (Some(y_fd), None) => {
                     drop(y_fd);
-                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                    tracing::warn!(
+                        "[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path"
+                    );
                 }
                 (None, Some(uv_fd)) => {
                     drop(uv_fd);
-                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                    tracing::warn!(
+                        "[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path"
+                    );
                 }
                 (None, None) => {
-                    tracing::warn!("[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path");
+                    tracing::warn!(
+                        "[VIDEO] dup failed for dual-plane DMA-BUF, falling back to CPU path"
+                    );
                 }
             }
         }
@@ -921,7 +962,9 @@ fn extract_dmabuf_nv12(
         let mem = buffer.peek_memory(0);
         if let Some(dmabuf) = mem.downcast_memory_ref::<gst_alloc::DmaBufMemory>() {
             let Some(y_fd) = dup_dma_fd(dmabuf.fd()) else {
-                tracing::warn!("[VIDEO] dup failed for single-plane DMA-BUF, falling back to CPU path");
+                tracing::warn!(
+                    "[VIDEO] dup failed for single-plane DMA-BUF, falling back to CPU path"
+                );
                 return VideoFrameFormat::Nv12 {
                     y_stride: strides[0] as u32,
                     uv_offset: offsets[1] as u32,

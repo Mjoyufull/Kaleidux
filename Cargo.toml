@@ -9,6 +9,7 @@ resolver = "2"
 [workspace.package]
 version = "0.0.1-kneecap"
 edition = "2024"
+rust-version = "1.89"
 authors = ["Mjoyufull"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/Mjoyufull/Kaleidux"
