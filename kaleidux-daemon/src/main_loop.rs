@@ -29,7 +29,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -1013,7 +1013,7 @@ impl MainLoopContext {
             self.metrics
                 .record_frame_channel_size(frames_received + self.latest_video_frames.occupancy());
             if frames_discarded > 0 || superseded_source_discards > 0 {
-                debug!(
+                trace!(
                     "[VIDEO] Discarded {} frames (stale_session={}, superseded_by_newer_same_source={})",
                     frames_discarded + superseded_source_discards,
                     stale_session_discards,

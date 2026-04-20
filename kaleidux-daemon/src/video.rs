@@ -22,6 +22,7 @@ pub enum VideoMode {
 static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
 static VIDEO_CAPABILITIES: once_cell::sync::Lazy<parking_lot::Mutex<Option<VideoCapabilities>>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+static CPU_VIDEO_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 const NVCODEC_DECODER_FACTORIES: [&str; 5] =
     ["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec"];
@@ -335,6 +336,36 @@ mod tests {
     fn positive_volume_keeps_audio_pipeline() {
         assert!(audio_enabled_for_volume(0.01));
         assert_eq!(playbin_flags_for_volume(0.01), "video+audio");
+    }
+
+    #[test]
+    fn cpu_video_path_warning_triggers_for_auto_i420() {
+        assert!(should_warn_about_cpu_video_path(
+            VideoMode::Auto,
+            &VideoFrameFormat::I420 {
+                y_stride: 1,
+                u_offset: 2,
+                u_stride: 3,
+                v_offset: 4,
+                v_stride: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn cpu_video_path_warning_skips_for_forced_cpu_modes() {
+        assert!(!should_warn_about_cpu_video_path(
+            VideoMode::ForceNv12,
+            &VideoFrameFormat::Nv12 {
+                y_stride: 1,
+                uv_offset: 2,
+                uv_stride: 3,
+            }
+        ));
+        assert!(!should_warn_about_cpu_video_path(
+            VideoMode::ForceRgba,
+            &VideoFrameFormat::Rgba
+        ));
     }
 
     #[test]
@@ -1563,16 +1594,40 @@ pub fn frame_decode_path_label(frame: &VideoFrame) -> &'static str {
     }
 }
 
+fn should_warn_about_cpu_video_path(mode: VideoMode, format: &VideoFrameFormat) -> bool {
+    matches!(
+        (mode, format),
+        (
+            VideoMode::Auto | VideoMode::StrictCuda | VideoMode::ForceDmaBuf,
+            VideoFrameFormat::Nv12 { .. } | VideoFrameFormat::I420 { .. } | VideoFrameFormat::Rgba
+        )
+    )
+}
+
 fn maybe_log_decode_path(source_id: &str, frame: &VideoFrame, logged: &AtomicBool) {
     if !logged.swap(true, Ordering::SeqCst) {
+        let actual_path = frame_decode_path_label(frame);
         info!(
             "[VIDEO] {}: Actual decode path={} frame={}x{} session={}",
-            source_id,
-            frame_decode_path_label(frame),
-            frame.width,
-            frame.height,
-            frame.session_id
+            source_id, actual_path, frame.width, frame.height, frame.session_id
         );
+
+        let requested_mode = get_video_mode();
+        if should_warn_about_cpu_video_path(requested_mode, &frame.format)
+            && !CPU_VIDEO_FALLBACK_WARNED.swap(true, Ordering::SeqCst)
+        {
+            let capabilities = current_video_capabilities();
+            warn!(
+                "[VIDEO] {}: Falling back to CPU video path (actual={} requested_mode={} nvidia_driver={} vaapi={:?} nvcodec={:?} cuda_elements={:?}); this usually means hardware decode/zero-copy is unavailable and can cause high CPU usage",
+                source_id,
+                actual_path,
+                requested_mode.cli_label(),
+                capabilities.has_nvidia_driver,
+                capabilities.vaapi_decoders,
+                capabilities.nvcodec_decoders,
+                capabilities.cuda_elements
+            );
+        }
     }
 }
 

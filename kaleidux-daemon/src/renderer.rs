@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use wayland_client::QueueHandle;
 use wgpu::{Adapter, Device, Instance, Queue, Surface, SurfaceConfiguration};
 
@@ -1872,7 +1872,7 @@ impl Renderer {
                 let elapsed = frame_time.saturating_duration_since(start).as_secs_f32();
                 let new_progress = (elapsed / self.transition_duration).min(1.0);
                 if new_progress != self.transition_progress {
-                    debug!(
+                    trace!(
                         "[TRANSITION] {}: Progress updated {:.3} -> {:.3} (elapsed={:.3}s, duration={:.3}s)",
                         self.name,
                         self.transition_progress,
