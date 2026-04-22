@@ -481,9 +481,9 @@ impl SmartQueue {
         Ok((files, ct_cache))
     }
 
-    /// Look up a path's ContentType from the in-memory cache (no file I/O fallback).
-    /// All files in the pool are pre-cached during discover_content, so a miss
-    /// means the file was added after discovery (handled on next refresh).
+    /// Look up a path's ContentType from the in-memory cache first.
+    /// On a cache miss this falls back to `Self::get_content_type(path)`, which
+    /// may open and read the file to detect its media type.
     fn cached_content_type(&self, path: &Path) -> Option<ContentType> {
         self.content_type_cache
             .get(path)

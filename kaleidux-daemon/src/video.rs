@@ -77,7 +77,7 @@ pub fn set_video_mode(mode: VideoMode) {
 
 pub fn get_video_mode() -> VideoMode {
     match VIDEO_MODE.load(Ordering::SeqCst) {
-        1 | 2 => VideoMode::StrictCuda,
+        1 => VideoMode::StrictCuda,
         3 => VideoMode::ForceDmaBuf,
         4 => VideoMode::ForceNv12,
         5 => VideoMode::ForceRgba,
@@ -95,6 +95,23 @@ fn playbin_flags_for_volume(volume: f64) -> &'static str {
     } else {
         "video"
     }
+}
+
+fn build_video_uri(uri: &str) -> anyhow::Result<String> {
+    if uri.contains("://") {
+        return Ok(uri.to_string());
+    }
+
+    let path = std::path::Path::new(uri);
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    gst::glib::filename_to_uri(&abs_path, None)
+        .map(|uri| uri.to_string())
+        .map_err(anyhow::Error::from)
 }
 
 fn should_abort_appsink_sample(
@@ -336,6 +353,40 @@ mod tests {
     fn positive_volume_keeps_audio_pipeline() {
         assert!(audio_enabled_for_volume(0.01));
         assert_eq!(playbin_flags_for_volume(0.01), "video+audio");
+    }
+
+    #[test]
+    fn local_video_paths_are_percent_encoded_in_file_uris() {
+        let uri = build_video_uri("/tmp/video clip #1?.mp4").expect("uri should be built");
+        assert_eq!(uri, "file:///tmp/video%20clip%20%231%3F.mp4");
+    }
+
+    #[test]
+    fn dmabuf_try_clone_preserves_dmabuf_format() {
+        let y_file = std::fs::File::open("/dev/null").expect("should open /dev/null");
+        let uv_file = std::fs::File::open("/dev/null").expect("should open /dev/null");
+        let y_fd: OwnedFd = y_file.into();
+        let uv_fd: OwnedFd = uv_file.into();
+        let original_y = y_fd.as_raw_fd();
+        let original_uv = uv_fd.as_raw_fd();
+
+        let format = VideoFrameFormat::DmaBufNv12 {
+            y_fd,
+            y_stride: 64,
+            y_offset: 0,
+            uv_fd,
+            uv_stride: 64,
+            uv_offset: 128,
+        };
+
+        let cloned = format.try_clone().expect("dma-buf clone should succeed");
+        match cloned {
+            VideoFrameFormat::DmaBufNv12 { y_fd, uv_fd, .. } => {
+                assert_ne!(y_fd.as_raw_fd(), original_y);
+                assert_ne!(uv_fd.as_raw_fd(), original_uv);
+            }
+            other => panic!("expected DMA-BUF clone, got {:?}", other),
+        }
     }
 
     #[test]
@@ -593,41 +644,41 @@ pub enum VideoFrameFormat {
     },
 }
 
-impl Clone for VideoFrameFormat {
-    fn clone(&self) -> Self {
+impl VideoFrameFormat {
+    pub fn try_clone(&self) -> Option<Self> {
         match self {
-            Self::Rgba => Self::Rgba,
+            Self::Rgba => Some(Self::Rgba),
             Self::Nv12 {
                 y_stride,
                 uv_offset,
                 uv_stride,
-            } => Self::Nv12 {
+            } => Some(Self::Nv12 {
                 y_stride: *y_stride,
                 uv_offset: *uv_offset,
                 uv_stride: *uv_stride,
-            },
+            }),
             Self::CudaNv12 {
                 y_stride,
                 uv_offset,
                 uv_stride,
-            } => Self::CudaNv12 {
+            } => Some(Self::CudaNv12 {
                 y_stride: *y_stride,
                 uv_offset: *uv_offset,
                 uv_stride: *uv_stride,
-            },
+            }),
             Self::I420 {
                 y_stride,
                 u_offset,
                 u_stride,
                 v_offset,
                 v_stride,
-            } => Self::I420 {
+            } => Some(Self::I420 {
                 y_stride: *y_stride,
                 u_offset: *u_offset,
                 u_stride: *u_stride,
                 v_offset: *v_offset,
                 v_stride: *v_stride,
-            },
+            }),
             Self::DmaBufNv12 {
                 y_fd,
                 y_stride,
@@ -635,55 +686,24 @@ impl Clone for VideoFrameFormat {
                 uv_fd,
                 uv_stride,
                 uv_offset,
-            } => match (dup_plane_fd_for_clone(y_fd), dup_plane_fd_for_clone(uv_fd)) {
-                (Some(y_fd), Some(uv_fd)) => Self::DmaBufNv12 {
+            } => {
+                let y_fd = dup_plane_fd_for_clone(y_fd)?;
+                let uv_fd = dup_plane_fd_for_clone(uv_fd)?;
+                Some(Self::DmaBufNv12 {
                     y_fd,
                     y_stride: *y_stride,
                     y_offset: *y_offset,
                     uv_fd,
                     uv_stride: *uv_stride,
                     uv_offset: *uv_offset,
-                },
-                (Some(y_fd), None) => {
-                    drop(y_fd);
-                    tracing::warn!(
-                        "[VIDEO] Falling back to CPU NV12 clone after UV DMA-BUF fd duplication failed"
-                    );
-                    Self::Nv12 {
-                        y_stride: *y_stride,
-                        uv_offset: *uv_offset,
-                        uv_stride: *uv_stride,
-                    }
-                }
-                (None, Some(uv_fd)) => {
-                    drop(uv_fd);
-                    tracing::warn!(
-                        "[VIDEO] Falling back to CPU NV12 clone after Y DMA-BUF fd duplication failed"
-                    );
-                    Self::Nv12 {
-                        y_stride: *y_stride,
-                        uv_offset: *uv_offset,
-                        uv_stride: *uv_stride,
-                    }
-                }
-                (None, None) => {
-                    tracing::warn!(
-                        "[VIDEO] Falling back to CPU NV12 clone after DMA-BUF fd duplication failed"
-                    );
-                    Self::Nv12 {
-                        y_stride: *y_stride,
-                        uv_offset: *uv_offset,
-                        uv_stride: *uv_stride,
-                    }
-                }
-            },
+                })
+            }
         }
     }
 }
 
 /// Video frame carrying pixel data in RGBA or planar YUV formats.
 /// Uses gst::Buffer to avoid copying data.
-#[derive(Clone)]
 pub struct VideoFrame {
     pub buffer: gst::Buffer,
     pub width: u32,
@@ -691,6 +711,20 @@ pub struct VideoFrame {
     pub stride: u32,
     pub format: VideoFrameFormat,
     pub session_id: u64,
+}
+
+impl VideoFrame {
+    #[allow(dead_code)]
+    pub fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            buffer: self.buffer.clone(),
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            format: self.format.try_clone()?,
+            session_id: self.session_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1085,18 +1119,7 @@ impl VideoPlayer {
             .build()?;
 
         // Set the URI
-        let full_uri = if uri.contains("://") {
-            uri.to_string()
-        } else {
-            // Convert local path to file:// URI
-            let path = std::path::Path::new(uri);
-            let abs_path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(path)
-            };
-            format!("file://{}", abs_path.display())
-        };
+        let full_uri = build_video_uri(uri)?;
 
         info!("Setting video URI: {}", full_uri);
         pipeline.set_property("uri", &full_uri);

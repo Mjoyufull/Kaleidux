@@ -1,3 +1,4 @@
+use crate::background::{self, BackgroundWorkKind};
 use crate::cache::FileCache;
 use crate::metrics::PerformanceMetrics;
 use crate::orchestration::{Config, MonitorBehavior, OutputConfig};
@@ -222,7 +223,17 @@ impl OutputOrchestrator {
     pub fn pick_prev(&mut self) -> Option<(PathBuf, crate::queue::ContentType)> {
         if let Some(queue) = &mut self.queue {
             if let Some(path) = queue.pick_prev() {
-                let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+                let content_type = match crate::queue::SmartQueue::get_content_type(&path) {
+                    Some(content_type) => content_type,
+                    None => {
+                        warn!(
+                            "[PICK] {}: Could not determine content type for previous path: {}",
+                            self._name,
+                            path.display()
+                        );
+                        return None;
+                    }
+                };
                 self.current_path = Some(path.clone());
                 // Reset display start time - will be set when content actually starts displaying
                 self.display_start_time = None;
@@ -239,7 +250,17 @@ impl OutputOrchestrator {
         path: PathBuf,
     ) -> Option<(PathBuf, crate::queue::ContentType)> {
         info!("[PICK] {}: Selected path: {:?}", self._name, path);
-        let content_type = crate::queue::SmartQueue::get_content_type(&path).unwrap();
+        let content_type = match crate::queue::SmartQueue::get_content_type(&path) {
+            Some(content_type) => content_type,
+            None => {
+                warn!(
+                    "[PICK] {}: Skipping selected path with unknown content type: {}",
+                    self._name,
+                    path.display()
+                );
+                return None;
+            }
+        };
         self.current_path = Some(path.clone());
         self.display_start_time = None;
         self.next_change = Some(Instant::now() + content_load_timeout(self.cycle_duration()));
@@ -286,7 +307,7 @@ impl MonitorManager {
             || old.default_playlist != new.default_playlist
     }
 
-    fn build_refreshed_queue(
+    fn build_refreshed_queue_sync(
         cache: Arc<FileCache>,
         metrics: Option<Arc<PerformanceMetrics>>,
         name: &str,
@@ -347,6 +368,58 @@ impl MonitorManager {
         }
     }
 
+    fn build_refreshed_queue(
+        cache: Arc<FileCache>,
+        metrics: Option<Arc<PerformanceMetrics>>,
+        name: &str,
+        output_config: &OutputConfig,
+    ) -> Option<SmartQueue> {
+        let name_owned = name.to_string();
+        let output_config_owned = output_config.clone();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                let cache_for_spawn = cache.clone();
+                let metrics_for_spawn = metrics.clone();
+                let name_for_spawn = name_owned.clone();
+                let config_for_spawn = output_config_owned.clone();
+
+                match background::spawn_blocking_tracked(
+                    BackgroundWorkKind::QueueDiscovery,
+                    move || {
+                        Self::build_refreshed_queue_sync(
+                            cache_for_spawn,
+                            metrics_for_spawn,
+                            &name_for_spawn,
+                            &config_for_spawn,
+                        )
+                    },
+                ) {
+                    Some(join_handle) => match handle.block_on(join_handle) {
+                        Ok(queue) => queue,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CONFIG] Queue refresh worker failed for {}: {}",
+                                name_owned,
+                                e
+                            );
+                            None
+                        }
+                    },
+                    None => Self::build_refreshed_queue_sync(
+                        cache,
+                        metrics,
+                        &name_owned,
+                        &output_config_owned,
+                    ),
+                }
+            }),
+            Err(_) => {
+                Self::build_refreshed_queue_sync(cache, metrics, &name_owned, &output_config_owned)
+            }
+        }
+    }
+
     fn flush_queue_stats(queue: &mut SmartQueue, label: &str) {
         if let Err(e) = queue.flush_stats() {
             tracing::warn!("[CONFIG] Failed to flush queue stats for {}: {}", label, e);
@@ -359,6 +432,142 @@ impl MonitorManager {
         orch.next_content_type = None;
         orch.display_start_time = None;
         orch.next_change = None;
+    }
+
+    fn flush_all_queue_stats(&mut self) {
+        for (name, orch) in &mut self.outputs {
+            if let Some(queue) = &mut orch.queue {
+                Self::flush_queue_stats(queue, name);
+            }
+        }
+        if let Some(queue) = &mut self.shared_queue {
+            Self::flush_queue_stats(queue, "synchronized queue");
+        }
+        for (gid, queue) in &mut self.group_queues {
+            Self::flush_queue_stats(queue, &format!("group queue {}", gid));
+        }
+    }
+
+    fn rebuild_all_queues_for_behavior_change(
+        &mut self,
+        updated_configs: &HashMap<String, OutputConfig>,
+    ) {
+        let cache = self.cache.clone();
+        let metrics = self.metrics.clone();
+        let mut output_names: Vec<String> = updated_configs.keys().cloned().collect();
+        output_names.sort();
+
+        self.flush_all_queue_stats();
+        self.shared_queue = None;
+        self.group_queues.clear();
+        self.output_groups.clear();
+        self.shared_display_start_time = None;
+        self.group_display_start_times.clear();
+
+        match &self.config.global.monitor_behavior {
+            MonitorBehavior::Independent => {
+                for name in &output_names {
+                    if let Some(orch) = self.outputs.get_mut(name) {
+                        let output_config = updated_configs
+                            .get(name)
+                            .expect("updated config should exist for output");
+                        orch.queue = Self::build_refreshed_queue(
+                            cache.clone(),
+                            metrics.clone(),
+                            name,
+                            output_config,
+                        );
+                        Self::reset_output_after_queue_refresh(orch);
+                        tracing::info!(
+                            "[CONFIG] {}: Monitor behavior changed to independent; queue rebuilt",
+                            name
+                        );
+                    }
+                }
+            }
+            MonitorBehavior::Synchronized => {
+                if let Some(representative_name) = output_names.first() {
+                    let representative_config = updated_configs
+                        .get(representative_name)
+                        .expect("updated config should exist for synchronized output");
+                    self.shared_queue = Self::build_refreshed_queue(
+                        cache.clone(),
+                        metrics.clone(),
+                        representative_name,
+                        representative_config,
+                    );
+                }
+
+                for name in &output_names {
+                    if let Some(orch) = self.outputs.get_mut(name) {
+                        orch.queue = None;
+                        Self::reset_output_after_queue_refresh(orch);
+                        tracing::info!(
+                            "[CONFIG] {}: Monitor behavior changed to synchronized; shared queue rebuilt",
+                            name
+                        );
+                    }
+                }
+            }
+            MonitorBehavior::Grouped(groups) => {
+                for name in &output_names {
+                    if let Some(gid) = groups
+                        .iter()
+                        .position(|group| group.iter().any(|member| member == name))
+                    {
+                        self.output_groups.insert(name.clone(), gid);
+                    }
+                }
+
+                for (gid, group) in groups.iter().enumerate() {
+                    let Some(representative_name) = group
+                        .iter()
+                        .find(|name| updated_configs.contains_key(*name))
+                    else {
+                        continue;
+                    };
+                    let representative_config = updated_configs
+                        .get(representative_name)
+                        .expect("updated config should exist for grouped output");
+                    if let Some(queue) = Self::build_refreshed_queue(
+                        cache.clone(),
+                        metrics.clone(),
+                        representative_name,
+                        representative_config,
+                    ) {
+                        self.group_queues.insert(gid, queue);
+                    }
+                }
+
+                for name in &output_names {
+                    if let Some(orch) = self.outputs.get_mut(name) {
+                        if self.output_groups.contains_key(name) {
+                            orch.queue = None;
+                            Self::reset_output_after_queue_refresh(orch);
+                            tracing::info!(
+                                "[CONFIG] {}: Monitor behavior changed to grouped; group queue rebuilt",
+                                name
+                            );
+                        } else {
+                            let output_config = updated_configs
+                                .get(name)
+                                .expect("updated config should exist for output");
+                            orch.queue = Self::build_refreshed_queue(
+                                cache.clone(),
+                                metrics.clone(),
+                                name,
+                                output_config,
+                            );
+                            Self::reset_output_after_queue_refresh(orch);
+                            tracing::info!(
+                                "[CONFIG] {}: Monitor behavior changed to grouped; output remains independent",
+                                name
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn first_changed_name<'a>(
@@ -413,11 +622,13 @@ impl MonitorManager {
 
     #[allow(dead_code)]
     pub fn update_config(&mut self, config: Config) {
+        let previous_behavior = self.config.global.monitor_behavior.clone();
         self.config = config;
         let cache = self.cache.clone();
         let metrics = self.metrics.clone();
         let mut updated_configs = HashMap::new();
         let mut changed_names = Vec::new();
+        let behavior_changed = previous_behavior != self.config.global.monitor_behavior;
 
         for (name, orch) in &self.outputs {
             let output_config = self.config.get_config_for_output(name, &orch.description);
@@ -427,6 +638,17 @@ impl MonitorManager {
             updated_configs.insert(name.clone(), output_config);
         }
         changed_names.sort();
+
+        if behavior_changed {
+            self.rebuild_all_queues_for_behavior_change(&updated_configs);
+            for (name, orch) in &mut self.outputs {
+                let output_config = updated_configs
+                    .remove(name)
+                    .expect("updated config should exist for every output");
+                orch.apply_config(output_config);
+            }
+            return;
+        }
 
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
@@ -1762,14 +1984,14 @@ mod tests {
     ) -> Config {
         let mut outputs = HashMap::new();
         outputs.insert(name.to_string(), output_partial(config));
-        Config {
-            global: crate::orchestration::GlobalConfig {
+        Config::from_parts(
+            crate::orchestration::GlobalConfig {
                 monitor_behavior,
                 ..Default::default()
             },
-            any: PartialOutputConfig::default(),
+            PartialOutputConfig::default(),
             outputs,
-        }
+        )
     }
 
     fn config_for_output(name: &str, config: &OutputConfig) -> Config {
@@ -1786,6 +2008,36 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("test dir should be created");
         dir
+    }
+
+    #[test]
+    fn apply_selected_path_skips_unknown_content_type_without_mutating_state() {
+        let temp = unique_test_dir("unknown-content");
+        let path = temp.join("mystery.bin");
+        std::fs::write(&path, b"short").expect("test file should be written");
+
+        let mut orch = OutputOrchestrator {
+            _name: "DP-1".to_string(),
+            description: "DisplayPort-1".to_string(),
+            config: test_output_config(Duration::from_secs(60)),
+            queue: None,
+            current_path: Some(PathBuf::from("/tmp/original")),
+            next_path: Some(PathBuf::from("/tmp/next")),
+            next_content_type: Some(crate::queue::ContentType::Image),
+            next_change: Some(Instant::now()),
+            display_start_time: Some(Instant::now()),
+            phase_offset: Duration::ZERO,
+        };
+
+        assert!(orch.apply_selected_path(path).is_none());
+        assert_eq!(orch.current_path, Some(PathBuf::from("/tmp/original")));
+        assert_eq!(orch.next_path, Some(PathBuf::from("/tmp/next")));
+        assert_eq!(
+            orch.next_content_type,
+            Some(crate::queue::ContentType::Image)
+        );
+        assert!(orch.display_start_time.is_some());
+        assert!(orch.next_change.is_some());
     }
 
     fn write_test_image(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -2240,5 +2492,125 @@ mod tests {
         assert!(orch.current_path.is_none());
         assert!(orch.display_start_time.is_none());
         assert!(orch.next_change.is_none());
+    }
+
+    #[test]
+    fn update_config_switches_from_synchronized_to_independent() {
+        let temp = unique_test_dir("sync-to-independent");
+        let cache = Arc::new(
+            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
+        );
+        let path = temp.join("wallpapers");
+        std::fs::create_dir_all(&path).expect("wallpaper dir should be created");
+        let first = write_test_image(&path, "a.png");
+        let second = write_test_image(&path, "b.png");
+        cache
+            .set_cached_pool(&path, &[first.clone(), second.clone()])
+            .expect("cached pool should be stored");
+
+        let mut output_config = test_output_config(Duration::from_secs(60));
+        output_config.path = Some(path.clone());
+        let shared_queue = make_test_queue(
+            cache.clone(),
+            &path,
+            vec![first.clone(), second.clone()],
+            &output_config,
+        );
+        let orch = OutputOrchestrator {
+            _name: "DP-1".to_string(),
+            description: "DisplayPort-1".to_string(),
+            phase_offset: independent_phase_offset("DP-1", output_config.duration),
+            config: output_config.clone(),
+            queue: None,
+            current_path: Some(first),
+            next_path: Some(second),
+            next_content_type: Some(crate::queue::ContentType::Image),
+            next_change: Some(Instant::now()),
+            display_start_time: Some(Instant::now()),
+        };
+        let mut manager = make_test_manager(
+            "DP-1",
+            cache.clone(),
+            orch,
+            config_for_output_with_behavior("DP-1", &output_config, MonitorBehavior::Synchronized),
+        );
+        manager.shared_queue = Some(shared_queue);
+        manager.shared_display_start_time = Some(Instant::now());
+
+        manager.update_config(config_for_output_with_behavior(
+            "DP-1",
+            &output_config,
+            MonitorBehavior::Independent,
+        ));
+
+        assert!(manager.shared_queue.is_none());
+        assert!(manager.group_queues.is_empty());
+        let orch = manager.outputs.get("DP-1").expect("output should exist");
+        assert!(
+            orch.queue.is_some(),
+            "independent mode should rebuild per-output queue"
+        );
+        assert!(orch.current_path.is_none());
+        assert!(orch.next_path.is_none());
+        assert!(orch.display_start_time.is_none());
+    }
+
+    #[test]
+    fn update_config_switches_from_independent_to_synchronized() {
+        let temp = unique_test_dir("independent-to-sync");
+        let cache = Arc::new(
+            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
+        );
+        let path = temp.join("wallpapers");
+        std::fs::create_dir_all(&path).expect("wallpaper dir should be created");
+        let first = write_test_image(&path, "a.png");
+        let second = write_test_image(&path, "b.png");
+        cache
+            .set_cached_pool(&path, &[first.clone(), second.clone()])
+            .expect("cached pool should be stored");
+
+        let mut output_config = test_output_config(Duration::from_secs(60));
+        output_config.path = Some(path.clone());
+        let queue = make_test_queue(
+            cache.clone(),
+            &path,
+            vec![first.clone(), second.clone()],
+            &output_config,
+        );
+        let orch = OutputOrchestrator {
+            _name: "DP-1".to_string(),
+            description: "DisplayPort-1".to_string(),
+            phase_offset: independent_phase_offset("DP-1", output_config.duration),
+            config: output_config.clone(),
+            queue: Some(queue),
+            current_path: Some(first),
+            next_path: Some(second),
+            next_content_type: Some(crate::queue::ContentType::Image),
+            next_change: Some(Instant::now()),
+            display_start_time: Some(Instant::now()),
+        };
+        let mut manager = make_test_manager(
+            "DP-1",
+            cache.clone(),
+            orch,
+            config_for_output("DP-1", &output_config),
+        );
+
+        manager.update_config(config_for_output_with_behavior(
+            "DP-1",
+            &output_config,
+            MonitorBehavior::Synchronized,
+        ));
+
+        assert!(
+            manager.shared_queue.is_some(),
+            "synchronized mode should rebuild shared queue"
+        );
+        assert!(manager.group_queues.is_empty());
+        let orch = manager.outputs.get("DP-1").expect("output should exist");
+        assert!(orch.queue.is_none());
+        assert!(orch.current_path.is_none());
+        assert!(orch.next_path.is_none());
+        assert!(orch.display_start_time.is_none());
     }
 }

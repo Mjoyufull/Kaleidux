@@ -156,8 +156,7 @@ pub async fn run(
 
     let x11_fd = {
         use std::os::unix::io::AsRawFd;
-        tokio::io::unix::AsyncFd::new(backend.conn.as_raw_fd())
-            .expect("Failed to create AsyncFd for X11 connection")
+        tokio::io::unix::AsyncFd::new(backend.conn.as_raw_fd())?
     };
 
     loop {
@@ -184,32 +183,38 @@ pub async fn run(
 
         // ─── X11 event polling ──────────────────────────────────────────
 
-        while let Ok(maybe_event) = backend.conn.poll_for_event() {
-            if let Some(event) = maybe_event {
-                use x11rb::protocol::Event;
-                match event {
-                    Event::ConfigureNotify(ev) => {
-                        if let Some(name) = window_to_renderer.get(&ev.window) {
-                            if let Some(r) = ctx.renderers.get_mut(name) {
-                                let _ = r.resize_checked(ev.width as u32, ev.height as u32);
+        loop {
+            match backend.conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    use x11rb::protocol::Event;
+                    match event {
+                        Event::ConfigureNotify(ev) => {
+                            if let Some(name) = window_to_renderer.get(&ev.window) {
+                                if let Some(r) = ctx.renderers.get_mut(name) {
+                                    let _ = r.resize_checked(ev.width as u32, ev.height as u32);
+                                }
                             }
                         }
-                    }
-                    Event::Expose(ev) => {
-                        if let Some(name) = window_to_renderer.get(&ev.window) {
-                            if let Some(r) = ctx.renderers.get_mut(name) {
-                                r.needs_redraw = true;
+                        Event::Expose(ev) => {
+                            if let Some(name) = window_to_renderer.get(&ev.window) {
+                                if let Some(r) = ctx.renderers.get_mut(name) {
+                                    r.needs_redraw = true;
+                                }
                             }
                         }
+                        Event::RandrNotify(_) | Event::RandrScreenChangeNotify(_) => {
+                            debug!("[X11] RandR event received, marking monitors dirty");
+                            backend.monitors_dirty.store(true, Ordering::SeqCst);
+                        }
+                        _ => {}
                     }
-                    Event::RandrNotify(_) | Event::RandrScreenChangeNotify(_) => {
-                        debug!("[X11] RandR event received, marking monitors dirty");
-                        backend.monitors_dirty.store(true, Ordering::SeqCst);
-                    }
-                    _ => {}
                 }
-            } else {
-                break;
+                Ok(None) => break,
+                Err(err) => {
+                    error!("[X11] Connection error while polling events: {}", err);
+                    ctx.shutdown().await;
+                    return Err(err.into());
+                }
             }
         }
 

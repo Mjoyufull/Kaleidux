@@ -93,6 +93,14 @@ pub struct Config {
     pub any: PartialOutputConfig,
     #[serde(flatten)]
     pub outputs: HashMap<String, PartialOutputConfig>,
+    #[serde(skip)]
+    regex_outputs: Vec<RegexOutputOverride>,
+}
+
+#[derive(Debug, Clone)]
+struct RegexOutputOverride {
+    regex: Regex,
+    config: PartialOutputConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -244,6 +252,67 @@ pub struct PartialOutputConfig {
 }
 
 impl Config {
+    fn compile_regex_outputs(
+        outputs: &HashMap<String, PartialOutputConfig>,
+    ) -> Vec<RegexOutputOverride> {
+        let mut regex_outputs: Vec<_> = outputs
+            .iter()
+            .filter_map(|(key, config)| {
+                key.strip_prefix("re:")
+                    .map(|pattern| (key.clone(), pattern.to_string(), config.clone()))
+            })
+            .collect();
+        regex_outputs.sort_by(|left, right| left.0.cmp(&right.0));
+
+        regex_outputs
+            .into_iter()
+            .filter_map(|(key, pattern, config)| match Regex::new(&pattern) {
+                Ok(regex) => Some(RegexOutputOverride { regex, config }),
+                Err(e) => {
+                    tracing::warn!(
+                        "[CONFIG] Ignoring invalid regex output override [{}]: {}",
+                        key,
+                        e
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn matching_regex_output(&self, description: &str) -> Option<PartialOutputConfig> {
+        if let Some(entry) = self
+            .regex_outputs
+            .iter()
+            .find(|entry| entry.regex.is_match(description))
+        {
+            return Some(entry.config.clone());
+        }
+
+        if self.regex_outputs.is_empty() {
+            return Self::compile_regex_outputs(&self.outputs)
+                .into_iter()
+                .find(|entry| entry.regex.is_match(description))
+                .map(|entry| entry.config);
+        }
+
+        None
+    }
+
+    pub(crate) fn from_parts(
+        global: GlobalConfig,
+        any: PartialOutputConfig,
+        outputs: HashMap<String, PartialOutputConfig>,
+    ) -> Self {
+        let regex_outputs = Self::compile_regex_outputs(&outputs);
+        Self {
+            global,
+            any,
+            outputs,
+            regex_outputs,
+        }
+    }
+
     pub(crate) fn parse_str(content: &str) -> Result<Self> {
         let table: toml::Table =
             toml::from_str(content).with_context(|| "Failed to parse config TOML")?;
@@ -292,12 +361,7 @@ impl Config {
         }
 
         tracing::info!("Loaded config with {} output overrides", outputs.len());
-
-        Ok(Config {
-            global,
-            any,
-            outputs,
-        })
+        Ok(Self::from_parts(global, any, outputs))
     }
 
     pub async fn load() -> Result<Self> {
@@ -336,22 +400,14 @@ impl Config {
         final_config.merge(&self.any);
 
         // 3. Exact output names override regex matches.
-        let mut matched = self.outputs.get(name);
-        if matched.is_none() {
-            for (key, val) in &self.outputs {
-                if let Some(stripped) = key.strip_prefix("re:") {
-                    if let Ok(re) = Regex::new(stripped) {
-                        if re.is_match(description) {
-                            matched = Some(val);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let matched = self
+            .outputs
+            .get(name)
+            .cloned()
+            .or_else(|| self.matching_regex_output(description));
 
         if let Some(output_val) = matched {
-            final_config.merge(output_val);
+            final_config.merge(&output_val);
         }
 
         final_config.into_output_config()
@@ -540,5 +596,22 @@ mod tests {
         assert_eq!(fallback.transition, Transition::Fade);
         assert_eq!(fallback.transition_time, 400);
         assert_eq!(fallback.sorting, SortingStrategy::Ascending);
+    }
+
+    #[test]
+    fn regex_output_matching_is_lexicographically_deterministic() {
+        let cfg = Config::parse_str(
+            r#"
+            ["re:Primary.*"]
+            volume = 40
+
+            ["re:P.*"]
+            volume = 25
+            "#,
+        )
+        .unwrap();
+
+        let matched = cfg.get_config_for_output("HDMI-A-1", "Primary Display");
+        assert_eq!(matched.volume, 25);
     }
 }

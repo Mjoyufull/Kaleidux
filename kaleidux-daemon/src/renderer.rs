@@ -42,7 +42,8 @@ pub struct TexturePoolEntry {
     last_used: std::time::Instant,
 }
 
-// LRU cache for transition pipelines (P-04: O(1) access via counter-based tracking)
+// LRU cache for transition pipelines. Lookups and access updates are O(1), while
+// eviction scans `access_order` to find the least-recently-used entry.
 pub struct PipelineLRU {
     pipelines: HashMap<String, Arc<wgpu::RenderPipeline>>,
     access_order: HashMap<String, u64>,
@@ -3974,6 +3975,11 @@ impl Renderer {
             if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
                 interop.free_exportable(cuda_cache.y_cuda_alloc);
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
+            } else {
+                warn!(
+                    "[VIDEO] {}: Dropping CUDA texture cache without CUDA interop; exportable allocations will leak until process exit",
+                    self.name
+                );
             }
         }
     }
@@ -4114,6 +4120,11 @@ impl Drop for Renderer {
             if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
                 interop.free_exportable(cuda_cache.y_cuda_alloc);
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
+            } else {
+                warn!(
+                    "[VIDEO] {}: Renderer dropped without CUDA interop; exportable allocations will leak until process exit",
+                    self.name
+                );
             }
         }
         self.nv12_y_texture = None;
