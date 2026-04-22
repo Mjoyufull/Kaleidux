@@ -30,7 +30,9 @@ pub struct TransitionStats {
 
 pub enum BackendContext<'a> {
     Wayland {
+        #[allow(dead_code)]
         surface: &'a LayerSurface,
+        #[allow(dead_code)]
         qh: &'a QueueHandle<crate::wayland::WaylandBackend>,
     },
     X11,
@@ -121,6 +123,7 @@ pub struct WgpuContext {
         parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub blit_bind_group_layout: wgpu::BindGroupLayout,
     pub transition_bind_group_layout: wgpu::BindGroupLayout,
+    #[allow(dead_code)]
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_pipeline: wgpu::RenderPipeline,
@@ -904,6 +907,7 @@ impl WgpuContext {
         pipeline_arc
     }
 
+    #[allow(dead_code)]
     pub fn get_mipmap_pipeline(&self, format: wgpu::TextureFormat) -> Arc<wgpu::RenderPipeline> {
         if let Some(pipe) = self.mipmap_pipelines.lock().get(&format) {
             return pipe.clone();
@@ -1131,11 +1135,13 @@ impl WgpuContext {
 }
 
 struct CudaTextureCache {
+    #[allow(dead_code)]
     y_texture: wgpu::Texture,
     y_view: wgpu::TextureView,
     y_cuda_alloc: crate::cuda_interop::ExportableCudaAllocation,
     y_pitch: usize,
     y_offset: usize,
+    #[allow(dead_code)]
     uv_texture: wgpu::Texture,
     uv_view: wgpu::TextureView,
     uv_cuda_alloc: crate::cuda_interop::ExportableCudaAllocation,
@@ -2491,7 +2497,7 @@ impl Renderer {
     /// This is used to prevent memory leaks by throttling frame uploads when stuck
     pub fn frame_callback_pending_too_long(&self, threshold_ms: u64) -> bool {
         self.frame_callback_pending_duration()
-            .map_or(false, |d| d.as_millis() > threshold_ms as u128)
+            .is_some_and(|d| d.as_millis() > threshold_ms as u128)
     }
 
     #[allow(dead_code)]
@@ -3606,7 +3612,7 @@ impl Renderer {
         let need_new = self
             .cuda_textures
             .as_ref()
-            .map_or(true, |c| c.width != width || c.height != height);
+            .is_none_or(|c| c.width != width || c.height != height);
         if need_new {
             let ci_guard = self.ctx.cuda_interop.lock();
             let ci = ci_guard.as_ref().unwrap();
@@ -4344,10 +4350,7 @@ fn import_dmabuf_as_texture(
         })?
     };
 
-    let hal_texture = match hal_texture {
-        Some(t) => t,
-        None => return None,
-    };
+    let hal_texture = hal_texture?;
 
     // 8. Wrap the HAL texture as a wgpu::Texture
     let wgpu_desc = wgpu::TextureDescriptor {
@@ -4389,12 +4392,7 @@ fn wgpu_format_to_vk(format: wgpu::TextureFormat) -> Option<ash::vk::Format> {
 
 /// Find the lowest-index set bit in a memory type bitmask.
 fn find_memory_type(type_bits: u32) -> Option<u32> {
-    for i in 0..32 {
-        if (type_bits & (1 << i)) != 0 {
-            return Some(i);
-        }
-    }
-    None
+    (0..32).find(|&i| (type_bits & (1 << i)) != 0)
 }
 
 /// Allocate CUDA-exportable memory, import the fd into Vulkan as a LINEAR

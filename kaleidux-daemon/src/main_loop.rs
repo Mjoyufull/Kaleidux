@@ -110,14 +110,14 @@ mod tests {
 
     #[test]
     fn rgb_prep_keeps_source_dimensions_even_when_target_is_smaller() {
-        let rgb = vec![64; 4 * 1 * 3];
+        let rgb = vec![64; 4 * 3];
         let (rgba, width, height, resize, _expand, filter) =
             prepare_rgb_image(rgb, 4, 1, 1, 1).expect("rgb prep should succeed");
 
         assert_eq!((width, height), (4, 1));
         assert_eq!(resize, Duration::ZERO);
         assert_eq!(filter, None);
-        assert_eq!(rgba.len(), 4 * 1 * 4);
+        assert_eq!(rgba.len(), 4 * 4);
     }
 
     #[test]
@@ -555,10 +555,10 @@ fn startup_barrier_release_candidate(
             "all_ready"
         });
     }
-    if let Some(first_ready_at) = barrier.first_ready_at {
-        if now >= first_ready_at + STARTUP_BARRIER_SKEW_RELEASE {
-            return Some("bounded_skew");
-        }
+    if let Some(first_ready_at) = barrier.first_ready_at
+        && now >= first_ready_at + STARTUP_BARRIER_SKEW_RELEASE
+    {
+        return Some("bounded_skew");
     }
     if now >= barrier.armed_at + STARTUP_BARRIER_TIMEOUT {
         return Some("timeout");
@@ -609,7 +609,6 @@ pub struct MainLoopContext {
     pub latest_video_frames: video::LatestFrameMailbox,
 
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<CmdMsg>,
-    pub cmd_tx: tokio::sync::mpsc::UnboundedSender<CmdMsg>,
     pub frame_rx: tokio::sync::mpsc::Receiver<FrameMsg>,
     pub frame_tx: tokio::sync::mpsc::Sender<FrameMsg>,
     pub image_rx: tokio::sync::mpsc::Receiver<LoadedImage>,
@@ -786,7 +785,6 @@ impl MainLoopContext {
             startup_present_barrier: None,
             latest_video_frames,
             cmd_rx,
-            cmd_tx,
             frame_rx,
             frame_tx,
             image_rx,
@@ -2869,8 +2867,8 @@ pub fn switch_wallpaper_content(
             r.active_image_session_id = session_id;
             r.active_video_session_id = 0;
             r.switch_content();
-            let target_width = r.config.width.clone();
-            let target_height = r.config.height.clone();
+            let target_width = r.config.width;
+            let target_height = r.config.height;
 
             let name_clone = name.to_string();
             let path_clone = path.to_path_buf();
@@ -3114,7 +3112,7 @@ fn create_and_start_video_player(
                             return Ok(None);
                         }
                         let prebuffer_start = Instant::now();
-                        let prebuffer = match vp.prebuffer(&should_abort) {
+                        let prebuffer = match vp.prebuffer(should_abort) {
                             Ok(result) => result,
                             Err(e) => {
                                 if should_abort() {

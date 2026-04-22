@@ -24,7 +24,7 @@ fn path_from_redb_key(key: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(key)));
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(key)))
     }
     #[cfg(not(unix))]
     {
@@ -95,20 +95,20 @@ impl FileCache {
         if needs_wipe {
             tracing::info!("[CACHE] Cache version mismatch or missing, wiping database...");
             drop(db);
-            match std::fs::remove_file(&db_path) {
+            match std::fs::remove_file(db_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(e).context("Failed to remove stale cache database before recreate");
                 }
             }
-            if std::fs::metadata(&db_path).is_ok() {
+            if std::fs::metadata(db_path).is_ok() {
                 bail!(
                     "Stale cache file {:?} still exists after remove_file; refusing to recreate to avoid corruption",
                     db_path
                 );
             }
-            db = Database::create(&db_path)?;
+            db = Database::create(db_path)?;
         }
 
         // Initialize tables
@@ -222,10 +222,8 @@ impl FileCache {
                         .into_iter()
                         .filter_map(|b| path_from_redb_key(&b))
                         .collect()
-                } else if let Ok(legacy) = postcard::from_bytes::<Vec<PathBuf>>(bytes) {
-                    legacy
                 } else {
-                    Vec::new()
+                    postcard::from_bytes::<Vec<PathBuf>>(bytes).unwrap_or_default()
                 };
                 Ok(Some(paths))
             }
@@ -233,6 +231,7 @@ impl FileCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_file_valid(&self, path: &Path) -> Result<bool> {
         let metadata = std::fs::metadata(path)?;
         let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
@@ -403,6 +402,7 @@ impl FileCache {
         Ok(blacklist)
     }
 
+    #[allow(dead_code)]
     pub fn set_history(&self, output_name: &str, history: &[PathBuf]) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -414,6 +414,7 @@ impl FileCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_history(&self, output_name: &str) -> Result<Vec<PathBuf>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(HISTORY_TABLE)?;

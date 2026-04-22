@@ -907,14 +907,14 @@ impl BusDispatcher {
 
         self.main_loop.quit();
 
-        if let Some(receiver) = self.finished_rx.lock().take() {
-            if receiver.recv_timeout(timeout).is_err() {
-                warn!(
-                    "[VIDEO] Shared GStreamer bus dispatcher did not exit within {:.1}ms",
-                    timeout.as_secs_f64() * 1000.0
-                );
-                return;
-            }
+        if let Some(receiver) = self.finished_rx.lock().take()
+            && receiver.recv_timeout(timeout).is_err()
+        {
+            warn!(
+                "[VIDEO] Shared GStreamer bus dispatcher did not exit within {:.1}ms",
+                timeout.as_secs_f64() * 1000.0
+            );
+            return;
         }
 
         if let Some(thread) = self.thread.lock().take() {
@@ -1491,22 +1491,22 @@ impl VideoPlayer {
                             return gst::glib::ControlFlow::Break;
                         }
                     }
-                    MessageView::SegmentDone(..) => {
+                    MessageView::SegmentDone(..)
                         if pipeline
                             .seek_simple(gst::SeekFlags::SEGMENT, gst::ClockTime::ZERO)
-                            .is_err()
-                        {
-                            let reason = "failed to restart segment loop".to_string();
-                            let _ = player_event_tx.send(PlayerEvent {
-                                source_id: source_id.to_string(),
-                                session_id,
-                                kind: PlayerEventKind::FatalLifecycle,
-                                reason: reason.clone(),
-                            });
-                            tracing::error!("[VIDEO] {}: {}", source_id, reason);
-                            return gst::glib::ControlFlow::Break;
-                        }
+                            .is_err() =>
+                    {
+                        let reason = "failed to restart segment loop".to_string();
+                        let _ = player_event_tx.send(PlayerEvent {
+                            source_id: source_id.to_string(),
+                            session_id,
+                            kind: PlayerEventKind::FatalLifecycle,
+                            reason: reason.clone(),
+                        });
+                        tracing::error!("[VIDEO] {}: {}", source_id, reason);
+                        return gst::glib::ControlFlow::Break;
                     }
+                    MessageView::SegmentDone(..) => {}
                     MessageView::Error(err) => {
                         let error_msg = format!(
                             "Error from {:?}: {} ({:?})",
@@ -1545,13 +1545,7 @@ impl VideoPlayer {
     }
 
     pub fn appsink_queue_levels(&self) -> Option<AppsinkQueueLevels> {
-        if self
-            .appsink
-            .find_property("current-level-buffers")
-            .is_none()
-        {
-            return None;
-        }
+        self.appsink.find_property("current-level-buffers")?;
 
         Some(AppsinkQueueLevels {
             buffers: self.appsink.property::<u64>("current-level-buffers"),
@@ -1690,10 +1684,8 @@ fn sample_to_video_frame(
             let mut s = [0i32; 4];
             let mut o = [0usize; 4];
             let n_planes = (video_info.n_planes() as usize).min(4);
-            for i in 0..n_planes {
-                s[i] = vi_strides[i];
-                o[i] = vi_offsets[i] as usize;
-            }
+            s[..n_planes].copy_from_slice(&vi_strides[..n_planes]);
+            o[..n_planes].copy_from_slice(&vi_offsets[..n_planes]);
             (s, o)
         }
     };

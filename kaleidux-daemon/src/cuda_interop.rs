@@ -277,7 +277,7 @@ impl CudaInterop {
             }
 
             // Round up to granularity
-            let alloc_size = ((min_size + granularity - 1) / granularity) * granularity;
+            let alloc_size = min_size.div_ceil(granularity) * granularity;
 
             // Create exportable allocation
             let mut handle: CUmemGenericAllocationHandle = 0;

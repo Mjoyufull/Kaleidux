@@ -1,3 +1,10 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::items_after_test_module,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use kaleidux_common::Transition;
 use std::time::Instant;
 use tracing::{error, info, warn};

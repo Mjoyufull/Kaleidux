@@ -368,6 +368,7 @@ impl PerformanceMetrics {
         );
     }
 
+    #[allow(dead_code)]
     pub fn record_image_upload_cpu_time(&self, duration: Duration) {
         Self::push_sample(
             &self.image_upload_samples,
@@ -399,6 +400,7 @@ impl PerformanceMetrics {
     }
 
     /// Get average CPU time per file discovery operation (in ms)
+    #[allow(dead_code)]
     pub fn get_avg_file_discovery_cpu_time_ms(&self) -> f64 {
         let ops = self.file_discovery_ops.load(Ordering::Relaxed);
         if ops == 0 {
@@ -604,6 +606,7 @@ impl PerformanceMetrics {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn get_texture_pool_hit_rate(&self) -> f64 {
         let hits = self.texture_pool_hits.load(Ordering::Relaxed) as f64;
         let misses = self.texture_pool_misses.load(Ordering::Relaxed) as f64;
@@ -611,6 +614,7 @@ impl PerformanceMetrics {
         if total == 0.0 { 0.0 } else { hits / total }
     }
 
+    #[allow(dead_code)]
     pub fn get_cache_hit_rate(&self) -> f64 {
         let hits = self.cache_hits.load(Ordering::Relaxed) as f64;
         let misses = self.cache_misses.load(Ordering::Relaxed) as f64;

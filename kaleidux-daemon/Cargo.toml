@@ -53,9 +53,9 @@ sysinfo = { version = "0.38", features = ["component"] }
 parking_lot = "0.12"
 futures = "0.3"
 notify = { workspace = true }
-nvml-wrapper = "0.10"
-lru = "0.14"
-fast_image_resize = { version = "5", features = ["image"] }
+nvml-wrapper = "0.12"
+lru = "0.17"
+fast_image_resize = { version = "6", features = ["image"] }
 zune-core = "0.5.1"
 zune-jpeg = "0.5.12"
 zune-png = "0.5.2"

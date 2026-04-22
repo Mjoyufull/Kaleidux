@@ -420,10 +420,10 @@ impl ShaderManager {
     pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
         // Use block_in_place to call async version from sync context
         tokio::task::block_in_place(|| -> anyhow::Result<String> {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                if let Ok(result) = handle.block_on(Self::load_external_glsl_async(name)) {
-                    return Ok(result);
-                }
+            if let Ok(handle) = tokio::runtime::Handle::try_current()
+                && let Ok(result) = handle.block_on(Self::load_external_glsl_async(name))
+            {
+                return Ok(result);
             }
             // Fallback to sync if no runtime available
             let config_dir = dirs::config_dir()
@@ -450,10 +450,10 @@ impl ShaderManager {
         let fingerprint = Self::builtin_shader_cache_fingerprint(&name, glsl, mapping);
 
         // Check process-wide cache first (P-21)
-        if let Some(cached) = WGSL_CACHE.lock().get(&name) {
-            if cached.fingerprint == fingerprint {
-                return Ok(cached.wgsl.clone());
-            }
+        if let Some(cached) = WGSL_CACHE.lock().get(&name)
+            && cached.fingerprint == fingerprint
+        {
+            return Ok(cached.wgsl.clone());
         }
 
         // Note: We use getFromParams(i) which handles the aligned vec4 array access
@@ -491,10 +491,7 @@ impl ShaderManager {
         stable_shader_fingerprint(&[name, GLSL_PRELUDE, glsl, mapping])
     }
 
-    fn builtin_shader_source<'a>(
-        transition: &Transition,
-        name: &'a str,
-    ) -> anyhow::Result<&'static str> {
+    fn builtin_shader_source(transition: &Transition, name: &str) -> anyhow::Result<&'static str> {
         match transition {
             Transition::Cube { .. } => Ok(CUBE_SAFE_GLSL),
             Transition::Displacement => Ok(DISPLACEMENT_SAFE_GLSL),

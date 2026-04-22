@@ -160,9 +160,7 @@ impl OutputOrchestrator {
                 return result;
             }
         } else if self.current_path.is_none() {
-            if self.queue.is_none() {
-                return None;
-            }
+            self.queue.as_ref()?;
             info!(
                 "[TICK] {}: Initial tick - picking first content (queue exists)",
                 self._name
@@ -570,10 +568,10 @@ impl MonitorManager {
         }
     }
 
-    fn first_changed_name<'a>(
-        changed_names: &'a [String],
+    fn first_changed_name(
+        changed_names: &[String],
         predicate: impl Fn(&str) -> bool,
-    ) -> Option<&'a str> {
+    ) -> Option<&str> {
         changed_names
             .iter()
             .find(|name| predicate(name))

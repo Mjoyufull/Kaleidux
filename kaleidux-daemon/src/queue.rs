@@ -1042,10 +1042,7 @@ impl SmartQueue {
     }
 
     pub fn love_file(&mut self, path: PathBuf, multiplier: f32) -> Result<()> {
-        let stat = self
-            .stats
-            .files
-            .get_or_insert_mut(path, || FileStats::default());
+        let stat = self.stats.files.get_or_insert_mut(path, FileStats::default);
         stat.love_multiplier = multiplier;
         self.save_stats()
     }
