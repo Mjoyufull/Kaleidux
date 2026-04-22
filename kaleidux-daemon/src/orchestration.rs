@@ -228,8 +228,7 @@ fn canonical_transition_tag(name: &str) -> Option<String> {
         .as_str()?
         .to_string();
 
-    if canonical == "fade" && normalized != "fade" {
-        None
+    if canonical == "Fade" && normalized != "fade" {
     } else {
         Some(canonical)
     }
