@@ -38,6 +38,51 @@ use zune_core::options::DecoderOptions;
 // Limit to 2 concurrent decodes since each can be 35-40MB
 static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(2)));
+
+async fn read_ipc_request_line(
+    stream: &mut tokio::net::UnixStream,
+    max_message_size: usize,
+) -> Option<String> {
+    let mut message = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &chunk[..n];
+                let bytes_to_take = chunk.iter().position(|&b| b == b'\n').unwrap_or(n);
+                if message.len() + bytes_to_take > max_message_size {
+                    warn!(
+                        "[IPC] Dropping oversized request (>{} bytes) from control socket",
+                        max_message_size
+                    );
+                    return None;
+                }
+                message.extend_from_slice(&chunk[..bytes_to_take]);
+                if bytes_to_take != n {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("[IPC] Failed reading request from control socket: {}", e);
+                return None;
+            }
+        }
+    }
+
+    if message.is_empty() {
+        return None;
+    }
+
+    match String::from_utf8(message) {
+        Ok(message) => Some(message),
+        Err(e) => {
+            warn!("[IPC] Received non-UTF8 request on control socket: {}", e);
+            None
+        }
+    }
+}
 static IMAGE_PREFETCH_IN_FLIGHT: once_cell::sync::Lazy<Arc<Mutex<HashSet<PathBuf>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(HashSet::new())));
 
@@ -729,23 +774,21 @@ impl MainLoopContext {
                     let cmd_tx = cmd_tx_clone.clone();
                     tokio::spawn(async move {
                         const MAX_MESSAGE_SIZE: usize = 8192;
-                        let mut temp_buf = [0u8; MAX_MESSAGE_SIZE];
-                        if let Ok(n) = stream.read(&mut temp_buf).await {
-                            if n == 0 || n >= MAX_MESSAGE_SIZE {
-                                return;
-                            }
-                            if let Ok(req_str) = std::str::from_utf8(&temp_buf[..n]) {
-                                if let Ok(req) = serde_json::from_str::<Request>(req_str.trim()) {
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    if cmd_tx.send((req, resp_tx)).is_ok() {
-                                        if let Ok(response) = resp_rx.await {
-                                            if let Ok(json) = serde_json::to_string(&response) {
-                                                let _ = stream.write_all(json.as_bytes()).await;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        let Some(req_str) =
+                            read_ipc_request_line(&mut stream, MAX_MESSAGE_SIZE).await
+                        else {
+                            return;
+                        };
+                        let Ok(req) = serde_json::from_str::<Request>(req_str.trim()) else {
+                            warn!("[IPC] Failed to parse control request JSON");
+                            return;
+                        };
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        if cmd_tx.send((req, resp_tx)).is_ok()
+                            && let Ok(response) = resp_rx.await
+                            && let Ok(json) = serde_json::to_string(&response)
+                        {
+                            let _ = stream.write_all(json.as_bytes()).await;
                         }
                     });
                 }

@@ -312,13 +312,17 @@ impl MonitorManager {
         output_config: &OutputConfig,
     ) -> Option<SmartQueue> {
         let path = output_config.path.as_ref()?;
-        let blacklist = cache.get_all_blacklisted().unwrap_or_else(|e| {
-            tracing::warn!(
-                "[CONFIG] Failed to read blacklist while refreshing queue: {}",
-                e
-            );
-            HashSet::new()
-        });
+        let blacklist = match cache.get_all_blacklisted() {
+            Ok(blacklist) => blacklist,
+            Err(e) => {
+                tracing::error!(
+                    "[CONFIG] Failed to read blacklist while refreshing queue for {}: {}",
+                    name,
+                    e
+                );
+                return None;
+            }
+        };
         let mut pool = cache
             .get_cached_pool(path)
             .ok()

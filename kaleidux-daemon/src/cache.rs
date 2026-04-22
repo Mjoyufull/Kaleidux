@@ -223,7 +223,18 @@ impl FileCache {
                         .filter_map(|b| path_from_redb_key(&b))
                         .collect()
                 } else {
-                    postcard::from_bytes::<Vec<PathBuf>>(bytes).unwrap_or_default()
+                    match postcard::from_bytes::<Vec<PathBuf>>(bytes) {
+                        Ok(legacy) => legacy,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[CACHE] Failed to deserialize cached pool entry for {:?} ({} bytes): {}",
+                                dir,
+                                bytes.len(),
+                                e
+                            );
+                            Vec::new()
+                        }
+                    }
                 };
                 Ok(Some(paths))
             }

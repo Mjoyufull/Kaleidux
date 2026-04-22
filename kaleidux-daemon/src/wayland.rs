@@ -288,7 +288,8 @@ impl LayerShellHandler for WaylandBackend {
             "Layer surface CLOSED by compositor for output: {}. Surface will be re-created if output still exists.",
             name
         );
-        self.surfaces.retain(|_, s| s != layer_surface);
+        self.surfaces
+            .retain(|_, s| s.wl_surface() != layer_surface.wl_surface());
     }
     fn configure(
         &mut self,
