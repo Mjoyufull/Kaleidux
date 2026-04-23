@@ -1771,7 +1771,7 @@ impl Renderer {
 
     pub fn render(
         &mut self,
-        _context: BackendContext,
+        context: BackendContext,
         _frame_time: std::time::Instant,
     ) -> anyhow::Result<()> {
         let render_start = std::time::Instant::now();
@@ -2163,13 +2163,45 @@ impl Renderer {
         let blit_source = match blit_source {
             Some(s) => s,
             None => {
-                // No textures available - can't render, but keep needs_redraw for next attempt
                 debug!(
                     "[RENDER] {}: No blit source available (current={}, prev={})",
                     self.name,
                     self.current_texture.is_some(),
                     self.prev_texture.is_some()
                 );
+
+                if matches!(context, BackendContext::X11) {
+                    // On X11, leaving the acquired surface unpresented here can wedge that
+                    // output into repeated acquisition timeouts. Present an explicit black
+                    // frame so startup stays black instead of white and the swapchain keeps
+                    // advancing until real content arrives.
+                    {
+                        let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Black Frame Render Pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                    }
+
+                    self.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    output.present();
+                    self.last_present_time = std::time::Instant::now();
+                    self.needs_redraw = false;
+
+                    if let Some(m) = &self.metrics {
+                        m.record_renderer_cpu_time(render_start.elapsed());
+                    }
+                }
+
                 return Ok(());
             }
         };

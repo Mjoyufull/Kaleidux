@@ -124,7 +124,7 @@ Usage: kaleidux-daemon [OPTIONS]
 Options:
       --demo              Run in demo mode (rotating built-in shaders)
       --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
-      --video-mode <MODE> Force video decode path: auto, cuda, DMA-BUF, nv12, rgba
+      --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
   -h, --help              Show help
 ```
 
@@ -181,7 +181,7 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **High CPU during video**: Use a zero-copy path when possible. On AMD/Intel, the daemon auto-detects and prefers DMA-BUF when the driver stack exposes it. On NVIDIA, driver/toolkit limitations do not reliably expose DMA-BUF automatically, so use `--video-mode cuda` to force the CUDA zero-copy path. If no zero-copy path is available, video falls back to NV12 or RGBA CPU upload.
+- **High CPU during video**: Use a zero-copy path when possible. On AMD/Intel, the daemon auto-detects and prefers DMA-BUF when the driver stack exposes it. On NVIDIA, driver/toolkit limitations do not reliably expose DMA-BUF automatically, so use `--video-mode cuda` to force the CUDA zero-copy path. Use `--video-mode cpu` only when you intentionally want software decode or system-memory uploads for debugging or compatibility; it disables the zero-copy ladder and can raise CPU load substantially.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
 ## Contributing

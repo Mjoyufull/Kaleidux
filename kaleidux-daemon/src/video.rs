@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 pub enum VideoMode {
     Auto,
     StrictCuda,
+    ForceCpu,
     ForceDmaBuf,
     ForceNv12,
     ForceRgba,
@@ -56,6 +57,7 @@ impl VideoMode {
         match self {
             Self::Auto => "auto",
             Self::StrictCuda => "cuda",
+            Self::ForceCpu => "cpu",
             Self::ForceDmaBuf => "dmabuf",
             Self::ForceNv12 => "nv12",
             Self::ForceRgba => "rgba",
@@ -67,6 +69,7 @@ pub fn set_video_mode(mode: VideoMode) {
     let val = match mode {
         VideoMode::Auto => 0,
         VideoMode::StrictCuda => 1,
+        VideoMode::ForceCpu => 2,
         VideoMode::ForceDmaBuf => 3,
         VideoMode::ForceNv12 => 4,
         VideoMode::ForceRgba => 5,
@@ -78,6 +81,7 @@ pub fn set_video_mode(mode: VideoMode) {
 pub fn get_video_mode() -> VideoMode {
     match VIDEO_MODE.load(Ordering::SeqCst) {
         1 => VideoMode::StrictCuda,
+        2 => VideoMode::ForceCpu,
         3 => VideoMode::ForceDmaBuf,
         4 => VideoMode::ForceNv12,
         5 => VideoMode::ForceRgba,
@@ -199,6 +203,7 @@ pub fn current_video_capabilities() -> VideoCapabilities {
 fn caps_ladder_for_mode(mode: VideoMode, capabilities: &VideoCapabilities) -> Vec<gst::Caps> {
     match mode {
         VideoMode::ForceRgba => vec![rgba_caps()],
+        VideoMode::ForceCpu => vec![nv12_caps(), i420_caps(), rgba_caps()],
         VideoMode::ForceNv12 => vec![nv12_caps()],
         VideoMode::ForceDmaBuf => vec![dmabuf_nv12_caps()],
         VideoMode::StrictCuda => vec![cuda_nv12_caps()],
@@ -219,6 +224,7 @@ fn caps_ladder_for_mode(mode: VideoMode, capabilities: &VideoCapabilities) -> Ve
 pub fn caps_ladder_labels(mode: VideoMode, capabilities: &VideoCapabilities) -> Vec<&'static str> {
     match mode {
         VideoMode::ForceRgba => vec!["RGBA"],
+        VideoMode::ForceCpu => vec!["NV12", "I420", "RGBA"],
         VideoMode::ForceNv12 => vec!["NV12"],
         VideoMode::ForceDmaBuf => vec!["DMABuf NV12"],
         VideoMode::StrictCuda => vec!["CUDAMemory NV12"],
@@ -406,6 +412,16 @@ mod tests {
     #[test]
     fn cpu_video_path_warning_skips_for_forced_cpu_modes() {
         assert!(!should_warn_about_cpu_video_path(
+            VideoMode::ForceCpu,
+            &VideoFrameFormat::I420 {
+                y_stride: 1,
+                u_offset: 2,
+                u_stride: 3,
+                v_offset: 4,
+                v_stride: 5,
+            }
+        ));
+        assert!(!should_warn_about_cpu_video_path(
             VideoMode::ForceNv12,
             &VideoFrameFormat::Nv12 {
                 y_stride: 1,
@@ -482,6 +498,19 @@ mod tests {
         assert!(caps_text.contains("format=(string)NV12"));
         assert!(!caps_text.contains("I420"));
         assert!(!caps_text.contains("RGBA"));
+    }
+
+    #[test]
+    fn force_cpu_caps_exclude_zero_copy_formats() {
+        init_gst_for_tests();
+        let caps_text =
+            build_video_sink_caps(VideoMode::ForceCpu, &VideoCapabilities::default()).to_string();
+
+        assert!(caps_text.contains("format=(string)NV12"));
+        assert!(caps_text.contains("format=(string)I420"));
+        assert!(caps_text.contains("format=(string)RGBA"));
+        assert!(!caps_text.contains("memory:CUDAMemory"));
+        assert!(!caps_text.contains("memory:DMABuf"));
     }
 
     #[test]
@@ -578,6 +607,31 @@ mod tests {
 /// shim (nvidia-vaapi-driver, which cannot export DMA-BUF).
 pub fn configure_hw_decoders() {
     let capabilities = refresh_video_capabilities();
+    let mode = get_video_mode();
+
+    if matches!(mode, VideoMode::ForceCpu) {
+        let mut demoted_nvcodec = Vec::new();
+        for name in NVCODEC_DECODER_FACTORIES {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(gst::Rank::MARGINAL);
+                demoted_nvcodec.push(name);
+            }
+        }
+
+        let mut demoted_vaapi = Vec::new();
+        for name in VAAPI_DECODER_FACTORIES {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(gst::Rank::MARGINAL);
+                demoted_vaapi.push(name);
+            }
+        }
+
+        info!(
+            "[VIDEO] CPU mode requested: demoted hardware decoders nvcodec {:?}, vaapi {:?}; software decode/system-memory formats will be preferred when available",
+            demoted_nvcodec, demoted_vaapi
+        );
+        return;
+    }
 
     if capabilities.has_nvidia_driver {
         let mut boosted = Vec::new();
@@ -934,10 +988,10 @@ fn dup_dma_fd(raw: std::os::unix::io::RawFd) -> Option<OwnedFd> {
     if raw < 0 {
         return None;
     }
-    let duped = unsafe { libc::dup(raw) };
+    let duped = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
     if duped < 0 {
         tracing::warn!(
-            "[VIDEO] dup_dma_fd: libc::dup failed: {}",
+            "[VIDEO] dup_dma_fd: F_DUPFD_CLOEXEC failed: {}",
             std::io::Error::last_os_error()
         );
         return None;

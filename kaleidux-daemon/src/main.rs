@@ -151,13 +151,14 @@ async fn async_main() -> anyhow::Result<()> {
         let deprecated_dmabuf_alias = mode_str.eq_ignore_ascii_case("zero-copy");
         let mode = match mode_str.to_lowercase().as_str() {
             "cuda" | "nvdec" | "nvidia" | "cuda-strict" => crate::video::VideoMode::StrictCuda,
+            "cpu" => crate::video::VideoMode::ForceCpu,
             "dmabuf" | "dma-buf" | "zero-copy" => crate::video::VideoMode::ForceDmaBuf,
             "nv12" => crate::video::VideoMode::ForceNv12,
             "rgba" => crate::video::VideoMode::ForceRgba,
             "auto" => crate::video::VideoMode::Auto,
             other => {
                 let msg = format!(
-                    "ERROR: Unknown --video-mode '{}', valid: auto, cuda, cuda-strict, dmabuf, nv12, rgba",
+                    "ERROR: Unknown --video-mode '{}', valid: auto, cpu, cuda, cuda-strict, dmabuf, nv12, rgba",
                     other
                 );
                 eprintln!("{}", msg);

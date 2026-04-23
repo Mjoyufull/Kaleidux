@@ -185,7 +185,8 @@ impl X11Backend {
         // REMOVED override_redirect(1) to let WM handle stacking (keeping it below apps)
         let win_aux = CreateWindowAux::new()
             .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY)
-            .background_pixel(screen.white_pixel);
+            // Keep startup black until the renderer presents real content.
+            .background_pixel(screen.black_pixel);
 
         self.conn.create_window(
             x11rb::COPY_DEPTH_FROM_PARENT,
