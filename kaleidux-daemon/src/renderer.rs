@@ -3914,21 +3914,26 @@ impl Renderer {
         let frame_size = frame.buffer.size();
         let min_y_bytes = y_stride as usize * height as usize;
         let min_uv_bytes = uv_stride as usize * uv_height as usize;
+        let expected_uv_offset_floor = min_y_bytes;
         if y_stride < width
             || uv_stride < uv_width.saturating_mul(2)
             || min_y_bytes > frame_size
             || (uv_offset as usize) > frame_size
             || (uv_offset as usize).saturating_add(min_uv_bytes) > frame_size
+            || (uv_offset as usize) < expected_uv_offset_floor
+            || (y_stride & 1) != 0
+            || (uv_stride & 1) != 0
         {
             warn!(
-                "[VIDEO] {}: Rejecting CUDA NV12 layout and falling back to CPU upload: frame={}x{} size={} y_stride={} uv_offset={} uv_stride={}",
+                "[VIDEO] {}: Rejecting CUDA NV12 layout and falling back to CPU upload: frame={}x{} size={} y_stride={} uv_offset={} uv_stride={} min_uv_offset={}",
                 self.name,
                 width,
                 height,
                 frame_size,
                 y_stride,
                 uv_offset,
-                uv_stride
+                uv_stride,
+                expected_uv_offset_floor
             );
             return false;
         }
