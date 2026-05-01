@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use jwalk::WalkDir;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -670,6 +671,54 @@ impl SmartQueue {
         None
     }
 
+    /// Return a bounded list of upcoming image candidates without mutating queue state.
+    ///
+    /// For sequential queues this walks the future pool order directly, which is good
+    /// enough for prefetch even when video/image ratio may insert videos between them.
+    /// For Loveit, this returns the highest-weight image candidates under the current
+    /// recency/loveit model. Random remains intentionally conservative.
+    pub fn peek_upcoming_images(&self, limit: usize) -> Vec<PathBuf> {
+        if limit == 0 || self.pool.is_empty() {
+            return Vec::new();
+        }
+
+        match self.strategy {
+            crate::orchestration::SortingStrategy::Ascending
+            | crate::orchestration::SortingStrategy::Descending => {
+                let descending = matches!(
+                    self.strategy,
+                    crate::orchestration::SortingStrategy::Descending
+                );
+                let mut idx = self.current_index.min(self.pool.len().saturating_sub(1));
+                let mut seen = HashSet::new();
+                let mut upcoming = Vec::with_capacity(limit.min(self.pool.len()));
+
+                for _ in 0..self.pool.len() {
+                    let candidate = &self.pool[idx];
+                    if matches!(
+                        self.cached_content_type(candidate),
+                        Some(ContentType::Image)
+                    ) && seen.insert(candidate.clone())
+                    {
+                        upcoming.push(candidate.clone());
+                        if upcoming.len() >= limit {
+                            break;
+                        }
+                    }
+                    idx = self.advance_index(idx, descending);
+                }
+
+                upcoming
+            }
+            crate::orchestration::SortingStrategy::Loveit => self.peek_loveit_images(limit),
+            crate::orchestration::SortingStrategy::Random => self
+                .peek_next()
+                .filter(|(_, content_type)| *content_type == ContentType::Image)
+                .map(|(path, _)| vec![path])
+                .unwrap_or_default(),
+        }
+    }
+
     #[inline]
     pub fn pick_prev(&mut self) -> Option<PathBuf> {
         if self.pool.is_empty() {
@@ -812,27 +861,7 @@ impl SmartQueue {
         let now = Utc::now();
 
         for path in &active_pool {
-            let stat = self.stats.files.peek(*path).cloned().unwrap_or_default();
-
-            // Score = LoveMultiplier / (1 + Count) * RecencyFactor
-            let count_score = 100.0 / (stat.count as f32 + 1.0);
-
-            let recency_factor = if let Some(last) = stat.last_seen {
-                let hours_since = (now - last).num_hours() as f32;
-                // Favor items not seen in a long time
-                (hours_since / 24.0).clamp(1.0, 10.0)
-            } else {
-                10.0 // Never seen is high priority
-            };
-
-            let love_weight = if stat.love_multiplier > 0.0 {
-                stat.love_multiplier
-            } else {
-                1.0
-            };
-
-            let weight = count_score * recency_factor * love_weight;
-            weights.push(weight);
+            weights.push(self.loveit_weight_for_path(path, now));
         }
 
         let total_weight: f32 = weights.iter().sum();
@@ -846,6 +875,48 @@ impl SmartQueue {
         }
 
         Some(active_pool[0].clone())
+    }
+
+    fn loveit_weight_for_path(&self, path: &PathBuf, now: DateTime<Utc>) -> f32 {
+        let stat = self.stats.files.peek(path).cloned().unwrap_or_default();
+
+        let count_score = 100.0 / (stat.count as f32 + 1.0);
+        let recency_factor = if let Some(last) = stat.last_seen {
+            let hours_since = (now - last).num_hours() as f32;
+            (hours_since / 24.0).clamp(1.0, 10.0)
+        } else {
+            10.0
+        };
+        let love_weight = if stat.love_multiplier > 0.0 {
+            stat.love_multiplier
+        } else {
+            1.0
+        };
+
+        count_score * recency_factor * love_weight
+    }
+
+    fn peek_loveit_images(&self, limit: usize) -> Vec<PathBuf> {
+        let now = Utc::now();
+        let mut weighted_images: Vec<(PathBuf, f32)> = self
+            .pool
+            .iter()
+            .filter(|path| matches!(self.cached_content_type(path), Some(ContentType::Image)))
+            .map(|path| (path.clone(), self.loveit_weight_for_path(path, now)))
+            .collect();
+
+        weighted_images.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+                .then(Ordering::Equal)
+        });
+        weighted_images.truncate(limit);
+        weighted_images
+            .into_iter()
+            .map(|(path, _weight)| path)
+            .collect()
     }
 
     fn choose_cycle_content_type<R: Rng + ?Sized>(&self, rng: &mut R) -> ContentType {
@@ -1260,5 +1331,81 @@ mod tests {
 
         assert_eq!(queue.pick_next(), Some(PathBuf::from("d.mp4")));
         assert_eq!(queue.pick_next(), Some(PathBuf::from("c.mp4")));
+    }
+
+    #[test]
+    fn sequential_peek_upcoming_images_skips_videos_and_wraps() {
+        let img_a = PathBuf::from("a.jpg");
+        let img_b = PathBuf::from("b.jpg");
+        let img_c = PathBuf::from("c.jpg");
+        let vid_a = PathBuf::from("d.mp4");
+        let pool = vec![img_a.clone(), vid_a.clone(), img_b.clone(), img_c.clone()];
+        let content_type_cache = HashMap::from([
+            (img_a.clone(), ContentType::Image),
+            (img_b.clone(), ContentType::Image),
+            (img_c.clone(), ContentType::Image),
+            (vid_a, ContentType::Video),
+        ]);
+        let queue = make_test_queue(
+            pool,
+            crate::orchestration::SortingStrategy::Ascending,
+            50,
+            content_type_cache,
+        );
+
+        assert_eq!(queue.peek_upcoming_images(3), vec![img_a, img_b, img_c]);
+    }
+
+    #[test]
+    fn non_sequential_peek_upcoming_images_returns_no_deterministic_lookahead() {
+        let img = PathBuf::from("a.jpg");
+        let content_type_cache = HashMap::from([(img.clone(), ContentType::Image)]);
+        let queue = make_test_queue(
+            vec![img.clone()],
+            crate::orchestration::SortingStrategy::Random,
+            0,
+            content_type_cache,
+        );
+
+        assert!(queue.peek_upcoming_images(4).is_empty());
+    }
+
+    #[test]
+    fn loveit_peek_upcoming_images_prioritizes_high_weight_images() {
+        let img_a = PathBuf::from("a.jpg");
+        let img_b = PathBuf::from("b.jpg");
+        let img_c = PathBuf::from("c.jpg");
+        let vid_a = PathBuf::from("d.mp4");
+        let content_type_cache = HashMap::from([
+            (img_a.clone(), ContentType::Image),
+            (img_b.clone(), ContentType::Image),
+            (img_c.clone(), ContentType::Image),
+            (vid_a.clone(), ContentType::Video),
+        ]);
+        let mut queue = make_test_queue(
+            vec![img_a.clone(), img_b.clone(), img_c.clone(), vid_a],
+            crate::orchestration::SortingStrategy::Loveit,
+            50,
+            content_type_cache,
+        );
+
+        queue.stats.files.put(
+            img_a.clone(),
+            FileStats {
+                count: 25,
+                last_seen: Some(Utc::now()),
+                love_multiplier: 1.0,
+            },
+        );
+        queue.stats.files.put(
+            img_c.clone(),
+            FileStats {
+                count: 0,
+                last_seen: Some(Utc::now()),
+                love_multiplier: 5.0,
+            },
+        );
+
+        assert_eq!(queue.peek_upcoming_images(2), vec![img_b, img_c]);
     }
 }

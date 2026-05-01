@@ -184,6 +184,16 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 - **High CPU during video**: Use a zero-copy path when possible. On AMD/Intel, the daemon auto-detects and prefers DMA-BUF when the driver stack exposes it. On NVIDIA, driver/toolkit limitations do not reliably expose DMA-BUF automatically, so use `--video-mode cuda` to force the CUDA zero-copy path. Use `--video-mode cpu` only when you intentionally want software decode or system-memory uploads for debugging or compatibility; it disables the zero-copy ladder and can raise CPU load substantially.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
+## Sub-5 Benchmark Harness
+
+Use the in-tree benchmark harness to evaluate architecture changes against the sub-5% process CPU target:
+
+```bash
+bash tools/sub5/run_benchmark.sh three_video_mixed_res kaleidux-daemon-2026-04-26_13-26-27.log
+```
+
+Artifacts are written under `unattended_runs/<date>/sub5_<scenario>/` with machine-readable JSON and a short summary.
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_STANDARDS.md) for guidelines.

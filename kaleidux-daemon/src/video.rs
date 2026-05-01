@@ -3,6 +3,7 @@ use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use libc::uintptr_t;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -24,6 +25,59 @@ static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
 static VIDEO_CAPABILITIES: once_cell::sync::Lazy<parking_lot::Mutex<Option<VideoCapabilities>>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 static CPU_VIDEO_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static CUDA_LAYOUT_LOG_SIGNATURES: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<String, String>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+#[link(name = "gstwayland-1.0")]
+unsafe extern "C" {
+    fn gst_wl_display_handle_context_new(
+        display: *mut std::ffi::c_void,
+    ) -> *mut gst::ffi::GstContext;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoBackendKind {
+    Appsink,
+    WaylandDirect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoBackendRequest {
+    Auto,
+    ForceAppsink,
+    ForceWaylandDirect,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeWaylandVideoTarget {
+    pub output_name: String,
+    pub display_handle: uintptr_t,
+    pub surface_handle: uintptr_t,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl NativeWaylandVideoTarget {
+    pub fn new(
+        output_name: impl Into<String>,
+        display_handle: *mut std::ffi::c_void,
+        surface_handle: *mut std::ffi::c_void,
+    ) -> Self {
+        Self {
+            output_name: output_name.into(),
+            display_handle: display_handle as uintptr_t,
+            surface_handle: surface_handle as uintptr_t,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.width = width.max(1) as i32;
+        self.height = height.max(1) as i32;
+        self
+    }
+}
 
 const NVCODEC_DECODER_FACTORIES: [&str; 5] =
     ["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec"];
@@ -87,6 +141,124 @@ pub fn get_video_mode() -> VideoMode {
         5 => VideoMode::ForceRgba,
         _ => VideoMode::Auto,
     }
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    std::env::var_os(key)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn cuda_layout_log_every_frame_enabled() -> bool {
+    env_flag_enabled("KLD_TRACE_VIDEO_LAYOUT_EVERY_FRAME")
+}
+
+fn prefer_videoinfo_cuda_layout_enabled() -> bool {
+    env_flag_enabled("KLD_CUDA_LAYOUT_PREFER_VIDEOINFO")
+}
+
+fn direct_aspect_mode_value() -> String {
+    std::env::var("KLD_DIRECT_ASPECT_MODE")
+        .unwrap_or_else(|_| "letterbox".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+pub fn native_wayland_backend_enabled() -> bool {
+    if env_flag_enabled("KLD_DISABLE_NATIVE_WAYLAND_VIDEO") {
+        return false;
+    }
+
+    if env_flag_enabled("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO") {
+        return true;
+    }
+
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+fn resolve_backend_request(
+    request: VideoBackendRequest,
+    native_wayland_target: Option<&NativeWaylandVideoTarget>,
+) -> VideoBackendKind {
+    match request {
+        VideoBackendRequest::ForceAppsink => VideoBackendKind::Appsink,
+        VideoBackendRequest::ForceWaylandDirect => {
+            if native_wayland_backend_enabled() && native_wayland_target.is_some() {
+                VideoBackendKind::WaylandDirect
+            } else {
+                VideoBackendKind::Appsink
+            }
+        }
+        VideoBackendRequest::Auto => {
+            if native_wayland_backend_enabled() && native_wayland_target.is_some() {
+                VideoBackendKind::WaylandDirect
+            } else {
+                VideoBackendKind::Appsink
+            }
+        }
+    }
+}
+
+fn maybe_create_wayland_display_context(
+    target: &NativeWaylandVideoTarget,
+) -> anyhow::Result<gst::Context> {
+    if target.display_handle == 0 {
+        anyhow::bail!(
+            "native Wayland target for {} has no display handle",
+            target.output_name
+        );
+    }
+
+    let context = unsafe {
+        gst::glib::translate::from_glib_full(gst_wl_display_handle_context_new(
+            target.display_handle as *mut std::ffi::c_void,
+        ))
+    };
+    Ok(context)
+}
+
+fn apply_native_wayland_target(
+    pipeline: &gst::Element,
+    sink: &gst::Element,
+    target: &NativeWaylandVideoTarget,
+) -> anyhow::Result<()> {
+    let context = maybe_create_wayland_display_context(target)?;
+    pipeline.set_context(&context);
+    sink.set_context(&context);
+
+    let overlay = sink
+        .clone()
+        .dynamic_cast::<gst_video::VideoOverlay>()
+        .map_err(|_| anyhow::anyhow!("waylandsink does not implement GstVideoOverlay"))?;
+
+    unsafe {
+        gst_video::prelude::VideoOverlayExtManual::set_window_handle(
+            &overlay,
+            target.surface_handle,
+        );
+    }
+    gst_video::prelude::VideoOverlayExt::set_render_rectangle(
+        &overlay,
+        0,
+        0,
+        target.width,
+        target.height,
+    )?;
+    debug!(
+        "[VIDEO] {}: Applied direct render rectangle {}x{} on surface=0x{:x}",
+        target.output_name,
+        target.width.max(1),
+        target.height.max(1),
+        target.surface_handle
+    );
+
+    Ok(())
 }
 
 fn audio_enabled_for_volume(volume: f64) -> bool {
@@ -167,6 +339,10 @@ fn cuda_nv12_caps() -> gst::Caps {
         .features(["memory:CUDAMemory"])
         .field("format", "NV12")
         .build()
+}
+
+fn chroma_plane_extent(width: u32, height: u32) -> (u32, u32) {
+    (width.div_ceil(2), height.div_ceil(2))
 }
 
 fn element_factories_available(names: &[&'static str]) -> Vec<&'static str> {
@@ -280,23 +456,6 @@ fn is_nvcodec_decoder_factory(factory_name: &str) -> bool {
     NVCODEC_DECODER_FACTORIES.contains(&factory_name)
 }
 
-fn set_optional_property<T>(
-    element: &gst::Element,
-    property_name: &str,
-    value: T,
-    applied: &mut Vec<&'static str>,
-    applied_label: &'static str,
-) where
-    T: Clone + Send + Sync + 'static + gst::glib::value::ToValue,
-{
-    if element.find_property(property_name).is_none() {
-        return;
-    }
-
-    element.set_property(property_name, &value);
-    applied.push(applied_label);
-}
-
 fn configure_decoder_element(source_id: &str, element: &gst::Element) {
     let Some(factory_name) = element.factory().map(|factory| factory.name().to_string()) else {
         return;
@@ -306,35 +465,10 @@ fn configure_decoder_element(source_id: &str, element: &gst::Element) {
         return;
     }
 
-    let mut applied = Vec::new();
-    set_optional_property(
-        element,
-        "max-display-delay",
-        0i32,
-        &mut applied,
-        "max-display-delay=0",
+    debug!(
+        "[VIDEO] {}: Keeping decoder {} on default scheduling/presentation settings",
+        source_id, factory_name
     );
-    set_optional_property(
-        element,
-        "num-output-surfaces",
-        1u32,
-        &mut applied,
-        "num-output-surfaces=1",
-    );
-
-    if applied.is_empty() {
-        info!(
-            "[VIDEO] {}: Decoder tuning {} -> no supported low-latency properties",
-            source_id, factory_name
-        );
-    } else {
-        info!(
-            "[VIDEO] {}: Decoder tuning {} -> {}",
-            source_id,
-            factory_name,
-            applied.join(", ")
-        );
-    }
 }
 
 #[cfg(test)]
@@ -540,6 +674,79 @@ mod tests {
         assert!(!caps_text.contains("format=(string)RGBA"));
     }
 
+    fn with_video_env_test_lock<T>(test: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+            once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("env test lock should not be poisoned");
+        test()
+    }
+
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe { std::env::remove_var(key) }
+    }
+
+    #[test]
+    fn native_wayland_backend_is_enabled_by_default_on_wayland() {
+        with_video_env_test_lock(|| {
+            let old_disable = std::env::var_os("KLD_DISABLE_NATIVE_WAYLAND_VIDEO");
+            let old_experimental = std::env::var_os("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO");
+            let old_wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+
+            remove_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO");
+            remove_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO");
+            set_env_var("WAYLAND_DISPLAY", "wayland-test-0");
+
+            assert!(native_wayland_backend_enabled());
+
+            match old_disable {
+                Some(value) => set_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO", value),
+                None => remove_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO"),
+            }
+            match old_experimental {
+                Some(value) => set_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO", value),
+                None => remove_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO"),
+            }
+            match old_wayland_display {
+                Some(value) => set_env_var("WAYLAND_DISPLAY", value),
+                None => remove_env_var("WAYLAND_DISPLAY"),
+            }
+        });
+    }
+
+    #[test]
+    fn disable_flag_overrides_default_wayland_direct_backend() {
+        with_video_env_test_lock(|| {
+            let old_disable = std::env::var_os("KLD_DISABLE_NATIVE_WAYLAND_VIDEO");
+            let old_experimental = std::env::var_os("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO");
+            let old_wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+
+            set_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO", "1");
+            remove_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO");
+            set_env_var("WAYLAND_DISPLAY", "wayland-test-0");
+
+            assert!(!native_wayland_backend_enabled());
+
+            match old_disable {
+                Some(value) => set_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO", value),
+                None => remove_env_var("KLD_DISABLE_NATIVE_WAYLAND_VIDEO"),
+            }
+            match old_experimental {
+                Some(value) => set_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO", value),
+                None => remove_env_var("KLD_EXPERIMENTAL_NATIVE_WAYLAND_VIDEO"),
+            }
+            match old_wayland_display {
+                Some(value) => set_env_var("WAYLAND_DISPLAY", value),
+                None => remove_env_var("WAYLAND_DISPLAY"),
+            }
+        });
+    }
+
     fn dummy_frame(session_id: u64) -> VideoFrame {
         init_gst_for_tests();
         let buffer = gst::Buffer::with_size(4).expect("buffer allocation should succeed");
@@ -550,22 +757,20 @@ mod tests {
             stride: 4,
             format: VideoFrameFormat::Rgba,
             session_id,
+            pts_ns: None,
+            duration_ns: None,
         }
     }
 
     #[test]
     fn latest_frame_mailbox_coalesces_same_source_frames() {
         let mailbox = LatestFrameMailbox::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
 
-        mailbox.publish_frame("DP-2", dummy_frame(1), &tx);
-        mailbox.publish_frame("DP-2", dummy_frame(2), &tx);
+        mailbox.publish_frame("DP-2", dummy_frame(1));
+        mailbox.publish_frame("DP-2", dummy_frame(2));
 
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(FrameSignal::Ready(source)) if source == "DP-2"
-        ));
-        assert!(rx.try_recv().is_err());
+        assert!(mailbox.has_signal_pending());
+        assert_eq!(mailbox.pending_sources(), vec!["DP-2".to_string()]);
         assert_eq!(mailbox.take_overwrite_count(), 1);
         assert_eq!(
             mailbox
@@ -579,18 +784,15 @@ mod tests {
     #[test]
     fn latest_frame_mailbox_clear_source_allows_resignal() {
         let mailbox = LatestFrameMailbox::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
 
-        mailbox.publish_frame("HDMI-A-1", dummy_frame(5), &tx);
+        mailbox.publish_frame("HDMI-A-1", dummy_frame(5));
         mailbox.clear_source("HDMI-A-1");
         assert!(mailbox.take_frame("HDMI-A-1").is_none());
 
-        mailbox.publish_frame("HDMI-A-1", dummy_frame(6), &tx);
+        mailbox.publish_frame("HDMI-A-1", dummy_frame(6));
 
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(FrameSignal::Ready(source)) if source == "HDMI-A-1"
-        ));
+        assert!(mailbox.has_signal_pending());
+        assert_eq!(mailbox.pending_sources(), vec!["HDMI-A-1".to_string()]);
         assert_eq!(
             mailbox
                 .take_frame("HDMI-A-1")
@@ -765,6 +967,8 @@ pub struct VideoFrame {
     pub stride: u32,
     pub format: VideoFrameFormat,
     pub session_id: u64,
+    pub pts_ns: Option<u64>,
+    pub duration_ns: Option<u64>,
 }
 
 impl VideoFrame {
@@ -777,13 +981,10 @@ impl VideoFrame {
             stride: self.stride,
             format: self.format.try_clone()?,
             session_id: self.session_id,
+            pts_ns: self.pts_ns,
+            duration_ns: self.duration_ns,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum FrameSignal {
-    Ready(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,8 +998,16 @@ pub enum PlayerEventKind {
 pub struct PlayerEvent {
     pub source_id: String,
     pub session_id: u64,
+    pub backend_kind: VideoBackendKind,
     pub kind: PlayerEventKind,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectSinkStats {
+    pub rendered: u64,
+    pub dropped: u64,
+    pub average_rate: f64,
 }
 
 #[derive(Clone, Default)]
@@ -806,6 +1015,8 @@ pub struct LatestFrameMailbox {
     frames: Arc<parking_lot::Mutex<HashMap<String, VideoFrame>>>,
     pending_notifications: Arc<parking_lot::Mutex<HashSet<String>>>,
     overwrite_count: Arc<AtomicU64>,
+    signal_pending: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl LatestFrameMailbox {
@@ -813,12 +1024,7 @@ impl LatestFrameMailbox {
         Self::default()
     }
 
-    pub fn publish_frame(
-        &self,
-        source_id: &str,
-        frame: VideoFrame,
-        signal_tx: &tokio::sync::mpsc::Sender<FrameSignal>,
-    ) {
+    pub fn publish_frame(&self, source_id: &str, frame: VideoFrame) {
         let mut should_signal = false;
         {
             let mut frames = self.frames.lock();
@@ -837,25 +1043,22 @@ impl LatestFrameMailbox {
             return;
         }
 
-        match signal_tx.try_send(FrameSignal::Ready(source_id.to_string())) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.pending_notifications.lock().remove(source_id);
-                debug!(
-                    "[VIDEO] {}: Frame-ready signal channel full, will retry on next frame",
-                    source_id
-                );
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.pending_notifications.lock().remove(source_id);
-            }
-        }
+        self.signal_pending.store(true, Ordering::Release);
+        self.notify.notify_one();
     }
 
     pub fn take_frame(&self, source_id: &str) -> Option<VideoFrame> {
         let frame = self.frames.lock().remove(source_id);
         self.pending_notifications.lock().remove(source_id);
         frame
+    }
+
+    pub fn inspect_frame<R, F>(&self, source_id: &str, inspect: F) -> Option<R>
+    where
+        F: FnOnce(&VideoFrame) -> R,
+    {
+        let frames = self.frames.lock();
+        frames.get(source_id).map(inspect)
     }
 
     pub fn clear_source(&self, source_id: &str) {
@@ -865,6 +1068,22 @@ impl LatestFrameMailbox {
 
     pub fn take_overwrite_count(&self) -> u64 {
         self.overwrite_count.swap(0, Ordering::Relaxed)
+    }
+
+    pub fn has_signal_pending(&self) -> bool {
+        self.signal_pending.load(Ordering::Acquire)
+    }
+
+    pub fn clear_signal_pending(&self) {
+        self.signal_pending.store(false, Ordering::Release);
+    }
+
+    pub fn pending_sources(&self) -> Vec<String> {
+        self.pending_notifications.lock().iter().cloned().collect()
+    }
+
+    pub fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
     }
 
     pub fn occupancy(&self) -> usize {
@@ -1134,7 +1353,9 @@ fn extract_dmabuf_nv12(
 
 pub struct VideoPlayer {
     pub pipeline: gst::Element,
-    pub appsink: gst_app::AppSink,
+    appsink: Option<gst_app::AppSink>,
+    direct_wayland_sink: Option<gst::Element>,
+    backend_kind: VideoBackendKind,
     is_running: Arc<AtomicBool>,
     bus_watch: Option<BusWatchHandle>,
     frame_mailbox: LatestFrameMailbox,
@@ -1145,94 +1366,198 @@ pub struct VideoPlayer {
     first_frame_logged: Arc<AtomicBool>,
     decode_path_logged: Arc<AtomicBool>,
     accept_samples: Arc<AtomicBool>,
+    pending_start_position_ns: Option<u64>,
 }
 
 impl VideoPlayer {
+    fn backend_label(&self) -> &'static str {
+        match self.backend_kind {
+            VideoBackendKind::Appsink => "appsink",
+            VideoBackendKind::WaylandDirect => "wayland-direct",
+        }
+    }
+
     /// Create a new video player with a bounded channel for backpressure
     pub fn new(
         uri: &str,
         source_id: Arc<String>,
         session_id: u64,
         volume: f64,
-        frame_signal_tx: tokio::sync::mpsc::Sender<FrameSignal>,
         frame_mailbox: LatestFrameMailbox,
         player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+        backend_request: VideoBackendRequest,
+        native_wayland_target: Option<NativeWaylandVideoTarget>,
     ) -> anyhow::Result<Self> {
-        let _video_start = std::time::Instant::now();
         let creation_start = std::time::Instant::now();
-        // Prefer playbin3 on modern GStreamer for lower-latency URI changes and
-        // more efficient internal graph management. Fall back to playbin if it
-        // is unavailable on the host system.
-        let pipeline_name = if gst::ElementFactory::find("playbin3").is_some() {
+        let pipeline_name = if gst::ElementFactory::find("playbin").is_some() {
+            "playbin"
+        } else if gst::ElementFactory::find("playbin3").is_some() {
             "playbin3"
         } else {
-            "playbin"
+            anyhow::bail!("Neither playbin nor playbin3 is available");
         };
         let pipeline = gst::ElementFactory::make(pipeline_name)
             .name("playbin")
             .build()?;
 
-        // Set the URI
         let full_uri = build_video_uri(uri)?;
-
         info!("Setting video URI: {}", full_uri);
         pipeline.set_property("uri", &full_uri);
 
-        // Disable subtitles/buffering unconditionally. Also skip audio decoding entirely
-        // when the configured volume is zero to avoid extra decoder/buffer state.
         pipeline.set_property_from_str("flags", playbin_flags_for_volume(volume));
+        pipeline.set_property("message-forward", true);
         if !audio_enabled_for_volume(volume) {
             pipeline.set_property("mute", true);
         }
         if pipeline_name == "playbin3" {
             pipeline.set_property("instant-uri", true);
-            let tune_source_id = source_id.clone();
-            let _ = pipeline.connect("element-setup", false, move |values| {
-                if let Ok(element) = values[1].get::<gst::Element>() {
-                    configure_decoder_element(tune_source_id.as_ref(), &element);
-                }
-                None
-            });
         }
+        let tune_source_id = source_id.clone();
+        let _ = pipeline.connect("element-setup", false, move |values| {
+            if let Ok(element) = values[1].get::<gst::Element>() {
+                configure_decoder_element(tune_source_id.as_ref(), &element);
+            }
+            None
+        });
 
-        // Create appsink for video frames - configure like gSlapper does
+        let first_frame_logged = Arc::new(AtomicBool::new(false));
+        let decode_path_logged = Arc::new(AtomicBool::new(false));
+        let accept_samples = Arc::new(AtomicBool::new(true));
+        let mode = get_video_mode();
+        let capabilities = current_video_capabilities();
+        let caps_ladder = caps_ladder_labels(mode, &capabilities);
+        let caps = build_video_sink_caps(mode, &capabilities);
+
+        let requested_backend =
+            resolve_backend_request(backend_request, native_wayland_target.as_ref());
+        let (backend_kind, appsink, direct_wayland_sink) = match requested_backend {
+            VideoBackendKind::WaylandDirect => {
+                if let Some(target) = native_wayland_target.as_ref() {
+                    let sink = Self::configure_native_wayland_sink(&pipeline, target)?;
+                    info!(
+                        "[VIDEO] {}: VideoPlayer created with playbin + waylandsink direct path on {}",
+                        source_id, target.output_name
+                    );
+                    (VideoBackendKind::WaylandDirect, None, Some(sink))
+                } else {
+                    (
+                        VideoBackendKind::Appsink,
+                        Some(Self::configure_appsink(
+                            &pipeline,
+                            &source_id,
+                            session_id,
+                            &frame_mailbox,
+                            creation_start,
+                            &caps,
+                            &caps_ladder,
+                            first_frame_logged.clone(),
+                            decode_path_logged.clone(),
+                            accept_samples.clone(),
+                        )?),
+                        None,
+                    )
+                }
+            }
+            VideoBackendKind::Appsink => (
+                VideoBackendKind::Appsink,
+                Some(Self::configure_appsink(
+                    &pipeline,
+                    &source_id,
+                    session_id,
+                    &frame_mailbox,
+                    creation_start,
+                    &caps,
+                    &caps_ladder,
+                    first_frame_logged.clone(),
+                    decode_path_logged.clone(),
+                    accept_samples.clone(),
+                )?),
+                None,
+            ),
+        };
+
+        Ok(Self {
+            pipeline,
+            appsink,
+            direct_wayland_sink,
+            backend_kind,
+            is_running: Arc::new(AtomicBool::new(false)),
+            bus_watch: None,
+            frame_mailbox,
+            player_event_tx,
+            source_id,
+            session_id,
+            start_time: creation_start,
+            first_frame_logged,
+            decode_path_logged,
+            accept_samples,
+            pending_start_position_ns: None,
+        })
+    }
+
+    fn configure_native_wayland_sink(
+        pipeline: &gst::Element,
+        target: &NativeWaylandVideoTarget,
+    ) -> anyhow::Result<gst::Element> {
+        let sink = gst::ElementFactory::make("waylandsink")
+            .name("video-sink")
+            .build()?;
+        sink.set_property("sync", true);
+        sink.set_property("qos", true);
+        sink.set_property("enable-last-sample", false);
+        sink.set_property("show-preroll-frame", true);
+        let aspect_mode = direct_aspect_mode_value();
+        let force_aspect_ratio = !matches!(aspect_mode.as_str(), "crop");
+        sink.set_property("force-aspect-ratio", force_aspect_ratio);
+        sink.set_property("processing-deadline", 0u64);
+        sink.set_property("max-lateness", -1i64);
+        if matches!(aspect_mode.as_str(), "crop") {
+            debug!(
+                "[VIDEO] {}: direct aspect mode=crop requested (force-aspect-ratio=false)",
+                target.output_name
+            );
+        }
+        pipeline.set_property("video-sink", &sink);
+        apply_native_wayland_target(pipeline, &sink, target)?;
+        Self::expose_direct_sink(&sink)?;
+        Ok(sink)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn configure_appsink(
+        pipeline: &gst::Element,
+        source_id: &Arc<String>,
+        session_id: u64,
+        frame_mailbox: &LatestFrameMailbox,
+        creation_start: std::time::Instant,
+        caps: &gst::Caps,
+        caps_ladder: &[&str],
+        first_frame_logged: Arc<AtomicBool>,
+        decode_path_logged: Arc<AtomicBool>,
+        accept_samples: Arc<AtomicBool>,
+    ) -> anyhow::Result<gst_app::AppSink> {
         let appsink = gst::ElementFactory::make("appsink")
             .name("video-sink")
             .build()?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow::anyhow!("Failed to downcast to AppSink"))?;
 
-        let mode = get_video_mode();
-        let capabilities = current_video_capabilities();
-        let caps_ladder = caps_ladder_labels(mode, &capabilities);
-        let caps = build_video_sink_caps(mode, &capabilities);
-
-        appsink.set_caps(Some(&caps));
-        appsink.set_sync(true); // Sync to clock
-        appsink.set_drop(true); // Drop frames if late - CRITICAL for preventing buffer accumulation
-        appsink.set_max_buffers(1); // Match gSlapper: 1 buffer to minimize latency and memory
-        appsink.set_property("enable-last-sample", false); // Don't retain a full decoded frame.
-        appsink.set_property("wait-on-eos", false); // Tear down without waiting on queued buffers.
-        appsink.set_property("qos", true); // Let upstream know we're latency-sensitive.
+        appsink.set_caps(Some(caps));
+        appsink.set_sync(true);
+        appsink.set_drop(true);
+        appsink.set_max_buffers(1);
+        appsink.set_property("enable-last-sample", false);
+        appsink.set_property("wait-on-eos", false);
+        appsink.set_property("qos", true);
         appsink.set_property_from_str("leaky-type", "downstream");
-        // CRITICAL: Enable emit-signals to get callbacks, but ensure we handle them quickly
-        // The new_sample callback will be called for each frame
 
-        // Keep source_id for closure
         let cb_source_id = source_id.clone();
-
-        // Set up new-sample callback
-        let frame_signal_tx_clone = frame_signal_tx.clone();
         let frame_mailbox_clone = frame_mailbox.clone();
-        let first_frame_logged = Arc::new(AtomicBool::new(false));
         let callback_first_frame_logged = first_frame_logged.clone();
-        let decode_path_logged = Arc::new(AtomicBool::new(false));
         let callback_decode_path_logged = decode_path_logged.clone();
-        let accept_samples = Arc::new(AtomicBool::new(true));
         let callback_accept_samples = accept_samples.clone();
         let callback_stop_logged = Arc::new(AtomicBool::new(false));
         let callback_stop_logged_clone = callback_stop_logged.clone();
-        let creation_time_ref = creation_start;
 
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -1250,7 +1575,7 @@ impl VideoPlayer {
 
                     if !callback_first_frame_logged.load(Ordering::SeqCst) {
                         callback_first_frame_logged.store(true, Ordering::SeqCst);
-                        let duration = creation_time_ref.elapsed();
+                        let duration = creation_start.elapsed();
                         info!(
                             "[ASSET] {}: First video frame produced in {:.3}ms",
                             source_id,
@@ -1258,10 +1583,8 @@ impl VideoPlayer {
                         );
                     }
 
-                    let session_id = session_id;
-
                     let sample = match sink.pull_sample() {
-                        Ok(s) => s,
+                        Ok(sample) => sample,
                         Err(_) => return Err(gst::FlowError::Error),
                     };
 
@@ -1273,47 +1596,109 @@ impl VideoPlayer {
                         return Err(gst::FlowError::Flushing);
                     }
 
-                    let frame = sample_to_video_frame(sample, session_id)?;
+                    let frame = sample_to_video_frame(source_name, sample, session_id)?;
                     maybe_log_decode_path(source_name, &frame, &callback_decode_path_logged);
-
-                    // Send frame - if channel is full, drop frame immediately to release gst::Buffer
-                    frame_mailbox_clone.publish_frame(source_name, frame, &frame_signal_tx_clone);
+                    frame_mailbox_clone.publish_frame(source_name, frame);
 
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
         );
 
-        // Configure appsink
         appsink.set_property("drop", true);
         appsink.set_property("max-buffers", 1u32);
-
-        // Set appsink as the video sink
         pipeline.set_property("video-sink", &appsink);
 
         info!(
-            "[VIDEO] {}: VideoPlayer created with playbin + appsink (requested_mode={} audio={} caps_ladder={:?} caps={})",
+            "[VIDEO] {}: VideoPlayer created with playbin + appsink (requested_mode={} caps_ladder={:?} caps={})",
             source_id,
-            mode.cli_label(),
-            audio_enabled_for_volume(volume),
+            get_video_mode().cli_label(),
             caps_ladder,
             caps
         );
 
-        Ok(Self {
-            pipeline,
-            appsink,
-            is_running: Arc::new(AtomicBool::new(false)),
-            bus_watch: None,
-            frame_mailbox,
-            player_event_tx,
-            source_id,
-            session_id,
-            start_time: creation_start,
-            first_frame_logged,
-            decode_path_logged,
-            accept_samples,
+        Ok(appsink)
+    }
+
+    pub fn is_direct_surface_backend(&self) -> bool {
+        self.backend_kind == VideoBackendKind::WaylandDirect
+    }
+
+    pub fn is_appsink_backend(&self) -> bool {
+        self.backend_kind == VideoBackendKind::Appsink
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    pub fn current_position_ns(&self) -> Option<u64> {
+        self.pipeline
+            .query_position::<gst::ClockTime>()
+            .map(gst::ClockTime::nseconds)
+    }
+
+    pub fn seek_to_position_ns(&self, position_ns: u64) -> anyhow::Result<()> {
+        if position_ns == 0 {
+            return Ok(());
+        }
+
+        self.pipeline.seek_simple(
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT | gst::SeekFlags::ACCURATE,
+            gst::ClockTime::from_nseconds(position_ns),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_start_position_ns(&mut self, position_ns: u64) {
+        self.pending_start_position_ns = (position_ns > 0).then_some(position_ns);
+    }
+
+    fn expose_direct_sink(sink: &gst::Element) -> anyhow::Result<()> {
+        let overlay = sink
+            .clone()
+            .dynamic_cast::<gst_video::VideoOverlay>()
+            .map_err(|_| anyhow::anyhow!("waylandsink does not implement GstVideoOverlay"))?;
+        gst_video::prelude::VideoOverlayExt::expose(&overlay);
+        Ok(())
+    }
+
+    pub fn direct_sink_stats(&self) -> Option<DirectSinkStats> {
+        let sink = self.direct_wayland_sink.as_ref()?;
+        sink.find_property("stats")?;
+
+        let structure = sink.property::<gst::Structure>("stats");
+        Some(DirectSinkStats {
+            rendered: structure.get::<u64>("rendered").ok().unwrap_or(0),
+            dropped: structure.get::<u64>("dropped").ok().unwrap_or(0),
+            average_rate: structure.get::<f64>("average-rate").ok().unwrap_or(0.0),
         })
+    }
+
+    pub fn update_direct_surface_size(&self, width: u32, height: u32) -> anyhow::Result<()> {
+        let Some(sink) = self.direct_wayland_sink.as_ref() else {
+            return Ok(());
+        };
+
+        let overlay = sink
+            .clone()
+            .dynamic_cast::<gst_video::VideoOverlay>()
+            .map_err(|_| anyhow::anyhow!("waylandsink does not implement GstVideoOverlay"))?;
+        gst_video::prelude::VideoOverlayExt::set_render_rectangle(
+            &overlay,
+            0,
+            0,
+            width.max(1) as i32,
+            height.max(1) as i32,
+        )?;
+        debug!(
+            "[VIDEO] {}: Updated direct render rectangle to {}x{}",
+            self.source_id,
+            width.max(1),
+            height.max(1)
+        );
+        Self::expose_direct_sink(sink)?;
+        Ok(())
     }
 
     /// Pre-buffer video by moving the pipeline to PAUSED and extracting the preroll sample.
@@ -1382,31 +1767,32 @@ impl VideoPlayer {
         let preroll_budget = std::time::Duration::from_millis(250);
         let preroll_slice = std::time::Duration::from_millis(50);
         let mut preroll = None;
-        while pull_preroll_start.elapsed() < preroll_budget {
-            if should_abort() {
-                anyhow::bail!("prebuffer aborted");
-            }
-
-            let remaining = preroll_budget.saturating_sub(pull_preroll_start.elapsed());
-            let wait_slice = remaining.min(preroll_slice);
-            let Some(sample) = self
-                .appsink
-                .try_pull_preroll(gst::ClockTime::from_mseconds(wait_slice.as_millis() as u64))
-            else {
-                continue;
-            };
-
-            preroll = match sample_to_video_frame(sample, self.session_id) {
-                Ok(frame) => Some(frame),
-                Err(e) => {
-                    debug!(
-                        "[VIDEO] {}: Failed to decode preroll sample: {:?}",
-                        self.source_id, e
-                    );
-                    None
+        if let Some(appsink) = self.appsink.as_ref() {
+            while pull_preroll_start.elapsed() < preroll_budget {
+                if should_abort() {
+                    anyhow::bail!("prebuffer aborted");
                 }
-            };
-            break;
+
+                let remaining = preroll_budget.saturating_sub(pull_preroll_start.elapsed());
+                let wait_slice = remaining.min(preroll_slice);
+                let Some(sample) = appsink
+                    .try_pull_preroll(gst::ClockTime::from_mseconds(wait_slice.as_millis() as u64))
+                else {
+                    continue;
+                };
+
+                preroll = match sample_to_video_frame(self.source_id.as_ref(), sample, self.session_id) {
+                    Ok(frame) => Some(frame),
+                    Err(e) => {
+                        debug!(
+                            "[VIDEO] {}: Failed to decode preroll sample: {:?}",
+                            self.source_id, e
+                        );
+                        None
+                    }
+                };
+                break;
+            }
         }
         let pull_preroll_duration = pull_preroll_start.elapsed();
 
@@ -1443,6 +1829,14 @@ impl VideoPlayer {
         }
         if let Some(frame) = preroll.as_ref() {
             maybe_log_decode_path(self.source_id.as_ref(), frame, &self.decode_path_logged);
+        } else if self.is_direct_surface_backend()
+            && !self.first_frame_logged.swap(true, Ordering::SeqCst)
+        {
+            info!(
+                "[ASSET] {}: Native Wayland video pipeline preroll completed in {:.3}ms",
+                self.source_id,
+                self.start_time.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(VideoPrebufferResult {
@@ -1480,6 +1874,24 @@ impl VideoPlayer {
         }
 
         self.install_bus_watch()?;
+        if let Some(position_ns) = self.pending_start_position_ns.take()
+            && let Err(e) = self.seek_to_position_ns(position_ns)
+        {
+            debug!(
+                "[VIDEO] {}: Direct/startup seek to {:.1}ms was skipped after start: {}",
+                self.source_id,
+                position_ns as f64 / 1_000_000.0,
+                e
+            );
+        }
+        if let Some(sink) = self.direct_wayland_sink.as_ref()
+            && let Err(e) = Self::expose_direct_sink(sink)
+        {
+            debug!(
+                "[VIDEO] {}: Direct wayland expose after start failed: {}",
+                self.source_id, e
+            );
+        }
         self.is_running.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1494,6 +1906,7 @@ impl VideoPlayer {
         let source_id = self.source_id.clone();
         let player_event_tx = self.player_event_tx.clone();
         let session_id = self.session_id;
+        let backend_kind = self.backend_kind;
 
         let watch = bus.create_watch(
             Some(&format!("kaleidux-bus-{}", source_id)),
@@ -1524,6 +1937,7 @@ impl VideoPlayer {
                         let _ = player_event_tx.send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
+                            backend_kind,
                             kind: PlayerEventKind::Eos,
                             reason: "eos".to_string(),
                         });
@@ -1538,6 +1952,7 @@ impl VideoPlayer {
                             let _ = player_event_tx.send(PlayerEvent {
                                 source_id: source_id.to_string(),
                                 session_id,
+                                backend_kind,
                                 kind: PlayerEventKind::FatalLifecycle,
                                 reason: reason.clone(),
                             });
@@ -1554,6 +1969,7 @@ impl VideoPlayer {
                         let _ = player_event_tx.send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
+                            backend_kind,
                             kind: PlayerEventKind::FatalLifecycle,
                             reason: reason.clone(),
                         });
@@ -1572,6 +1988,7 @@ impl VideoPlayer {
                         let _ = player_event_tx.send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
+                            backend_kind,
                             kind: PlayerEventKind::Error,
                             reason: error_msg,
                         });
@@ -1599,19 +2016,18 @@ impl VideoPlayer {
     }
 
     pub fn appsink_queue_levels(&self) -> Option<AppsinkQueueLevels> {
-        self.appsink.find_property("current-level-buffers")?;
+        let appsink = self.appsink.as_ref()?;
+        appsink.find_property("current-level-buffers")?;
 
         Some(AppsinkQueueLevels {
-            buffers: self.appsink.property::<u64>("current-level-buffers"),
-            bytes: self
-                .appsink
+            buffers: appsink.property::<u64>("current-level-buffers"),
+            bytes: appsink
                 .find_property("current-level-bytes")
-                .map(|_| self.appsink.property::<u64>("current-level-bytes"))
+                .map(|_| appsink.property::<u64>("current-level-bytes"))
                 .unwrap_or_default(),
-            time_ns: self
-                .appsink
+            time_ns: appsink
                 .find_property("current-level-time")
-                .map(|_| self.appsink.property::<u64>("current-level-time"))
+                .map(|_| appsink.property::<u64>("current-level-time"))
                 .unwrap_or_default(),
         })
     }
@@ -1621,12 +2037,21 @@ impl VideoPlayer {
         self.remove_bus_watch();
         self.accept_samples.store(false, Ordering::SeqCst);
         self.frame_mailbox.clear_source(self.source_id.as_ref());
-        if gst::version() >= (1, 16, 3, 0) {
-            self.appsink
-                .set_callbacks(gst_app::AppSinkCallbacks::builder().build());
+        if let Some(bus) = self.pipeline.bus() {
+            bus.unset_sync_handler();
+        }
+        if gst::version() >= (1, 16, 3, 0)
+            && let Some(appsink) = self.appsink.as_ref()
+        {
+            appsink.set_callbacks(gst_app::AppSinkCallbacks::builder().build());
         }
         if was_running {
-            info!("Stopping video playback...");
+            info!(
+                "[VIDEO] {}: Stopping video playback (session={} backend={})",
+                self.source_id,
+                self.session_id,
+                self.backend_label()
+            );
             // Fade audio before teardown to prevent clicks on audio-enabled pipelines.
             self.pipeline.set_property("volume", 0.0);
         }
@@ -1703,6 +2128,7 @@ fn maybe_log_decode_path(source_id: &str, frame: &VideoFrame, logged: &AtomicBoo
 }
 
 fn sample_to_video_frame(
+    source_name: &str,
     sample: gst::Sample,
     session_id: u64,
 ) -> Result<VideoFrame, gst::FlowError> {
@@ -1726,40 +2152,102 @@ fn sample_to_video_frame(
 
     // Prefer GstVideoMeta stride/offset (reflects actual memory layout from
     // hardware decoders), fall back to VideoInfo when the meta is absent.
-    let (strides, offsets) = unsafe {
+    let (meta_strides, meta_offsets, has_meta) = unsafe {
         let raw_meta =
             gst_video::ffi::gst_buffer_get_video_meta(buffer.as_ptr() as *mut gst::ffi::GstBuffer);
         if !raw_meta.is_null() {
             let meta = &*raw_meta;
-            (meta.stride, meta.offset)
+            (meta.stride, meta.offset, true)
         } else {
-            let vi_strides = video_info.stride();
-            let vi_offsets = video_info.offset();
-            let mut s = [0i32; 4];
-            let mut o = [0usize; 4];
-            let n_planes = (video_info.n_planes() as usize).min(4);
-            s[..n_planes].copy_from_slice(&vi_strides[..n_planes]);
-            o[..n_planes].copy_from_slice(&vi_offsets[..n_planes]);
-            (s, o)
+            ([0i32; 4], [0usize; 4], false)
         }
     };
-    let y_stride = strides[0] as u32;
+    let vi_strides = video_info.stride();
+    let vi_offsets = video_info.offset();
+    let mut vi_s = [0i32; 4];
+    let mut vi_o = [0usize; 4];
+    let n_planes = (video_info.n_planes() as usize).min(4);
+    vi_s[..n_planes].copy_from_slice(&vi_strides[..n_planes]);
+    vi_o[..n_planes].copy_from_slice(&vi_offsets[..n_planes]);
+    let buffer_size = buffer.size();
+    let caps_str = caps.to_string();
 
     let is_cuda = caps
         .features(0)
         .is_some_and(|f| f.contains("memory:CUDAMemory"));
+    let (strides, offsets) = if is_cuda && prefer_videoinfo_cuda_layout_enabled() {
+        (vi_s, vi_o)
+    } else if has_meta {
+        (meta_strides, meta_offsets)
+    } else {
+        (vi_s, vi_o)
+    };
+    let y_stride = strides[0] as u32;
 
     let format = match video_info.format() {
         gst_video::VideoFormat::Nv12 => {
-            if is_cuda {
-                tracing::trace!(
-                    "[VIDEO] CUDA NV12 layout: y_stride={}, uv_offset={}, uv_stride={} ({}x{})",
+            let (uv_width, uv_height) = chroma_plane_extent(width, height);
+            let min_y_bytes = y_stride as usize * height as usize;
+            let uv_offset = offsets[1];
+            let uv_stride = strides[1].max(0) as usize;
+            let min_uv_bytes = uv_stride.saturating_mul(uv_height as usize);
+            let nv12_layout_invalid = strides[0] <= 0
+                || strides[1] <= 0
+                || y_stride < width
+                || uv_stride < (uv_width.saturating_mul(2)) as usize
+                || uv_offset > buffer_size
+                || uv_offset.saturating_add(min_uv_bytes) > buffer_size
+                || min_y_bytes > buffer_size;
+            if nv12_layout_invalid {
+                tracing::warn!(
+                    "[VIDEO] Invalid NV12 layout detected: size={} frame={}x{} y_stride={} uv_offset={} uv_stride={} caps={}",
+                    buffer_size,
+                    width,
+                    height,
                     strides[0],
                     offsets[1],
                     strides[1],
-                    width,
-                    height
+                    caps_str
                 );
+            }
+            if is_cuda {
+                let signature = format!(
+                    "{}x{}:{}:{}:{}:{}:{}:{}:{}",
+                    width,
+                    height,
+                    strides[0],
+                    offsets[1],
+                    strides[1],
+                    buffer_size,
+                    has_meta as u8,
+                    vi_s[0],
+                    vi_s[1]
+                );
+                let key = format!("{source_name}:{session_id}");
+                let mut should_log_layout = cuda_layout_log_every_frame_enabled();
+                if !should_log_layout {
+                    let mut signatures = CUDA_LAYOUT_LOG_SIGNATURES.lock();
+                    if signatures.get(&key) != Some(&signature) {
+                        signatures.insert(key, signature);
+                        should_log_layout = true;
+                    }
+                }
+                if should_log_layout {
+                    tracing::debug!(
+                        "[VIDEO] CUDA NV12 layout {}: y_stride={} uv_offset={} uv_stride={} frame={}x{} size={} has_meta={} vi_y_stride={} vi_uv_stride={} caps={}",
+                        source_name,
+                        strides[0],
+                        offsets[1],
+                        strides[1],
+                        width,
+                        height,
+                        buffer_size,
+                        has_meta,
+                        vi_s[0],
+                        vi_s[1],
+                        caps_str
+                    );
+                }
                 VideoFrameFormat::CudaNv12 {
                     y_stride,
                     uv_offset: offsets[1] as u32,
@@ -1797,6 +2285,9 @@ fn sample_to_video_frame(
         }
     };
 
+    let pts_ns = buffer.pts().map(|pts| pts.nseconds());
+    let duration_ns = buffer.duration().map(|duration| duration.nseconds());
+
     Ok(VideoFrame {
         buffer,
         width,
@@ -1804,6 +2295,8 @@ fn sample_to_video_frame(
         stride: y_stride,
         format,
         session_id,
+        pts_ns,
+        duration_ns,
     })
 }
 

@@ -53,6 +53,19 @@ pub struct PerformanceMetrics {
     wayland_idle_loops: Arc<AtomicU64>,
     wayland_hot_loops: Arc<AtomicU64>,
     wayland_callback_wakes: Arc<AtomicU64>,
+    wayland_expired_deadline_wakes: Arc<AtomicU64>,
+
+    // Video pacing diagnostics
+    video_frames_received: Arc<AtomicU64>,
+    video_frames_uploaded: Arc<AtomicU64>,
+    video_frames_presented: Arc<AtomicU64>,
+    video_frames_stale_skipped: Arc<AtomicU64>,
+    direct_fallback_aspect_mismatch: Arc<AtomicU64>,
+    direct_fallback_prepare_failed: Arc<AtomicU64>,
+    direct_fallback_runtime_error: Arc<AtomicU64>,
+    direct_fallback_other: Arc<AtomicU64>,
+    shared_broker_hits: Arc<AtomicU64>,
+    shared_broker_misses: Arc<AtomicU64>,
 
     // Component CPU tracking (time spent in each component in milliseconds)
     renderer_cpu_time: Arc<AtomicU64>, // Total CPU time in microseconds
@@ -129,6 +142,17 @@ impl PerformanceMetrics {
             wayland_idle_loops: Arc::new(AtomicU64::new(0)),
             wayland_hot_loops: Arc::new(AtomicU64::new(0)),
             wayland_callback_wakes: Arc::new(AtomicU64::new(0)),
+            wayland_expired_deadline_wakes: Arc::new(AtomicU64::new(0)),
+            video_frames_received: Arc::new(AtomicU64::new(0)),
+            video_frames_uploaded: Arc::new(AtomicU64::new(0)),
+            video_frames_presented: Arc::new(AtomicU64::new(0)),
+            video_frames_stale_skipped: Arc::new(AtomicU64::new(0)),
+            direct_fallback_aspect_mismatch: Arc::new(AtomicU64::new(0)),
+            direct_fallback_prepare_failed: Arc::new(AtomicU64::new(0)),
+            direct_fallback_runtime_error: Arc::new(AtomicU64::new(0)),
+            direct_fallback_other: Arc::new(AtomicU64::new(0)),
+            shared_broker_hits: Arc::new(AtomicU64::new(0)),
+            shared_broker_misses: Arc::new(AtomicU64::new(0)),
             renderer_cpu_time: Arc::new(AtomicU64::new(0)),
             video_cpu_time: Arc::new(AtomicU64::new(0)),
             file_discovery_cpu_time: Arc::new(AtomicU64::new(0)),
@@ -178,6 +202,56 @@ impl PerformanceMetrics {
 
     pub fn record_wayland_callback_wake(&self) {
         self.wayland_callback_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_wayland_expired_deadline_wake(&self) {
+        self.wayland_expired_deadline_wakes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_video_frame_received(&self) {
+        self.video_frames_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_video_frame_uploaded(&self) {
+        self.video_frames_uploaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_video_frame_presented(&self) {
+        self.video_frames_presented.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_video_frame_stale_skipped(&self) {
+        self.video_frames_stale_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_fallback_reason(&self, reason: &str) {
+        match reason {
+            "aspect_mismatch" | "cover_compositing_required" => {
+                self.direct_fallback_aspect_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "player_prepare_failed" => {
+                self.direct_fallback_prepare_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "pending_runtime_error" | "runtime_error" => {
+                self.direct_fallback_runtime_error
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.direct_fallback_other.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn record_shared_broker_hit(&self) {
+        self.shared_broker_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_shared_broker_miss(&self) {
+        self.shared_broker_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_error_rate(&self) -> f64 {
@@ -818,11 +892,31 @@ impl PerformanceMetrics {
             "renderer={:.2}ms video={:.2}ms image={:.2}ms file_disc={:.2}ms shader={:.2}ms",
             renderer_avg, video_avg, image_avg, file_disc_avg, shader_avg
         );
+        let video_pacing = format!(
+            " recv={} upload={} present={} stale={}",
+            self.video_frames_received.load(Ordering::Relaxed),
+            self.video_frames_uploaded.load(Ordering::Relaxed),
+            self.video_frames_presented.load(Ordering::Relaxed),
+            self.video_frames_stale_skipped.load(Ordering::Relaxed)
+        );
         let wayland_info = format!(
-            " wayland=idle:{} hot:{} callbacks:{}",
+            " wayland=idle:{} hot:{} callbacks:{} expired:{}",
             self.wayland_idle_loops.load(Ordering::Relaxed),
             self.wayland_hot_loops.load(Ordering::Relaxed),
-            self.wayland_callback_wakes.load(Ordering::Relaxed)
+            self.wayland_callback_wakes.load(Ordering::Relaxed),
+            self.wayland_expired_deadline_wakes.load(Ordering::Relaxed)
+        );
+        let fallback_info = format!(
+            " direct_fallback=aspect:{} prepare:{} runtime:{} other:{}",
+            self.direct_fallback_aspect_mismatch.load(Ordering::Relaxed),
+            self.direct_fallback_prepare_failed.load(Ordering::Relaxed),
+            self.direct_fallback_runtime_error.load(Ordering::Relaxed),
+            self.direct_fallback_other.load(Ordering::Relaxed)
+        );
+        let shared_broker_info = format!(
+            " shared_broker=hit:{} miss:{}",
+            self.shared_broker_hits.load(Ordering::Relaxed),
+            self.shared_broker_misses.load(Ordering::Relaxed)
         );
 
         let hits = self.texture_pool_hits.load(Ordering::Relaxed);
@@ -863,6 +957,12 @@ impl PerformanceMetrics {
             component_cpu,
             leak_msg,
             wayland_info
+        );
+        tracing::info!(
+            "[METRICS] Video pacing:{}{}{}",
+            video_pacing,
+            fallback_info,
+            shared_broker_info
         );
 
         if image_avg > 0.0 || self.get_recent_avg_image_upload_ms() > 0.0 {

@@ -139,6 +139,8 @@ pub struct WgpuContext {
 }
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
+pub(crate) const DIRECT_VIDEO_PARENT_HEARTBEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
 const MAX_TEXTURE_POOL_SIZE: usize = 16; // Global limit on total textures in pool
 const MAX_TEXTURE_POOL_BYTES: u64 = 32 * 1024 * 1024; // Keep pooled RGBA textures under 32 MiB
 const MAX_POOLED_TEXTURE_BYTES: u64 = 16 * 1024 * 1024; // Skip pooling huge 4K-class RGBA textures
@@ -149,6 +151,46 @@ pub struct RetainedTextureFootprint {
     pub prev_bytes: u64,
     pub composition_bytes: u64,
     pub video_aux_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectPresentationDecision {
+    Compatible,
+    MissingVideoSourceSize,
+    InvalidDimensions,
+    AspectMismatch,
+}
+
+impl DirectPresentationDecision {
+    pub fn fallback_reason(self) -> &'static str {
+        match self {
+            DirectPresentationDecision::Compatible => "compatible",
+            DirectPresentationDecision::MissingVideoSourceSize => "missing_source_size",
+            DirectPresentationDecision::InvalidDimensions => "invalid_dimensions",
+            DirectPresentationDecision::AspectMismatch => "aspect_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectAspectMode {
+    Strict,
+    Letterbox,
+    Crop,
+}
+
+fn direct_aspect_mode() -> DirectAspectMode {
+    match std::env::var("KLD_DIRECT_ASPECT_MODE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("strict") => DirectAspectMode::Strict,
+        Some("crop") => DirectAspectMode::Crop,
+        _ => DirectAspectMode::Letterbox,
+    }
 }
 
 impl RetainedTextureFootprint {
@@ -1199,8 +1241,10 @@ pub struct Renderer {
     pub valid_content_type: crate::queue::ContentType,
     pub active_image_session_id: u64,
     pub active_video_session_id: u64,
+    presented_video_session_id: u64,
     pub active_batch_id: Option<u64>,
     pub batch_start_time: Option<std::time::Instant>, // Anchor for shared batch transitions
+    direct_video_presentation_active: bool,
     display_timer_pending: bool,
     display_timer_ready: bool,
 
@@ -1256,6 +1300,11 @@ impl Renderer {
             _ => 2,
         };
 
+        let wayland_window = matches!(
+            window.window_handle().map(|handle| handle.as_raw()),
+            Ok(raw_window_handle::RawWindowHandle::Wayland(_))
+        );
+
         // Reuse the first surface if provided to avoid protocol errors (multiple roles on wl_surface)
         let surface = if let Some(s) = first_surface {
             s
@@ -1269,11 +1318,19 @@ impl Renderer {
             .first()
             .cloned()
             .unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
-        let alpha_mode = caps
-            .alpha_modes
-            .first()
-            .cloned()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+        let alpha_mode = if wayland_window {
+            caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode != wgpu::CompositeAlphaMode::Opaque)
+                .or_else(|| caps.alpha_modes.first().copied())
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        };
         let present_mode = select_present_mode(&caps.present_modes);
 
         if caps.formats.is_empty() {
@@ -1346,8 +1403,10 @@ impl Renderer {
             valid_content_type: crate::queue::ContentType::Image,
             active_image_session_id: 0,
             active_video_session_id: 0,
+            presented_video_session_id: 0,
             active_batch_id: None,
             batch_start_time: None,
+            direct_video_presentation_active: false,
             display_timer_pending: false,
             display_timer_ready: false,
             metrics,
@@ -1379,6 +1438,10 @@ impl Renderer {
 
     pub fn resize_checked(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         if width > 0 && height > 0 {
+            if self.configured && self.config.width == width && self.config.height == height {
+                return Ok(());
+            }
+
             // Check capabilities FIRST to avoid hard panic in wgpu on Nvidia/Wayland
             let caps = self.target_caps();
             if caps.formats.is_empty() {
@@ -2370,6 +2433,12 @@ impl Renderer {
         }
 
         self.last_present_time = std::time::Instant::now();
+        if self.valid_content_type == crate::queue::ContentType::Video {
+            self.presented_video_session_id = self.active_video_session_id;
+            if let Some(m) = &self.metrics {
+                m.record_video_frame_presented();
+            }
+        }
 
         // CRITICAL: Reset needs_redraw AFTER we've actually rendered and presented
         // This ensures we render at least once for static images
@@ -2381,6 +2450,119 @@ impl Renderer {
         if let Some(m) = &self.metrics {
             let render_duration = render_start.elapsed();
             m.record_renderer_cpu_time(render_duration);
+        }
+
+        Ok(())
+    }
+
+    pub fn direct_video_heartbeat_due(&self, interval: std::time::Duration) -> bool {
+        self.direct_video_presentation_active && self.last_present_time.elapsed() >= interval
+    }
+
+    pub fn next_direct_video_heartbeat_deadline(
+        &self,
+        interval: std::time::Duration,
+    ) -> Option<std::time::Instant> {
+        if !self.direct_video_presentation_active {
+            return None;
+        }
+
+        Some(self.last_present_time + interval)
+    }
+
+    pub fn present_direct_video_heartbeat(&mut self) -> anyhow::Result<()> {
+        let render_start = std::time::Instant::now();
+
+        if !self.configured {
+            if self.config.width > 0 && self.config.height > 0 {
+                let _ = self.resize_checked(self.config.width, self.config.height);
+            }
+            if !self.configured {
+                return Ok(());
+            }
+        }
+
+        let output = match self.surface.get_current_texture() {
+            Ok(texture) => texture,
+            Err(wgpu::SurfaceError::Lost) => {
+                warn!(
+                    "Surface Lost for {} during direct heartbeat. Marking not-configured to trigger re-creation.",
+                    self.name
+                );
+                self.configured = false;
+                self.needs_redraw = true;
+                self.frame_callback_pending = false;
+                return Ok(());
+            }
+            Err(wgpu::SurfaceError::Outdated) => {
+                warn!(
+                    "Surface Outdated for {} during direct heartbeat. Reconfiguring.",
+                    self.name
+                );
+                self.configured = false;
+                self.needs_redraw = true;
+                self.frame_callback_pending = false;
+                return Ok(());
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("timeout") {
+                    debug!(
+                        "Surface acquisition timeout for {} during direct heartbeat, skipping frame.",
+                        self.name
+                    );
+                    return Ok(());
+                }
+                error!(
+                    "Failed to get current surface texture for {} during direct heartbeat: {}",
+                    self.name, err_str
+                );
+                return Ok(());
+            }
+        };
+
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Direct Video Heartbeat Encoder"),
+            });
+
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Direct Video Heartbeat Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        if self.display_timer_pending {
+            self.display_timer_pending = false;
+            self.display_timer_ready = true;
+        }
+        self.last_present_time = std::time::Instant::now();
+
+        if let Some(m) = &self.metrics {
+            m.record_renderer_cpu_time(render_start.elapsed());
         }
 
         Ok(())
@@ -2410,9 +2592,15 @@ impl Renderer {
 
         let wl_surface = layer_surface.wl_surface();
         wl_surface.frame(qh, wl_surface.clone());
+        wl_surface.damage_buffer(
+            0,
+            0,
+            self.config.width.max(1) as i32,
+            self.config.height.max(1) as i32,
+        );
 
-        // CRITICAL: Commit the surface to ensure the frame callback is registered and processed
-        // This prevents the compositor from "hanging" the surface if it's waiting for a commit
+        // Commit after requesting the callback so direct-video parent surfaces keep
+        // producing compositor damage, which Hyprland blur and tiled snapshots rely on.
         wl_surface.commit();
 
         self.frame_callback_pending = true;
@@ -2435,7 +2623,36 @@ impl Renderer {
             self.last_video_source_size = None;
             self.last_video_presentation_size = None;
         }
+        if content_type != crate::queue::ContentType::Video {
+            self.direct_video_presentation_active = false;
+            self.presented_video_session_id = 0;
+        }
         self.valid_content_type = content_type;
+    }
+
+    pub fn set_direct_video_presentation_active(&mut self, active: bool) {
+        self.direct_video_presentation_active = active;
+        if !active {
+            return;
+        }
+
+        self.content_swap_pending = false;
+        self.transition_active = false;
+        self.transition_just_completed = false;
+        self.needs_redraw = false;
+        self.frame_callback_pending = false;
+        self.last_frame_request = None;
+        self.display_timer_pending = false;
+        self.display_timer_ready = true;
+        self.presented_video_session_id = self.active_video_session_id;
+    }
+
+    pub fn is_direct_video_presentation_active(&self) -> bool {
+        self.direct_video_presentation_active
+    }
+
+    pub fn transition_just_completed(&self) -> bool {
+        self.transition_just_completed
     }
 
     pub fn retained_texture_footprint(&self) -> RetainedTextureFootprint {
@@ -2473,7 +2690,7 @@ impl Renderer {
         }
     }
 
-    /// Check if current_texture exists (used for throttling logic)
+    /// Check if current_texture exists.
     pub fn has_current_texture(&self) -> bool {
         self.current_texture.is_some()
     }
@@ -2483,10 +2700,65 @@ impl Renderer {
         self.current_texture.is_some() || self.prev_texture.is_some()
     }
 
+    pub fn ready_for_direct_video_handoff(&self) -> bool {
+        self.valid_content_type == crate::queue::ContentType::Video
+            && self.current_texture.is_some()
+            && !self.content_swap_pending
+            && !self.transition_active
+            && self.active_video_session_id != 0
+            && self.presented_video_session_id == self.active_video_session_id
+    }
+
+    pub fn direct_wayland_presentation_decision(&self) -> DirectPresentationDecision {
+        let Some((source_width, source_height)) = self.last_video_source_size else {
+            return DirectPresentationDecision::MissingVideoSourceSize;
+        };
+        if source_width == 0
+            || source_height == 0
+            || self.config.width == 0
+            || self.config.height == 0
+        {
+            return DirectPresentationDecision::InvalidDimensions;
+        }
+
+        let source_aspect = source_width as f32 / source_height as f32;
+        let output_aspect = self.config.width as f32 / self.config.height as f32;
+        if (source_aspect - output_aspect).abs() <= 0.02 {
+            DirectPresentationDecision::Compatible
+        } else if matches!(
+            direct_aspect_mode(),
+            DirectAspectMode::Letterbox | DirectAspectMode::Crop
+        ) {
+            // Letterbox/crop modes keep direct path active for non-matching AR.
+            // Actual crop behavior is compositor/sink dependent; Kaleidux still
+            // treats this as direct-compatible to avoid expensive appsink fallback.
+            DirectPresentationDecision::Compatible
+        } else {
+            DirectPresentationDecision::AspectMismatch
+        }
+    }
+
+    pub fn should_hold_video_frame_for_callback(&self) -> bool {
+        if self.direct_video_presentation_active {
+            return false;
+        }
+
+        self.valid_content_type == crate::queue::ContentType::Video
+            && self.current_texture.is_some()
+            && !self.content_swap_pending
+            && !self.transition_active
+            && self.frame_callback_pending
+            && !self.frame_callback_pending_too_long(1000)
+    }
+
     pub fn needs_wayland_immediate_work(&self) -> bool {
-        self.transition_active
-            || (self.needs_redraw
-                && (!self.frame_callback_pending || self.frame_callback_pending_too_long(500)))
+        if self.direct_video_presentation_active {
+            return false;
+        }
+
+        let wants_to_draw = self.transition_active || self.needs_redraw;
+        
+        wants_to_draw && (!self.frame_callback_pending || self.frame_callback_pending_too_long(500))
     }
 
     pub fn next_wayland_retry_deadline(
@@ -2540,12 +2812,12 @@ impl Renderer {
         let (width, height) = rgba.dimensions();
         let data = rgba.into_raw();
 
-        self.upload_image_data(data, width, height)
+        self.upload_image_data(&data, width, height)
     }
 
     pub fn upload_image_data(
         &mut self,
-        data: Vec<u8>,
+        data: &[u8],
         width: u32,
         height: u32,
     ) -> anyhow::Result<()> {
@@ -2583,7 +2855,7 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &data,
+            data,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
@@ -3639,6 +3911,27 @@ impl Renderer {
         }
 
         let (uv_width, uv_height) = chroma_plane_extent(width, height);
+        let frame_size = frame.buffer.size();
+        let min_y_bytes = y_stride as usize * height as usize;
+        let min_uv_bytes = uv_stride as usize * uv_height as usize;
+        if y_stride < width
+            || uv_stride < uv_width.saturating_mul(2)
+            || min_y_bytes > frame_size
+            || (uv_offset as usize) > frame_size
+            || (uv_offset as usize).saturating_add(min_uv_bytes) > frame_size
+        {
+            warn!(
+                "[VIDEO] {}: Rejecting CUDA NV12 layout and falling back to CPU upload: frame={}x{} size={} y_stride={} uv_offset={} uv_stride={}",
+                self.name,
+                width,
+                height,
+                frame_size,
+                y_stride,
+                uv_offset,
+                uv_stride
+            );
+            return false;
+        }
 
         // (Re)create shared CUDA↔Vulkan textures when dimensions change
         let need_new = self
@@ -3841,6 +4134,7 @@ impl Renderer {
     pub fn switch_content(&mut self) {
         let had_current = self.current_texture.is_some();
         let flattened_active_transition = self.freeze_active_transition_to_current();
+        self.direct_video_presentation_active = false;
 
         // If a previous transition left a prev texture behind, release it before preparing
         // the next swap. The current texture stays visible until replacement upload is ready.
@@ -3862,6 +4156,7 @@ impl Renderer {
         self.transition_start_time = None; // Will be set when content is uploaded
         self.transition_active = false; // Will be set to true when replacement content is ready
         self.transition_just_completed = false; // Reset completion flag
+        self.presented_video_session_id = 0;
         self.display_timer_pending = false;
         self.display_timer_ready = false;
         self.transition_bind_group = None; // Invalidate
@@ -3895,6 +4190,7 @@ impl Renderer {
             }
             self.content_swap_pending = false;
             self.transition_active = false;
+            self.direct_video_presentation_active = false;
             self.transition_just_completed = false; // Reset flag
             self.display_timer_pending = false;
             self.display_timer_ready = false;

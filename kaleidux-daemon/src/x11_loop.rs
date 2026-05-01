@@ -169,16 +169,22 @@ pub async fn run(
         let any_active = ctx.any_active();
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf, mut player_event_buf) =
-            (None, None, None, None, None);
+        let (
+            mut cmd_buf,
+            mut frame_ready,
+            _x11_fd_ready,
+            mut image_buf,
+            mut player_buf,
+            mut player_event_buf,
+        ) = (None, false, false, None, None, None);
         if !any_active {
             let idle_deadline = ctx.next_common_idle_deadline(loop_start);
             let result = ctx.idle_wait(&x11_fd, idle_deadline).await;
             cmd_buf = result.0;
-            frame_buf = result.1;
-            image_buf = result.2;
-            player_buf = result.3;
-            player_event_buf = result.4;
+            frame_ready = result.1;
+            image_buf = result.3;
+            player_buf = result.4;
+            player_event_buf = result.5;
         }
 
         // ─── X11 event polling ──────────────────────────────────────────
@@ -227,7 +233,8 @@ pub async fn run(
 
         // ─── Frame handling (X11: immediate render) ─────────────────────
 
-        let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
+        let (latest_frames, _frames_received, _frames_discarded) =
+            ctx.drain_frames(any_active || frame_ready, false);
         for (src, frame) in latest_frames {
             let barrier_blocks = ctx.startup_barrier_blocks_output(src.as_str(), loop_start);
             let mut mark_presented = false;
@@ -245,6 +252,7 @@ pub async fn run(
                     r.upload_frame(&frame);
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
+                    ctx.metrics.record_video_frame_uploaded();
                     mark_ready = true;
                     drop(frame);
                 } else {
@@ -309,11 +317,7 @@ pub async fn run(
         let mut presented_outputs = Vec::new();
         for (name, r) in ctx.renderers.iter_mut() {
             let barrier_blocks = blocked_outputs.contains(name);
-            if (r.needs_redraw
-                || r.transition_active
-                || r.valid_content_type == crate::queue::ContentType::Video)
-                && !barrier_blocks
-            {
+            if (r.needs_redraw || r.transition_active) && !barrier_blocks {
                 let _ = r.render(renderer::BackendContext::X11, loop_start);
                 if !ctx.first_frame_recorded {
                     ctx.metrics.record_first_frame();
@@ -322,17 +326,13 @@ pub async fn run(
                 presented_outputs.push(name.clone());
             }
         }
+        let rendered_any = !presented_outputs.is_empty();
         for name in presented_outputs {
             ctx.mark_output_presented_if_ready(&name);
         }
 
         // Flush X11 commands only if something was rendered
-        let needs_flush = ctx.renderers.values().any(|r| {
-            r.needs_redraw
-                || r.transition_active
-                || r.valid_content_type == crate::queue::ContentType::Video
-        });
-        if needs_flush {
+        if rendered_any {
             let _ = backend.conn.flush();
         }
 
