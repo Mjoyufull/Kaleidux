@@ -982,8 +982,10 @@ pub(crate) struct PendingDirectTakeover {
     last_rendered: u64,
 }
 
-const DIRECT_HANDOFF_MIN_RENDERED_FRAMES: u64 = 2;
+const DIRECT_HANDOFF_MIN_RENDERED_FRAMES: u64 = 4;
 const DIRECT_HANDOFF_TIMEOUT: Duration = Duration::from_millis(1500);
+const DIRECT_HANDOFF_COOLDOWN_BASE: Duration = Duration::from_secs(10);
+const DIRECT_HANDOFF_COOLDOWN_MAX: Duration = Duration::from_secs(90);
 const STARTUP_BARRIER_SKEW_RELEASE: Duration = Duration::from_millis(150);
 const STARTUP_BARRIER_TIMEOUT: Duration = Duration::from_millis(1000);
 const STARTUP_RETRY_LIMIT: u8 = 2;
@@ -1182,6 +1184,8 @@ pub struct MainLoopContext {
     pending_direct_takeovers: HashMap<String, PendingDirectTakeover>,
     pub pending_direct_handoffs: HashMap<String, u64>,
     blocked_direct_handoff_sessions: HashMap<String, u64>,
+    direct_handoff_cooldown_until: HashMap<String, Instant>,
+    direct_handoff_failure_streak: HashMap<String, u32>,
     pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
     pub startup_present_barrier: Option<StartupPresentBarrier>,
@@ -1358,6 +1362,8 @@ impl MainLoopContext {
             pending_direct_takeovers: HashMap::new(),
             pending_direct_handoffs: HashMap::new(),
             blocked_direct_handoff_sessions: HashMap::new(),
+            direct_handoff_cooldown_until: HashMap::new(),
+            direct_handoff_failure_streak: HashMap::new(),
             pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
             startup_present_barrier: None,
@@ -1577,6 +1583,8 @@ impl MainLoopContext {
                 &mut self.pending_direct_takeovers,
                 &mut self.pending_direct_handoffs,
                 &mut self.blocked_direct_handoff_sessions,
+                &mut self.direct_handoff_cooldown_until,
+                &mut self.direct_handoff_failure_streak,
                 &self.pending_video_sessions,
                 &self.metrics,
                 &self.latest_video_frames,
@@ -1836,11 +1844,61 @@ impl MainLoopContext {
         false
     }
 
+    fn direct_handoff_cooldown_active(&self, name: &str, now: Instant) -> Option<Duration> {
+        let until = self.direct_handoff_cooldown_until.get(name).copied()?;
+        if until <= now {
+            return None;
+        }
+        Some(until.saturating_duration_since(now))
+    }
+
+    fn arm_direct_handoff_cooldown(&mut self, name: &str, session_id: u64, reason: &str) {
+        let next_streak = self
+            .direct_handoff_failure_streak
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .min(6);
+        self.direct_handoff_failure_streak
+            .insert(name.to_string(), next_streak);
+        let scale = 1u32 << next_streak.saturating_sub(1);
+        let cooldown = DIRECT_HANDOFF_COOLDOWN_BASE
+            .saturating_mul(scale)
+            .min(DIRECT_HANDOFF_COOLDOWN_MAX);
+        let until = Instant::now() + cooldown;
+        self.direct_handoff_cooldown_until
+            .insert(name.to_string(), until);
+        info!(
+            "[VIDEO] {}: Direct handoff cooldown armed for {:.1}s after {} (session={}, streak={})",
+            name,
+            cooldown.as_secs_f64(),
+            reason,
+            session_id,
+            next_streak
+        );
+    }
+
+    fn clear_direct_handoff_backoff(&mut self, name: &str) {
+        self.direct_handoff_failure_streak.remove(name);
+        self.direct_handoff_cooldown_until.remove(name);
+    }
+
     pub(crate) fn maybe_schedule_direct_wayland_handoff(&mut self, name: &str) {
         if !video::native_wayland_backend_enabled()
             || self.pending_video_switches.contains_key(name)
             || self.pending_direct_takeovers.contains_key(name)
         {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(remaining) = self.direct_handoff_cooldown_active(name, now) {
+            self.metrics.record_direct_handoff_cooldown_skip();
+            debug!(
+                "[VIDEO] {}: Skipping direct handoff while cooldown is active ({:.1}s remaining)",
+                name,
+                remaining.as_secs_f64()
+            );
             return;
         }
 
@@ -1907,6 +1965,7 @@ impl MainLoopContext {
             session_id,
             start_position_ns.unwrap_or(0) as f64 / 1_000_000.0
         );
+        self.metrics.record_direct_handoff_attempt();
 
         self.pending_direct_handoffs
             .insert(name.to_string(), session_id);
@@ -1977,6 +2036,8 @@ impl MainLoopContext {
         if let Some(renderer) = self.renderers.get_mut(name) {
             renderer.set_direct_video_presentation_active(true);
         }
+        self.clear_direct_handoff_backoff(name);
+        self.metrics.record_direct_handoff_promoted();
         info!(
             "[VIDEO] {}: Direct Wayland handoff promoted after {:.1}ms (rendered={} avg_rate={:.1})",
             name,
@@ -2021,10 +2082,12 @@ impl MainLoopContext {
             }
 
             let elapsed = pending.armed_at.elapsed();
-            let rendered_enough = stats.rendered >= DIRECT_HANDOFF_MIN_RENDERED_FRAMES;
-            let clearly_advancing = stats.rendered >= 1
-                && stats.average_rate > 0.0
-                && elapsed >= Duration::from_millis(250);
+            let rendered_enough =
+                stats.rendered >= DIRECT_HANDOFF_MIN_RENDERED_FRAMES && stats.average_rate >= 6.0;
+            let clearly_advancing = stats.rendered >= 4
+                && stats.average_rate >= 4.0
+                && stats.dropped == 0
+                && elapsed >= Duration::from_millis(500);
             if rendered_enough || clearly_advancing {
                 self.promote_pending_direct_takeover(&name, stats.rendered, stats.average_rate);
                 continue;
@@ -2040,6 +2103,8 @@ impl MainLoopContext {
                     stats.average_rate
                 );
                 let pending_session_id = pending.session_id;
+                self.metrics.record_direct_handoff_timeout();
+                self.arm_direct_handoff_cooldown(&name, pending_session_id, "promotion_timeout");
                 self.block_direct_handoff_session(&name, pending_session_id, "promotion_timeout");
                 self.abandon_pending_direct_takeover(&name, "promotion_timeout");
             }
@@ -2963,6 +3028,8 @@ impl MainLoopContext {
         self.pending_video_switches.clear();
         self.pending_direct_handoffs.clear();
         self.blocked_direct_handoff_sessions.clear();
+        self.direct_handoff_cooldown_until.clear();
+        self.direct_handoff_failure_streak.clear();
         for (_, mut pending) in self.pending_direct_takeovers.drain() {
             let _ = pending.player.request_stop();
         }
@@ -4869,6 +4936,8 @@ pub async fn handle_command(
     pending_direct_takeovers: &mut HashMap<String, PendingDirectTakeover>,
     pending_direct_handoffs: &mut HashMap<String, u64>,
     blocked_direct_handoff_sessions: &mut HashMap<String, u64>,
+    direct_handoff_cooldown_until: &mut HashMap<String, Instant>,
+    direct_handoff_failure_streak: &mut HashMap<String, u32>,
     pending_video_sessions: &PendingVideoSessions,
     metrics: &Arc<metrics::PerformanceMetrics>,
     frame_mailbox: &video::LatestFrameMailbox,
@@ -5025,6 +5094,8 @@ pub async fn handle_command(
                 pending_video_switches.remove(&name);
                 pending_direct_handoffs.remove(&name);
                 blocked_direct_handoff_sessions.remove(&name);
+                direct_handoff_cooldown_until.remove(&name);
+                direct_handoff_failure_streak.remove(&name);
                 frame_mailbox.clear_source(&name);
                 if let Some(player) = video_players.remove(&name) {
                     stop_video_player_in_background(name, player);
@@ -5049,6 +5120,8 @@ pub async fn handle_command(
                 pending_video_switches.remove(&name);
                 pending_direct_handoffs.remove(&name);
                 blocked_direct_handoff_sessions.remove(&name);
+                direct_handoff_cooldown_until.remove(&name);
+                direct_handoff_failure_streak.remove(&name);
                 frame_mailbox.clear_source(&name);
                 if let Some(vp) = video_players.remove(&name) {
                     stop_video_player_in_background(name.clone(), vp);

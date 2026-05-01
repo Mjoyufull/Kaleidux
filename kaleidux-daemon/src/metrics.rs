@@ -66,6 +66,10 @@ pub struct PerformanceMetrics {
     direct_fallback_other: Arc<AtomicU64>,
     shared_broker_hits: Arc<AtomicU64>,
     shared_broker_misses: Arc<AtomicU64>,
+    direct_handoff_attempts: Arc<AtomicU64>,
+    direct_handoff_promoted: Arc<AtomicU64>,
+    direct_handoff_timeouts: Arc<AtomicU64>,
+    direct_handoff_cooldown_skips: Arc<AtomicU64>,
 
     // Component CPU tracking (time spent in each component in milliseconds)
     renderer_cpu_time: Arc<AtomicU64>, // Total CPU time in microseconds
@@ -153,6 +157,10 @@ impl PerformanceMetrics {
             direct_fallback_other: Arc::new(AtomicU64::new(0)),
             shared_broker_hits: Arc::new(AtomicU64::new(0)),
             shared_broker_misses: Arc::new(AtomicU64::new(0)),
+            direct_handoff_attempts: Arc::new(AtomicU64::new(0)),
+            direct_handoff_promoted: Arc::new(AtomicU64::new(0)),
+            direct_handoff_timeouts: Arc::new(AtomicU64::new(0)),
+            direct_handoff_cooldown_skips: Arc::new(AtomicU64::new(0)),
             renderer_cpu_time: Arc::new(AtomicU64::new(0)),
             video_cpu_time: Arc::new(AtomicU64::new(0)),
             file_discovery_cpu_time: Arc::new(AtomicU64::new(0)),
@@ -252,6 +260,23 @@ impl PerformanceMetrics {
 
     pub fn record_shared_broker_miss(&self) {
         self.shared_broker_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_handoff_attempt(&self) {
+        self.direct_handoff_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_handoff_promoted(&self) {
+        self.direct_handoff_promoted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_handoff_timeout(&self) {
+        self.direct_handoff_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_handoff_cooldown_skip(&self) {
+        self.direct_handoff_cooldown_skips
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_error_rate(&self) -> f64 {
@@ -963,6 +988,13 @@ impl PerformanceMetrics {
             video_pacing,
             fallback_info,
             shared_broker_info
+        );
+        tracing::info!(
+            "[METRICS] Video handoff: attempts={} promoted={} timeouts={} cooldown_skips={}",
+            self.direct_handoff_attempts.load(Ordering::Relaxed),
+            self.direct_handoff_promoted.load(Ordering::Relaxed),
+            self.direct_handoff_timeouts.load(Ordering::Relaxed),
+            self.direct_handoff_cooldown_skips.load(Ordering::Relaxed),
         );
 
         if image_avg > 0.0 || self.get_recent_avg_image_upload_ms() > 0.0 {
