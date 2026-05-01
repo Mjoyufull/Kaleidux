@@ -163,6 +163,10 @@ fn prefer_videoinfo_cuda_layout_enabled() -> bool {
     env_flag_enabled("KLD_CUDA_LAYOUT_PREFER_VIDEOINFO")
 }
 
+fn appsink_sync_enabled() -> bool {
+    env_flag_enabled("KLD_APPSINK_SYNC")
+}
+
 fn direct_aspect_mode_value() -> String {
     std::env::var("KLD_DIRECT_ASPECT_MODE")
         .unwrap_or_else(|_| "letterbox".to_string())
@@ -1543,7 +1547,8 @@ impl VideoPlayer {
             .map_err(|_| anyhow::anyhow!("Failed to downcast to AppSink"))?;
 
         appsink.set_caps(Some(caps));
-        appsink.set_sync(true);
+        let sink_sync_enabled = appsink_sync_enabled();
+        appsink.set_sync(sink_sync_enabled);
         appsink.set_drop(true);
         appsink.set_max_buffers(1);
         appsink.set_property("enable-last-sample", false);
@@ -1610,9 +1615,10 @@ impl VideoPlayer {
         pipeline.set_property("video-sink", &appsink);
 
         info!(
-            "[VIDEO] {}: VideoPlayer created with playbin + appsink (requested_mode={} caps_ladder={:?} caps={})",
+            "[VIDEO] {}: VideoPlayer created with playbin + appsink (requested_mode={} sync={} caps_ladder={:?} caps={})",
             source_id,
             get_video_mode().cli_label(),
+            sink_sync_enabled,
             caps_ladder,
             caps
         );
