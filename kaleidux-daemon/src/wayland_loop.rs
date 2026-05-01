@@ -4,16 +4,46 @@
 //! and connection error recovery. All shared logic lives in `main_loop::MainLoopContext`.
 
 use crate::background::{self, BackgroundWorkKind};
-use crate::main_loop::{MainLoopContext, stop_video_player_in_background};
+use crate::main_loop::{
+    MainLoopContext, should_accept_video_frame, stop_video_player_in_background,
+};
 use crate::orchestration;
 use crate::renderer;
 
-use std::collections::HashSet;
+use smithay_client_toolkit::shell::WaylandSurface;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{error, info, warn};
-use wayland_client::{Connection, globals::registry_queue_init};
+use wayland_client::{Connection, Proxy, globals::registry_queue_init};
+
+fn ensure_native_video_target(
+    ctx: &mut MainLoopContext,
+    backend: &crate::wayland::WaylandBackend,
+    display_ptr: *mut std::ffi::c_void,
+    name: &str,
+) -> Option<crate::video::NativeWaylandVideoTarget> {
+    // waylandsink embeds its own subsurfaces under the supplied parent surface.
+    // Reuse the wallpaper layer surface instead of creating a second layer-shell surface.
+    let surface = backend.surfaces.get(name)?;
+
+    let mut target = crate::video::NativeWaylandVideoTarget::new(
+        name.to_string(),
+        display_ptr,
+        surface.wl_surface().id().as_ptr() as *mut std::ffi::c_void,
+    );
+    if let Some(renderer) = ctx.renderers.get(name) {
+        target = target.with_size(renderer.config.width, renderer.config.height);
+    }
+    ctx.native_video_targets
+        .insert(name.to_string(), target.clone());
+    Some(target)
+}
+
+fn destroy_native_video_target(ctx: &mut MainLoopContext, name: &str) {
+    ctx.native_video_targets.remove(name);
+}
 
 pub async fn run(
     config: orchestration::Config,
@@ -32,7 +62,6 @@ pub async fn run(
     event_queue.roundtrip(&mut backend)?;
 
     let mut initial_surface: Option<wgpu::Surface<'static>> = None;
-
     let display_ptr = {
         let backend_ref = conn.backend();
         backend_ref.display_ptr() as *mut std::ffi::c_void
@@ -262,12 +291,22 @@ pub async fn run(
         }
 
         // Process pending_resizes to configure renderers
-        let resizes: Vec<_> = backend.pending_resizes.drain(..).collect();
-        for (name, w, h, _) in resizes {
+        let mut latest_resizes: HashMap<String, (u32, u32)> = HashMap::new();
+        for (name, w, h, _) in backend.pending_resizes.drain(..) {
+            latest_resizes.insert(name, (w, h));
+        }
+        for (name, (w, h)) in latest_resizes {
             if let Some(r) = ctx.renderers.get_mut(&name) {
                 let width = if w == 0 { r.config.width } else { w };
                 let height = if h == 0 { r.config.height } else { h };
                 let _ = r.resize_checked(width, height);
+                if let Some(target) = ctx.native_video_targets.get_mut(&name) {
+                    target.width = width.max(1) as i32;
+                    target.height = height.max(1) as i32;
+                }
+                if let Some(player) = ctx.video_players.get(&name) {
+                    let _ = player.update_direct_surface_size(width, height);
+                }
             }
         }
 
@@ -365,64 +404,73 @@ pub async fn run(
         }
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf, mut player_event_buf) =
-            (None, None, None, None, None);
+        let (
+            mut cmd_buf,
+            mut frame_ready,
+            mut wayland_fd_ready,
+            mut image_buf,
+            mut player_buf,
+            mut player_event_buf,
+        ) = (None, false, false, None, None, None);
         let mut entered_idle_wait = false;
         if !hot_loop_active && !connection_dead {
             let idle_deadline = ctx.next_wayland_idle_deadline(loop_start);
             let result = ctx.idle_wait(&wayland_fd, idle_deadline).await;
             cmd_buf = result.0;
-            frame_buf = result.1;
-            image_buf = result.2;
-            player_buf = result.3;
-            player_event_buf = result.4;
+            frame_ready = result.1;
+            wayland_fd_ready = result.2;
+            image_buf = result.3;
+            player_buf = result.4;
+            player_event_buf = result.5;
             entered_idle_wait = true;
         }
 
         // ─── Wayland event polling ──────────────────────────────────────
 
-        if let Some(guard) = conn.prepare_read() {
-            use std::os::unix::io::{AsFd, AsRawFd};
-            let fd = conn.as_fd().as_raw_fd();
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ret = unsafe { libc::poll(&mut poll_fd, 1, 0) };
-            if ret > 0 && (poll_fd.revents & libc::POLLIN != 0) {
-                let _ = guard.read();
-            }
-        }
-
-        match event_queue.dispatch_pending(&mut backend) {
-            Ok(_) => {
-                connection_error_count = 0;
-            }
-            Err(e) => {
-                let error_str = e.to_string();
-                error!("Failed to dispatch Wayland events in main loop: {}", e);
-                connection_error_count += 1;
-                last_error_time = Instant::now();
-                if connection_error_count >= MAX_CONSECUTIVE_ERRORS {
-                    connection_dead = true;
-                }
-                if !error_str.contains("Broken pipe") {
-                    tracing::debug!(
-                        "[WAYLAND] Non-broken-pipe dispatch error (count={})",
-                        connection_error_count
-                    );
+        if hot_loop_active || wayland_fd_ready {
+            if let Some(guard) = conn.prepare_read() {
+                use std::os::unix::io::{AsFd, AsRawFd};
+                let fd = conn.as_fd().as_raw_fd();
+                let mut poll_fd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+                if ret > 0 && (poll_fd.revents & libc::POLLIN != 0) {
+                    let _ = guard.read();
                 }
             }
-        }
 
-        if !connection_dead {
-            let needs_flush = ctx
-                .renderers
-                .values()
-                .any(|r| r.needs_redraw || r.transition_active);
-            if needs_flush {
-                let _ = conn.flush();
+            match event_queue.dispatch_pending(&mut backend) {
+                Ok(_) => {
+                    connection_error_count = 0;
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    error!("Failed to dispatch Wayland events in main loop: {}", e);
+                    connection_error_count += 1;
+                    last_error_time = Instant::now();
+                    if connection_error_count >= MAX_CONSECUTIVE_ERRORS {
+                        connection_dead = true;
+                    }
+                    if !error_str.contains("Broken pipe") {
+                        tracing::debug!(
+                            "[WAYLAND] Non-broken-pipe dispatch error (count={})",
+                            connection_error_count
+                        );
+                    }
+                }
+            }
+
+            if !connection_dead {
+                let needs_flush = ctx
+                    .renderers
+                    .values()
+                    .any(|r| r.needs_redraw || r.transition_active);
+                if needs_flush {
+                    let _ = conn.flush();
+                }
             }
         }
 
@@ -434,30 +482,44 @@ pub async fn run(
                 .outputs()
                 .filter_map(|o| backend.output_state.info(&o).and_then(|i| i.name.clone()))
                 .collect();
-            ctx.renderers.retain(|name, _| {
-                if !active_output_names.contains(name) {
-                    if let Some(vp) = ctx.video_players.remove(name) {
-                        stop_video_player_in_background(name.clone(), vp);
-                    }
-                    ctx.pending_video_switches.remove(name);
-                    crate::main_loop::set_pending_video_session(
-                        &ctx.pending_video_sessions,
-                        name,
-                        None,
-                    );
-                    false
-                } else {
-                    true
+            let removed_outputs: Vec<String> = ctx
+                .renderers
+                .keys()
+                .filter(|name| !active_output_names.contains(*name))
+                .cloned()
+                .collect();
+            for name in &removed_outputs {
+                destroy_native_video_target(&mut ctx, name);
+                if let Some(vp) = ctx.video_players.remove(name) {
+                    stop_video_player_in_background(name.clone(), vp);
                 }
-            });
+                ctx.pending_video_switches.remove(name);
+                crate::main_loop::set_pending_video_session(
+                    &ctx.pending_video_sessions,
+                    name,
+                    None,
+                );
+            }
+            ctx.renderers
+                .retain(|name, _| active_output_names.contains(name));
 
-            let resizes: Vec<_> = backend.pending_resizes.drain(..).collect();
-            for (name, w, h, _) in resizes {
+            let mut latest_resizes: HashMap<String, (u32, u32)> = HashMap::new();
+            for (name, w, h, _) in backend.pending_resizes.drain(..) {
+                latest_resizes.insert(name, (w, h));
+            }
+            for (name, (w, h)) in latest_resizes {
                 if let Some(r) = ctx.renderers.get_mut(&name) {
                     let width = if w == 0 { r.config.width } else { w };
                     let height = if h == 0 { r.config.height } else { h };
                     let _ = r.resize_checked(width, height);
-                    if r.configured {
+                    if let Some(target) = ctx.native_video_targets.get_mut(&name) {
+                        target.width = width.max(1) as i32;
+                        target.height = height.max(1) as i32;
+                    }
+                    if let Some(player) = ctx.video_players.get(&name) {
+                        let _ = player.update_direct_surface_size(width, height);
+                    }
+                    if r.configured && !r.is_direct_video_presentation_active() {
                         if let Some(layer_surface) = backend.surfaces.get(&name) {
                             let _ = r.render(
                                 renderer::BackendContext::Wayland {
@@ -482,14 +544,19 @@ pub async fn run(
 
         // ─── Frame handling (Wayland-specific upload + render) ───────────
 
-        let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
+        let (latest_frames, _frames_received, _frames_discarded) =
+            ctx.drain_frames(hot_loop_active || frame_ready, true);
         for (source_id, frame) in latest_frames {
             let barrier_blocks = ctx.startup_barrier_blocks_output(source_id.as_str(), loop_start);
             let mut mark_presented = false;
             let mut mark_ready = false;
+            let mut schedule_direct_handoff = false;
             if let Some(r) = ctx.renderers.get_mut(source_id.as_str()) {
+                let had_current_texture = r.has_current_texture();
                 let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
-                    !r.has_current_texture() || !r.frame_callback_pending_too_long(1000)
+                    !had_current_texture
+                        || !r.frame_callback_pending
+                        || r.frame_callback_pending_too_long(1000)
                 } else {
                     !r.frame_callback_pending || !r.has_current_texture()
                 };
@@ -499,6 +566,7 @@ pub async fn run(
                     r.upload_frame(&frame);
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
+                    ctx.metrics.record_video_frame_uploaded();
                     mark_ready = true;
                     drop(frame);
                 } else {
@@ -508,7 +576,23 @@ pub async fn run(
                 if r.valid_content_type == crate::queue::ContentType::Video {
                     if let Some(layer_surface) = backend.surfaces.get(source_id.as_str()) {
                         if !barrier_blocks {
-                            if r.frame_callback_pending_too_long(1000) {
+                            if mark_ready && !had_current_texture {
+                                let _ = r.render(
+                                    renderer::BackendContext::Wayland {
+                                        surface: layer_surface,
+                                        qh: &qh,
+                                    },
+                                    loop_start,
+                                );
+                                if !ctx.first_frame_recorded {
+                                    ctx.metrics.record_first_frame();
+                                    ctx.first_frame_recorded = true;
+                                }
+                                mark_presented = true;
+                                schedule_direct_handoff = r.transition_just_completed();
+                                callback_flush_needed |=
+                                    r.request_frame_callback(layer_surface, &qh);
+                            } else if r.frame_callback_pending_too_long(1000) {
                                 let _ = r.render(
                                     renderer::BackendContext::Wayland {
                                         surface: layer_surface,
@@ -539,15 +623,16 @@ pub async fn run(
             if mark_presented {
                 ctx.mark_output_presented_if_ready(source_id.as_str());
             }
+            if schedule_direct_handoff {
+                ctx.maybe_schedule_direct_wayland_handoff(source_id.as_str());
+            }
         }
 
         // ─── Image handling (Wayland render via closure) ─────────────────
 
-        // We need to capture backend reference for the render closure
-        let surfaces = &backend.surfaces;
         ctx.drain_images(image_buf, loop_start, |r, name, ls| {
             if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
+                if let Some(layer_surface) = backend.surfaces.get(name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
@@ -563,7 +648,7 @@ pub async fn run(
 
         ctx.drain_players(player_buf, loop_start, |r, name, ls| {
             if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
+                if let Some(layer_surface) = backend.surfaces.get(name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
@@ -575,9 +660,58 @@ pub async fn run(
             }
         });
 
+        if crate::video::native_wayland_backend_enabled() {
+            let handoff_candidates: Vec<String> = ctx
+                .renderers
+                .iter()
+                .filter_map(|(name, renderer)| {
+                    if !renderer.ready_for_direct_video_handoff()
+                        || renderer.is_direct_video_presentation_active()
+                        || ctx.startup_barrier_blocks_output(name, loop_start)
+                    {
+                        return None;
+                    }
+
+                    let player = ctx.video_players.get(name)?;
+                    if !player.is_appsink_backend()
+                        || player.session_id() == 0
+                        || player.session_id() != renderer.active_video_session_id
+                    {
+                        return None;
+                    }
+
+                    Some(name.clone())
+                })
+                .collect();
+            for name in handoff_candidates {
+                let _ = ensure_native_video_target(&mut ctx, &backend, display_ptr, &name);
+                ctx.maybe_schedule_direct_wayland_handoff(&name);
+            }
+        }
+
+        let kept_native_targets: std::collections::HashSet<String> = ctx
+            .renderers
+            .iter()
+            .filter_map(|(name, renderer)| {
+                renderer
+                    .is_direct_video_presentation_active()
+                    .then_some(name.clone())
+            })
+            .chain(ctx.pending_direct_handoffs.keys().cloned())
+            .collect();
+        let stale_native_targets: Vec<String> = ctx
+            .native_video_targets
+            .keys()
+            .filter(|name| !kept_native_targets.contains(*name))
+            .cloned()
+            .collect();
+        for name in stale_native_targets {
+            destroy_native_video_target(&mut ctx, &name);
+        }
+
         ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
             if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
+                if let Some(layer_surface) = backend.surfaces.get(name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
@@ -588,6 +722,40 @@ pub async fn run(
                 }
             }
         });
+
+        let direct_heartbeat_blocked_outputs: HashSet<String> = ctx
+            .startup_present_barrier
+            .as_ref()
+            .map(|barrier| {
+                barrier
+                    .outputs
+                    .iter()
+                    .filter_map(|(name, state)| {
+                        if state.can_block && barrier.release_reason.is_none() {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, r) in ctx.renderers.iter_mut() {
+            if !r.is_direct_video_presentation_active()
+                || direct_heartbeat_blocked_outputs.contains(name)
+            {
+                continue;
+            }
+
+            if r.direct_video_heartbeat_due(renderer::DIRECT_VIDEO_PARENT_HEARTBEAT_INTERVAL) {
+                if let Err(e) = r.present_direct_video_heartbeat() {
+                    warn!(
+                        "[VIDEO] {}: direct video parent heartbeat present failed: {}",
+                        name, e
+                    );
+                }
+            }
+        }
 
         // ─── Wayland frame callback rendering ───────────────────────────
 
@@ -596,7 +764,25 @@ pub async fn run(
             ctx.metrics.record_wayland_callback_wake();
             let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
             let mut mark_presented = false;
+            let deferred_frame = ctx.latest_video_frames.take_frame(&name);
             if let Some(r) = ctx.renderers.get_mut(&name) {
+                if r.is_direct_video_presentation_active() {
+                    r.frame_callback_pending = false;
+                    r.last_frame_request = None;
+                    continue;
+                }
+                if let Some(frame) = deferred_frame
+                    && should_accept_video_frame(
+                        r.valid_content_type,
+                        r.active_video_session_id,
+                        frame.session_id,
+                    )
+                {
+                    let upload_start = std::time::Instant::now();
+                    r.upload_frame(&frame);
+                    ctx.metrics.record_video_cpu_time(upload_start.elapsed());
+                    ctx.metrics.record_video_frame_uploaded();
+                }
                 if let Some(wait_duration) = r.frame_callback_pending_duration() {
                     if wait_duration > std::time::Duration::from_millis(250) {
                         tracing::warn!(
@@ -656,8 +842,11 @@ pub async fn run(
             .unwrap_or_default();
         for (name, r) in ctx.renderers.iter_mut() {
             let barrier_blocks = blocked_outputs.contains(name);
-            let should_request =
-                r.has_any_content() && (r.needs_redraw || r.transition_active) && !barrier_blocks;
+            let should_request = if r.is_direct_video_presentation_active() {
+                false
+            } else {
+                r.has_any_content() && (r.needs_redraw || r.transition_active)
+            } && !barrier_blocks;
             if should_request {
                 if let Some(layer_surface) = backend.surfaces.get(name) {
                     callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);

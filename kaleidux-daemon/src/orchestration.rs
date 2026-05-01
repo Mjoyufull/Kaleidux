@@ -229,6 +229,7 @@ fn canonical_transition_tag(name: &str) -> Option<String> {
         .to_string();
 
     if canonical == "Fade" && normalized != "fade" {
+        None
     } else {
         Some(canonical)
     }
@@ -612,5 +613,29 @@ mod tests {
 
         let matched = cfg.get_config_for_output("HDMI-A-1", "Primary Display");
         assert_eq!(matched.volume, 25);
+    }
+
+    #[test]
+    fn exact_output_override_keeps_zero_global_volume() {
+        let cfg = Config::parse_str(
+            r#"
+            [global]
+            monitor-behavior = "independent"
+            volume = 0
+            sorting = "ascending"
+
+            [any]
+            duration = "3m"
+            transition = "fade"
+
+            [DP-2]
+            path = "/tmp/videos"
+            "#,
+        )
+        .unwrap();
+
+        let matched = cfg.get_config_for_output("DP-2", "Test Display");
+        assert_eq!(matched.volume, 0);
+        assert_eq!(matched.sorting, SortingStrategy::Ascending);
     }
 }
