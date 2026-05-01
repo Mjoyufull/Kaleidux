@@ -131,12 +131,12 @@ impl WaylandBackend {
         })
     }
 
-    pub fn create_wallpaper_surface(
+    fn create_layer_surface_internal(
         &mut self,
         output: &wl_output::WlOutput,
         qh: &QueueHandle<Self>,
-        name: String,
         layer: Layer,
+        namespace: &'static str,
     ) -> anyhow::Result<LayerSurface> {
         let wl_surface = self.compositor.create_surface(qh);
 
@@ -144,7 +144,7 @@ impl WaylandBackend {
             qh,
             wl_surface,
             layer,
-            Some("kaleidux-wallpaper"),
+            Some(namespace),
             Some(output),
         );
 
@@ -154,12 +154,35 @@ impl WaylandBackend {
         layer_surface.set_exclusive_zone(-1);
         layer_surface.commit();
 
-        // Keep track of them
+        Ok(layer_surface)
+    }
+
+    pub fn create_wallpaper_surface(
+        &mut self,
+        output: &wl_output::WlOutput,
+        qh: &QueueHandle<Self>,
+        name: String,
+        layer: Layer,
+    ) -> anyhow::Result<LayerSurface> {
+        let layer_surface =
+            self.create_layer_surface_internal(output, qh, layer, "kaleidux-wallpaper")?;
+
         if let Some(_prev) = self.surfaces.insert(name.clone(), layer_surface.clone()) {
             warn!("[WAYLAND] Replacing existing LayerSurface for {}", name);
         }
 
         Ok(layer_surface)
+    }
+
+    pub fn find_renderer_surface_name(&self, surface: &wl_surface::WlSurface) -> Option<String> {
+        self.surfaces
+            .iter()
+            .find(|(_, s)| s.wl_surface() == surface)
+            .map(|(n, _)| n.clone())
+    }
+
+    pub fn find_surface_name(&self, surface: &wl_surface::WlSurface) -> Option<String> {
+        self.find_renderer_surface_name(surface)
     }
 }
 
@@ -201,16 +224,13 @@ impl CompositorHandler for WaylandBackend {
             surface.id().protocol_id(),
             time
         );
-        // Find which output this surface belongs to
-        let name = self
-            .surfaces
-            .iter()
-            .find(|(_, s)| s.wl_surface() == surface)
-            .map(|(n, _)| n.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if name != "unknown" {
-            tracing::trace!("[FRAME] Frame callback received for output: {}", name);
+        // Only renderer-owned surfaces should wake the renderer loop.
+        // Direct video surfaces have their own presentation lifecycle.
+        if let Some(name) = self.find_renderer_surface_name(surface) {
+            tracing::trace!(
+                "[FRAME] Renderer frame callback received for output: {}",
+                name
+            );
             // Signal that this renderer should render now
             self.frame_callback_ready.insert(name);
         }
@@ -278,10 +298,7 @@ impl LayerShellHandler for WaylandBackend {
     ) {
         // Find the name of the surface being closed
         let name = self
-            .surfaces
-            .iter()
-            .find(|(_, s)| s.wl_surface() == layer_surface.wl_surface())
-            .map(|(n, _)| n.clone())
+            .find_surface_name(layer_surface.wl_surface())
             .unwrap_or_else(|| "unknown".to_string());
 
         tracing::warn!(
@@ -303,10 +320,7 @@ impl LayerShellHandler for WaylandBackend {
 
         // Find which output name this belongs to
         let name = self
-            .surfaces
-            .iter()
-            .find(|(_, s)| s.wl_surface() == layer_surface.wl_surface())
-            .map(|(n, _)| n.clone())
+            .find_surface_name(layer_surface.wl_surface())
             .unwrap_or_else(|| "unknown".to_string());
 
         let protocol_id = layer_surface.wl_surface().id().protocol_id();

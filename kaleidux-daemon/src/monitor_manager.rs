@@ -1116,6 +1116,20 @@ impl MonitorManager {
         next_deadline
     }
 
+    pub fn tick_due(&self, now: Instant) -> bool {
+        if self.paused {
+            return false;
+        }
+
+        match self.next_switch_deadline() {
+            Some(deadline) => deadline <= now,
+            None => self
+                .outputs
+                .values()
+                .any(|orch| orch.current_path.is_none()),
+        }
+    }
+
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
         // Don't cycle wallpapers when paused

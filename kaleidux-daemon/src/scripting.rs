@@ -74,4 +74,8 @@ impl ScriptManager {
             }
         }
     }
+
+    pub fn is_loaded(&self) -> bool {
+        self.ast.is_some()
+    }
 }
