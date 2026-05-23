@@ -141,9 +141,11 @@ pub struct CudaInterop {
     op_lock: parking_lot::Mutex<()>,
 }
 
+// SAFETY: all CUDA driver entry points on `CudaInterop` acquire `op_lock` before
+// touching the context or allocation state, so moving the wrapper between threads is serialized.
 unsafe impl Send for CudaInterop {}
-/// CUDA driver APIs used here are not thread-safe, but every exported entry point on
-/// `CudaInterop` is serialized with `op_lock`, so sharing via `Arc` across threads is sound.
+// SAFETY: shared access is serialized by `op_lock`; function pointers remain valid because
+// the owning CUDA driver `Library` is stored in the same struct.
 unsafe impl Sync for CudaInterop {}
 
 fn cuda_err(name: &str, res: CUresult) -> String {
@@ -160,6 +162,8 @@ macro_rules! load_fn {
 
 impl CudaInterop {
     pub fn new() -> Result<Self, String> {
+        // SAFETY: CUDA symbols are loaded from the process CUDA driver library and stored
+        // with the owning `Library` in `CudaInterop`, so function pointers never outlive it.
         unsafe {
             let lib = libloading::Library::new("libcuda.so.1")
                 .or_else(|_| libloading::Library::new("libcuda.so"))
@@ -228,6 +232,8 @@ impl CudaInterop {
     }
 
     fn push_context(&self) -> Result<(), String> {
+        // SAFETY: `self.ctx` was created by `cuCtxCreate` during construction and is
+        // destroyed only in `Drop`; callers serialize CUDA use with `op_lock`.
         let res = unsafe { (self.cu_ctx_set_current)(self.ctx) };
         if res != CUDA_SUCCESS {
             return Err(cuda_err("cuCtxSetCurrent", res));
@@ -245,6 +251,8 @@ impl CudaInterop {
         let _guard = self.op_lock.lock();
         self.push_context()?;
 
+        // SAFETY: CUDA virtual-memory calls use initialized structs, checked result codes,
+        // and unwind failures by closing fds and releasing CUDA handles before returning.
         unsafe {
             let prop = CUmemAllocationProp {
                 type_: CU_MEM_ALLOCATION_TYPE_PINNED,
@@ -353,6 +361,7 @@ impl CudaInterop {
     pub fn synchronize(&self) -> Result<(), String> {
         let _guard = self.op_lock.lock();
         self.push_context()?;
+        // SAFETY: the current context was pushed under `op_lock` immediately above.
         let res = unsafe { (self.cu_ctx_synchronize)() };
         if res != CUDA_SUCCESS {
             return Err(cuda_err("cuCtxSynchronize", res));
@@ -363,6 +372,8 @@ impl CudaInterop {
     pub fn free_exportable(&self, alloc: ExportableCudaAllocation) {
         let _guard = self.op_lock.lock();
         let _ = self.push_context();
+        // SAFETY: `alloc` was returned by `allocate_exportable`; unmap/free/release are
+        // called once by ownership convention and serialized under `op_lock`.
         unsafe {
             (self.cu_mem_unmap)(alloc.dev_ptr, alloc.alloc_size);
             (self.cu_mem_address_free)(alloc.dev_ptr, alloc.alloc_size);
@@ -403,6 +414,8 @@ impl CudaInterop {
             height,
         };
 
+        // SAFETY: `params` contains device pointers/pitches supplied by the caller for live
+        // CUDA allocations; the call is serialized under `op_lock` with this context current.
         let res = unsafe { (self.cu_memcpy_2d)(&params) };
         if res != CUDA_SUCCESS {
             return Err(cuda_err("cuMemcpy2D", res));
@@ -413,6 +426,7 @@ impl CudaInterop {
 
 impl Drop for CudaInterop {
     fn drop(&mut self) {
+        // SAFETY: `ctx` was created by this object and is destroyed exactly once in `Drop`.
         unsafe {
             (self.cu_ctx_destroy)(self.ctx);
         }
@@ -427,6 +441,8 @@ pub struct CudaMapGuard {
     map_info: gstreamer::ffi::GstMapInfo,
 }
 
+// SAFETY: the guard owns a cloned `Buffer` and unmaps it on drop; callers only expose
+// the device pointer value and do not provide shared mutable Rust references to mapped data.
 unsafe impl Send for CudaMapGuard {}
 
 impl CudaMapGuard {
@@ -437,6 +453,8 @@ impl CudaMapGuard {
 
 impl Drop for CudaMapGuard {
     fn drop(&mut self) {
+        // SAFETY: `map_info` was initialized by a successful `gst_buffer_map` for `buffer`
+        // and is unmapped exactly once when this guard is dropped.
         unsafe {
             gstreamer::ffi::gst_buffer_unmap(self.buffer.as_ptr() as *mut _, &mut self.map_info);
         }
@@ -445,6 +463,8 @@ impl Drop for CudaMapGuard {
 
 pub fn map_buffer_cuda(buffer: &gstreamer::Buffer) -> Option<CudaMapGuard> {
     const GST_MAP_CUDA: u32 = 1 << 17;
+    // SAFETY: `map_info` is zero-initialized for GStreamer to fill, `buffer` stays alive
+    // through the returned guard, and every successful map is paired with guard unmap.
     unsafe {
         let mut map_info: gstreamer::ffi::GstMapInfo = std::mem::zeroed();
         let flags = gstreamer::ffi::GST_MAP_READ | GST_MAP_CUDA;

@@ -268,7 +268,10 @@ pub struct RawX11Surface {
     pub screen: i32,
 }
 
+// SAFETY: `RawX11Surface` owns an `Arc<XCBConnection>` and stores immutable window/screen IDs.
+// The raw handles returned from it are borrowed only for WGPU surface creation while `self` lives.
 unsafe impl Send for RawX11Surface {}
+// SAFETY: Shared access does not mutate the XCB connection wrapper or handle IDs.
 unsafe impl Sync for RawX11Surface {}
 
 impl HasWindowHandle for RawX11Surface {
@@ -277,6 +280,7 @@ impl HasWindowHandle for RawX11Surface {
         let handle = XcbWindowHandle::new(
             std::num::NonZeroU32::new(self.window_id).expect("Window ID is 0"),
         );
+        // SAFETY: The raw XCB window ID belongs to this surface and remains valid for `self`.
         Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Xcb(handle)) })
     }
 }
@@ -285,6 +289,7 @@ impl HasDisplayHandle for RawX11Surface {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
         let ptr = self.connection.get_raw_xcb_connection();
         let handle = XcbDisplayHandle::new(NonNull::new(ptr as *mut _), self.screen);
+        // SAFETY: The XCB display pointer is owned by `self.connection` and remains valid for `self`.
         Ok(unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Xcb(handle)) })
     }
 }

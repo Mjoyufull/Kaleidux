@@ -51,6 +51,10 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 notify = "6.1"
 
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
 [profile.dev.package.fast_image_resize]
 opt-level = 3
 [profile.dev.package.zune-jpeg]

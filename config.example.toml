@@ -20,6 +20,17 @@ monitor-behavior = "independent"
 #   100 = videos only
 video-ratio = 50
 
+# Video publish cadence for appsink-rendered video:
+#   low       = 12 FPS, safest CPU default for low-power
+#   medium    = 24 FPS, better motion for 24 FPS source videos
+#   high      = 48 FPS, smoother motion with more CPU work
+#   unlimited = publish every decoded frame
+# Low-power defaults to low, quality defaults to high, balanced/debug default to unlimited.
+# Steady video frame callbacks use minimal damage by default; use
+# KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full only for compositor damage debugging.
+video-fps = "low"
+
+
 # Default sorting strategy:
 #   "loveit"     - Weighted random using popularity and recency (default)
 #   "random"     - Pure random selection
