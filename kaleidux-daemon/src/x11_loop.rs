@@ -180,11 +180,11 @@ pub async fn run(
         if !any_active {
             let idle_deadline = ctx.next_common_idle_deadline(loop_start);
             let result = ctx.idle_wait(&x11_fd, idle_deadline).await;
-            cmd_buf = result.0;
-            frame_ready = result.1;
-            image_buf = result.3;
-            player_buf = result.4;
-            player_event_buf = result.5;
+            cmd_buf = result.cmd;
+            frame_ready = result.frame_ready;
+            image_buf = result.image;
+            player_buf = result.player;
+            player_event_buf = result.player_event;
         }
 
         // ─── X11 event polling ──────────────────────────────────────────

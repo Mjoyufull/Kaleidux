@@ -178,10 +178,19 @@ transition = { type = "cube", duration = 1000 }
 
 See [USAGE.MD](./USAGE.MD) for full configuration reference.
 
+Operational defaults to know:
+
+- Console logging defaults to `WARN`; use `--log 1..4` for progressively more verbose daemon diagnostics.
+- Exact output-name sections override regex sections, so `[DP-1]` wins over a matching `["re:.*"]`.
+- Independent monitor mode applies a small deterministic phase offset to avoid synchronized image/video swaps across all outputs.
+- `loveit` stats are LRU-bounded; loved entries stay weighted while retained in the stats cache and can age out when the cache exceeds capacity.
+
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **High CPU during video**: Use a zero-copy path when possible. On AMD/Intel, the daemon auto-detects and prefers DMA-BUF when the driver stack exposes it. On NVIDIA, driver/toolkit limitations do not reliably expose DMA-BUF automatically, so use `--video-mode cuda` to force the CUDA zero-copy path. Use `--video-mode cpu` only when you intentionally want software decode or system-memory uploads for debugging or compatibility; it disables the zero-copy ladder and can raise CPU load substantially.
+- **High CPU or blank video wallpaper**: The production path is still appsink/WGPU. On NVIDIA, use `--video-mode cuda` to force the CUDA zero-copy decode path when auto mode cannot infer it. An experimental libmpv backend can be built with `--features mpv-backend` and selected with `--video-backend mpv`; it captures `screenshot-raw` RGBA frames back into WGPU and is meant for correctness testing, not CPU wins yet.
+- **Video looks too choppy in low-power mode**: set `video-fps = "medium"` for 24 FPS publishing, `video-fps = "high"` for 48 FPS, or `video-fps = "unlimited"` to publish every decoded frame. The default `video-fps = "low"` has the most CPU headroom; the Wayland path uses minimal steady-video frame-callback damage by default to keep higher tiers under the sub-5 target on the tested setup. Set `KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full` only when debugging compositor damage behavior.
+- **Full-rate video CPU tuning**: appsink mailbox backpressure is enabled by default so a decoded sample is not converted again while the renderer already has an unconsumed frame. Set `KLD_APPSINK_DROP_IF_MAILBOX_PENDING=0` only for visual debugging; local one-video testing showed it raised CPU substantially. Uncapped appsink backpressure uses a slower `KLD_APPSINK_PENDING_REFRESH_MS` default than capped playback, and steady Wayland callback uploads use the same CPU-shield cadence by default; override with `KLD_VIDEO_CALLBACK_UPLOAD_INTERVAL_MS=0` for old full-callback behavior while debugging. Appsink remains the only production video path; the libmpv backend is experimental and still keeps final presentation under the WGPU renderer. Video players are stopped immediately when switching to images so stale decoders do not keep publishing during image prep; set `KLD_STOP_VIDEO_ON_IMAGE_SWITCH=legacy` only when debugging old crossfade behavior.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
 ## Sub-5 Benchmark Harness
@@ -192,7 +201,7 @@ Use the in-tree benchmark harness to evaluate architecture changes against the s
 bash tools/sub5/run_benchmark.sh three_video_mixed_res kaleidux-daemon-2026-04-26_13-26-27.log
 ```
 
-Artifacts are written under `unattended_runs/<date>/sub5_<scenario>/` with machine-readable JSON and a short summary.
+Artifacts are written under `unattended_runs/<date>/sub5_<scenario>/` with machine-readable JSON and a short summary. Live matrix runs build `target/release/kaleidux-daemon` first by default so CPU gates do not accidentally test a stale binary; set `KLD_LIVE_MATRIX_SKIP_BUILD=1` only when intentionally reusing an existing release build.
 
 ## Contributing
 

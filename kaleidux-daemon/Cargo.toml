@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+mpv-backend = ["dep:libmpv2", "dep:libmpv2-sys"]
+
 [dependencies]
 kaleidux-common = { workspace = true }
 wgpu = { workspace = true }
@@ -36,6 +40,8 @@ chrono = { workspace = true }
 rand = { workspace = true }
 anyhow = "1.0"
 raw-window-handle.workspace = true
+libmpv2 = { version = "6.0.0", default-features = false, optional = true }
+libmpv2-sys = { version = "4.0.1", optional = true }
 
 # Specifically for Wayland and X11
 smithay-client-toolkit = "0.20"
@@ -59,3 +65,6 @@ fast_image_resize = { version = "6", features = ["image"] }
 zune-core = "0.5.1"
 zune-jpeg = "0.5.12"
 zune-png = "0.5.2"
+
+[lints]
+workspace = true
