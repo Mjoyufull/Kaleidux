@@ -1,9 +1,7 @@
 use gstreamer as gst;
 use libmpv2::{Format, Mpv, events};
 use libmpv2_sys as sys;
-use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::ptr;
+use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -22,6 +20,8 @@ const DEFAULT_MPV_CAPTURE_FPS: u32 = 48;
 const MAX_MPV_CAPTURE_FPS: u32 = 120;
 const MPV_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
 const MPV_FIRST_FRAME_POLL: Duration = Duration::from_millis(50);
+const SOFTWARE_RENDER_FORMAT: &str = "rgb0";
+const RENDER_WITHOUT_TARGET_BLOCK: i32 = 0;
 
 pub struct MpvPlayer {
     mpv: Arc<Mpv>,
@@ -117,11 +117,14 @@ impl MpvPlayer {
         }
 
         let wait_start = Instant::now();
+        let mut render_context = None;
         while wait_start.elapsed() < MPV_FIRST_FRAME_TIMEOUT {
             if should_abort() {
                 anyhow::bail!("prebuffer aborted");
             }
-            if let Some(frame) = capture_video_frame(&self.mpv, self.session_id)? {
+            if let Some(frame) =
+                capture_video_frame_with_context(&self.mpv, self.session_id, &mut render_context)?
+            {
                 self.log_first_frame("preroll");
                 return Ok(Some(frame));
             }
@@ -270,13 +273,18 @@ impl MpvPlayer {
         self.frame_thread = std::thread::Builder::new()
             .name(format!("kld-mpv-frames-{}", source_id))
             .spawn(move || {
+                let mut render_context = None;
                 while !stop_requested.load(Ordering::SeqCst) {
                     let frame_start = Instant::now();
                     let elapsed_ns = start_time.elapsed().as_nanos() as u64;
                     if should_publish_now(&last_publish_ns, publish_interval_ns, elapsed_ns) {
                         metrics
                             .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureAttempt);
-                        match capture_video_frame(&mpv, session_id) {
+                        match capture_video_frame_with_context(
+                            &mpv,
+                            session_id,
+                            &mut render_context,
+                        ) {
                             Ok(Some(frame)) => {
                                 if !first_frame_logged.swap(true, Ordering::SeqCst) {
                                     info!(
@@ -327,41 +335,57 @@ fn mpv_capture_fps(max_publish_fps: Option<u32>) -> u32 {
         .clamp(1, MAX_MPV_CAPTURE_FPS)
 }
 
-fn capture_video_frame(mpv: &Mpv, session_id: u64) -> anyhow::Result<Option<VideoFrame>> {
-    let Some(raw) = screenshot_raw(mpv)? else {
+fn capture_video_frame_with_context(
+    mpv: &Mpv,
+    session_id: u64,
+    render_context: &mut Option<SoftwareRenderContext>,
+) -> anyhow::Result<Option<VideoFrame>> {
+    let Some((width, height)) = video_dimensions(mpv) else {
         return Ok(None);
     };
-    let Some(data) = raw.data else {
-        return Ok(None);
-    };
-    if raw.width == 0 || raw.height == 0 || raw.stride == 0 {
-        return Ok(None);
+    if render_context.is_none() {
+        *render_context = Some(SoftwareRenderContext::new(mpv)?);
     }
-    if raw.format != "rgba" {
-        anyhow::bail!("unsupported screenshot-raw format '{}'", raw.format);
-    }
+    let render_context = render_context
+        .as_ref()
+        .expect("mpv software render context was initialized");
+    render_video_frame(mpv, session_id, render_context, width, height)
+}
 
-    let expected_stride = raw.width.saturating_mul(4);
-    if raw.stride < expected_stride {
-        anyhow::bail!(
-            "invalid screenshot-raw stride {} for {}x{} rgba",
-            raw.stride,
-            raw.width,
-            raw.height
-        );
-    }
-
+fn render_video_frame(
+    mpv: &Mpv,
+    session_id: u64,
+    render_context: &SoftwareRenderContext,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Option<VideoFrame>> {
+    let SoftwareRenderedFrame { data, stride } = render_context.render(width, height)?;
     let buffer = gst::Buffer::from_mut_slice(data);
     Ok(Some(VideoFrame {
         buffer,
-        width: raw.width,
-        height: raw.height,
-        stride: raw.stride,
+        width,
+        height,
+        stride,
         format: VideoFrameFormat::Rgba,
         session_id,
         pts_ns: current_position_ns(mpv),
         duration_ns: None,
     }))
+}
+
+fn video_dimensions(mpv: &Mpv) -> Option<(u32, u32)> {
+    let width = mpv
+        .get_property::<i64>("dwidth")
+        .or_else(|_| mpv.get_property::<i64>("width"))
+        .ok()?;
+    let height = mpv
+        .get_property::<i64>("dheight")
+        .or_else(|_| mpv.get_property::<i64>("height"))
+        .ok()?;
+
+    let width = u32::try_from(width).ok()?;
+    let height = u32::try_from(height).ok()?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn current_position_ns(mpv: &Mpv) -> Option<u64> {
@@ -371,147 +395,152 @@ fn current_position_ns(mpv: &Mpv) -> Option<u64> {
         .map(|seconds| (seconds * 1_000_000_000.0) as u64)
 }
 
-#[derive(Default)]
-struct RawScreenshot {
-    width: u32,
-    height: u32,
+struct SoftwareRenderedFrame {
     stride: u32,
-    format: String,
-    data: Option<Vec<u8>>,
+    data: Vec<u8>,
 }
 
-fn screenshot_raw(mpv: &Mpv) -> anyhow::Result<Option<RawScreenshot>> {
-    let args = CommandNode::array(&["screenshot-raw", "video", "rgba"])?;
-    let mut result = unsafe { zero_node() };
-    let code = unsafe { sys::mpv_command_node(mpv.ctx.as_ptr(), args.as_ptr(), &mut result) };
-    if code < 0 {
-        return Ok(None);
-    }
-
-    let parsed = unsafe { parse_raw_screenshot(&result) };
-    unsafe { sys::mpv_free_node_contents(&mut result) };
-    parsed.map(Some)
+struct SoftwareRenderContext {
+    context: *mut sys::mpv_render_context,
 }
 
-unsafe fn parse_raw_screenshot(node: &sys::mpv_node) -> anyhow::Result<RawScreenshot> {
-    if node.format != sys::mpv_format_MPV_FORMAT_NODE_MAP {
-        anyhow::bail!(
-            "screenshot-raw returned unexpected node format {}",
-            node.format
-        );
-    }
-    let list = unsafe { node.u.list.as_ref() }
-        .ok_or_else(|| anyhow::anyhow!("screenshot-raw returned a null map"))?;
-    let values = unsafe { std::slice::from_raw_parts(list.values, list.num as usize) };
-    let keys = unsafe { std::slice::from_raw_parts(list.keys, list.num as usize) };
-
-    let mut fields = HashMap::new();
-    for (key_ptr, value) in keys.iter().zip(values.iter()) {
-        if key_ptr.is_null() {
-            continue;
-        }
-        let key = unsafe { CStr::from_ptr(*key_ptr) }
-            .to_string_lossy()
-            .into_owned();
-        fields.insert(key, value);
-    }
-
-    let mut raw = RawScreenshot::default();
-    raw.width = node_i64(fields.get("w"))
-        .or_else(|| node_i64(fields.get("width")))
-        .unwrap_or(0) as u32;
-    raw.height = node_i64(fields.get("h"))
-        .or_else(|| node_i64(fields.get("height")))
-        .unwrap_or(0) as u32;
-    raw.stride = node_i64(fields.get("stride")).unwrap_or(0) as u32;
-    raw.format = node_string(fields.get("format")).unwrap_or_default();
-    raw.data = node_bytes(fields.get("data"));
-    Ok(raw)
-}
-
-fn node_i64(node: Option<&&sys::mpv_node>) -> Option<i64> {
-    let node = *node?;
-    if node.format != sys::mpv_format_MPV_FORMAT_INT64 {
-        return None;
-    }
-    Some(unsafe { node.u.int64 })
-}
-
-fn node_string(node: Option<&&sys::mpv_node>) -> Option<String> {
-    let node = *node?;
-    if node.format != sys::mpv_format_MPV_FORMAT_STRING {
-        return None;
-    }
-    let raw = unsafe { node.u.string.as_ref() }?;
-    Some(
-        unsafe { CStr::from_ptr(raw) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-fn node_bytes(node: Option<&&sys::mpv_node>) -> Option<Vec<u8>> {
-    let node = *node?;
-    if node.format != sys::mpv_format_MPV_FORMAT_BYTE_ARRAY {
-        return None;
-    }
-    let bytes = unsafe { node.u.ba.as_ref() }?;
-    if bytes.data.is_null() || bytes.size == 0 {
-        return None;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(bytes.data as *const u8, bytes.size) };
-    Some(slice.to_vec())
-}
-
-struct CommandNode {
-    _values: Vec<sys::mpv_node>,
-    _strings: Vec<CString>,
-    _list: Box<sys::mpv_node_list>,
-    root: Box<sys::mpv_node>,
-}
-
-impl CommandNode {
-    fn array(values: &[&str]) -> anyhow::Result<Self> {
-        let strings: Vec<CString> = values
-            .iter()
-            .map(|value| CString::new(*value))
-            .collect::<Result<_, _>>()?;
-        let mut nodes = Vec::with_capacity(strings.len());
-        for string in &strings {
-            nodes.push(sys::mpv_node {
-                u: sys::mpv_node__bindgen_ty_1 {
-                    string: string.as_ptr() as *mut _,
-                },
-                format: sys::mpv_format_MPV_FORMAT_STRING,
-            });
-        }
-        let mut list = Box::new(sys::mpv_node_list {
-            num: nodes.len() as i32,
-            values: nodes.as_mut_ptr(),
-            keys: ptr::null_mut(),
-        });
-        let root = Box::new(sys::mpv_node {
-            u: sys::mpv_node__bindgen_ty_1 {
-                list: list.as_mut() as *mut _,
+impl SoftwareRenderContext {
+    fn new(mpv: &Mpv) -> anyhow::Result<Self> {
+        let api_type = CString::new("sw")?;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
+                data: api_type.as_ptr() as *mut _,
             },
-            format: sys::mpv_format_MPV_FORMAT_NODE_ARRAY,
-        });
-        Ok(Self {
-            _values: nodes,
-            _strings: strings,
-            _list: list,
-            root,
-        })
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+        let mut context = std::ptr::null_mut();
+        // Safety: libmpv only reads the parameter array during this call, and
+        // the API string plus terminator remain live until the call returns.
+        let result = unsafe {
+            sys::mpv_render_context_create(&mut context, mpv.ctx.as_ptr(), params.as_mut_ptr())
+        };
+        if result < 0 {
+            anyhow::bail!("mpv software render context creation failed: {}", result);
+        }
+        Ok(Self { context })
     }
 
-    fn as_ptr(&self) -> *mut sys::mpv_node {
-        self.root.as_ref() as *const _ as *mut _
+    fn render(&self, width: u32, height: u32) -> anyhow::Result<SoftwareRenderedFrame> {
+        let stride = align_to(width.saturating_mul(4), 64);
+        let mut data = vec![0u8; stride as usize * height as usize];
+        let size = [width as i32, height as i32];
+        let format = CString::new(SOFTWARE_RENDER_FORMAT)?;
+        let mut stride_param = stride as usize;
+        let mut block_for_target_time = RENDER_WITHOUT_TARGET_BLOCK;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_SIZE,
+                data: size.as_ptr() as *mut _,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_FORMAT,
+                data: format.as_ptr() as *mut _,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_STRIDE,
+                data: &mut stride_param as *mut _ as *mut _,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
+                data: data.as_mut_ptr() as *mut _,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &mut block_for_target_time as *mut _ as *mut _,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+
+        // Safety: `self.context` is owned by this wrapper and all render
+        // parameters point at buffers that remain valid for the call duration.
+        let _ = unsafe { sys::mpv_render_context_update(self.context) };
+        let result = unsafe { sys::mpv_render_context_render(self.context, params.as_mut_ptr()) };
+        if result < 0 {
+            anyhow::bail!("mpv software render failed: {}", result);
+        }
+        fill_alpha_for_rgb0(&mut data, width, height, stride);
+        Ok(SoftwareRenderedFrame { stride, data })
     }
 }
 
-unsafe fn zero_node() -> sys::mpv_node {
-    sys::mpv_node {
-        u: sys::mpv_node__bindgen_ty_1 { int64: 0 },
-        format: sys::mpv_format_MPV_FORMAT_NONE,
+impl Drop for SoftwareRenderContext {
+    fn drop(&mut self) {
+        // Safety: the context pointer was returned by libmpv, is owned by this
+        // wrapper, and is freed exactly once here.
+        unsafe {
+            sys::mpv_render_context_free(self.context);
+        }
+    }
+}
+
+fn align_to(value: u32, alignment: u32) -> u32 {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+fn fill_alpha_for_rgb0(data: &mut [u8], width: u32, height: u32, stride: u32) {
+    let row_pixels = width as usize;
+    let stride = stride as usize;
+    for row in 0..height as usize {
+        let row_start = row * stride;
+        for pixel in 0..row_pixels {
+            let alpha_index = row_start + pixel * 4 + 3;
+            if let Some(alpha) = data.get_mut(alpha_index) {
+                *alpha = 255;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn align_to_rounds_to_power_of_two_boundary() {
+        assert_eq!(align_to(0, 64), 0);
+        assert_eq!(align_to(4, 64), 64);
+        assert_eq!(align_to(64, 64), 64);
+        assert_eq!(align_to(65, 64), 128);
+    }
+
+    #[test]
+    fn fill_alpha_for_rgb0_sets_pixels_without_touching_padding() {
+        let width = 2;
+        let height = 2;
+        let stride = 12;
+        let mut data = vec![7u8; stride as usize * height as usize];
+
+        fill_alpha_for_rgb0(&mut data, width, height, stride);
+
+        assert_eq!(data[3], 255);
+        assert_eq!(data[7], 255);
+        assert_eq!(data[15], 255);
+        assert_eq!(data[19], 255);
+        assert_eq!(data[8], 7);
+        assert_eq!(data[11], 7);
+        assert_eq!(data[20], 7);
+        assert_eq!(data[23], 7);
+    }
+
+    #[test]
+    fn fill_alpha_for_rgb0_tolerates_short_buffers() {
+        let mut data = vec![0u8; 3];
+
+        fill_alpha_for_rgb0(&mut data, 1, 1, 4);
+
+        assert_eq!(data, vec![0, 0, 0]);
     }
 }
