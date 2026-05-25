@@ -69,13 +69,12 @@ impl MainLoopContext {
         snapshot: RendererActivitySnapshot,
     ) -> Option<(Instant, DeadlineReason)> {
         let deadline = self.next_common_idle_deadline(now);
-        let deadline = min_deadline_with_reason(
+        min_deadline_with_reason(
             deadline,
             snapshot
                 .next_wayland_retry_deadline
                 .map(|deadline| (deadline, DeadlineReason::WaylandRetry)),
-        );
-        deadline
+        )
     }
 
     /// Idle-wait using `tokio::select!` until any event source fires.
