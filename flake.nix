@@ -13,6 +13,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         naersk-lib = pkgs.callPackage naersk { };
+        rustMinVersion = "1.89.0";
         
         # Runtime deps for linking - vulkan-loader needed for build but NOT in runtime path
         # On non-NixOS, system's vulkan-loader must be used to find system ICD files
@@ -70,14 +71,18 @@
           gst-libav
         ]);
 
-        buildDeps = with pkgs; [
-          pkg-config
-          cmake
-          python3
-          llvmPackages.libclang.lib
-          makeWrapper
-          vulkan-headers
-        ];
+        buildDeps =
+          assert pkgs.lib.assertMsg
+            (pkgs.lib.versionAtLeast pkgs.rustc.version rustMinVersion)
+            "Kaleidux requires Rust ${rustMinVersion}+ stable, but nixpkgs provides ${pkgs.rustc.version}";
+          with pkgs; [
+            pkg-config
+            cmake
+            python3
+            llvmPackages.libclang.lib
+            makeWrapper
+            vulkan-headers
+          ];
 
         kaleidux = naersk-lib.buildPackage {
           src = ./.;

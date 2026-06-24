@@ -49,10 +49,6 @@ struct Cli {
     /// Daemon socket path (defaults to XDG_RUNTIME_DIR/kaleidux.sock or /tmp/kaleidux-{USER}.sock)
     #[arg(short, long, global = true)]
     socket: Option<String>,
-
-    /// Show version information
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
-    version: Option<bool>,
 }
 
 #[derive(Subcommand)]

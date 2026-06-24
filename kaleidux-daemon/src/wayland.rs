@@ -9,19 +9,19 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::{
+        WaylandSurface,
         wlr_layer::{
             Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
         },
-        WaylandSurface,
     },
     shm::{Shm, ShmHandler},
 };
 use std::ptr::NonNull;
-use tracing::info;
+use tracing::{info, warn};
 use wayland_client::{
+    Connection, Proxy, QueueHandle,
     globals::GlobalList,
     protocol::{wl_output, wl_surface},
-    Connection, Proxy, QueueHandle,
 };
 
 /// Wrapper around LayerSurface that implements raw_window_handle traits
@@ -104,7 +104,7 @@ pub struct WaylandBackend {
     pub output_state: OutputState,
     pub layer_shell: LayerShell,
     pub shm: Shm,
-    pub surfaces: Vec<(String, LayerSurface)>,
+    pub surfaces: std::collections::HashMap<String, LayerSurface>,
     // (name, width, height, serial)
     pub pending_resizes: Vec<(String, u32, u32, u32)>,
     // Frame callback notifications: surface name -> should render
@@ -125,7 +125,7 @@ impl WaylandBackend {
             output_state,
             layer_shell,
             shm,
-            surfaces: Vec::new(),
+            surfaces: std::collections::HashMap::new(),
             pending_resizes: Vec::new(),
             frame_callback_ready: std::collections::HashSet::new(),
         })
@@ -155,7 +155,9 @@ impl WaylandBackend {
         layer_surface.commit();
 
         // Keep track of them
-        self.surfaces.push((name, layer_surface.clone()));
+        if let Some(_prev) = self.surfaces.insert(name.clone(), layer_surface.clone()) {
+            warn!("[WAYLAND] Replacing existing LayerSurface for {}", name);
+        }
 
         Ok(layer_surface)
     }
@@ -208,7 +210,7 @@ impl CompositorHandler for WaylandBackend {
             .unwrap_or_else(|| "unknown".to_string());
 
         if name != "unknown" {
-            tracing::debug!("[FRAME] Frame callback received for output: {}", name);
+            tracing::trace!("[FRAME] Frame callback received for output: {}", name);
             // Signal that this renderer should render now
             self.frame_callback_ready.insert(name);
         }
@@ -282,8 +284,12 @@ impl LayerShellHandler for WaylandBackend {
             .map(|(n, _)| n.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        tracing::warn!("Layer surface CLOSED by compositor for output: {}. Surface will be re-created if output still exists.", name);
-        self.surfaces.retain(|(_, s)| s != layer_surface);
+        tracing::warn!(
+            "Layer surface CLOSED by compositor for output: {}. Surface will be re-created if output still exists.",
+            name
+        );
+        self.surfaces
+            .retain(|_, s| s.wl_surface() != layer_surface.wl_surface());
     }
     fn configure(
         &mut self,
@@ -308,8 +314,15 @@ impl LayerShellHandler for WaylandBackend {
             "Configure event received for output {} (id: #{}): size {}x{}, serial {}",
             name, protocol_id, width, height, serial
         );
-        tracing::trace!("[WAYLAND] [TRACE] Configure details: name={}, id=#{}, w={}, h={}, serial={}, suggest_resize={:?}, suggest_rescale={:?}", 
-            name, protocol_id, width, height, serial, config.new_size, config.new_size);
+        tracing::trace!(
+            "[WAYLAND] [TRACE] Configure details: name={}, id=#{}, w={}, h={}, serial={}, suggest_resize={:?}",
+            name,
+            protocol_id,
+            width,
+            height,
+            serial,
+            config.new_size
+        );
 
         // NOTE: SCTK 0.19.2 handles ack_configure(serial) AUTOMATICALLY before calling this handler.
         // Calling it here again causes a FATAL "Serial invalid" protocol error.

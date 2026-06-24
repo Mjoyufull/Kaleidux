@@ -32,13 +32,16 @@ vec4 bgColor (vec2 p, vec2 pfr, vec2 pto) {
 // center : the xcenter in [0, 1] \ 0.5 excluded
 vec2 xskew (vec2 p, float persp, float center) {
   float x = mix(p.x, 1.0-p.x, center);
+  float center_side = step(0.5, center);
+  float direction = mix(1.0, -1.0, center_side);
+  float edge = center_side;
   return (
     (
       vec2( x, (p.y - 0.5*(1.0-persp) * x) / (1.0+(persp-1.0)*x) )
       - vec2(0.5-distance(center, 0.5), 0.0)
     )
-    * vec2(0.5 / distance(center, 0.5) * (center<0.5 ? 1.0 : -1.0), 1.0)
-    + vec2(center<0.5 ? 0.0 : 1.0, 0.0)
+    * vec2(0.5 / distance(center, 0.5) * direction, 1.0)
+    + vec2(edge, 0.0)
   );
 }
 

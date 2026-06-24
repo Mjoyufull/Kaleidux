@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Performance metrics for monitoring
@@ -49,6 +49,11 @@ pub struct PerformanceMetrics {
     error_count: Arc<AtomicU64>,
     error_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, String)>>>, // (timestamp, error_type)
 
+    // Wayland pacing diagnostics
+    wayland_idle_loops: Arc<AtomicU64>,
+    wayland_hot_loops: Arc<AtomicU64>,
+    wayland_callback_wakes: Arc<AtomicU64>,
+
     // Component CPU tracking (time spent in each component in milliseconds)
     renderer_cpu_time: Arc<AtomicU64>, // Total CPU time in microseconds
     video_cpu_time: Arc<AtomicU64>,    // Total CPU time in microseconds
@@ -64,8 +69,15 @@ pub struct PerformanceMetrics {
     // Component CPU time samples (for averaging)
     renderer_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>, // Last 100 renderer times in ms
     video_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,    // Last 100 video times in ms
-    file_discovery_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>, // Last 20 file discovery times in ms
+    file_discovery_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, f64)>>>, // Last 20 file discovery times in ms
     shader_compile_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>, // Last 50 shader compile times in ms
+    image_total_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_wait_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_decode_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_convert_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_resize_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_expand_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    image_upload_samples: Arc<parking_lot::Mutex<VecDeque<f64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +126,9 @@ impl PerformanceMetrics {
             gpu_util_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             error_count: Arc::new(AtomicU64::new(0)),
             error_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            wayland_idle_loops: Arc::new(AtomicU64::new(0)),
+            wayland_hot_loops: Arc::new(AtomicU64::new(0)),
+            wayland_callback_wakes: Arc::new(AtomicU64::new(0)),
             renderer_cpu_time: Arc::new(AtomicU64::new(0)),
             video_cpu_time: Arc::new(AtomicU64::new(0)),
             file_discovery_cpu_time: Arc::new(AtomicU64::new(0)),
@@ -126,6 +141,21 @@ impl PerformanceMetrics {
             video_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             file_discovery_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(20))),
             shader_compile_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(50))),
+            image_total_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_wait_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_decode_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_convert_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_resize_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_expand_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+            image_upload_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
+        }
+    }
+
+    fn push_sample(samples: &parking_lot::Mutex<VecDeque<f64>>, value_ms: f64, capacity: usize) {
+        let mut samples = samples.lock();
+        samples.push_back(value_ms);
+        if samples.len() > capacity {
+            samples.pop_front();
         }
     }
 
@@ -136,6 +166,18 @@ impl PerformanceMetrics {
         if samples.len() > 100 {
             samples.pop_front();
         }
+    }
+
+    pub fn record_wayland_idle_loop(&self) {
+        self.wayland_idle_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_wayland_hot_loop(&self) {
+        self.wayland_hot_loops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_wayland_callback_wake(&self) {
+        self.wayland_callback_wakes.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn get_error_rate(&self) -> f64 {
@@ -263,7 +305,7 @@ impl PerformanceMetrics {
         self.file_discovery_ops.fetch_add(1, Ordering::Relaxed);
         let ms = duration.as_secs_f64() * 1000.0;
         let mut samples = self.file_discovery_samples.lock();
-        samples.push_back(ms);
+        samples.push_back((std::time::Instant::now(), ms));
         if samples.len() > 20 {
             samples.pop_front();
         }
@@ -281,6 +323,58 @@ impl PerformanceMetrics {
         if samples.len() > 50 {
             samples.pop_front();
         }
+    }
+
+    pub fn record_image_stage_timings(
+        &self,
+        permit_wait: Duration,
+        decode: Duration,
+        convert: Duration,
+        resize: Duration,
+        expand: Duration,
+        upload: Duration,
+    ) {
+        let total = permit_wait + decode + convert + resize + expand + upload;
+        Self::push_sample(&self.image_total_samples, total.as_secs_f64() * 1000.0, 100);
+        Self::push_sample(
+            &self.image_wait_samples,
+            permit_wait.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_decode_samples,
+            decode.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_convert_samples,
+            convert.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_resize_samples,
+            resize.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_expand_samples,
+            expand.as_secs_f64() * 1000.0,
+            100,
+        );
+        Self::push_sample(
+            &self.image_upload_samples,
+            upload.as_secs_f64() * 1000.0,
+            100,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn record_image_upload_cpu_time(&self, duration: Duration) {
+        Self::push_sample(
+            &self.image_upload_samples,
+            duration.as_secs_f64() * 1000.0,
+            100,
+        );
     }
 
     /// Get average CPU time per renderer operation (in ms)
@@ -306,6 +400,7 @@ impl PerformanceMetrics {
     }
 
     /// Get average CPU time per file discovery operation (in ms)
+    #[allow(dead_code)]
     pub fn get_avg_file_discovery_cpu_time_ms(&self) -> f64 {
         let ops = self.file_discovery_ops.load(Ordering::Relaxed);
         if ops == 0 {
@@ -313,6 +408,23 @@ impl PerformanceMetrics {
         }
         let total_us = self.file_discovery_cpu_time.load(Ordering::Relaxed);
         (total_us as f64 / ops as f64) / 1000.0
+    }
+
+    /// Get recent average file discovery CPU time from samples (in ms).
+    /// Startup discovery is a one-shot event, so stale samples should age out
+    /// instead of showing up forever as active steady-state CPU.
+    pub fn get_recent_avg_file_discovery_cpu_time_ms(&self) -> f64 {
+        let cutoff = std::time::Instant::now() - Duration::from_secs(15);
+        let samples = self.file_discovery_samples.lock();
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for (ts, ms) in samples.iter() {
+            if *ts >= cutoff {
+                sum += *ms;
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     /// Get average CPU time per shader compile operation (in ms)
@@ -341,6 +453,43 @@ impl PerformanceMetrics {
             return 0.0;
         }
         samples.iter().sum::<f64>() / samples.len() as f64
+    }
+
+    fn average_samples(samples: &parking_lot::Mutex<VecDeque<f64>>) -> f64 {
+        let samples = samples.lock();
+        if samples.is_empty() {
+            0.0
+        } else {
+            samples.iter().sum::<f64>() / samples.len() as f64
+        }
+    }
+
+    pub fn get_recent_avg_image_total_ms(&self) -> f64 {
+        Self::average_samples(&self.image_total_samples)
+    }
+
+    pub fn get_recent_avg_image_wait_ms(&self) -> f64 {
+        Self::average_samples(&self.image_wait_samples)
+    }
+
+    pub fn get_recent_avg_image_decode_ms(&self) -> f64 {
+        Self::average_samples(&self.image_decode_samples)
+    }
+
+    pub fn get_recent_avg_image_convert_ms(&self) -> f64 {
+        Self::average_samples(&self.image_convert_samples)
+    }
+
+    pub fn get_recent_avg_image_resize_ms(&self) -> f64 {
+        Self::average_samples(&self.image_resize_samples)
+    }
+
+    pub fn get_recent_avg_image_expand_ms(&self) -> f64 {
+        Self::average_samples(&self.image_expand_samples)
+    }
+
+    pub fn get_recent_avg_image_upload_ms(&self) -> f64 {
+        Self::average_samples(&self.image_upload_samples)
     }
 
     pub fn record_first_frame(&self) {
@@ -457,26 +606,20 @@ impl PerformanceMetrics {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn get_texture_pool_hit_rate(&self) -> f64 {
         let hits = self.texture_pool_hits.load(Ordering::Relaxed) as f64;
         let misses = self.texture_pool_misses.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 
+    #[allow(dead_code)]
     pub fn get_cache_hit_rate(&self) -> f64 {
         let hits = self.cache_hits.load(Ordering::Relaxed) as f64;
         let misses = self.cache_misses.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 
     pub fn get_avg_frame_time_ms(&self) -> f64 {
@@ -668,15 +811,40 @@ impl PerformanceMetrics {
         // Component CPU stats
         let renderer_avg = self.get_recent_avg_renderer_cpu_time_ms();
         let video_avg = self.get_recent_avg_video_cpu_time_ms();
-        let file_disc_avg = self.get_avg_file_discovery_cpu_time_ms();
+        let file_disc_avg = self.get_recent_avg_file_discovery_cpu_time_ms();
         let shader_avg = self.get_avg_shader_compile_cpu_time_ms();
+        let image_avg = self.get_recent_avg_image_total_ms();
         let component_cpu = format!(
-            "renderer={:.2}ms video={:.2}ms file_disc={:.2}ms shader={:.2}ms",
-            renderer_avg, video_avg, file_disc_avg, shader_avg
+            "renderer={:.2}ms video={:.2}ms image={:.2}ms file_disc={:.2}ms shader={:.2}ms",
+            renderer_avg, video_avg, image_avg, file_disc_avg, shader_avg
+        );
+        let wayland_info = format!(
+            " wayland=idle:{} hot:{} callbacks:{}",
+            self.wayland_idle_loops.load(Ordering::Relaxed),
+            self.wayland_hot_loops.load(Ordering::Relaxed),
+            self.wayland_callback_wakes.load(Ordering::Relaxed)
         );
 
+        let hits = self.texture_pool_hits.load(Ordering::Relaxed);
+        let misses = self.texture_pool_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        let texture_hit_rate = if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        };
+
+        let c_hits = self.cache_hits.load(Ordering::Relaxed);
+        let c_misses = self.cache_misses.load(Ordering::Relaxed);
+        let c_total = c_hits + c_misses;
+        let cache_hit_rate = if c_total == 0 {
+            0.0
+        } else {
+            c_hits as f64 / c_total as f64
+        };
+
         tracing::info!(
-            "[METRICS] Uptime: {} | Memory: {} | GPU: {} | Errors: {} | Frame time: avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms | Texture pool: hit_rate={:.1}% ({}/{}) | Cache: hit_rate={:.1}% ({}/{}) | Transitions: {} | Component CPU: {}{}",
+            "[METRICS] Uptime: {} | Memory: {} | GPU: {} | Errors: {} | Frame time: avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms | Texture pool: hit_rate={:.1}% ({}/{}) | Cache: hit_rate={:.1}% ({}/{}) | Transitions: {} | Component CPU: {}{}{}",
             uptime_str,
             memory_info,
             gpu_info,
@@ -685,21 +853,71 @@ impl PerformanceMetrics {
             self.get_p50_frame_time_ms(),
             self.get_p95_frame_time_ms(),
             self.get_p99_frame_time_ms(),
-            self.get_texture_pool_hit_rate() * 100.0,
-            self.texture_pool_hits.load(Ordering::Relaxed),
-            self.texture_pool_hits.load(Ordering::Relaxed) + self.texture_pool_misses.load(Ordering::Relaxed),
-            self.get_cache_hit_rate() * 100.0,
-            self.cache_hits.load(Ordering::Relaxed),
-            self.cache_hits.load(Ordering::Relaxed) + self.cache_misses.load(Ordering::Relaxed),
+            texture_hit_rate * 100.0,
+            hits,
+            total,
+            cache_hit_rate * 100.0,
+            c_hits,
+            c_total,
             self.transition_count.load(Ordering::Relaxed),
             component_cpu,
-            leak_msg
+            leak_msg,
+            wayland_info
         );
+
+        if image_avg > 0.0 || self.get_recent_avg_image_upload_ms() > 0.0 {
+            tracing::info!(
+                "[METRICS] Image stages: total={:.2}ms wait={:.2}ms decode={:.2}ms convert={:.2}ms resize={:.2}ms expand={:.2}ms upload={:.2}ms",
+                image_avg,
+                self.get_recent_avg_image_wait_ms(),
+                self.get_recent_avg_image_decode_ms(),
+                self.get_recent_avg_image_convert_ms(),
+                self.get_recent_avg_image_resize_ms(),
+                self.get_recent_avg_image_expand_ms(),
+                self.get_recent_avg_image_upload_ms(),
+            );
+        }
     }
 }
 
 impl Default for PerformanceMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_file_discovery_avg_ignores_stale_samples() {
+        let metrics = PerformanceMetrics::new();
+        {
+            let mut samples = metrics.file_discovery_samples.lock();
+            samples.push_back((std::time::Instant::now() - Duration::from_secs(30), 111.0));
+        }
+        assert_eq!(metrics.get_recent_avg_file_discovery_cpu_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn image_stage_timings_are_averaged() {
+        let metrics = PerformanceMetrics::new();
+        metrics.record_image_stage_timings(
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            Duration::from_millis(60),
+        );
+
+        assert_eq!(metrics.get_recent_avg_image_wait_ms(), 10.0);
+        assert_eq!(metrics.get_recent_avg_image_decode_ms(), 20.0);
+        assert_eq!(metrics.get_recent_avg_image_convert_ms(), 30.0);
+        assert_eq!(metrics.get_recent_avg_image_resize_ms(), 40.0);
+        assert_eq!(metrics.get_recent_avg_image_expand_ms(), 50.0);
+        assert_eq!(metrics.get_recent_avg_image_upload_ms(), 60.0);
+        assert_eq!(metrics.get_recent_avg_image_total_ms(), 210.0);
     }
 }
