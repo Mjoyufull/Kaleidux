@@ -67,6 +67,8 @@ pub struct WaylandBackend {
     pub layer_shell: LayerShell,
     pub shm: Shm,
     pub surfaces: std::collections::HashMap<String, LayerSurface>,
+    #[cfg(feature = "mpv-backend")]
+    pub mpv_video_surfaces: std::collections::HashMap<String, LayerSurface>,
     // (name, width, height, serial)
     pub pending_resizes: Vec<(String, u32, u32, u32)>,
     // Frame callback notifications: surface name -> should render
@@ -88,6 +90,8 @@ impl WaylandBackend {
             layer_shell,
             shm,
             surfaces: std::collections::HashMap::new(),
+            #[cfg(feature = "mpv-backend")]
+            mpv_video_surfaces: std::collections::HashMap::new(),
             pending_resizes: Vec::new(),
             frame_callback_ready: std::collections::HashSet::new(),
         })
@@ -119,6 +123,27 @@ impl WaylandBackend {
         Ok(layer_surface)
     }
 
+    #[cfg(feature = "mpv-backend")]
+    pub fn create_mpv_video_surface(
+        &mut self,
+        output: &wl_output::WlOutput,
+        qh: &QueueHandle<Self>,
+        name: String,
+        layer: Layer,
+    ) -> anyhow::Result<LayerSurface> {
+        let layer_surface =
+            self.create_layer_surface_internal(output, qh, layer, "kaleidux-mpv-video")?;
+
+        if let Some(_prev) = self
+            .mpv_video_surfaces
+            .insert(name.clone(), layer_surface.clone())
+        {
+            warn!("[WAYLAND] Replacing existing mpv LayerSurface for {}", name);
+        }
+
+        Ok(layer_surface)
+    }
+
     pub fn create_wallpaper_surface(
         &mut self,
         output: &wl_output::WlOutput,
@@ -138,6 +163,14 @@ impl WaylandBackend {
 
     pub fn find_renderer_surface_name(&self, surface: &wl_surface::WlSurface) -> Option<String> {
         self.surfaces
+            .iter()
+            .find(|(_, s)| s.wl_surface() == surface)
+            .map(|(n, _)| n.clone())
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    pub fn find_mpv_surface_name(&self, surface: &wl_surface::WlSurface) -> Option<String> {
+        self.mpv_video_surfaces
             .iter()
             .find(|(_, s)| s.wl_surface() == surface)
             .map(|(n, _)| n.clone())
@@ -260,6 +293,16 @@ impl LayerShellHandler for WaylandBackend {
         // Find the name of the surface being closed
         let name = self
             .find_renderer_surface_name(layer_surface.wl_surface())
+            .or_else(|| {
+                #[cfg(feature = "mpv-backend")]
+                {
+                    self.find_mpv_surface_name(layer_surface.wl_surface())
+                }
+                #[cfg(not(feature = "mpv-backend"))]
+                {
+                    None
+                }
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         tracing::warn!(
@@ -267,6 +310,9 @@ impl LayerShellHandler for WaylandBackend {
             name
         );
         self.surfaces
+            .retain(|_, s| s.wl_surface() != layer_surface.wl_surface());
+        #[cfg(feature = "mpv-backend")]
+        self.mpv_video_surfaces
             .retain(|_, s| s.wl_surface() != layer_surface.wl_surface());
     }
     fn configure(
@@ -280,9 +326,21 @@ impl LayerShellHandler for WaylandBackend {
         let (width, height) = config.new_size;
 
         let renderer_name = self.find_renderer_surface_name(layer_surface.wl_surface());
+        #[cfg(feature = "mpv-backend")]
+        let mpv_name = self.find_mpv_surface_name(layer_surface.wl_surface());
         let name = renderer_name
             .as_ref()
             .cloned()
+            .or_else(|| {
+                #[cfg(feature = "mpv-backend")]
+                {
+                    mpv_name.as_ref().cloned()
+                }
+                #[cfg(not(feature = "mpv-backend"))]
+                {
+                    None
+                }
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         let protocol_id = layer_surface.wl_surface().id().protocol_id();

@@ -1666,6 +1666,7 @@ dependencies = [
  "image",
  "jwalk",
  "kaleidux-common",
+ "khronos-egl",
  "libc",
  "libloading 0.9.0",
  "libmpv2",
@@ -1695,6 +1696,7 @@ dependencies = [
  "walkdir",
  "wayland-backend",
  "wayland-client",
+ "wayland-egl",
  "wgpu",
  "wgpu-hal",
  "x11rb",
@@ -3505,6 +3507,16 @@ dependencies = [
  "rustix",
  "wayland-client",
  "xcursor",
+]
+
+[[package]]
+name = "wayland-egl"
+version = "0.32.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b97bdb7c49e5bd9b7562f38ff84f0dad47079fdc9e926f691a787f6dbc05451"
+dependencies = [
+ "wayland-backend",
+ "wayland-sys",
 ]
 
 [[package]]

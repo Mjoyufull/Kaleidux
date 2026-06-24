@@ -137,8 +137,8 @@ impl super::Renderer {
 
         // Render transition if we have all required textures and transition is active
         let should_render_transition = self.transition_active
-            && self.prev_texture.is_some()
-            && self.current_texture.is_some()
+            && (self.prev_texture.is_some() || self.prev_external_view_available())
+            && (self.current_texture.is_some() || self.current_external_view_available())
             && self.composition_texture.is_some()
             && self.composition_texture_view.is_some();
 
@@ -217,8 +217,8 @@ impl super::Renderer {
 
             // CLEANUP: Return prev_texture to pool when transition is TRULY finished
             if self.transition_progress >= 1.0
-                && self.current_texture.is_some()
-                && self.prev_texture.is_some()
+                && (self.current_texture.is_some() || self.current_external_view_available())
+                && (self.prev_texture.is_some() || self.prev_external_view_available())
             {
                 debug!(
                     "[TRANSITION] {}: Transition completed, returning prev_texture to pool",
@@ -230,6 +230,12 @@ impl super::Renderer {
                         self.ctx.return_texture_to_pool(prev_tex, w, h);
                     }
                     // If size unknown, texture is still dropped here (freed by WGPU)
+                }
+                #[cfg(feature = "mpv-backend")]
+                {
+                    self.prev_external_view = None;
+                    let frame = self.prev_external_frame.take();
+                    self.drop_external_frame(frame);
                 }
                 self.prev_texture_view = None;
                 self.transition_bind_group = None;

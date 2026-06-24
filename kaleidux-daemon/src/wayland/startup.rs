@@ -5,7 +5,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
+#[cfg(feature = "mpv-backend")]
+use wayland_client::Proxy;
 use wayland_client::{Connection, QueueHandle};
+
+#[cfg(feature = "mpv-backend")]
+fn should_create_mpv_native_surfaces() -> bool {
+    if !matches!(
+        crate::video::get_video_backend_request(),
+        crate::video::VideoBackendRequest::ForceMpvExperimental
+    ) {
+        return false;
+    }
+
+    crate::video::MpvRenderApiRequest::from_env().enables_native_overlay()
+}
+
+#[cfg(feature = "mpv-backend")]
+fn should_create_mpv_composed_targets() -> bool {
+    matches!(
+        crate::video::get_video_backend_request(),
+        crate::video::VideoBackendRequest::ForceMpvExperimental
+    ) && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl()
+}
 
 pub(crate) async fn initialize_outputs_and_renderers(
     ctx: &mut MainLoopContext,
@@ -21,11 +43,23 @@ pub(crate) async fn initialize_outputs_and_renderers(
         backend_ref.display_ptr() as *mut std::ffi::c_void
     };
 
+    #[cfg(feature = "mpv-backend")]
+    match crate::video::MpvRenderApiRequest::from_env() {
+        crate::video::MpvRenderApiRequest::DeprecatedNativeGlAlias => warn!(
+            "[VIDEO] KLD_MPV_RENDER_API=gl|opengl|native|wayland no longer enables the native Wayland overlay experiment because it bypasses wallpaper composition and transitions; use gl-overlay only for isolated visual diagnostics"
+        ),
+        crate::video::MpvRenderApiRequest::Unknown => warn!(
+            "[VIDEO] Ignoring unknown KLD_MPV_RENDER_API value; using WGPU-composed libmpv software rendering"
+        ),
+        _ => {}
+    }
+
     // Phase 1: Collect all output info (fast, no IO)
     let mut output_infos: Vec<(
         String,
         String,
         wayland_client::protocol::wl_output::WlOutput,
+        (u32, u32),
     )> = Vec::new();
     let outputs: Vec<_> = backend.output_state.outputs().collect();
     for output in outputs {
@@ -35,18 +69,28 @@ pub(crate) async fn initialize_outputs_and_renderers(
         };
         let name = info.name.as_deref().unwrap_or("unknown").to_string();
         let description = info.description.as_deref().unwrap_or("unknown").to_string();
+        let output_size = info
+            .logical_size
+            .or_else(|| {
+                info.modes
+                    .iter()
+                    .find(|mode| mode.current)
+                    .map(|mode| mode.dimensions)
+            })
+            .map(|(width, height)| (width.max(1) as u32, height.max(1) as u32))
+            .unwrap_or((1920, 1080));
         info!("Found output: {} ({})", name, description);
-        output_infos.push((name, description, output));
+        output_infos.push((name, description, output, output_size));
     }
 
     // Phase 2: Initialize all outputs (monitor_manager reuses cached file lists)
-    for (name, description, _) in &output_infos {
+    for (name, description, _, _) in &output_infos {
         ctx.monitor_manager.add_output(name, description).await;
     }
 
     // Phase 3: Create Wayland surfaces (fast, no IO)
     let mut surface_infos = Vec::new();
-    for (name, _description, output) in &output_infos {
+    for (name, _description, output, _output_size) in &output_infos {
         let output_config = match ctx.monitor_manager.get_output_config(name) {
             Some(cfg) => cfg,
             None => continue,
@@ -58,6 +102,30 @@ pub(crate) async fn initialize_outputs_and_renderers(
             name.clone(),
             output_config.layer.clone().into(),
         )?;
+
+        #[cfg(feature = "mpv-backend")]
+        if should_create_mpv_native_surfaces() {
+            use smithay_client_toolkit::shell::WaylandSurface;
+
+            let mpv_surface = backend.create_mpv_video_surface(
+                output,
+                qh,
+                name.clone(),
+                output_config.layer.clone().into(),
+            )?;
+            if let Some(target) = crate::video::MpvNativeVideoTarget::new(
+                display_ptr,
+                mpv_surface.wl_surface().id(),
+                _output_size.0,
+                _output_size.1,
+            ) {
+                ctx.mpv_native_targets.insert(name.clone(), target);
+                info!(
+                    "[VIDEO] {}: prepared native libmpv Wayland GL surface {}x{}",
+                    name, _output_size.0, _output_size.1
+                );
+            }
+        }
 
         let raw_handle_surface = crate::wayland::RawHandleSurface {
             layer_surface,
@@ -100,6 +168,23 @@ pub(crate) async fn initialize_outputs_and_renderers(
         let wgpu_duration = wgpu_start.elapsed();
         ctx.metrics.record_wgpu_init(wgpu_duration);
         let adapter_name = wgpu_ctx.adapter.get_info().name.clone();
+        #[cfg(feature = "mpv-backend")]
+        if should_create_mpv_composed_targets() {
+            for (name, _description, _output, output_size) in &output_infos {
+                if let Some(target) = crate::video::MpvComposedVideoTarget::new(
+                    display_ptr,
+                    wgpu_ctx.clone(),
+                    output_size.0,
+                    output_size.1,
+                ) {
+                    ctx.mpv_composed_targets.insert(name.clone(), target);
+                    info!(
+                        "[VIDEO] {}: prepared composed libmpv GL/WGPU target {}x{}",
+                        name, output_size.0, output_size.1
+                    );
+                }
+            }
+        }
         ctx.wgpu_ctx = Some(wgpu_ctx);
         initial_surface = Some(surface);
         info!("WGPU initialized on GPU: {:?}", adapter_name);

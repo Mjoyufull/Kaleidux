@@ -26,6 +26,10 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         next_session_id,
         loop_start,
         shutdown_flag,
+        #[cfg(feature = "mpv-backend")]
+        mpv_native_targets,
+        #[cfg(feature = "mpv-backend")]
+        mpv_composed_targets,
     } = ctx;
     match req {
         Request::PerfSnapshot => Response::PerfSnapshot(metrics.perf_snapshot()),
@@ -73,6 +77,10 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                         player_tx,
                         player_event_tx,
                         shutdown_flag,
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_native_targets,
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_composed_targets,
                     },
                 );
             }
@@ -107,6 +115,10 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                         player_tx,
                         player_event_tx,
                         shutdown_flag,
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_native_targets,
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_composed_targets,
                     },
                 );
             }

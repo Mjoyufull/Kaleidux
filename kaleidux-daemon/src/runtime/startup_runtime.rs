@@ -71,6 +71,10 @@ impl MainLoopContext {
                     player_tx: &self.player_tx,
                     player_event_tx: &self.player_event_tx,
                     shutdown_flag: &self.shutdown_flag,
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_native_targets: Some(&self.mpv_native_targets),
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             );
         }
