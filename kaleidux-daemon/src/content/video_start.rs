@@ -21,6 +21,11 @@ pub(crate) struct VideoPlayerStartRequest {
     pub(crate) backend_request: video::VideoBackendRequest,
     pub(crate) start_position_ns: Option<u64>,
     pub(crate) max_publish_fps: Option<u32>,
+    pub(crate) render_size: Option<(u32, u32)>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_native_target: Option<video::MpvNativeVideoTarget>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_composed_target: Option<video::MpvComposedVideoTarget>,
 }
 
 pub(crate) struct VideoPlayerStartContext<'a> {
@@ -44,6 +49,11 @@ pub(crate) fn create_and_start_video_player(
         backend_request,
         start_position_ns,
         max_publish_fps,
+        render_size,
+        #[cfg(feature = "mpv-backend")]
+        mpv_native_target,
+        #[cfg(feature = "mpv-backend")]
+        mpv_composed_target,
     } = request;
     let VideoPlayerStartContext {
         frame_mailbox,
@@ -98,6 +108,11 @@ pub(crate) fn create_and_start_video_player(
                     metrics.clone(),
                     backend_request,
                     max_publish_fps,
+                    render_size,
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_native_target,
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_composed_target,
                 ) {
                     Ok(mut vp) => {
                         let create_duration = prepare_start.elapsed();

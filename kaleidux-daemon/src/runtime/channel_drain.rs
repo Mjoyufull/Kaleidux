@@ -80,6 +80,10 @@ impl MainLoopContext {
                         player_tx: &self.player_tx,
                         player_event_tx: &self.player_event_tx,
                         shutdown_flag: &self.shutdown_flag,
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_native_targets: Some(&self.mpv_native_targets),
+                        #[cfg(feature = "mpv-backend")]
+                        mpv_composed_targets: Some(&self.mpv_composed_targets),
                     },
                 );
             }
@@ -163,6 +167,10 @@ impl MainLoopContext {
                     next_session_id: &mut self.next_session_id,
                     loop_start,
                     shutdown_flag: &self.shutdown_flag,
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_native_targets: Some(&self.mpv_native_targets),
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             )
             .await;
@@ -207,6 +215,7 @@ impl MainLoopContext {
                 };
 
                 if hold_for_callback {
+                    self.latest_video_frames.defer_notification(&source_id);
                     continue;
                 }
 

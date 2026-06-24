@@ -10,6 +10,9 @@ use wgpu::{Surface, SurfaceConfiguration};
 #[path = "renderer/context.rs"]
 mod context;
 mod context_pipelines;
+#[cfg(feature = "mpv-backend")]
+#[path = "renderer/context_vulkan.rs"]
+mod context_vulkan;
 pub use context::WgpuContext;
 
 #[path = "renderer/texture.rs"]
@@ -41,8 +44,13 @@ mod image_upload;
 #[path = "renderer/state.rs"]
 mod state;
 
+#[cfg(feature = "mpv-backend")]
+#[path = "renderer/mpv_gl_interop.rs"]
+mod mpv_gl_interop;
 #[path = "renderer/video_interop.rs"]
 mod video_interop;
+#[cfg(feature = "mpv-backend")]
+pub(crate) use mpv_gl_interop::create_exportable_rgba_texture;
 
 #[path = "renderer/video_cpu_upload.rs"]
 mod video_cpu_upload;
@@ -126,8 +134,16 @@ pub struct Renderer {
     composition_texture: Option<wgpu::Texture>,
 
     current_texture: Option<wgpu::Texture>,
+    #[cfg(feature = "mpv-backend")]
+    current_external_view: Option<wgpu::TextureView>,
+    #[cfg(feature = "mpv-backend")]
+    current_external_frame: Option<crate::video::GlExternalFrame>,
     current_aspect: f32,
     prev_texture: Option<wgpu::Texture>,
+    #[cfg(feature = "mpv-backend")]
+    prev_external_view: Option<wgpu::TextureView>,
+    #[cfg(feature = "mpv-backend")]
+    prev_external_frame: Option<crate::video::GlExternalFrame>,
     prev_aspect: f32,
     pub transition_progress: f32,
     pub transition_start_time: Option<std::time::Instant>,
@@ -296,8 +312,16 @@ impl Renderer {
             }),
             composition_texture: None,
             current_texture: None,
+            #[cfg(feature = "mpv-backend")]
+            current_external_view: None,
+            #[cfg(feature = "mpv-backend")]
+            current_external_frame: None,
             current_aspect: 1.0,
             prev_texture: None,
+            #[cfg(feature = "mpv-backend")]
+            prev_external_view: None,
+            #[cfg(feature = "mpv-backend")]
+            prev_external_frame: None,
             prev_aspect: 1.0,
             transition_progress: 1.0,
             transition_start_time: None,

@@ -73,6 +73,10 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) next_session_id: &'a mut u64,
     pub(crate) loop_start: Instant,
     pub(crate) shutdown_flag: &'a Arc<AtomicBool>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_native_targets: Option<&'a HashMap<String, video::MpvNativeVideoTarget>>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_composed_targets: Option<&'a HashMap<String, video::MpvComposedVideoTarget>>,
 }
 
 /// Shared state for both Wayland and X11 main loops.
@@ -85,6 +89,10 @@ pub struct MainLoopContext {
     pub pending_image_video_stops: HashMap<String, video::VideoPlayer>,
     pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
+    #[cfg(feature = "mpv-backend")]
+    pub mpv_native_targets: HashMap<String, video::MpvNativeVideoTarget>,
+    #[cfg(feature = "mpv-backend")]
+    pub mpv_composed_targets: HashMap<String, video::MpvComposedVideoTarget>,
     pub startup_present_barrier: Option<StartupPresentBarrier>,
     pub latest_video_frames: video::LatestFrameMailbox,
 
@@ -258,6 +266,10 @@ impl MainLoopContext {
             pending_image_video_stops: HashMap::new(),
             pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
+            #[cfg(feature = "mpv-backend")]
+            mpv_native_targets: HashMap::new(),
+            #[cfg(feature = "mpv-backend")]
+            mpv_composed_targets: HashMap::new(),
             startup_present_barrier: None,
             latest_video_frames,
             cmd_rx,

@@ -24,7 +24,7 @@ fn trace_video_upload_enabled() -> bool {
 
 impl super::Renderer {
     pub fn upload_frame(&mut self, frame: &crate::video::VideoFrame) {
-        if !self.transition_active && !self.content_swap_pending && self.prev_texture.is_some() {
+        if !self.transition_active && !self.content_swap_pending && self.has_previous_texture() {
             self.release_prev_texture("video upload cleanup");
         }
 
@@ -38,8 +38,7 @@ impl super::Renderer {
             return;
         }
 
-        let is_first_frame_after_switch =
-            self.content_swap_pending || self.current_texture.is_none();
+        let is_first_frame_after_switch = self.content_swap_pending || !self.has_current_texture();
 
         if is_first_frame_after_switch && self.video_first_frame_time.is_none() {
             self.video_first_frame_time = Some(std::time::Instant::now());
@@ -53,6 +52,8 @@ impl super::Renderer {
         let source_height = frame.height;
         let (presentation_width, presentation_height) = match frame.format {
             crate::video::VideoFrameFormat::Rgba => (source_width, source_height),
+            #[cfg(feature = "mpv-backend")]
+            crate::video::VideoFrameFormat::GlExternalRgba { .. } => (source_width, source_height),
             _ => compute_cover_target_dimensions(
                 source_width,
                 source_height,
@@ -60,6 +61,23 @@ impl super::Renderer {
                 self.config.height.max(1),
             ),
         };
+
+        #[cfg(feature = "mpv-backend")]
+        if let crate::video::VideoFrameFormat::GlExternalRgba { frame } = &frame.format {
+            if is_first_frame_after_switch {
+                info!(
+                    "[VIDEO] {}: Frame decode path: libmpv OpenGL-Vulkan shared RGBA source={}x{} presentation={}x{}",
+                    self.name, source_width, source_height, presentation_width, presentation_height
+                );
+            }
+            self.last_video_source_size = Some((source_width, source_height));
+            self.last_video_presentation_size = Some((presentation_width, presentation_height));
+            self.release_video_backend_resources("libmpv GL shared frame path");
+            self.set_current_gl_external_rgba(frame, presentation_width, presentation_height);
+            self.current_aspect = source_width as f32 / source_height as f32;
+            self.finish_video_frame_upload(is_first_frame_after_switch);
+            return;
+        }
 
         // Get or reuse the RGBA output texture (same size AND single mip level = reuse)
         let needs_new_texture = match self.current_texture.as_ref() {
@@ -97,6 +115,12 @@ impl super::Renderer {
                 self.metrics.as_deref(),
             ),
         };
+        #[cfg(feature = "mpv-backend")]
+        {
+            self.current_external_view = None;
+            let frame = self.current_external_frame.take();
+            self.drop_external_frame(frame);
+        }
 
         if is_first_frame_after_switch {
             let path_name = match &frame.format {
@@ -105,6 +129,10 @@ impl super::Renderer {
                 crate::video::VideoFrameFormat::Nv12 { .. } => "NV12 CPU upload",
                 crate::video::VideoFrameFormat::I420 { .. } => "I420 CPU upload",
                 crate::video::VideoFrameFormat::Rgba => "RGBA CPU upload (legacy)",
+                #[cfg(feature = "mpv-backend")]
+                crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
+                    "libmpv OpenGL-Vulkan shared RGBA"
+                }
             };
             info!(
                 "[VIDEO] {}: Frame decode path: {} source={}x{} presentation={}x{}",
@@ -138,6 +166,10 @@ impl super::Renderer {
             }
             crate::video::VideoFrameFormat::Rgba => {
                 self.release_video_backend_resources("rgba frame path");
+            }
+            #[cfg(feature = "mpv-backend")]
+            crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
+                self.release_video_backend_resources("libmpv GL shared frame path");
             }
         }
 
@@ -178,6 +210,10 @@ impl super::Renderer {
             }
             crate::video::VideoFrameFormat::Rgba => {
                 self.upload_frame_rgba(frame, &texture, source_width, source_height);
+            }
+            #[cfg(feature = "mpv-backend")]
+            crate::video::VideoFrameFormat::GlExternalRgba { frame } => {
+                self.upload_frame_gl_external_rgba(frame, &texture);
             }
             crate::video::VideoFrameFormat::DmaBufNv12 {
                 y_fd,
@@ -261,6 +297,12 @@ impl super::Renderer {
         self.current_texture = Some(texture);
         self.current_texture_size = Some((presentation_width, presentation_height));
         self.current_aspect = source_width as f32 / source_height as f32;
+        self.finish_video_frame_upload(is_first_frame_after_switch);
+
+        // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
+    }
+
+    fn finish_video_frame_upload(&mut self, is_first_frame_after_switch: bool) {
         self.needs_redraw = true;
 
         if is_first_frame_after_switch {
@@ -272,7 +314,7 @@ impl super::Renderer {
                 }
             }
 
-            if self.prev_texture.is_some() {
+            if self.has_previous_texture() {
                 info!(
                     "[TRANSITION] {}: First video frame after switch - transition will start on first render frame",
                     self.name
@@ -297,13 +339,27 @@ impl super::Renderer {
             tracing::trace!(
                 "[TRANSITION] {}: Video frame uploaded - current_texture={}, prev_texture={}, transition_progress={:.3}, transition_start_time={:?}",
                 self.name,
-                self.current_texture.is_some(),
-                self.prev_texture.is_some(),
+                self.has_current_texture(),
+                self.has_previous_texture(),
                 self.transition_progress,
                 self.transition_start_time.is_some()
             );
         }
 
         // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
+    }
+
+    fn has_previous_texture(&self) -> bool {
+        self.prev_texture.is_some() || self.has_prev_external_texture_for_video()
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn has_prev_external_texture_for_video(&self) -> bool {
+        self.prev_external_view.is_some()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn has_prev_external_texture_for_video(&self) -> bool {
+        false
     }
 }
