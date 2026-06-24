@@ -31,6 +31,7 @@ impl MainLoopContext {
             match res {
                 VideoPlayerResult::Success(name, session_id, player, preroll_frame) => {
                     let mut player = *player;
+                    let renders_natively = player.renders_natively();
                     let barrier_blocks = self.startup_barrier_blocks_output(&name, loop_start);
                     let pending = self.pending_video_switches.get(&name).cloned();
                     if let Some(pending) = pending.filter(|p| p.session_id == session_id) {
@@ -54,6 +55,8 @@ impl MainLoopContext {
                                 self.metrics.record_video_frame_uploaded();
                                 startup_ready = true;
                                 should_render = true;
+                            } else if renders_natively {
+                                startup_ready = true;
                             }
                         } else {
                             stop_video_player_in_background(name, player);
@@ -100,6 +103,10 @@ impl MainLoopContext {
                                 }
                             }
                             self.mark_output_presented_if_ready(&name);
+                        } else if renders_natively {
+                            self.mark_startup_output_ready(&name, loop_start);
+                            self.mark_startup_output_presented(&name, loop_start);
+                            self.maybe_clear_startup_present_barrier();
                         }
                     } else if self.renderers.get(&name).map(|r| r.active_video_session_id)
                         == Some(session_id)
@@ -129,6 +136,10 @@ impl MainLoopContext {
                                     self.metrics.record_first_frame();
                                     self.first_frame_recorded = true;
                                 }
+                            } else if renders_natively {
+                                self.mark_startup_output_ready(&name, loop_start);
+                                self.mark_startup_output_presented(&name, loop_start);
+                                self.maybe_clear_startup_present_barrier();
                             }
                         }
 
@@ -292,6 +303,10 @@ impl MainLoopContext {
                     player_tx: &self.player_tx,
                     player_event_tx: &self.player_event_tx,
                     shutdown_flag: &self.shutdown_flag,
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_native_targets: Some(&self.mpv_native_targets),
+                    #[cfg(feature = "mpv-backend")]
+                    mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             );
         }

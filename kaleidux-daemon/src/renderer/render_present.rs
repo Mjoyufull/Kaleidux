@@ -12,7 +12,10 @@ impl super::Renderer {
         let render_start = std::time::Instant::now();
         let frame_time = render_start;
 
-        if !self.transition_active && !self.content_swap_pending && self.prev_texture.is_some() {
+        if !self.transition_active
+            && !self.content_swap_pending
+            && self.has_previous_render_texture()
+        {
             self.release_prev_texture("render idle cleanup");
         }
         if !self.transition_active
@@ -214,5 +217,19 @@ impl super::Renderer {
         }
 
         Ok(())
+    }
+
+    fn has_previous_render_texture(&self) -> bool {
+        self.prev_texture.is_some() || self.has_previous_external_render_texture()
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn has_previous_external_render_texture(&self) -> bool {
+        self.prev_external_view.is_some()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn has_previous_external_render_texture(&self) -> bool {
+        false
     }
 }

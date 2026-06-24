@@ -58,21 +58,18 @@ pub(crate) fn transition_prewarm_candidates(transition: &Transition) -> Vec<Tran
 
 impl super::Renderer {
     pub fn switch_content(&mut self) {
-        let had_current = self.current_texture.is_some();
+        let had_current = self.has_current_texture();
         let flattened_active_transition = self.freeze_active_transition_to_current();
 
         // If a previous transition left a prev texture behind, release it before preparing
         // the next swap. The current texture stays visible until replacement upload is ready.
         if !flattened_active_transition {
-            if let Some(old_prev) = self.prev_texture.take() {
-                if let Some((w, h)) = self.prev_texture_size.take() {
-                    debug!(
-                        "[TRANSITION] {}: Releasing carry-over prev_texture before new switch",
-                        self.name
-                    );
-                    self.ctx.return_texture_to_pool(old_prev, w, h);
-                }
-                drop(self.prev_texture_view.take());
+            if self.prev_texture.is_some() || self.prev_external_view_available() {
+                debug!(
+                    "[TRANSITION] {}: Releasing carry-over prev_texture before new switch",
+                    self.name
+                );
+                self.release_prev_texture("new switch");
             }
         }
 
@@ -99,14 +96,14 @@ impl super::Renderer {
             "[TRANSITION] {}: switch_content() - had_current={}, prev_texture={}, pending_swap={}, flattened_active_transition={}",
             self.name,
             had_current,
-            self.prev_texture.is_some(),
+            self.prev_texture.is_some() || self.prev_external_view_available(),
             self.content_swap_pending,
             flattened_active_transition
         );
     }
 
     pub fn abort_transition(&mut self) {
-        if self.transition_active || self.content_swap_pending || self.current_texture.is_none() {
+        if self.transition_active || self.content_swap_pending || !self.has_current_texture() {
             if self.transition_active {
                 info!(
                     "[TRANSITION] {}: Aborting transition due to load failure",
@@ -133,8 +130,20 @@ impl super::Renderer {
         // Explicitly drop textures to free GPU memory
         self.current_texture = None;
         self.current_texture_view = None;
+        #[cfg(feature = "mpv-backend")]
+        {
+            self.current_external_view = None;
+            let frame = self.current_external_frame.take();
+            self.drop_external_frame(frame);
+        }
         self.prev_texture = None;
         self.prev_texture_view = None;
+        #[cfg(feature = "mpv-backend")]
+        {
+            self.prev_external_view = None;
+            let frame = self.prev_external_frame.take();
+            self.drop_external_frame(frame);
+        }
         self.current_texture_size = None;
         self.prev_texture_size = None;
         self.last_video_source_size = None;
@@ -174,6 +183,14 @@ impl super::Renderer {
         if let Some(curr) = self.current_texture.take() {
             self.prev_texture_view = self.current_texture_view.take();
             self.prev_texture = Some(curr);
+            self.prev_aspect = self.current_aspect;
+            self.prev_texture_size = self.current_texture_size.take();
+        } else if self.current_external_view_available() {
+            #[cfg(feature = "mpv-backend")]
+            {
+                self.prev_external_view = self.current_external_view.take();
+                self.prev_external_frame = self.current_external_frame.take();
+            }
             self.prev_aspect = self.current_aspect;
             self.prev_texture_size = self.current_texture_size.take();
         } else {
@@ -236,13 +253,13 @@ impl super::Renderer {
         }
 
         // Only recreate if both texture views are present
-        let prev_view = match self.prev_texture_view.as_ref() {
+        let prev_view = match self.prev_transition_view() {
             Some(v) => v,
             None => {
                 return;
             }
         };
-        let current_view = match self.current_texture_view.as_ref() {
+        let current_view = match self.current_transition_view() {
             Some(v) => v,
             None => {
                 return;
@@ -273,6 +290,38 @@ impl super::Renderer {
                 ],
             },
         ));
+    }
+
+    fn current_transition_view(&self) -> Option<&wgpu::TextureView> {
+        self.current_texture_view
+            .as_ref()
+            .or_else(|| self.current_external_transition_view())
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn current_external_transition_view(&self) -> Option<&wgpu::TextureView> {
+        self.current_external_view.as_ref()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn current_external_transition_view(&self) -> Option<&wgpu::TextureView> {
+        None
+    }
+
+    fn prev_transition_view(&self) -> Option<&wgpu::TextureView> {
+        self.prev_texture_view
+            .as_ref()
+            .or_else(|| self.prev_external_transition_view())
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn prev_external_transition_view(&self) -> Option<&wgpu::TextureView> {
+        self.prev_external_view.as_ref()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn prev_external_transition_view(&self) -> Option<&wgpu::TextureView> {
+        None
     }
 }
 

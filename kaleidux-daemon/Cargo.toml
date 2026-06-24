@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 default = []
-mpv-backend = ["dep:libmpv2", "dep:libmpv2-sys"]
+mpv-backend = ["dep:khronos-egl", "dep:libmpv2", "dep:libmpv2-sys", "dep:wayland-egl"]
 
 [dependencies]
 kaleidux-common = { workspace = true }
@@ -42,6 +42,8 @@ anyhow = "1.0"
 raw-window-handle.workspace = true
 libmpv2 = { version = "6.0.0", default-features = false, optional = true }
 libmpv2-sys = { version = "4.0.1", optional = true }
+khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
+wayland-egl = { version = "0.32.11", optional = true }
 
 # Specifically for Wayland and X11
 smithay-client-toolkit = "0.20"

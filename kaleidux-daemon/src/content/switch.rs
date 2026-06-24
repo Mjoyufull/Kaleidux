@@ -102,6 +102,10 @@ pub(crate) struct ContentSwitchContext<'a> {
     pub(crate) player_tx: &'a tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
     pub(crate) player_event_tx: &'a tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
     pub(crate) shutdown_flag: &'a Arc<AtomicBool>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_native_targets: Option<&'a HashMap<String, video::MpvNativeVideoTarget>>,
+    #[cfg(feature = "mpv-backend")]
+    pub(crate) mpv_composed_targets: Option<&'a HashMap<String, video::MpvComposedVideoTarget>>,
 }
 
 fn resolve_transition_for_output(
@@ -155,6 +159,10 @@ pub(crate) fn switch_wallpaper_content(
         player_tx,
         player_event_tx,
         shutdown_flag,
+        #[cfg(feature = "mpv-backend")]
+        mpv_native_targets,
+        #[cfg(feature = "mpv-backend")]
+        mpv_composed_targets,
     } = ctx;
 
     info!("{}: {} -> {:?}", log_prefix, name, path.display());
@@ -175,6 +183,7 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
+    let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
         let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
         r.active_batch_id = batch_id;
@@ -288,6 +297,7 @@ pub(crate) fn switch_wallpaper_content(
             });
         } else {
             backend_request = video::VideoBackendRequest::Auto;
+            video_render_size = Some((r.config.width.max(1), r.config.height.max(1)));
             if let Some((peer_name, peer_player)) = video_players
                 .iter()
                 .find(|(output, player)| {
@@ -356,6 +366,11 @@ pub(crate) fn switch_wallpaper_content(
             .outputs
             .get(&name)
             .and_then(|output| configured_max_publish_fps(output.config.video_fps));
+        #[cfg(feature = "mpv-backend")]
+        let mpv_native_target = mpv_native_targets.and_then(|targets| targets.get(&name).cloned());
+        #[cfg(feature = "mpv-backend")]
+        let mpv_composed_target =
+            mpv_composed_targets.and_then(|targets| targets.get(&name).cloned());
         create_and_start_video_player(
             VideoPlayerStartRequest {
                 path: path.clone(),
@@ -365,6 +380,11 @@ pub(crate) fn switch_wallpaper_content(
                 backend_request,
                 start_position_ns: broker_start_position_ns,
                 max_publish_fps,
+                render_size: video_render_size,
+                #[cfg(feature = "mpv-backend")]
+                mpv_native_target,
+                #[cfg(feature = "mpv-backend")]
+                mpv_composed_target,
             },
             VideoPlayerStartContext {
                 frame_mailbox,

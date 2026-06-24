@@ -66,20 +66,23 @@ impl WgpuContext {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Kaleidux Shared Device"),
-                    required_features,
-                    required_limits: adapter.limits(),
-                    // Favor smaller allocator blocks over peak throughput. The retained
-                    // texture logs show renderer-visible textures are not the dominant
-                    // RSS anymore, so reducing allocator slack is the next useful lever.
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                },
-                None,
-            )
-            .await?;
+        let device_descriptor = wgpu::DeviceDescriptor {
+            label: Some("Kaleidux Shared Device"),
+            required_features,
+            required_limits: adapter.limits(),
+            // Favor smaller allocator blocks over peak throughput. The retained
+            // texture logs show renderer-visible textures are not the dominant
+            // RSS anymore, so reducing allocator slack is the next useful lever.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+        };
+        #[cfg(feature = "mpv-backend")]
+        let (device, queue) = if super::context_vulkan::mpv_gl_interop_requested() {
+            super::context_vulkan::create_mpv_gl_interop_device(&adapter, &device_descriptor)?
+        } else {
+            adapter.request_device(&device_descriptor, None).await?
+        };
+        #[cfg(not(feature = "mpv-backend"))]
+        let (device, queue) = adapter.request_device(&device_descriptor, None).await?;
 
         let pipeline_cache_path = pipeline_cache::path_for_adapter(&adapter);
         let pipeline_cache_seed = pipeline_cache_path

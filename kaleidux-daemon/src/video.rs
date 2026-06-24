@@ -30,13 +30,22 @@ mod dmabuf;
 #[cfg(feature = "mpv-backend")]
 #[path = "video/mpv_backend.rs"]
 mod mpv_backend;
+#[cfg(feature = "mpv-backend")]
+#[path = "video/mpv_native.rs"]
+mod mpv_native;
 pub use appsink::frame_decode_path_label;
+#[cfg(feature = "mpv-backend")]
+pub(crate) use mpv_native::MpvRenderApiRequest;
+#[cfg(feature = "mpv-backend")]
+pub use mpv_native::{MpvComposedVideoTarget, MpvNativeVideoTarget};
 #[path = "video/lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::{AppsinkQueueLevels, VideoPrebufferProfile, VideoPrebufferResult};
 
 #[path = "video/frame.rs"]
 mod frame;
+#[cfg(feature = "mpv-backend")]
+pub(crate) use frame::GlExternalFrame;
 pub use frame::{LatestFrameMailbox, PlayerEvent, PlayerEventKind, VideoFrame, VideoFrameFormat};
 
 pub(super) fn env_flag_enabled(key: &str) -> bool {
@@ -144,7 +153,7 @@ fn should_publish_now(last_publish_ns: &AtomicU64, interval_ns: Option<u64>, now
 
 #[path = "video/pipeline_config.rs"]
 mod pipeline_config;
-use pipeline_config::configure_pipeline_element;
+use pipeline_config::{build_publish_rate_filter, configure_pipeline_element};
 
 #[cfg(test)]
 #[path = "video/test_support.rs"]
@@ -212,6 +221,9 @@ impl VideoPlayer {
         metrics: Arc<PerformanceMetrics>,
         backend_request: VideoBackendRequest,
         max_publish_fps: Option<u32>,
+        render_size: Option<(u32, u32)>,
+        #[cfg(feature = "mpv-backend")] mpv_native_target: Option<MpvNativeVideoTarget>,
+        #[cfg(feature = "mpv-backend")] mpv_composed_target: Option<MpvComposedVideoTarget>,
     ) -> anyhow::Result<Self> {
         let creation_start = std::time::Instant::now();
         let resolved_backend_request = resolve_video_backend_request(backend_request);
@@ -229,6 +241,11 @@ impl VideoPlayer {
                 player_event_tx,
                 metrics,
                 max_publish_fps,
+                render_size,
+                #[cfg(feature = "mpv-backend")]
+                mpv_native_target,
+                #[cfg(feature = "mpv-backend")]
+                mpv_composed_target,
                 creation_start,
             );
         }
@@ -253,6 +270,9 @@ impl VideoPlayer {
         }
         if pipeline_name == "playbin3" {
             pipeline.set_property("instant-uri", true);
+        }
+        if let Some(video_filter) = build_publish_rate_filter(source_id.as_ref(), max_publish_fps) {
+            pipeline.set_property("video-filter", &video_filter);
         }
 
         let full_uri = build_video_uri(uri)?;
@@ -331,6 +351,9 @@ impl VideoPlayer {
         player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
         metrics: Arc<PerformanceMetrics>,
         max_publish_fps: Option<u32>,
+        render_size: Option<(u32, u32)>,
+        mpv_native_target: Option<MpvNativeVideoTarget>,
+        mpv_composed_target: Option<MpvComposedVideoTarget>,
         creation_start: std::time::Instant,
     ) -> anyhow::Result<Self> {
         let mpv = mpv_backend::MpvPlayer::new(
@@ -342,6 +365,9 @@ impl VideoPlayer {
             player_event_tx.clone(),
             metrics.clone(),
             max_publish_fps,
+            render_size,
+            mpv_native_target,
+            mpv_composed_target,
             creation_start,
         )?;
         let backend_kind = VideoBackendKind::MpvExperimental;
@@ -378,6 +404,7 @@ impl VideoPlayer {
         _player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
         _metrics: Arc<PerformanceMetrics>,
         _max_publish_fps: Option<u32>,
+        _render_size: Option<(u32, u32)>,
         _creation_start: std::time::Instant,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
@@ -387,6 +414,14 @@ impl VideoPlayer {
 
     pub fn is_appsink_backend(&self) -> bool {
         self.backend_kind == VideoBackendKind::Appsink
+    }
+
+    pub fn renders_natively(&self) -> bool {
+        #[cfg(feature = "mpv-backend")]
+        if let Some(mpv) = self.mpv.as_ref() {
+            return mpv.renders_natively();
+        }
+        false
     }
     pub fn session_id(&self) -> u64 {
         self.session_id

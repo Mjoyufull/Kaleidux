@@ -75,6 +75,12 @@ impl super::Renderer {
             }
         }
         self.prev_texture_view = None;
+        #[cfg(feature = "mpv-backend")]
+        {
+            self.prev_external_view = None;
+            let frame = self.prev_external_frame.take();
+            self.drop_external_frame(frame);
+        }
         self.transition_bind_group = None;
         self.blit_bind_group = None;
     }
@@ -132,17 +138,67 @@ impl super::Renderer {
 
     /// Check if current_texture exists.
     pub fn has_current_texture(&self) -> bool {
-        self.current_texture.is_some()
+        self.current_texture.is_some() || self.has_current_external_texture()
     }
 
     /// Check if any renderable content exists (current or previous texture)
     pub fn has_any_content(&self) -> bool {
-        self.current_texture.is_some() || self.prev_texture.is_some()
+        self.current_texture.is_some()
+            || self.prev_texture.is_some()
+            || self.has_current_external_texture()
+            || self.has_prev_external_texture()
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn has_current_external_texture(&self) -> bool {
+        self.current_external_view_available()
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    pub(super) fn drop_external_frame(&self, frame: Option<crate::video::GlExternalFrame>) {
+        if let Some(f) = frame {
+            f.release_after_submit(&self.ctx.queue);
+        }
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn has_current_external_texture(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn has_prev_external_texture(&self) -> bool {
+        self.prev_external_view_available()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn has_prev_external_texture(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    pub(super) fn current_external_view_available(&self) -> bool {
+        self.current_external_view.is_some()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    pub(super) fn current_external_view_available(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    pub(super) fn prev_external_view_available(&self) -> bool {
+        self.prev_external_view.is_some()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    pub(super) fn prev_external_view_available(&self) -> bool {
+        false
     }
 
     pub fn should_hold_video_frame_for_callback(&self) -> bool {
         self.valid_content_type == crate::queue::ContentType::Video
-            && self.current_texture.is_some()
+            && self.has_current_texture()
             && !self.content_swap_pending
             && !self.transition_active
             && self.frame_callback_pending
@@ -222,6 +278,13 @@ impl Drop for super::Renderer {
                     self.name
                 );
             }
+        }
+        #[cfg(feature = "mpv-backend")]
+        {
+            let cur = self.current_external_frame.take();
+            let prev = self.prev_external_frame.take();
+            self.drop_external_frame(cur);
+            self.drop_external_frame(prev);
         }
         self.nv12_y_texture = None;
         self.nv12_uv_texture = None;

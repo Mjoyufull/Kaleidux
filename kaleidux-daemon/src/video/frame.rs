@@ -8,9 +8,62 @@ use std::time::{Duration, Instant};
 
 use super::VideoBackendKind;
 
+#[cfg(feature = "mpv-backend")]
+#[derive(Clone, Debug)]
+pub struct GlExternalFrame {
+    inner: Arc<GlExternalFrameInner>,
+}
+
+#[cfg(feature = "mpv-backend")]
+#[derive(Debug)]
+struct GlExternalFrameInner {
+    texture: Arc<wgpu::Texture>,
+    slot_busy: Arc<AtomicBool>,
+    release_scheduled: AtomicBool,
+}
+
+#[cfg(feature = "mpv-backend")]
+impl GlExternalFrame {
+    pub(crate) fn new(texture: Arc<wgpu::Texture>, slot_busy: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Arc::new(GlExternalFrameInner {
+                texture,
+                slot_busy,
+                release_scheduled: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub(crate) fn texture(&self) -> &wgpu::Texture {
+        self.inner.texture.as_ref()
+    }
+
+    pub(crate) fn release_after_submit(&self, queue: &wgpu::Queue) {
+        if self.inner.release_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let slot_busy = self.inner.slot_busy.clone();
+        queue.on_submitted_work_done(move || slot_busy.store(false, Ordering::Release));
+    }
+}
+
+#[cfg(feature = "mpv-backend")]
+impl Drop for GlExternalFrameInner {
+    fn drop(&mut self) {
+        if !self.release_scheduled.load(Ordering::Acquire) {
+            self.slot_busy.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VideoFrameFormat {
     Rgba,
+    #[cfg(feature = "mpv-backend")]
+    /// OpenGL renders into memory shared with Vulkan; WGPU blits the GPU texture.
+    GlExternalRgba {
+        frame: GlExternalFrame,
+    },
     Nv12 {
         y_stride: u32,
         uv_offset: u32,
@@ -45,6 +98,10 @@ impl VideoFrameFormat {
     pub fn try_clone(&self) -> Option<Self> {
         match self {
             Self::Rgba => Some(Self::Rgba),
+            #[cfg(feature = "mpv-backend")]
+            Self::GlExternalRgba { frame } => Some(Self::GlExternalRgba {
+                frame: frame.clone(),
+            }),
             Self::Nv12 {
                 y_stride,
                 uv_offset,
@@ -128,6 +185,8 @@ impl VideoFrame {
         format!("{:?}", self.buffer.flags()).hash(&mut hasher);
         match &self.format {
             VideoFrameFormat::Rgba => "rgba".hash(&mut hasher),
+            #[cfg(feature = "mpv-backend")]
+            VideoFrameFormat::GlExternalRgba { .. } => "gl-external-rgba".hash(&mut hasher),
             VideoFrameFormat::Nv12 {
                 y_stride,
                 uv_offset,
@@ -252,6 +311,10 @@ impl LatestFrameMailbox {
         frame
     }
 
+    pub fn defer_notification(&self, source_id: &str) {
+        self.pending_notifications.lock().remove(source_id);
+    }
+
     pub fn inspect_frame<R, F>(&self, source_id: &str, inspect: F) -> Option<R>
     where
         F: FnOnce(&VideoFrame) -> R,
@@ -338,5 +401,27 @@ mod tests {
         let _ = mailbox.take_frame("HDMI-A-1");
         assert!(!mailbox.has_pending_frame("HDMI-A-1"));
         assert!(mailbox.pending_frame_age("HDMI-A-1").is_none());
+    }
+
+    #[test]
+    fn deferred_notification_keeps_frame_and_allows_resignal() {
+        let mailbox = LatestFrameMailbox::new();
+        mailbox.publish_frame("HDMI-A-1", test_frame(7));
+        mailbox.clear_signal_pending();
+
+        mailbox.defer_notification("HDMI-A-1");
+
+        assert!(mailbox.has_pending_frame("HDMI-A-1"));
+        assert!(mailbox.pending_frame_age("HDMI-A-1").is_some());
+        assert!(mailbox.pending_sources().is_empty());
+
+        mailbox.publish_frame("HDMI-A-1", test_frame(8));
+
+        assert!(mailbox.has_signal_pending());
+        assert_eq!(mailbox.pending_sources(), vec!["HDMI-A-1".to_string()]);
+        assert_eq!(
+            mailbox.take_frame("HDMI-A-1").map(|frame| frame.session_id),
+            Some(8)
+        );
     }
 }

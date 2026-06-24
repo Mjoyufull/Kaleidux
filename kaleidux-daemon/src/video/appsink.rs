@@ -257,6 +257,8 @@ impl VideoPlayer {
 pub fn frame_decode_path_label(frame: &VideoFrame) -> &'static str {
     match frame.format {
         VideoFrameFormat::Rgba => "rgba",
+        #[cfg(feature = "mpv-backend")]
+        VideoFrameFormat::GlExternalRgba { .. } => "libmpv-gl-shared-rgba",
         VideoFrameFormat::Nv12 { .. } => "nv12",
         VideoFrameFormat::DmaBufNv12 { .. } => "dmabuf-nv12",
         VideoFrameFormat::CudaNv12 { .. } => "cuda-nv12",

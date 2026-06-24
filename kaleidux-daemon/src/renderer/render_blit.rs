@@ -12,12 +12,14 @@ pub(super) enum BlitSource {
 
 impl super::Renderer {
     pub(super) fn select_blit_source(&self) -> Option<BlitSource> {
-        if self.current_texture.is_some() {
-            if !self.transition_active || self.prev_texture.is_none() {
+        if self.current_texture.is_some() || self.current_external_view_available() {
+            if !self.transition_active
+                || (self.prev_texture.is_none() && !self.prev_external_view_available())
+            {
                 Some(BlitSource::Current)
             } else if self.transition_active
-                && self.prev_texture.is_some()
-                && self.current_texture.is_some()
+                && (self.prev_texture.is_some() || self.prev_external_view_available())
+                && (self.current_texture.is_some() || self.current_external_view_available())
                 && self.composition_texture.is_some()
                 && self.composition_texture_view.is_some()
             {
@@ -28,7 +30,9 @@ impl super::Renderer {
                     );
                 }
                 Some(BlitSource::Composition)
-            } else if self.transition_active && self.prev_texture.is_some() {
+            } else if self.transition_active
+                && (self.prev_texture.is_some() || self.prev_external_view_available())
+            {
                 warn!(
                     "[RENDER] {}: Transition FALLBACK to PREV - missing resources (comp_view={})",
                     self.name,
@@ -38,7 +42,7 @@ impl super::Renderer {
             } else {
                 Some(BlitSource::Current)
             }
-        } else if self.prev_texture.is_some() {
+        } else if self.prev_texture.is_some() || self.prev_external_view_available() {
             debug!(
                 "[RENDER] {}: No current_texture, falling back to prev_texture (transition_active={})",
                 self.name, self.transition_active
@@ -109,8 +113,8 @@ impl super::Renderer {
         }
 
         let texture_view = match blit_source {
-            BlitSource::Current => self.current_texture_view.as_ref(),
-            BlitSource::Prev => self.prev_texture_view.as_ref(),
+            BlitSource::Current => self.current_blit_view(),
+            BlitSource::Prev => self.prev_blit_view(),
             BlitSource::Composition => self.composition_texture_view.as_ref(),
         };
 
@@ -122,6 +126,38 @@ impl super::Renderer {
             }
             None => self.create_fallback_blit_bind_group(blit_source),
         }
+    }
+
+    fn current_blit_view(&self) -> Option<&wgpu::TextureView> {
+        self.current_texture_view
+            .as_ref()
+            .or_else(|| self.current_external_blit_view())
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn current_external_blit_view(&self) -> Option<&wgpu::TextureView> {
+        self.current_external_view.as_ref()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn current_external_blit_view(&self) -> Option<&wgpu::TextureView> {
+        None
+    }
+
+    fn prev_blit_view(&self) -> Option<&wgpu::TextureView> {
+        self.prev_texture_view
+            .as_ref()
+            .or_else(|| self.prev_external_blit_view())
+    }
+
+    #[cfg(feature = "mpv-backend")]
+    fn prev_external_blit_view(&self) -> Option<&wgpu::TextureView> {
+        self.prev_external_view.as_ref()
+    }
+
+    #[cfg(not(feature = "mpv-backend"))]
+    fn prev_external_blit_view(&self) -> Option<&wgpu::TextureView> {
+        None
     }
 
     fn create_fallback_blit_bind_group(&mut self, blit_source: BlitSource) -> bool {
@@ -136,7 +172,7 @@ impl super::Renderer {
                         "[RENDER] {}: Prev texture view also missing, falling back to current",
                         self.name
                     );
-                    self.current_texture_view.as_ref()
+                    self.current_blit_view()
                 })
             }
             BlitSource::Prev => {
@@ -144,7 +180,7 @@ impl super::Renderer {
                     "[RENDER] {}: Prev texture view missing, falling back to current",
                     self.name
                 );
-                self.current_texture_view.as_ref()
+                self.current_blit_view()
             }
             BlitSource::Current => {
                 error!(
@@ -172,7 +208,7 @@ impl super::Renderer {
         true
     }
 
-    fn build_blit_bind_group(
+    pub(super) fn build_blit_bind_group(
         &self,
         texture_view: &wgpu::TextureView,
         label: &'static str,
