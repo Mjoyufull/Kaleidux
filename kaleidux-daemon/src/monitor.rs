@@ -1,13 +1,11 @@
 use std::fs;
-use std::process::Command;
 use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 pub struct SystemMonitor {
     sys: System,
-    has_nvidia: bool,
+    nvml: Option<nvml_wrapper::Nvml>,
     amd_gpu_path: Option<String>,
     metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
 }
@@ -21,25 +19,37 @@ impl SystemMonitor {
     pub fn new_with_metrics(
         metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
     ) -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
 
-        // Detect GPU type
-        let has_nvidia = fs::metadata("/proc/driver/nvidia/gpus").is_ok();
+        // Initialize NVML for NVIDIA GPU monitoring (loads libnvidia-ml.so at runtime)
+        let nvml = match nvml_wrapper::Nvml::init() {
+            Ok(n) => {
+                info!("[MONITOR] NVML initialized successfully");
+                Some(n)
+            }
+            Err(e) => {
+                debug!("[MONITOR] NVML not available ({}), will try sysfs", e);
+                None
+            }
+        };
 
         let mut amd_gpu_path = None;
-        // Check for common AMD/Intel paths
-        for i in 0..3 {
-            let path = format!("/sys/class/drm/card{}/device/gpu_busy_percent", i);
-            if fs::metadata(&path).is_ok() {
-                amd_gpu_path = Some(format!("/sys/class/drm/card{}/device", i));
-                break;
+        // Check for AMD/Intel sysfs paths (only if NVML not available)
+        if nvml.is_none() {
+            for i in 0..3 {
+                let path = format!("/sys/class/drm/card{}/device/gpu_busy_percent", i);
+                if fs::metadata(&path).is_ok() {
+                    amd_gpu_path = Some(format!("/sys/class/drm/card{}/device", i));
+                    break;
+                }
             }
         }
 
         Self {
             sys,
-            has_nvidia,
+            nvml,
             amd_gpu_path,
             metrics,
         }
@@ -50,26 +60,20 @@ impl SystemMonitor {
         let mut vram_used = None;
         let mut vram_total = None;
 
-        if self.has_nvidia {
-            // Try nvidia-smi
-            let output = Command::new("nvidia-smi")
-                .args([
-                    "--query-gpu=utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader,nounits",
-                ])
-                .output();
-
-            if let Ok(out) = output {
-                let s = String::from_utf8_lossy(&out.stdout);
-                let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
-                if parts.len() >= 3 {
-                    gpu_usage = parts[0].parse::<f32>().ok();
-                    vram_used = parts[1].parse::<f32>().map(|m| m / 1024.0).ok(); // MB to GB
-                    vram_total = parts[2].parse::<f32>().map(|m| m / 1024.0).ok();
-                }
+        if let Some(nvml) = &self.nvml {
+            // Use NVML library calls (sub-microsecond, no subprocess)
+            if let Ok(device) = nvml.device_by_index(0) {
+                gpu_usage = device.utilization_rates().ok().map(|u| u.gpu as f32);
+                let mem = device.memory_info().ok();
+                vram_used = mem
+                    .as_ref()
+                    .map(|m| m.used as f32 / 1024.0 / 1024.0 / 1024.0);
+                vram_total = mem
+                    .as_ref()
+                    .map(|m| m.total as f32 / 1024.0 / 1024.0 / 1024.0);
             }
         } else if let Some(base_path) = &self.amd_gpu_path {
-            // Try AMD sysfs
+            // AMD/Intel sysfs fallback
             if let Ok(content) = fs::read_to_string(format!("{}/gpu_busy_percent", base_path)) {
                 gpu_usage = content.trim().parse::<f32>().ok();
             }
@@ -78,7 +82,7 @@ impl SystemMonitor {
                     .trim()
                     .parse::<f32>()
                     .map(|b| b / 1024.0 / 1024.0 / 1024.0)
-                    .ok(); // Bytes to GB
+                    .ok();
             }
             if let Ok(content) = fs::read_to_string(format!("{}/mem_info_vram_total", base_path)) {
                 vram_total = content
@@ -93,11 +97,15 @@ impl SystemMonitor {
     }
 
     pub async fn run(mut self) {
-        let mut interval = interval(Duration::from_secs(10));
+        let interval_duration = Duration::from_secs(10);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + interval_duration,
+            interval_duration,
+        );
 
         info!("[MONITOR] Starting resource monitoring...");
-        if self.has_nvidia {
-            info!("[MONITOR] NVIDIA GPU detected.");
+        if self.nvml.is_some() {
+            info!("[MONITOR] NVIDIA GPU detected (NVML).");
         } else if self.amd_gpu_path.is_some() {
             info!("[MONITOR] AMD/Intel GPU detected (sysfs).");
         } else {
@@ -127,8 +135,8 @@ impl SystemMonitor {
                 );
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
-                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // KB to MB
-                                                                          // Record memory usage in metrics
+                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // Bytes to MB (assuming sysinfo returns bytes for process memory)
+                    // Record memory usage in metrics
                     if let Some(m) = &self.metrics {
                         m.record_memory_usage(proc_mem as f64);
                     }

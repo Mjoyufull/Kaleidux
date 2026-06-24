@@ -29,6 +29,7 @@ Supports Wayland & X11 with 50+ smooth GLSL transitions.
 **More Info:** [Detailed Usage & Advanced Config](./USAGE.MD)
 
 ## Quickstart
+
 <img width="1920" height="1080" alt="Screenshot_20260118-203253" src="https://github.com/user-attachments/assets/2487daf1-5dbc-4a57-a7fe-d5d8f7148a77" />
 
 Get up and running in 30 seconds:
@@ -52,9 +53,9 @@ kldctl next
 
 ## Features
 
-- **Video Support**: Seamlessly loop videos as wallpapers using GStreamer.
-- **Image Support**: High-quality image rendering and transitions.
-- **Hardware Accelerated**: Powered by `WGPU` for near-zero CPU overhead during transitions.
+- **Hardware-accelerated video**: Native zero-copy decoding on NVIDIA, AMD, and Intel GPUs.
+- **Hardware-accelerated rendering**: Powered by `wgpu` for low CPU overhead during rendering and transitions.
+- **Image support**: High-performance image loading and rendering.
 - **50+ Transitions**: Huge library of GLSL transitions (fade, cube, doom, wipe, ripple, etc.).
 - **Multi-Monitor**: Independent queue management for each output.
 - **Monitor Behaviors**: `Independent`, `Synchronized`, or `Grouped` monitor support.
@@ -62,8 +63,11 @@ kldctl next
 - **IPC Control**: Control the daemon via `kldctl` (next, prev, pause, status, etc.).
 
 ## Installation
+
 ### Option 1: Aur (Recommended)
+
 - Installing from the Arch User Repository
+
 ```
 $ yay -S kaleidux-git
 # or
@@ -118,9 +122,10 @@ The core background service handling rendering and display interop.
 Usage: kaleidux-daemon [OPTIONS]
 
 Options:
-      --demo       Run in demo mode (rotating built-in shaders)
-      --log <PATH> Specify log file path
-  -h, --help       Show help
+      --demo              Run in demo mode (rotating built-in shaders)
+      --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
+      --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
+  -h, --help              Show help
 ```
 
 ### Controller (`kldctl`)
@@ -176,7 +181,7 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **High CPU**: Video frames currently use a CPU-RGBA roundtrip. Zero-copy is planned.
+- **High CPU during video**: Use a zero-copy path when possible. On AMD/Intel, the daemon auto-detects and prefers DMA-BUF when the driver stack exposes it. On NVIDIA, driver/toolkit limitations do not reliably expose DMA-BUF automatically, so use `--video-mode cuda` to force the CUDA zero-copy path. Use `--video-mode cpu` only when you intentionally want software decode or system-memory uploads for debugging or compatibility; it disables the zero-copy ladder and can raise CPU load substantially.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
 ## Contributing
@@ -191,7 +196,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [GStreamer](https://gstreamer.freedesktop.org/)
 - [Clapper](https://github.com/Rafostar/clapper)
 - [swww](https://github.com/Horus645/swww)
-
 
 ## License
 

@@ -54,7 +54,235 @@ vec4 getToColor(vec2 uv) {
 
 pub struct ShaderManager;
 
+const WGSL_DISK_CACHE_VERSION: u32 = 2;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedWgslEntry {
+    fingerprint: u64,
+    wgsl: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WgslDiskCache {
+    version: u32,
+    entries: std::collections::HashMap<String, CachedWgslEntry>,
+}
+
+// Process-wide cache of compiled WGSL shader strings (P-21)
+// Keyed by transition name — avoids duplicate GLSL→WGSL compilation across renderers
+static WGSL_CACHE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, CachedWgslEntry>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static BROKEN_TRANSITIONS: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+use anyhow::Context;
+
+const CUBE_SAFE_GLSL: &str = r#"
+vec2 cube_project(vec2 p, float floating) {
+    return p * vec2(1.0, -1.2) + vec2(0.0, -floating / 100.0);
+}
+
+bool cube_in_bounds(vec2 p) {
+    return p.x > 0.0 && p.y > 0.0 && p.x < 1.0 && p.y < 1.0;
+}
+
+vec4 cube_bg_color(vec2 p, vec2 pfr, vec2 pto, float reflection, float floating) {
+    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 projected_from = cube_project(pfr, floating);
+    if (cube_in_bounds(projected_from)) {
+        c += mix(vec4(0.0), getFromColor(projected_from), reflection * (1.0 - projected_from.y));
+    }
+    vec2 projected_to = cube_project(pto, floating);
+    if (cube_in_bounds(projected_to)) {
+        c += mix(vec4(0.0), getToColor(projected_to), reflection * (1.0 - projected_to.y));
+    }
+    return c;
+}
+
+vec2 cube_xskew(vec2 p, float perspective, float center) {
+    float x = mix(p.x, 1.0 - p.x, center);
+    float edge_distance = max(abs(center - 0.5), 0.0001);
+    float center_side = step(0.5, center);
+    float direction = mix(1.0, -1.0, center_side);
+    return (
+        (
+            vec2(x, (p.y - 0.5 * (1.0 - perspective) * x) / (1.0 + (perspective - 1.0) * x))
+            - vec2(0.5 - edge_distance, 0.0)
+        ) * vec2(0.5 / edge_distance * direction, 1.0)
+        + vec2(center_side, 0.0)
+    );
+}
+
+vec4 transition(vec2 op) {
+    float perspective = getFromParams(0);
+    float unzoom = getFromParams(1);
+    float reflection = getFromParams(2);
+    float floating = getFromParams(3);
+
+    float uz = unzoom * 2.0 * (0.5 - abs(0.5 - progress));
+    vec2 p = -uz * 0.5 + (1.0 + uz) * op;
+
+    vec2 from_scale = vec2(max(1.0 - progress, 0.0001), 1.0);
+    vec2 to_scale = vec2(max(progress, 0.0001), 1.0);
+
+    vec2 from_p = cube_xskew(
+        (p - vec2(progress, 0.0)) / from_scale,
+        1.0 - mix(progress, 0.0, perspective),
+        0.0
+    );
+    vec2 to_p = cube_xskew(
+        p / to_scale,
+        mix(progress * progress, 1.0, perspective),
+        1.0
+    );
+
+    if (cube_in_bounds(from_p)) {
+        return getFromColor(from_p);
+    }
+    if (cube_in_bounds(to_p)) {
+        return getToColor(to_p);
+    }
+    return cube_bg_color(op, from_p, to_p, reflection, floating);
+}
+"#;
+
+const DISPLACEMENT_SAFE_GLSL: &str = r#"
+vec4 transition(vec2 uv) {
+    float strength = 0.5;
+    float displacement = getToColor(uv).r * strength;
+    vec2 uv_from = vec2(uv.x + progress * displacement, uv.y);
+    vec2 uv_to = vec2(uv.x - (1.0 - progress) * displacement, uv.y);
+    return mix(getFromColor(uv_from), getToColor(uv_to), progress);
+}
+"#;
+
+fn stable_shader_fingerprint(parts: &[&str]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
 impl ShaderManager {
+    pub fn mark_transition_broken(name: &str) {
+        BROKEN_TRANSITIONS.lock().insert(name.to_string());
+    }
+
+    pub fn is_transition_broken(name: &str) -> bool {
+        BROKEN_TRANSITIONS.lock().contains(name)
+    }
+
+    pub fn is_shader_cached(transition: &Transition) -> bool {
+        let name = transition.name();
+        WGSL_CACHE
+            .lock()
+            .get(&name)
+            .is_some_and(|entry| Self::cache_entry_matches_transition(transition, entry))
+    }
+
+    pub fn save_cache() -> anyhow::Result<()> {
+        let cache_dir = dirs::cache_dir().context("no cache dir")?.join("kaleidux");
+        std::fs::create_dir_all(&cache_dir)?;
+        let data = {
+            let cache = WGSL_CACHE.lock();
+            postcard::to_allocvec(&WgslDiskCache {
+                version: WGSL_DISK_CACHE_VERSION,
+                entries: cache.clone(),
+            })?
+        };
+        let tmp = cache_dir.join("wgsl_cache.bin.tmp");
+        let dst = cache_dir.join("wgsl_cache.bin");
+        std::fs::write(&tmp, &data)?;
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    }
+
+    pub fn load_cache() -> anyhow::Result<()> {
+        let path = dirs::cache_dir()
+            .context("no cache dir")?
+            .join("kaleidux")
+            .join("wgsl_cache.bin");
+        if path.exists() {
+            let data = std::fs::read(&path)?;
+            let mut cache = WGSL_CACHE.lock();
+            let loaded: std::collections::HashMap<String, CachedWgslEntry> =
+                match postcard::from_bytes::<WgslDiskCache>(&data) {
+                    Ok(blob) if blob.version == WGSL_DISK_CACHE_VERSION => blob.entries,
+                    Ok(blob) => {
+                        tracing::info!(
+                            "[SHADER] Ignoring WGSL disk cache (file version {} != {})",
+                            blob.version,
+                            WGSL_DISK_CACHE_VERSION
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            "[SHADER] Ignoring legacy WGSL disk cache (missing version header)"
+                        );
+                        return Ok(());
+                    }
+                };
+            for (k, v) in loaded {
+                cache.entry(k).or_insert(v);
+            }
+            tracing::info!(
+                "[SHADER] Loaded {} cached WGSL shaders from disk",
+                cache.len()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn pick_random_transition() -> Transition {
+        use rand::seq::SliceRandom;
+
+        let mut candidates: Vec<Transition> = Transition::random_candidate_names()
+            .iter()
+            .map(|name| Transition::from_name(name))
+            .collect();
+        let mut rng = rand::thread_rng();
+
+        candidates.shuffle(&mut rng);
+        candidates.sort_by_key(|transition| {
+            let name = transition.name();
+            (
+                Self::is_transition_broken(&name),
+                !Self::is_shader_cached(transition),
+            )
+        });
+
+        for transition in candidates {
+            let name = transition.name();
+            if Self::is_transition_broken(&name) {
+                continue;
+            }
+            match Self::get_builtin_shader(&transition) {
+                Ok(_) => return transition,
+                Err(e) => {
+                    Self::mark_transition_broken(&name);
+                    tracing::warn!(
+                        "[SHADER] Skipping random transition {} after compile failure: {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::warn!("[SHADER] No working random transitions available, falling back to fade");
+        Transition::Fade
+    }
+
     pub fn compile_glsl(
         name: &str,
         user_code: &str,
@@ -163,8 +391,8 @@ impl ShaderManager {
                 Self::compile_glsl(shader, &glsl, &mapping)
             }
             Transition::Random => {
-                // TODO: Pick a random builtin
-                Self::get_builtin_shader(&Transition::Fade)
+                let picked = Self::pick_random_transition();
+                Self::get_builtin_shader(&picked)
             }
             _ => Self::get_builtin_shader(transition),
         }
@@ -192,10 +420,10 @@ impl ShaderManager {
     pub fn load_external_glsl(name: &str) -> anyhow::Result<String> {
         // Use block_in_place to call async version from sync context
         tokio::task::block_in_place(|| -> anyhow::Result<String> {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                if let Ok(result) = handle.block_on(Self::load_external_glsl_async(name)) {
-                    return Ok(result);
-                }
+            if let Ok(handle) = tokio::runtime::Handle::try_current()
+                && let Ok(result) = handle.block_on(Self::load_external_glsl_async(name))
+            {
+                return Ok(result);
             }
             // Fallback to sync if no runtime available
             let config_dir = dirs::config_dir()
@@ -217,98 +445,240 @@ impl ShaderManager {
 
     pub fn get_builtin_shader(transition: &Transition) -> anyhow::Result<String> {
         let name = transition.name();
-        let glsl = Self::get_builtin_glsl(&name)
-            .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name))?;
+        let glsl = Self::builtin_shader_source(transition, &name)?;
+        let mapping = Self::builtin_shader_mapping(transition);
+        let fingerprint = Self::builtin_shader_cache_fingerprint(&name, glsl, mapping);
+
+        // Check process-wide cache first (P-21)
+        if let Some(cached) = WGSL_CACHE.lock().get(&name)
+            && cached.fingerprint == fingerprint
+        {
+            return Ok(cached.wgsl.clone());
+        }
 
         // Note: We use getFromParams(i) which handles the aligned vec4 array access
         // We must map Rust struct fields to the EXACT uniform names used in the GLSL shaders.
-        let mapping = match transition {
+        let wgsl = Self::compile_glsl(&name, glsl, mapping)?;
+
+        // Store in process-wide cache (P-21)
+        WGSL_CACHE.lock().insert(
+            name,
+            CachedWgslEntry {
+                fingerprint,
+                wgsl: wgsl.clone(),
+            },
+        );
+        Ok(wgsl)
+    }
+
+    fn cache_entry_matches_transition(transition: &Transition, entry: &CachedWgslEntry) -> bool {
+        match Self::builtin_shader_cache_fingerprint_for_transition(transition) {
+            Ok(fingerprint) => entry.fingerprint == fingerprint,
+            Err(_) => false,
+        }
+    }
+
+    fn builtin_shader_cache_fingerprint_for_transition(
+        transition: &Transition,
+    ) -> anyhow::Result<u64> {
+        let name = transition.name();
+        let glsl = Self::builtin_shader_source(transition, &name)?;
+        let mapping = Self::builtin_shader_mapping(transition);
+        Ok(Self::builtin_shader_cache_fingerprint(&name, glsl, mapping))
+    }
+
+    fn builtin_shader_cache_fingerprint(name: &str, glsl: &str, mapping: &str) -> u64 {
+        stable_shader_fingerprint(&[name, GLSL_PRELUDE, glsl, mapping])
+    }
+
+    fn builtin_shader_source(transition: &Transition, name: &str) -> anyhow::Result<&'static str> {
+        match transition {
+            Transition::Cube { .. } => Ok(CUBE_SAFE_GLSL),
+            Transition::Displacement => Ok(DISPLACEMENT_SAFE_GLSL),
+            Transition::Luma => Self::get_builtin_glsl("fade")
+                .ok_or_else(|| anyhow::anyhow!("Failed to find fallback shader 'fade'")),
+            _ => Self::get_builtin_glsl(name)
+                .ok_or_else(|| anyhow::anyhow!("Builtin shader not found: {}", name)),
+        }
+    }
+
+    fn builtin_shader_mapping(transition: &Transition) -> &'static str {
+        match transition {
             Transition::Angular { .. } => "float startingAngle = getFromParams(0);",
-            Transition::Bounce { .. } => "vec4 shadow_colour = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3)); float shadow_height = getFromParams(4); float bounces = getFromParams(5);",
-            Transition::BowTieWithParameter { .. } => "float adjust = getFromParams(0); bool reverse = getFromParams(1) > 0.5;",
+            Transition::Bounce { .. } => {
+                "vec4 shadow_colour = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3)); float shadow_height = getFromParams(4); float bounces = getFromParams(5);"
+            }
+            Transition::BowTieWithParameter { .. } => {
+                "float adjust = getFromParams(0); bool reverse = getFromParams(1) > 0.5;"
+            }
             Transition::Burn => "vec3 color = vec3(0.9, 0.4, 0.2);",
-            Transition::ButterflyWaveScrawler { .. } => "float amplitude = getFromParams(0); float waves = getFromParams(1); float colorSeparation = getFromParams(2);",
-            // Actually, ButterflyWaveScrawler.glsl standard is usually `colorSeparation`. Let's guess camelCase to be safe or check? 
-            // Most gl-transitions use camelCase. I'll define BOTH to be safe if that works? No, redefinition error.
-            // Let's stick to what we had unless proven wrong (User didn't complain about Butterfly). Use original:
-            // "float amplitude = getFromParams(0); float waves = getFromParams(1); float color_separation = getFromParams(2);"
-
-            Transition::Circle => "vec2 center = vec2(0.5, 0.5); vec3 backColor = vec3(0.1, 0.1, 0.1);",
-            Transition::CircleCrop { .. } => "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));",
-            Transition::CircleOpen { .. } => "float smoothness = getFromParams(0); bool opening = getFromParams(1) > 0.5;",
-            Transition::ColorPhase => "vec4 fromStep = vec4(0.0, 0.2, 0.4, 0.0); vec4 toStep = vec4(0.6, 0.8, 1.0, 1.0);",
+            Transition::ButterflyWaveScrawler { .. } => {
+                "float amplitude = getFromParams(0); float waves = getFromParams(1); float colorSeparation = getFromParams(2);"
+            }
+            Transition::Circle => {
+                "vec2 center = vec2(0.5, 0.5); vec3 backColor = vec3(0.1, 0.1, 0.1);"
+            }
+            Transition::CircleCrop { .. } => {
+                "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));"
+            }
+            Transition::CircleOpen { .. } => {
+                "float smoothness = getFromParams(0); bool opening = getFromParams(1) > 0.5;"
+            }
+            Transition::ColorPhase => {
+                "vec4 fromStep = vec4(0.0, 0.2, 0.4, 0.0); vec4 toStep = vec4(0.6, 0.8, 1.0, 1.0);"
+            }
             Transition::CoordFromIn => "",
-            Transition::CrazyParametricFun { .. } => "float a = getFromParams(0); float b = getFromParams(1); float amplitude = getFromParams(2); float smoothness = getFromParams(3);",
+            Transition::CrazyParametricFun { .. } => {
+                "float a = getFromParams(0); float b = getFromParams(1); float amplitude = getFromParams(2); float smoothness = getFromParams(3);"
+            }
             Transition::ColourDistance { .. } => "float power = getFromParams(0);",
-            Transition::CrossHatch => "vec2 center = vec2(0.5); float threshold = 3.0; float fadeEdge = 0.1;",
+            Transition::CrossHatch => {
+                "vec2 center = vec2(0.5); float threshold = 3.0; float fadeEdge = 0.1;"
+            }
             Transition::CrossZoom { .. } => "float strength = getFromParams(0);",
-            Transition::CrossWarp => "", // No params usually
-            Transition::Cube { .. } => "float persp = getFromParams(0); float unzoom = getFromParams(1); float reflection = getFromParams(2); float floating = getFromParams(3);",
-            Transition::Directional { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1));",
-            Transition::DirectionalEasing { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1));",
-            Transition::DirectionalScaled { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float scale = getFromParams(2);",
-            Transition::DirectionalWarp { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);", // Wait, verify `directionalwarp` uses smoothness? grep said: `uniform float smoothness;`.
-            Transition::DirectionalWipe { .. } => "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);",
-            Transition::Displacement => "float strength = 0.5; #define displacementMap t_next", // Mock displacementMap with t_next
-            Transition::Dissolve { .. } => "float uLineWidth = getFromParams(0); vec3 uSpreadClr = vec3(getFromParams(1), getFromParams(2), getFromParams(3)); vec3 uHotClr = vec3(getFromParams(4), getFromParams(5), getFromParams(6)); float uPow = getFromParams(7); float uIntensity = getFromParams(8);",
-            Transition::Doom { .. } => "int bars = int(getFromParams(0)); float amplitude = getFromParams(1); float noise = getFromParams(2); float frequency = getFromParams(3); float dripScale = getFromParams(4);", // grep didn't show dripScale name but camelCase is safer guess.
-            // Wait, previous code used `drip_scale`. I'll trust previous code unless I see error.
-
-            Transition::Doorway { .. } => "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);",
-            Transition::DreamyZoom { .. } => "float rotation = getFromParams(0); float scale = getFromParams(1);",
-            Transition::Edge { .. } => "float thickness = getFromParams(0); float brightness = getFromParams(1);",
-            Transition::FadeColor { .. } => "vec3 color = vec3(getFromParams(0), getFromParams(1), getFromParams(2)); float colorPhase = getFromParams(3);",
+            Transition::CrossWarp => "",
+            Transition::Cube { .. } => "",
+            Transition::Directional { .. } => {
+                "vec2 direction = vec2(getFromParams(0), getFromParams(1));"
+            }
+            Transition::DirectionalEasing { .. } => {
+                "vec2 direction = vec2(getFromParams(0), getFromParams(1));"
+            }
+            Transition::DirectionalScaled { .. } => {
+                "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float scale = getFromParams(2);"
+            }
+            Transition::DirectionalWarp { .. } => {
+                "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);"
+            }
+            Transition::DirectionalWipe { .. } => {
+                "vec2 direction = vec2(getFromParams(0), getFromParams(1)); float smoothness = getFromParams(2);"
+            }
+            Transition::Displacement => "",
+            Transition::Dissolve { .. } => {
+                "float uLineWidth = getFromParams(0); vec3 uSpreadClr = vec3(getFromParams(1), getFromParams(2), getFromParams(3)); vec3 uHotClr = vec3(getFromParams(4), getFromParams(5), getFromParams(6)); float uPow = getFromParams(7); float uIntensity = getFromParams(8);"
+            }
+            Transition::Doom { .. } => {
+                "int bars = int(getFromParams(0)); float amplitude = getFromParams(1); float noise = getFromParams(2); float frequency = getFromParams(3); float dripScale = getFromParams(4);"
+            }
+            Transition::Doorway { .. } => {
+                "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);"
+            }
+            Transition::DreamyZoom { .. } => {
+                "float rotation = getFromParams(0); float scale = getFromParams(1);"
+            }
+            Transition::Edge { .. } => {
+                "float edge_thickness = getFromParams(0); float edge_brightness = getFromParams(1);"
+            }
+            Transition::FadeColor { .. } => {
+                "vec3 color = vec3(getFromParams(0), getFromParams(1), getFromParams(2)); float colorPhase = getFromParams(3);"
+            }
             Transition::FadeGrayscale { .. } => "float intensity = getFromParams(0);",
-            Transition::FilmBurn { .. } => "float seed = getFromParams(0);",
-            Transition::FlyEye { .. } => "float size = getFromParams(0); float zoom = getFromParams(1); float colorSeparation = getFromParams(2);",
-            Transition::GridFlip { .. } => "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float pause = getFromParams(2); float divider_width = getFromParams(3); vec4 bgcolor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7)); float randomness = getFromParams(8);",
-            Transition::Hexagonalize { .. } => "int steps = int(getFromParams(0)); float horizontalHexagons = getFromParams(1);",
-            Transition::Kaleidoscope { .. } => "float speed = getFromParams(0); float angle = getFromParams(1); float power = getFromParams(2);",
+            Transition::FilmBurn { .. } => "float Seed = getFromParams(0);",
+            Transition::FlyEye { .. } => {
+                "float size = getFromParams(0); float zoom = getFromParams(1); float colorSeparation = getFromParams(2);"
+            }
+            Transition::GridFlip { .. } => {
+                "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float pause = getFromParams(2); float dividerWidth = getFromParams(3); vec4 bgcolor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7)); float randomness = getFromParams(8);"
+            }
+            Transition::Hexagonalize { .. } => {
+                "int steps = int(getFromParams(0)); float horizontalHexagons = getFromParams(1);"
+            }
+            Transition::Kaleidoscope { .. } => {
+                "float speed = getFromParams(0); float angle = getFromParams(1); float power = getFromParams(2);"
+            }
             Transition::LinearBlur { .. } => "float intensity = getFromParams(0);",
-            Transition::LuminanceMelt { .. } => "bool direction = getFromParams(0) > 0.5; float l_threshold = getFromParams(1); bool above = false;", 
-            Transition::Luma => return Self::compile_glsl("fade", Self::get_builtin_glsl("fade").unwrap(), ""), // Temporary fix: Luma crashes without secondary texture, fallback to fade.
+            Transition::LuminanceMelt { .. } => {
+                "bool direction = getFromParams(0) > 0.5; float l_threshold = getFromParams(1); bool above = false;"
+            }
+            Transition::Luma => "",
             Transition::Morph { .. } => "float strength = getFromParams(0);",
-            Transition::Mosaic { .. } => "int endx = int(getFromParams(0)); int endy = int(getFromParams(1));",
+            Transition::Mosaic { .. } => {
+                "int endx = int(getFromParams(0)); int endy = int(getFromParams(1));"
+            }
             Transition::MosaicTransition { .. } => "float mosaicNum = getFromParams(0);",
-            Transition::Perlin { .. } => "float scale = getFromParams(0); float smoothness = getFromParams(1); float seed = getFromParams(2);",
+            Transition::Perlin { .. } => {
+                "float scale = getFromParams(0); float smoothness = getFromParams(1); float seed = getFromParams(2);"
+            }
             Transition::Pinwheel { .. } => "float speed = getFromParams(0);",
-            Transition::Pixelize { .. } => "ivec2 squaresMin = ivec2(int(getFromParams(0)), int(getFromParams(1))); int steps = int(getFromParams(2));",
+            Transition::Pixelize { .. } => {
+                "ivec2 squaresMin = ivec2(int(getFromParams(0)), int(getFromParams(1))); int steps = int(getFromParams(2));"
+            }
             Transition::PolarFunction { .. } => "int segments = int(getFromParams(0));",
-            Transition::PolkaDotsCurtain { .. } => "float dots = getFromParams(0); vec2 center = vec2(getFromParams(1), getFromParams(2));",
-            Transition::PowerKaleido { .. } => "float scale = getFromParams(0); float z = getFromParams(1); float speed = getFromParams(2);",
+            Transition::PolkaDotsCurtain { .. } => {
+                "float dots = getFromParams(0); vec2 center = vec2(getFromParams(1), getFromParams(2));"
+            }
+            Transition::PowerKaleido { .. } => {
+                "float scale = getFromParams(0); float z = getFromParams(1); float speed = getFromParams(2);"
+            }
             Transition::Radial { .. } => "float smoothness = getFromParams(0);",
-            Transition::RandomSquares { .. } => "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float smoothness = getFromParams(2);",
-            Transition::Rectangle { .. } => "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));",
-            Transition::RectangleCrop { .. } => "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));",
-            Transition::Ripple { .. } => "float amplitude = getFromParams(0); float speed = getFromParams(1);",
-            Transition::Rolls { .. } => "int type = int(getFromParams(0)); bool RotDown = getFromParams(1) > 0.5;", // Rolls.glsl: `uniform int type; uniform bool RotDown;`
+            Transition::RandomSquares { .. } => {
+                "ivec2 size = ivec2(int(getFromParams(0)), int(getFromParams(1))); float smoothness = getFromParams(2);"
+            }
+            Transition::Rectangle { .. } => {
+                "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));"
+            }
+            Transition::RectangleCrop { .. } => {
+                "vec4 bgcolor = vec4(getFromParams(0), getFromParams(1), getFromParams(2), getFromParams(3));"
+            }
+            Transition::Ripple { .. } => {
+                "float amplitude = getFromParams(0); float speed = getFromParams(1);"
+            }
+            Transition::Rolls { .. } => {
+                "int type = int(getFromParams(0)); bool RotDown = getFromParams(1) > 0.5;"
+            } // Rolls.glsl: `uniform int type; uniform bool RotDown;`
             Transition::Rotate => "",
-            Transition::RotateScaleFade { .. } => "vec2 center = vec2(getFromParams(0), getFromParams(1)); float rotations = getFromParams(2); float scale = getFromParams(3); vec4 backColor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7));", // rotate_scale_fade.glsl: `uniform vec4 backColor;` (Grep showed backColor or back_color? Grep output snippet was truncated/not showed full. `backColor` is common. Let's guess backColor. Correction: grep said `src/shaders/transitions/rotate_scale_fade.glsl:uniform vec4 backColor`)
-            Transition::RotateScaleVanish { .. } => "bool FadeInSecond = getFromParams(0) > 0.5; bool ReverseEffect = getFromParams(1) > 0.5; bool ReverseRotation = getFromParams(2) > 0.5;", // PascalCase in shader.
+            Transition::RotateScaleFade { .. } => {
+                "vec2 center = vec2(getFromParams(0), getFromParams(1)); float rotations = getFromParams(2); float scale = getFromParams(3); vec4 backColor = vec4(getFromParams(4), getFromParams(5), getFromParams(6), getFromParams(7));"
+            } // rotate_scale_fade.glsl: `uniform vec4 backColor;` (Grep showed backColor or back_color? Grep output snippet was truncated/not showed full. `backColor` is common. Let's guess backColor. Correction: grep said `src/shaders/transitions/rotate_scale_fade.glsl:uniform vec4 backColor`)
+            Transition::RotateScaleVanish { .. } => {
+                "bool FadeInSecond = getFromParams(0) > 0.5; bool ReverseEffect = getFromParams(1) > 0.5; bool ReverseRotation = getFromParams(2) > 0.5;"
+            } // PascalCase in shader.
             Transition::ScaleIn => "",
             Transition::SimpleZoom { .. } => "float zoom_quickness = getFromParams(0);",
-            Transition::SimpleZoomOut { .. } => "float zoom_quickness = getFromParams(0); bool fade = getFromParams(1) > 0.5;",
-            Transition::Slides { .. } => "int type = int(getFromParams(0)); bool In = getFromParams(1) > 0.5;", // Slides.glsl: `uniform int type; uniform bool In;`
+            Transition::SimpleZoomOut { .. } => {
+                "float zoom_quickness = getFromParams(0); bool fade = getFromParams(1) > 0.5;"
+            }
+            Transition::Slides { .. } => {
+                "int type = int(getFromParams(0)); bool In = getFromParams(1) > 0.5;"
+            } // Slides.glsl: `uniform int type; uniform bool In;`
             Transition::Squeeze { .. } => "float colorSeparation = getFromParams(0);", // Grep didn't show. Guessing camelCase.
-            Transition::StaticFade { .. } => "float n_noise_pixels = getFromParams(0); float static_luminosity = getFromParams(1);",
-            Transition::StaticWipe { .. } => "bool u_transitionUpToDown = getFromParams(0) > 0.5; float u_max_static_span = getFromParams(1);",
-            Transition::StereoViewer { .. } => "float zoom = getFromParams(0); float corner_radius = getFromParams(1);",
-            Transition::Swap { .. } => "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);",
+            Transition::StaticFade { .. } => {
+                "float n_noise_pixels = getFromParams(0); float static_luminosity = getFromParams(1);"
+            }
+            Transition::StaticWipe { .. } => {
+                "bool u_transitionUpToDown = getFromParams(0) > 0.5; float u_max_static_span = getFromParams(1);"
+            }
+            Transition::StereoViewer { .. } => {
+                "float zoom = getFromParams(0); float corner_radius = getFromParams(1);"
+            }
+            Transition::Swap { .. } => {
+                "float reflection = getFromParams(0); float perspective = getFromParams(1); float depth = getFromParams(2);"
+            }
             Transition::TvStatic { .. } => "float offset = getFromParams(0);",
-            Transition::UndulatingBurnOut { .. } => "float smoothness = getFromParams(0); vec2 center = vec2(getFromParams(1), getFromParams(2)); vec3 color = vec3(getFromParams(3), getFromParams(4), getFromParams(5));",
-            Transition::WaterDrop { .. } => "float amplitude = getFromParams(0); float speed = getFromParams(1);",
+            Transition::UndulatingBurnOut { .. } => {
+                "float smoothness = getFromParams(0); vec2 center = vec2(getFromParams(1), getFromParams(2)); vec3 color = vec3(getFromParams(3), getFromParams(4), getFromParams(5));"
+            }
+            Transition::WaterDrop { .. } => {
+                "float amplitude = getFromParams(0); float speed = getFromParams(1);"
+            }
             Transition::Wind { .. } => "float size = getFromParams(0);",
-            Transition::WindowSlice { .. } => "float count = getFromParams(0); float smoothness = getFromParams(1);",
-            Transition::ZoomLeftWipe { .. } | Transition::ZoomRightWipe { .. } => "float zoom_quickness = getFromParams(0);",
+            Transition::WindowSlice { .. } => {
+                "float count = getFromParams(0); float smoothness = getFromParams(1);"
+            }
+            Transition::ZoomLeftWipe { .. } | Transition::ZoomRightWipe { .. } => {
+                "float zoom_quickness = getFromParams(0);"
+            }
+            Transition::Overexposure => "float strength = 0.6;",
+            Transition::SquaresWire { .. } => {
+                "ivec2 squares = ivec2(int(getFromParams(0)), int(getFromParams(1))); vec2 direction = vec2(getFromParams(2), getFromParams(3)); float smoothness = getFromParams(4);"
+            }
             _ => "",
-        };
-
-        Self::compile_glsl(&name, glsl, mapping)
+        }
     }
 
     pub fn get_builtin_glsl(name: &str) -> Option<&'static str> {
         match name {
-            "Angular" => Some(include_str!("shaders/transitions/angular.glsl")),
+            "angular" => Some(include_str!("shaders/transitions/angular.glsl")),
             "BookFlip" => Some(include_str!("shaders/transitions/BookFlip.glsl")),
             "Bounce" => Some(include_str!("shaders/transitions/Bounce.glsl")),
             "BowTieHorizontal" => Some(include_str!("shaders/transitions/BowTieHorizontal.glsl")),
@@ -422,5 +792,63 @@ impl ShaderManager {
             "ZoomRigthWipe" => Some(include_str!("shaders/transitions/ZoomRigthWipe.glsl")),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedWgslEntry, ShaderManager};
+    use kaleidux_common::Transition;
+
+    #[test]
+    fn all_random_candidate_shaders_compile() {
+        let mut failures = Vec::new();
+
+        for name in Transition::random_candidate_names() {
+            let transition = Transition::from_name(name);
+            if let Err(e) = ShaderManager::get_builtin_shader(&transition) {
+                failures.push(format!("{}: {}", name, e));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "builtin transition shader failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn stale_cache_entry_is_rejected() {
+        let transition = Transition::Fade;
+        let fingerprint =
+            ShaderManager::builtin_shader_cache_fingerprint_for_transition(&transition)
+                .expect("fade fingerprint should be available");
+
+        let matching = CachedWgslEntry {
+            fingerprint,
+            wgsl: "cached".to_string(),
+        };
+        let stale = CachedWgslEntry {
+            fingerprint: fingerprint ^ 1,
+            wgsl: "cached".to_string(),
+        };
+
+        assert!(ShaderManager::cache_entry_matches_transition(
+            &transition,
+            &matching
+        ));
+        assert!(!ShaderManager::cache_entry_matches_transition(
+            &transition,
+            &stale
+        ));
+    }
+
+    #[test]
+    fn overexposure_uses_shader_default_strength() {
+        assert_eq!(
+            ShaderManager::builtin_shader_mapping(&Transition::Overexposure),
+            "float strength = 0.6;"
+        );
     }
 }
