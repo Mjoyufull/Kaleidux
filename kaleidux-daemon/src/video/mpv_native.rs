@@ -1,7 +1,7 @@
 use libmpv2::Mpv;
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 use wayland_client::backend::ObjectId;
@@ -145,6 +145,59 @@ impl MpvNativeVideoTarget {
     }
 }
 
+/// Handshake that guarantees mpv's render context exists before `loadfile`.
+///
+/// mpv initializes its `libmpv` VO while loading a file. If no render context
+/// is set at that moment it logs `No render context set`, fails VO init, and
+/// **permanently deselects the video track for that file** (`Video: no video`)
+/// — playback then produces no `MPV_RENDER_UPDATE_FRAME` at all. The render
+/// context can only be created on the render thread (its EGL context is made
+/// current there), so the player thread has to wait for this signal before
+/// loading.
+pub(crate) struct RenderReadySignal {
+    /// `None` until the render thread reports; then `Ok` or the failure text.
+    state: Mutex<Option<Result<(), String>>>,
+    condvar: Condvar,
+}
+
+impl RenderReadySignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            condvar: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn signal(&self, result: Result<(), String>) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.is_none() {
+                *state = Some(result);
+            }
+            self.condvar.notify_all();
+        }
+    }
+
+    /// Blocks until the render thread reports readiness, the render context
+    /// fails, or `timeout` elapses.
+    pub(crate) fn wait(&self, timeout: Duration) -> anyhow::Result<()> {
+        let Ok(state) = self.state.lock() else {
+            anyhow::bail!("mpv render-ready signal poisoned");
+        };
+        let (state, wait_result) = self
+            .condvar
+            .wait_timeout_while(state, timeout, |state| state.is_none())
+            .map_err(|_| anyhow::anyhow!("mpv render-ready signal poisoned"))?;
+        if wait_result.timed_out() {
+            anyhow::bail!("mpv render context was not ready within {timeout:?}");
+        }
+        match state.as_ref() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => anyhow::bail!("mpv render context failed: {error}"),
+            None => anyhow::bail!("mpv render-ready signal woke without a result"),
+        }
+    }
+}
+
 pub(crate) struct MpvNativeRenderThreadConfig {
     pub(crate) mpv: Arc<Mpv>,
     pub(crate) source_id: Arc<String>,
@@ -156,6 +209,7 @@ pub(crate) struct MpvNativeRenderThreadConfig {
     pub(crate) player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
     pub(crate) start_time: Instant,
     pub(crate) render_interval: Duration,
+    pub(crate) render_ready: Arc<RenderReadySignal>,
 }
 
 pub(crate) struct MpvComposedRenderThreadConfig {
@@ -170,16 +224,23 @@ pub(crate) struct MpvComposedRenderThreadConfig {
     pub(crate) player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
     pub(crate) start_time: Instant,
     pub(crate) render_interval: Duration,
+    pub(crate) render_ready: Arc<RenderReadySignal>,
 }
 
 pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) {
     let mut renderer = match ComposedGlRenderContext::new(&config.mpv, &config.target) {
         Ok(renderer) => renderer,
         Err(error) => {
+            // Unblock the player thread before reporting: it is waiting on this
+            // signal and must fail fast rather than sit out the whole timeout.
+            config.render_ready.signal(Err(error.to_string()));
             report_gl_renderer_failure(&config, &error);
             return;
         }
     };
+    // The render context now exists, so mpv's VO can initialize. Only after
+    // this is it safe for the player thread to issue `loadfile`.
+    config.render_ready.signal(Ok(()));
     info!(
         "[VIDEO] {}: composed libmpv GL render thread started (session={} size={}x{})",
         config.source_id, config.session_id, config.target.width, config.target.height
@@ -252,11 +313,14 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
         player_event_tx,
         start_time,
         render_interval,
+        render_ready,
     } = config;
 
     let mut renderer = match NativeGlRenderContext::new(&mpv, &target) {
         Ok(renderer) => renderer,
         Err(error) => {
+            // Unblock the waiting player thread before reporting the failure.
+            render_ready.signal(Err(error.to_string()));
             warn!(
                 "[VIDEO] {}: native libmpv GL renderer failed to initialize: {}",
                 source_id, error
@@ -272,6 +336,8 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
             return;
         }
     };
+    // mpv's VO can initialize from here on; `loadfile` is now safe to issue.
+    render_ready.signal(Ok(()));
 
     info!(
         "[VIDEO] {}: native libmpv GL render thread started (session={} size={}x{})",
@@ -318,7 +384,9 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::MpvRenderApiRequest;
+    use super::{MpvRenderApiRequest, RenderReadySignal};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn native_overlay_requires_explicit_overlay_name() {
@@ -356,5 +424,50 @@ mod tests {
             MpvRenderApiRequest::DeprecatedNativeGlAlias
         );
         assert!(!MpvRenderApiRequest::parse(Some("gl")).enables_native_overlay());
+    }
+
+    // Regression cover for the 2026-07-28 defect: `loadfile` issued before the
+    // render context exists makes mpv fail VO init and drop the video track,
+    // which looks like a CPU win because nothing decodes.
+    #[test]
+    fn render_ready_reports_success_to_a_waiter() {
+        let signal = Arc::new(RenderReadySignal::new());
+        let render_thread = {
+            let signal = signal.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                signal.signal(Ok(()));
+            })
+        };
+        assert!(signal.wait(Duration::from_secs(5)).is_ok());
+        render_thread.join().unwrap();
+    }
+
+    #[test]
+    fn render_ready_propagates_render_context_failure() {
+        let signal = RenderReadySignal::new();
+        signal.signal(Err("EGL context creation failed".to_string()));
+        let error = signal.wait(Duration::from_secs(5)).unwrap_err().to_string();
+        assert!(error.contains("EGL context creation failed"), "{error}");
+    }
+
+    #[test]
+    fn render_ready_times_out_instead_of_blocking_forever() {
+        let signal = RenderReadySignal::new();
+        let error = signal
+            .wait(Duration::from_millis(50))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not ready"), "{error}");
+    }
+
+    #[test]
+    fn render_ready_keeps_the_first_result_and_returns_it_after_the_fact() {
+        // Signalling before anyone waits must still be observable, and a later
+        // signal must not overwrite the original outcome.
+        let signal = RenderReadySignal::new();
+        signal.signal(Ok(()));
+        signal.signal(Err("late failure".to_string()));
+        assert!(signal.wait(Duration::from_millis(50)).is_ok());
     }
 }

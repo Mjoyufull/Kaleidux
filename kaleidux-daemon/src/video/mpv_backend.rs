@@ -11,7 +11,7 @@ use crate::observability::video_backend::VideoBackendMetricKind;
 
 use super::mpv_native::{
     MpvComposedRenderThreadConfig, MpvComposedVideoTarget, MpvNativeRenderThreadConfig,
-    MpvNativeVideoTarget, run_composed_render_thread, run_native_render_thread,
+    MpvNativeVideoTarget, RenderReadySignal, run_composed_render_thread, run_native_render_thread,
 };
 use super::{
     LatestFrameMailbox, PlayerEvent, PlayerEventKind, VideoFrame, publish_interval_ns,
@@ -30,6 +30,10 @@ use software_render::{SoftwareRenderContext, capture_video_frame_with_context};
 
 const MPV_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
 const MPV_FIRST_FRAME_POLL: Duration = Duration::from_millis(50);
+/// Upper bound on waiting for a GL render context before `loadfile`. Context
+/// creation is local GPU/EGL setup measured in tens of milliseconds; this only
+/// guards against a render thread that never reports.
+const MPV_RENDER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const MPV_NOTHING_TO_PLAY_ERROR: i32 = sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY;
 
 pub struct MpvPlayer {
@@ -44,12 +48,16 @@ pub struct MpvPlayer {
     metrics: Arc<PerformanceMetrics>,
     stop_requested: Arc<AtomicBool>,
     first_frame_logged: Arc<AtomicBool>,
+    first_hwdec_logged: Arc<AtomicBool>,
     capture_interval: Duration,
     max_publish_fps: Option<u32>,
     render_size: Option<(u32, u32)>,
     event_thread: Option<JoinHandle<()>>,
     frame_thread: Option<JoinHandle<()>>,
     start_time: Instant,
+    /// Deferred until the GL render context exists; see `start`.
+    pending_uri: Option<String>,
+    render_ready: Arc<RenderReadySignal>,
 }
 
 impl MpvPlayer {
@@ -83,7 +91,11 @@ impl MpvPlayer {
             init.set_option("osd-level", 0i64)?;
             init.set_option("osc", false)?;
             init.set_option("terminal", false)?;
-            init.set_option("msg-level", "all=warn")?;
+            let msg_level = std::env::var("KLD_MPV_MSG_LEVEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "all=warn".to_string());
+            init.set_option("msg-level", msg_level.as_str())?;
             init.set_option("hwdec", mpv_hwdec_mode().as_str())?;
             apply_fast_gpu_options(&init);
             if let Err(error) = init.set_option("sws-fast", true) {
@@ -102,6 +114,19 @@ impl MpvPlayer {
         })?;
         mpv.set_property("volume", (volume * 100.0).clamp(0.0, 100.0))?;
         mpv.disable_deprecated_events()?;
+        // Route libmpv's own log lines (hwdec probe results, decoder errors)
+        // into tracing so daemon logs can explain decode-path decisions.
+        let log_level = std::env::var("KLD_MPV_LOG_LEVEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "warn".to_string());
+        let log_level_c = std::ffi::CString::new(log_level.as_str())?;
+        // SAFETY: ctx is a live mpv handle; level string outlives the call.
+        let log_result =
+            unsafe { sys::mpv_request_log_messages(mpv.ctx.as_ptr(), log_level_c.as_ptr()) };
+        if log_result < 0 {
+            warn!("[VIDEO] libmpv log message request failed: {log_result}");
+        }
         mpv.enable_event(events::mpv_event_id::EndFile)?;
         mpv.enable_event(events::mpv_event_id::FileLoaded)?;
         mpv.enable_event(events::mpv_event_id::PlaybackRestart)?;
@@ -148,7 +173,11 @@ impl MpvPlayer {
             uri
         );
 
-        let player = Self {
+        // On the GL paths mpv's VO cannot initialize until the render thread
+        // has created the render context, and a `loadfile` issued before that
+        // makes mpv drop the video track for good. Defer the load to `start`.
+        let defers_load = use_native_gl || use_composed_gl;
+        let mut player = Self {
             mpv: Arc::new(mpv),
             render_context,
             native_target: active_native_target,
@@ -160,14 +189,23 @@ impl MpvPlayer {
             metrics,
             stop_requested: Arc::new(AtomicBool::new(false)),
             first_frame_logged: Arc::new(AtomicBool::new(false)),
+            first_hwdec_logged: Arc::new(AtomicBool::new(false)),
             capture_interval: Duration::from_nanos(1_000_000_000u64 / capture_fps as u64),
             max_publish_fps,
             render_size: normalized_render_size,
             event_thread: None,
             frame_thread: None,
             start_time,
+            pending_uri: None,
+            render_ready: Arc::new(RenderReadySignal::new()),
         };
-        player.load_file(uri)?;
+        if defers_load {
+            player.pending_uri = Some(uri.to_string());
+        } else {
+            // Software path has no render context to wait on, and `prebuffer`
+            // runs before `start`, so it still needs the file loaded here.
+            player.load_file(uri)?;
+        }
         Ok(player)
     }
 
@@ -215,6 +253,20 @@ impl MpvPlayer {
             self.spawn_composed_render_thread();
         } else {
             self.spawn_frame_thread();
+        }
+        // GL paths defer `loadfile` until the render thread reports that mpv's
+        // render context exists; loading earlier makes mpv fail VO init and
+        // permanently deselect the video track.
+        if let Some(uri) = self.pending_uri.take() {
+            if self.frame_thread.is_none() {
+                anyhow::bail!("mpv GL render thread failed to spawn; cannot load {uri}");
+            }
+            if let Err(error) = self.render_ready.wait(MPV_RENDER_READY_TIMEOUT) {
+                // Put the URI back so a retry can load it once a context exists.
+                self.pending_uri = Some(uri);
+                return Err(error);
+            }
+            self.load_file(&uri)?;
         }
         self.mpv.set_property("pause", false)?;
         info!(
@@ -294,6 +346,7 @@ impl MpvPlayer {
         let session_id = self.session_id;
         let player_event_tx = self.player_event_tx.clone();
         let stop_requested = self.stop_requested.clone();
+        let first_hwdec_logged = self.first_hwdec_logged.clone();
         self.event_thread = std::thread::Builder::new()
             .name(format!("kld-mpv-events-{}", source_id))
             .spawn(move || {
@@ -313,14 +366,51 @@ impl MpvPlayer {
                                 "[VIDEO] {}: libmpv PlaybackRestart session={}",
                                 source_id, session_id
                             );
+                            log_decode_path_once(
+                                &event_handle,
+                                &source_id,
+                                session_id,
+                                &first_hwdec_logged,
+                            );
                         }
                         Ok(events::Event::VideoReconfig) => {
                             trace!(
                                 "[VIDEO] {}: libmpv VideoReconfig session={}",
                                 source_id, session_id
                             );
+                            // PlaybackRestart is not guaranteed (e.g. VO probe
+                            // raced render-context creation), so also log here.
+                            log_decode_path_once(
+                                &event_handle,
+                                &source_id,
+                                session_id,
+                                &first_hwdec_logged,
+                            );
                         }
                         Ok(events::Event::Shutdown) => break,
+                        Ok(events::Event::LogMessage {
+                            prefix,
+                            level,
+                            text,
+                            ..
+                        }) => {
+                            let text = text.trim_end();
+                            // mpv probes every registered hwdec driver at render
+                            // context creation. The drmprime-overlay probe errors
+                            // when the DRM params carry no KMS card fd (we pass a
+                            // render node for VA-API only). That driver is unused
+                            // on this path, so keep the noise out of ERROR/WARN.
+                            if prefix.contains("drmprime-overlay") {
+                                tracing::debug!("[MPV:{}] {}", prefix, text);
+                                continue;
+                            }
+                            match level {
+                                "error" => tracing::error!("[MPV:{}] {}", prefix, text),
+                                "warn" => tracing::warn!("[MPV:{}] {}", prefix, text),
+                                "info" => tracing::info!("[MPV:{}] {}", prefix, text),
+                                _ => tracing::debug!("[MPV:{}] {}", prefix, text),
+                            }
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             if is_ignorable_event_error(&e) {
@@ -433,6 +523,7 @@ impl MpvPlayer {
             player_event_tx: self.player_event_tx.clone(),
             start_time: self.start_time,
             render_interval: self.capture_interval,
+            render_ready: self.render_ready.clone(),
         };
         self.frame_thread = std::thread::Builder::new()
             .name(format!("kld-mpv-gl-{}", self.source_id))
@@ -459,6 +550,7 @@ impl MpvPlayer {
             player_event_tx: self.player_event_tx.clone(),
             start_time: self.start_time,
             render_interval: self.capture_interval,
+            render_ready: self.render_ready.clone(),
         };
         self.frame_thread = std::thread::Builder::new()
             .name(format!("kld-mpv-gpu-{}", self.source_id))
@@ -480,6 +572,36 @@ impl MpvPlayer {
 
 fn is_ignorable_event_error(error: &libmpv2::Error) -> bool {
     matches!(error, libmpv2::Error::Raw(code) if *code == MPV_NOTHING_TO_PLAY_ERROR)
+}
+
+/// One-shot per-session log of the decoder path mpv actually selected.
+/// `hwdec-current=no` means software decode; on wallpaper workloads that is
+/// the dominant CPU cost, so it gets an explicit warning with next steps.
+fn log_decode_path_once(
+    mpv: &Mpv,
+    source_id: &str,
+    session_id: u64,
+    first_hwdec_logged: &AtomicBool,
+) {
+    if first_hwdec_logged.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let hwdec = mpv
+        .get_property::<String>("hwdec-current")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let codec = mpv
+        .get_property::<String>("video-codec")
+        .unwrap_or_else(|_| "unknown".to_string());
+    info!(
+        "[VIDEO] {}: libmpv decode path hwdec-current={} codec={} (session={})",
+        source_id, hwdec, codec, session_id
+    );
+    if hwdec == "no" {
+        warn!(
+            "[VIDEO] {}: libmpv hardware decode is OFF (hwdec-current=no); software decode threads will dominate CPU. Check hwdec display resource logs ([MPV-GL]) and KLD_MPV_LOG_LEVEL=debug for probe details",
+            source_id
+        );
+    }
 }
 
 #[cfg(test)]

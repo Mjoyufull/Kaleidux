@@ -39,8 +39,19 @@ pub enum VideoBackendRequest {
 
 const NVCODEC_DECODER_FACTORIES: [&str; 5] =
     ["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec", "nvvp8dec"];
+/// Modern `va` plugin (gst-plugins-bad >= 1.22).
 const VAAPI_DECODER_FACTORIES: [&str; 5] =
     ["vah264dec", "vah265dec", "vaav1dec", "vavp9dec", "vavp8dec"];
+/// Legacy `gstreamer-vaapi` plugin element names, still shipped by several
+/// distributions alongside or instead of the modern `va` plugin.
+const LEGACY_VAAPI_DECODER_FACTORIES: [&str; 6] = [
+    "vaapih264dec",
+    "vaapih265dec",
+    "vaapivp9dec",
+    "vaapivp8dec",
+    "vaapimpeg2dec",
+    "vaapijpegdec",
+];
 const CUDA_SUPPORT_FACTORIES: [&str; 4] = [
     "cudaconvert",
     "cudaconvertscale",
@@ -180,10 +191,12 @@ fn element_factories_available(names: &[&'static str]) -> Vec<&'static str> {
 }
 
 pub fn detect_video_capabilities() -> VideoCapabilities {
+    let mut vaapi_decoders = element_factories_available(&VAAPI_DECODER_FACTORIES);
+    vaapi_decoders.extend(element_factories_available(&LEGACY_VAAPI_DECODER_FACTORIES));
     VideoCapabilities {
         has_nvidia_driver: std::fs::metadata("/proc/driver/nvidia/gpus").is_ok(),
         nvcodec_decoders: element_factories_available(&NVCODEC_DECODER_FACTORIES),
-        vaapi_decoders: element_factories_available(&VAAPI_DECODER_FACTORIES),
+        vaapi_decoders,
         cuda_elements: element_factories_available(&CUDA_SUPPORT_FACTORIES),
     }
 }
@@ -301,10 +314,13 @@ pub fn configure_hw_decoders() {
         }
 
         let mut demoted_vaapi = Vec::new();
-        for name in VAAPI_DECODER_FACTORIES {
+        for name in VAAPI_DECODER_FACTORIES
+            .iter()
+            .chain(LEGACY_VAAPI_DECODER_FACTORIES.iter())
+        {
             if let Some(factory) = gst::ElementFactory::find(name) {
                 factory.set_rank(gst::Rank::MARGINAL);
-                demoted_vaapi.push(name);
+                demoted_vaapi.push(*name);
             }
         }
 
@@ -325,10 +341,13 @@ pub fn configure_hw_decoders() {
         }
 
         let mut demoted = Vec::new();
-        for name in VAAPI_DECODER_FACTORIES {
+        for name in VAAPI_DECODER_FACTORIES
+            .iter()
+            .chain(LEGACY_VAAPI_DECODER_FACTORIES.iter())
+        {
             if let Some(factory) = gst::ElementFactory::find(name) {
                 factory.set_rank(gst::Rank::MARGINAL);
-                demoted.push(name);
+                demoted.push(*name);
             }
         }
 
@@ -338,6 +357,10 @@ pub fn configure_hw_decoders() {
             demoted,
             capabilities.cuda_elements,
             capabilities.has_cuda_path()
+        );
+    } else if capabilities.vaapi_decoders.is_empty() {
+        tracing::warn!(
+            "[VIDEO] Non-NVIDIA GPU but no VA-API decoder elements found (checked modern va* and legacy vaapi* factories); install gst-plugins-bad and/or gstreamer-vaapi for DMA-BUF zero-copy. Appsink will negotiate CPU-memory NV12/I420 decode"
         );
     } else {
         info!(
