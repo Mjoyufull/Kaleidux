@@ -3,7 +3,7 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::metrics::PerformanceMetrics;
 
@@ -13,9 +13,10 @@ pub(super) use capabilities::chroma_plane_extent;
 pub use capabilities::{
     VideoBackendKind, VideoBackendRequest, VideoCapabilities, VideoMode, caps_ladder_labels,
     configure_hw_decoders, current_video_capabilities, detect_video_capabilities,
-    get_video_backend_request, get_video_mode, refresh_video_capabilities,
-    resolve_video_backend_request, set_video_backend_request, set_video_mode,
-    validate_selected_video_backend, validate_selected_video_mode,
+    enabled_video_backend_labels, get_video_backend_request, get_video_mode,
+    mpv_backend_is_explicitly_forced, p010_sampling_supported, refresh_video_capabilities,
+    resolve_video_backend_request, set_p010_sampling_supported, set_video_backend_request,
+    set_video_mode, validate_selected_video_mode, video_backend_feature, video_backend_is_enabled,
 };
 use capabilities::{build_video_sink_caps, is_nvcodec_decoder_factory};
 
@@ -25,18 +26,32 @@ use bus::BusWatchHandle;
 pub use bus::shutdown_bus_dispatcher;
 #[path = "video/appsink.rs"]
 mod appsink;
+#[path = "video/appsink_pool.rs"]
+mod appsink_pool;
 #[path = "video/dmabuf.rs"]
 mod dmabuf;
-#[cfg(feature = "mpv-backend")]
+#[path = "video/drm_syncobj.rs"]
+pub(crate) mod drm_syncobj;
+#[cfg(feature = "backend-mpv")]
 #[path = "video/mpv_backend.rs"]
 mod mpv_backend;
-#[cfg(feature = "mpv-backend")]
+#[cfg(not(feature = "backend-mpv"))]
+#[path = "video/mpv_backend_disabled.rs"]
+mod mpv_backend;
+#[cfg(feature = "backend-mpv")]
 #[path = "video/mpv_native.rs"]
 mod mpv_native;
+#[cfg(not(feature = "backend-mpv"))]
+#[path = "video/mpv_native_disabled.rs"]
+mod mpv_native;
+#[cfg(feature = "backend-ffmpeg")]
+#[path = "video/native_backend.rs"]
+mod native_backend;
+#[cfg(not(feature = "backend-ffmpeg"))]
+#[path = "video/native_backend_disabled.rs"]
+mod native_backend;
 pub use appsink::frame_decode_path_label;
-#[cfg(feature = "mpv-backend")]
 pub(crate) use mpv_native::MpvRenderApiRequest;
-#[cfg(feature = "mpv-backend")]
 pub use mpv_native::{MpvComposedVideoTarget, MpvNativeVideoTarget};
 #[path = "video/lifecycle.rs"]
 mod lifecycle;
@@ -44,9 +59,21 @@ pub use lifecycle::{AppsinkQueueLevels, VideoPrebufferProfile, VideoPrebufferRes
 
 #[path = "video/frame.rs"]
 mod frame;
-#[cfg(feature = "mpv-backend")]
-pub(crate) use frame::GlExternalFrame;
-pub use frame::{LatestFrameMailbox, PlayerEvent, PlayerEventKind, VideoFrame, VideoFrameFormat};
+#[path = "video/frame_gl.rs"]
+mod frame_gl;
+#[path = "video/frame_mailbox.rs"]
+mod frame_mailbox;
+pub use frame::{
+    DrmSyncobjFrame, NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane, VideoChromaSiting,
+    VideoColorMatrix, VideoColorMetadata, VideoColorPrimaries, VideoColorRange,
+    VideoContentLightMetadata, VideoCropRect, VideoGeometry, VideoMasteringMetadata, VideoRotation,
+    VideoTransfer,
+};
+pub use frame::{PlayerEvent, PlayerEventKind, VideoFrame, VideoFrameFormat, VideoFrameStorage};
+pub(crate) use frame_gl::GlExternalFrame;
+pub use frame_mailbox::LatestFrameMailbox;
+pub(crate) use native_backend::report_native_surface_import_failure;
+pub use native_backend::{NativeDecoderApi, NativePathTier};
 
 pub(super) fn env_flag_enabled(key: &str) -> bool {
     std::env::var_os(key)
@@ -61,11 +88,13 @@ pub(super) fn env_flag_enabled(key: &str) -> bool {
 }
 
 fn cuda_layout_log_every_frame_enabled() -> bool {
-    env_flag_enabled("KLD_TRACE_VIDEO_LAYOUT_EVERY_FRAME")
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("KLD_TRACE_VIDEO_LAYOUT_EVERY_FRAME"))
 }
 
 fn prefer_videoinfo_cuda_layout_enabled() -> bool {
-    env_flag_enabled("KLD_CUDA_LAYOUT_PREFER_VIDEOINFO")
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("KLD_CUDA_LAYOUT_PREFER_VIDEOINFO"))
 }
 
 fn appsink_sync_enabled() -> bool {
@@ -163,15 +192,16 @@ pub(crate) mod test_support;
 mod tests;
 
 pub struct VideoPlayer {
+    source_uri: String,
     pub pipeline: Option<gst::Element>,
     appsink: Option<gst_app::AppSink>,
-    #[cfg(feature = "mpv-backend")]
     mpv: Option<mpv_backend::MpvPlayer>,
+    native: Option<native_backend::NativePlayer>,
     backend_kind: VideoBackendKind,
     is_running: Arc<AtomicBool>,
     bus_watch: Option<BusWatchHandle>,
     frame_mailbox: LatestFrameMailbox,
-    player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+    player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
     source_id: Arc<String>,
     session_id: u64,
     start_time: std::time::Instant,
@@ -185,7 +215,8 @@ impl VideoPlayer {
     fn backend_label(&self) -> &'static str {
         match self.backend_kind {
             VideoBackendKind::Appsink => "appsink",
-            VideoBackendKind::MpvExperimental => "mpv-experimental",
+            VideoBackendKind::Mpv => "mpv",
+            VideoBackendKind::Ffmpeg => "ffmpeg",
         }
     }
 
@@ -217,37 +248,96 @@ impl VideoPlayer {
         session_id: u64,
         volume: f64,
         frame_mailbox: LatestFrameMailbox,
-        player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+        player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
         metrics: Arc<PerformanceMetrics>,
         backend_request: VideoBackendRequest,
+        decode_group_id: Option<u64>,
         max_publish_fps: Option<u32>,
         render_size: Option<(u32, u32)>,
-        #[cfg(feature = "mpv-backend")] mpv_native_target: Option<MpvNativeVideoTarget>,
-        #[cfg(feature = "mpv-backend")] mpv_composed_target: Option<MpvComposedVideoTarget>,
+        mpv_native_target: Option<MpvNativeVideoTarget>,
+        mpv_composed_target: Option<MpvComposedVideoTarget>,
     ) -> anyhow::Result<Self> {
         let creation_start = std::time::Instant::now();
-        let resolved_backend_request = resolve_video_backend_request(backend_request);
-        validate_selected_video_backend(resolved_backend_request)?;
-        if matches!(
-            resolved_backend_request,
-            VideoBackendRequest::ForceMpvExperimental
-        ) {
-            return Self::new_mpv_experimental(
+        let mut resolved_backend_request = resolve_video_backend_request(backend_request);
+        let backend_is_explicitly_forced = backend_request != VideoBackendRequest::Auto
+            || get_video_backend_request() != VideoBackendRequest::Auto;
+        if !video_backend_is_enabled(resolved_backend_request) {
+            anyhow::bail!(
+                "video backend '{}' is disabled in this build (required Cargo feature: {}; enabled backends: {:?})",
+                match resolved_backend_request {
+                    VideoBackendRequest::Auto => "auto",
+                    VideoBackendRequest::ForceAppsink => "appsink",
+                    VideoBackendRequest::ForceMpv => "mpv",
+                    VideoBackendRequest::ForceFfmpeg => "ffmpeg",
+                },
+                video_backend_feature(resolved_backend_request),
+                enabled_video_backend_labels(),
+            );
+        }
+        if matches!(resolved_backend_request, VideoBackendRequest::ForceFfmpeg) {
+            let native_result = Self::new_native(
                 uri,
-                source_id,
+                source_id.clone(),
                 session_id,
                 volume,
-                frame_mailbox,
-                player_event_tx,
-                metrics,
+                frame_mailbox.clone(),
+                player_event_tx.clone(),
+                metrics.clone(),
+                decode_group_id,
                 max_publish_fps,
-                render_size,
-                #[cfg(feature = "mpv-backend")]
-                mpv_native_target,
-                #[cfg(feature = "mpv-backend")]
-                mpv_composed_target,
                 creation_start,
             );
+            match native_result {
+                Ok(player) => return Ok(player),
+                Err(error) if !backend_is_explicitly_forced => {
+                    if video_backend_is_enabled(VideoBackendRequest::ForceMpv) {
+                        warn!(
+                            "[VIDEO] {}: default FFmpeg backend unavailable ({error:#}); falling back to mpv",
+                            source_id
+                        );
+                        resolved_backend_request = VideoBackendRequest::ForceMpv;
+                    } else if video_backend_is_enabled(VideoBackendRequest::ForceAppsink) {
+                        warn!(
+                            "[VIDEO] {}: default FFmpeg backend unavailable ({error:#}); falling back to appsink",
+                            source_id
+                        );
+                        resolved_backend_request = VideoBackendRequest::ForceAppsink;
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if matches!(resolved_backend_request, VideoBackendRequest::ForceMpv) {
+            let mpv_result = Self::new_mpv(
+                uri,
+                source_id.clone(),
+                session_id,
+                volume,
+                frame_mailbox.clone(),
+                player_event_tx.clone(),
+                metrics.clone(),
+                max_publish_fps,
+                render_size,
+                mpv_native_target.clone(),
+                mpv_composed_target.clone(),
+                creation_start,
+            );
+            match mpv_result {
+                Ok(player) => return Ok(player),
+                Err(error)
+                    if !backend_is_explicitly_forced
+                        && !mpv_backend_is_explicitly_forced()
+                        && video_backend_is_enabled(VideoBackendRequest::ForceAppsink) =>
+                {
+                    warn!(
+                        "[VIDEO] {}: default mpv backend unavailable ({error:#}); falling back to appsink",
+                        source_id
+                    )
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let pipeline_name = if gst::ElementFactory::find("playbin").is_some() {
@@ -319,10 +409,11 @@ impl VideoPlayer {
         }
 
         let player = Self {
+            source_uri: uri.to_string(),
             pipeline: Some(pipeline),
             appsink: Some(appsink),
-            #[cfg(feature = "mpv-backend")]
             mpv: None,
+            native: None,
             backend_kind,
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
@@ -340,15 +431,14 @@ impl VideoPlayer {
         Ok(player)
     }
 
-    #[cfg(feature = "mpv-backend")]
     #[allow(clippy::too_many_arguments)]
-    fn new_mpv_experimental(
+    fn new_mpv(
         uri: &str,
         source_id: Arc<String>,
         session_id: u64,
         volume: f64,
         frame_mailbox: LatestFrameMailbox,
-        player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+        player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
         metrics: Arc<PerformanceMetrics>,
         max_publish_fps: Option<u32>,
         render_size: Option<(u32, u32)>,
@@ -370,12 +460,14 @@ impl VideoPlayer {
             mpv_composed_target,
             creation_start,
         )?;
-        let backend_kind = VideoBackendKind::MpvExperimental;
+        let backend_kind = VideoBackendKind::Mpv;
         metrics.record_video_backend_session(backend_kind);
         let player = Self {
+            source_uri: uri.to_string(),
             pipeline: None,
             appsink: None,
             mpv: Some(mpv),
+            native: None,
             backend_kind,
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
@@ -393,31 +485,75 @@ impl VideoPlayer {
         Ok(player)
     }
 
-    #[cfg(not(feature = "mpv-backend"))]
     #[allow(clippy::too_many_arguments)]
-    fn new_mpv_experimental(
-        _uri: &str,
-        _source_id: Arc<String>,
-        _session_id: u64,
-        _volume: f64,
-        _frame_mailbox: LatestFrameMailbox,
-        _player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
-        _metrics: Arc<PerformanceMetrics>,
-        _max_publish_fps: Option<u32>,
-        _render_size: Option<(u32, u32)>,
-        _creation_start: std::time::Instant,
+    fn new_native(
+        uri: &str,
+        source_id: Arc<String>,
+        session_id: u64,
+        volume: f64,
+        frame_mailbox: LatestFrameMailbox,
+        player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
+        metrics: Arc<PerformanceMetrics>,
+        decode_group_id: Option<u64>,
+        max_publish_fps: Option<u32>,
+        creation_start: std::time::Instant,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "libmpv backend requested but kaleidux-daemon was built without the mpv-backend Cargo feature"
-        )
+        let native = native_backend::NativePlayer::new(
+            uri,
+            source_id.clone(),
+            session_id,
+            volume,
+            frame_mailbox.clone(),
+            player_event_tx.clone(),
+            metrics.clone(),
+            decode_group_id,
+            max_publish_fps,
+            creation_start,
+        )?;
+        let backend_kind = VideoBackendKind::Ffmpeg;
+        metrics.record_video_backend_session(backend_kind);
+        let player = Self {
+            source_uri: uri.to_string(),
+            pipeline: None,
+            appsink: None,
+            mpv: None,
+            native: Some(native),
+            backend_kind,
+            is_running: Arc::new(AtomicBool::new(false)),
+            bus_watch: None,
+            frame_mailbox,
+            player_event_tx,
+            source_id,
+            session_id,
+            start_time: creation_start,
+            first_frame_logged: Arc::new(AtomicBool::new(false)),
+            decode_path_logged: Arc::new(AtomicBool::new(false)),
+            accept_samples: Arc::new(AtomicBool::new(true)),
+            pending_start_position_ns: None,
+        };
+        player.log_backend_snapshot("created");
+        Ok(player)
     }
 
     pub fn is_appsink_backend(&self) -> bool {
         self.backend_kind == VideoBackendKind::Appsink
     }
 
+    pub fn is_native_experimental_backend(&self) -> bool {
+        self.backend_kind == VideoBackendKind::Ffmpeg
+    }
+
+    pub fn request_video_frame(&self) {
+        if let Some(native) = self.native.as_ref() {
+            native.request_frame();
+        }
+    }
+
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
+    }
+
     pub fn renders_natively(&self) -> bool {
-        #[cfg(feature = "mpv-backend")]
         if let Some(mpv) = self.mpv.as_ref() {
             return mpv.renders_natively();
         }
@@ -428,7 +564,9 @@ impl VideoPlayer {
     }
 
     pub fn current_position_ns(&self) -> Option<u64> {
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_ref() {
+            return Some(native.current_position_ns());
+        }
         if let Some(mpv) = self.mpv.as_ref() {
             return mpv.current_position_ns();
         }
@@ -439,11 +577,13 @@ impl VideoPlayer {
     }
 
     pub fn seek_to_position_ns(&self, position_ns: u64) -> anyhow::Result<()> {
+        if let Some(native) = self.native.as_ref() {
+            native.seek_to_position_ns(position_ns);
+            return Ok(());
+        }
         if position_ns == 0 {
             return Ok(());
         }
-
-        #[cfg(feature = "mpv-backend")]
         if let Some(mpv) = self.mpv.as_ref() {
             return mpv.seek_to_position_ns(position_ns);
         }

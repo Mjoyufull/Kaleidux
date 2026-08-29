@@ -1,65 +1,323 @@
 use gstreamer as gst;
-use std::collections::{HashMap, HashSet};
+use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use super::VideoBackendKind;
+use super::drm_syncobj::DrmSyncobjTimeline;
+use super::frame_gl::GlExternalFrame;
 
-#[cfg(feature = "mpv-backend")]
-#[derive(Clone, Debug)]
-pub struct GlExternalFrame {
-    inner: Arc<GlExternalFrameInner>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoColorMatrix {
+    Bt601,
+    #[default]
+    Bt709,
+    Bt2020,
 }
 
-#[cfg(feature = "mpv-backend")]
-#[derive(Debug)]
-struct GlExternalFrameInner {
-    texture: Arc<wgpu::Texture>,
-    slot_busy: Arc<AtomicBool>,
-    release_scheduled: AtomicBool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoColorRange {
+    Full,
+    #[default]
+    Limited,
 }
 
-#[cfg(feature = "mpv-backend")]
-impl GlExternalFrame {
-    pub(crate) fn new(texture: Arc<wgpu::Texture>, slot_busy: Arc<AtomicBool>) -> Self {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoTransfer {
+    Srgb,
+    #[default]
+    Bt709,
+    Bt1886,
+    Pq,
+    Hlg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoColorPrimaries {
+    Bt601Ntsc,
+    Bt601Pal,
+    #[default]
+    Bt709,
+    Bt2020,
+    DciP3,
+    DisplayP3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoChromaSiting {
+    #[default]
+    Center,
+    Left,
+    TopLeft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoMasteringMetadata {
+    /// CIE 1931 xy coordinates in red, green, blue, white order.
+    pub primaries_xy: [[f32; 2]; 4],
+    pub min_luminance_nits: f32,
+    pub max_luminance_nits: f32,
+}
+
+impl Eq for VideoMasteringMetadata {}
+
+impl Hash for VideoMasteringMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for coordinate in self.primaries_xy.into_iter().flatten() {
+            coordinate.to_bits().hash(state);
+        }
+        self.min_luminance_nits.to_bits().hash(state);
+        self.max_luminance_nits.to_bits().hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct VideoContentLightMetadata {
+    pub max_content_light_level: Option<u32>,
+    pub max_frame_average_light_level: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct VideoCropRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VideoRotation {
+    #[default]
+    Rotate0,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VideoGeometry {
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub sample_aspect_num: u32,
+    pub sample_aspect_den: u32,
+    pub crop: VideoCropRect,
+    pub rotation: VideoRotation,
+}
+
+impl VideoGeometry {
+    pub fn for_dimensions(width: u32, height: u32) -> Self {
         Self {
-            inner: Arc::new(GlExternalFrameInner {
-                texture,
-                slot_busy,
-                release_scheduled: AtomicBool::new(false),
-            }),
+            coded_width: width,
+            coded_height: height,
+            display_width: width,
+            display_height: height,
+            sample_aspect_num: 1,
+            sample_aspect_den: 1,
+            crop: VideoCropRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            rotation: VideoRotation::Rotate0,
         }
     }
 
-    pub(crate) fn texture(&self) -> &wgpu::Texture {
-        self.inner.texture.as_ref()
-    }
-
-    pub(crate) fn release_after_submit(&self, queue: &wgpu::Queue) {
-        if self.inner.release_scheduled.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let slot_busy = self.inner.slot_busy.clone();
-        queue.on_submitted_work_done(move || slot_busy.store(false, Ordering::Release));
+    pub fn display_aspect(self) -> f32 {
+        let (width, height) = match self.rotation {
+            VideoRotation::Rotate90 | VideoRotation::Rotate270 => {
+                (self.display_height, self.display_width)
+            }
+            VideoRotation::Rotate0 | VideoRotation::Rotate180 => {
+                (self.display_width, self.display_height)
+            }
+        };
+        width.max(1) as f32 * self.sample_aspect_num.max(1) as f32
+            / (height.max(1) as f32 * self.sample_aspect_den.max(1) as f32)
     }
 }
 
-#[cfg(feature = "mpv-backend")]
-impl Drop for GlExternalFrameInner {
-    fn drop(&mut self) {
-        if !self.release_scheduled.load(Ordering::Acquire) {
-            self.slot_busy.store(false, Ordering::Release);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VideoColorMetadata {
+    pub matrix: VideoColorMatrix,
+    pub range: VideoColorRange,
+    pub transfer: VideoTransfer,
+    pub primaries: VideoColorPrimaries,
+    pub chroma_siting: VideoChromaSiting,
+    pub bit_depth: u8,
+    pub mastering: Option<VideoMasteringMetadata>,
+    pub content_light: VideoContentLightMetadata,
+}
+
+impl Default for VideoColorMetadata {
+    fn default() -> Self {
+        Self::sdr(
+            VideoColorMatrix::Bt709,
+            VideoColorRange::Limited,
+            VideoTransfer::Bt709,
+        )
+    }
+}
+
+impl VideoColorMetadata {
+    pub fn sdr(matrix: VideoColorMatrix, range: VideoColorRange, transfer: VideoTransfer) -> Self {
+        Self {
+            matrix,
+            range,
+            transfer,
+            primaries: VideoColorPrimaries::Bt709,
+            chroma_siting: VideoChromaSiting::Center,
+            bit_depth: 8,
+            mastering: None,
+            content_light: VideoContentLightMetadata::default(),
         }
+    }
+
+    pub fn is_hdr(self) -> bool {
+        matches!(self.transfer, VideoTransfer::Pq | VideoTransfer::Hlg)
+    }
+}
+
+#[derive(Clone)]
+pub enum VideoFrameStorage {
+    Gstreamer(gst::Buffer),
+    Cpu(Arc<[u8]>),
+    Native(Arc<dyn Any + Send + Sync>),
+    External,
+}
+
+impl VideoFrameStorage {
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Gstreamer(buffer) => buffer.size(),
+            Self::Cpu(bytes) => bytes.len(),
+            Self::Native(_) => 0,
+            Self::External => 0,
+        }
+    }
+
+    pub fn memory_count(&self) -> usize {
+        match self {
+            Self::Gstreamer(buffer) => buffer.n_memory(),
+            Self::Cpu(_) => 1,
+            Self::Native(_) => 1,
+            Self::External => 0,
+        }
+    }
+
+    pub fn gstreamer_buffer(&self) -> Option<&gst::Buffer> {
+        match self {
+            Self::Gstreamer(buffer) => Some(buffer),
+            Self::Cpu(_) | Self::External => None,
+            Self::Native(_) => None,
+        }
+    }
+
+    pub fn with_readable_bytes<T>(&self, consume: impl FnOnce(&[u8]) -> T) -> anyhow::Result<T> {
+        match self {
+            Self::Gstreamer(buffer) => {
+                let map = buffer
+                    .map_readable()
+                    .map_err(|error| anyhow::anyhow!("failed to map GStreamer buffer: {error}"))?;
+                Ok(consume(map.as_slice()))
+            }
+            Self::Cpu(bytes) => Ok(consume(bytes)),
+            Self::Native(_) => anyhow::bail!("native GPU frame has no CPU-readable storage"),
+            Self::External => anyhow::bail!("external GPU frame has no CPU-readable storage"),
+        }
+    }
+
+    fn trace_hash(&self, hasher: &mut impl Hasher) {
+        match self {
+            Self::Gstreamer(buffer) => {
+                "gstreamer".hash(hasher);
+                buffer.size().hash(hasher);
+                buffer.n_memory().hash(hasher);
+                buffer.offset().hash(hasher);
+                buffer.offset_end().hash(hasher);
+                format!("{:?}", buffer.flags()).hash(hasher);
+            }
+            Self::Cpu(bytes) => {
+                "cpu".hash(hasher);
+                bytes.len().hash(hasher);
+            }
+            Self::Native(owner) => {
+                "native".hash(hasher);
+                Arc::as_ptr(owner).hash(hasher);
+            }
+            Self::External => "external".hash(hasher),
+        }
+    }
+}
+
+impl From<gst::Buffer> for VideoFrameStorage {
+    fn from(buffer: gst::Buffer) -> Self {
+        Self::Gstreamer(buffer)
+    }
+}
+
+impl From<Vec<u8>> for VideoFrameStorage {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Cpu(bytes.into())
+    }
+}
+
+#[derive(Debug)]
+pub struct NativeDmaBufObject {
+    pub fd: OwnedFd,
+    pub size: u64,
+    pub modifier: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeDmaBufPlane {
+    pub layer_index: usize,
+    pub object_index: usize,
+    pub offset: u64,
+    pub pitch: u64,
+    pub drm_fourcc: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DrmSyncobjFrame {
+    pub acquire_timeline: DrmSyncobjTimeline,
+    pub acquire_point: u64,
+    pub release_timeline: DrmSyncobjTimeline,
+    pub release_point: u64,
+}
+
+impl DrmSyncobjFrame {
+    pub fn release_signaled(&self) -> bool {
+        self.release_timeline.is_signaled(self.release_point)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeDmaBufNv12 {
+    pub surface_id: u64,
+    pub objects: Arc<[NativeDmaBufObject]>,
+    pub planes: [NativeDmaBufPlane; 2],
+    /// Producer completion fence for this specific frame. This is populated
+    /// by the Vulkan linear bridge and consumed by Wayland explicit sync.
+    pub acquire_fence: Option<Arc<OwnedFd>>,
+    /// Preferred modern explicit-sync state. Each stable bridge buffer owns a
+    /// distinct release timeline so compositor completion cannot signal reuse
+    /// of an unrelated slot.
+    pub drm_syncobj: Option<DrmSyncobjFrame>,
+}
+
+impl NativeDmaBufNv12 {
+    fn try_clone(&self) -> Option<Self> {
+        Some(self.clone())
     }
 }
 
 #[derive(Debug)]
 pub enum VideoFrameFormat {
     Rgba,
-    #[cfg(feature = "mpv-backend")]
     /// OpenGL renders into memory shared with Vulkan; WGPU blits the GPU texture.
     GlExternalRgba {
         frame: GlExternalFrame,
@@ -69,15 +327,23 @@ pub enum VideoFrameFormat {
         uv_offset: u32,
         uv_stride: u32,
     },
-    /// DMA-BUF zero-copy: file descriptors for each plane, no CPU-side data.
-    /// File descriptors are owned and will be closed when dropped.
-    DmaBufNv12 {
-        y_fd: OwnedFd,
+    /// Little-endian P010: 10-bit samples stored in the most significant bits
+    /// of 16-bit Y and interleaved UV words. Kept as 16-bit planes through the
+    /// final shader, with no 8-bit or output-sized RGBA intermediate.
+    P010 {
         y_stride: u32,
-        y_offset: u32,
-        uv_fd: OwnedFd,
-        uv_stride: u32,
         uv_offset: u32,
+        uv_stride: u32,
+    },
+    /// GStreamer DMA-BUF frame with the negotiated DRM format/modifier and
+    /// stable allocation identity preserved. The descriptor is cached by the
+    /// appsink callback, so cloning a frame does not duplicate file
+    /// descriptors or reparse caps.
+    DmaBufNv12 {
+        frame: NativeDmaBufNv12,
+    },
+    NativeDmaBufNv12 {
+        frame: NativeDmaBufNv12,
     },
     /// CUDA zero-copy: buffer stays in GPU memory, renderer uses CUDA-Vulkan interop.
     CudaNv12 {
@@ -98,7 +364,6 @@ impl VideoFrameFormat {
     pub fn try_clone(&self) -> Option<Self> {
         match self {
             Self::Rgba => Some(Self::Rgba),
-            #[cfg(feature = "mpv-backend")]
             Self::GlExternalRgba { frame } => Some(Self::GlExternalRgba {
                 frame: frame.clone(),
             }),
@@ -107,6 +372,15 @@ impl VideoFrameFormat {
                 uv_offset,
                 uv_stride,
             } => Some(Self::Nv12 {
+                y_stride: *y_stride,
+                uv_offset: *uv_offset,
+                uv_stride: *uv_stride,
+            }),
+            Self::P010 {
+                y_stride,
+                uv_offset,
+                uv_stride,
+            } => Some(Self::P010 {
                 y_stride: *y_stride,
                 uv_offset: *uv_offset,
                 uv_stride: *uv_stride,
@@ -133,33 +407,19 @@ impl VideoFrameFormat {
                 v_offset: *v_offset,
                 v_stride: *v_stride,
             }),
-            Self::DmaBufNv12 {
-                y_fd,
-                y_stride,
-                y_offset,
-                uv_fd,
-                uv_stride,
-                uv_offset,
-            } => {
-                let y_fd = super::dmabuf::dup_plane_fd_for_clone(y_fd)?;
-                let uv_fd = super::dmabuf::dup_plane_fd_for_clone(uv_fd)?;
-                Some(Self::DmaBufNv12 {
-                    y_fd,
-                    y_stride: *y_stride,
-                    y_offset: *y_offset,
-                    uv_fd,
-                    uv_stride: *uv_stride,
-                    uv_offset: *uv_offset,
-                })
-            }
+            Self::DmaBufNv12 { frame } => Some(Self::DmaBufNv12 {
+                frame: frame.try_clone()?,
+            }),
+            Self::NativeDmaBufNv12 { frame } => Some(Self::NativeDmaBufNv12 {
+                frame: frame.try_clone()?,
+            }),
         }
     }
 }
 
-/// Video frame carrying pixel data in RGBA or planar YUV formats.
-/// Uses gst::Buffer to avoid copying data.
+/// Backend-neutral video frame carrying CPU bytes or an externally-owned GPU image.
 pub struct VideoFrame {
-    pub buffer: gst::Buffer,
+    pub storage: VideoFrameStorage,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -167,6 +427,8 @@ pub struct VideoFrame {
     pub session_id: u64,
     pub pts_ns: Option<u64>,
     pub duration_ns: Option<u64>,
+    pub color: VideoColorMetadata,
+    pub geometry: VideoGeometry,
 }
 
 impl VideoFrame {
@@ -178,14 +440,11 @@ impl VideoFrame {
         self.session_id.hash(&mut hasher);
         self.pts_ns.hash(&mut hasher);
         self.duration_ns.hash(&mut hasher);
-        self.buffer.size().hash(&mut hasher);
-        self.buffer.n_memory().hash(&mut hasher);
-        self.buffer.offset().hash(&mut hasher);
-        self.buffer.offset_end().hash(&mut hasher);
-        format!("{:?}", self.buffer.flags()).hash(&mut hasher);
+        self.color.hash(&mut hasher);
+        self.geometry.hash(&mut hasher);
+        self.storage.trace_hash(&mut hasher);
         match &self.format {
             VideoFrameFormat::Rgba => "rgba".hash(&mut hasher),
-            #[cfg(feature = "mpv-backend")]
             VideoFrameFormat::GlExternalRgba { .. } => "gl-external-rgba".hash(&mut hasher),
             VideoFrameFormat::Nv12 {
                 y_stride,
@@ -201,17 +460,24 @@ impl VideoFrame {
                 uv_offset.hash(&mut hasher);
                 uv_stride.hash(&mut hasher);
             }
-            VideoFrameFormat::DmaBufNv12 {
+            VideoFrameFormat::P010 {
                 y_stride,
-                y_offset,
-                uv_stride,
                 uv_offset,
-                ..
+                uv_stride,
             } => {
+                "p010".hash(&mut hasher);
                 y_stride.hash(&mut hasher);
-                y_offset.hash(&mut hasher);
-                uv_stride.hash(&mut hasher);
                 uv_offset.hash(&mut hasher);
+                uv_stride.hash(&mut hasher);
+            }
+            VideoFrameFormat::DmaBufNv12 { frame }
+            | VideoFrameFormat::NativeDmaBufNv12 { frame } => {
+                frame.surface_id.hash(&mut hasher);
+                frame.planes.hash(&mut hasher);
+                for object in frame.objects.iter() {
+                    object.size.hash(&mut hasher);
+                    object.modifier.hash(&mut hasher);
+                }
             }
             VideoFrameFormat::I420 {
                 y_stride,
@@ -233,7 +499,7 @@ impl VideoFrame {
     #[allow(dead_code)]
     pub fn try_clone(&self) -> Option<Self> {
         Some(Self {
-            buffer: self.buffer.clone(),
+            storage: self.storage.clone(),
             width: self.width,
             height: self.height,
             stride: self.stride,
@@ -241,6 +507,8 @@ impl VideoFrame {
             session_id: self.session_id,
             pts_ns: self.pts_ns,
             duration_ns: self.duration_ns,
+            color: self.color,
+            geometry: self.geometry,
         })
     }
 }
@@ -259,169 +527,4 @@ pub struct PlayerEvent {
     pub backend_kind: VideoBackendKind,
     pub kind: PlayerEventKind,
     pub reason: String,
-}
-
-#[derive(Clone, Default)]
-pub struct LatestFrameMailbox {
-    frames: Arc<parking_lot::Mutex<HashMap<String, VideoFrame>>>,
-    pending_notifications: Arc<parking_lot::Mutex<HashSet<String>>>,
-    pending_since: Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
-    overwrite_count: Arc<AtomicU64>,
-    signal_pending: Arc<AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl LatestFrameMailbox {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn publish_frame(&self, source_id: &str, frame: VideoFrame) {
-        let mut should_signal = false;
-        {
-            let mut frames = self.frames.lock();
-            if frames.insert(source_id.to_string(), frame).is_some() {
-                self.overwrite_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        {
-            self.pending_since
-                .lock()
-                .insert(source_id.to_string(), Instant::now());
-        }
-        {
-            let mut pending = self.pending_notifications.lock();
-            if pending.insert(source_id.to_string()) {
-                should_signal = true;
-            }
-        }
-
-        if !should_signal {
-            return;
-        }
-
-        self.signal_pending.store(true, Ordering::Release);
-        self.notify.notify_one();
-    }
-
-    pub fn take_frame(&self, source_id: &str) -> Option<VideoFrame> {
-        let frame = self.frames.lock().remove(source_id);
-        self.pending_notifications.lock().remove(source_id);
-        self.pending_since.lock().remove(source_id);
-        frame
-    }
-
-    pub fn defer_notification(&self, source_id: &str) {
-        self.pending_notifications.lock().remove(source_id);
-    }
-
-    pub fn inspect_frame<R, F>(&self, source_id: &str, inspect: F) -> Option<R>
-    where
-        F: FnOnce(&VideoFrame) -> R,
-    {
-        let frames = self.frames.lock();
-        frames.get(source_id).map(inspect)
-    }
-
-    pub fn has_pending_frame(&self, source_id: &str) -> bool {
-        self.frames.lock().contains_key(source_id)
-    }
-
-    pub fn pending_frame_age(&self, source_id: &str) -> Option<Duration> {
-        if !self.has_pending_frame(source_id) {
-            return None;
-        }
-        self.pending_since
-            .lock()
-            .get(source_id)
-            .map(Instant::elapsed)
-    }
-
-    pub fn clear_source(&self, source_id: &str) {
-        self.frames.lock().remove(source_id);
-        self.pending_notifications.lock().remove(source_id);
-        self.pending_since.lock().remove(source_id);
-    }
-
-    pub fn take_overwrite_count(&self) -> u64 {
-        self.overwrite_count.swap(0, Ordering::Relaxed)
-    }
-
-    pub fn has_signal_pending(&self) -> bool {
-        self.signal_pending.load(Ordering::Acquire)
-    }
-
-    pub fn clear_signal_pending(&self) {
-        self.signal_pending.store(false, Ordering::Release);
-    }
-
-    pub fn pending_sources(&self) -> Vec<String> {
-        self.pending_notifications.lock().iter().cloned().collect()
-    }
-
-    pub fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.notify.notified()
-    }
-
-    pub fn occupancy(&self) -> usize {
-        self.frames.lock().len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_frame(session_id: u64) -> VideoFrame {
-        let _ = gst::init();
-        let buffer = gst::Buffer::with_size(4).expect("buffer allocation should succeed");
-        VideoFrame {
-            buffer,
-            width: 1,
-            height: 1,
-            stride: 4,
-            format: VideoFrameFormat::Rgba,
-            session_id,
-            pts_ns: None,
-            duration_ns: None,
-        }
-    }
-
-    #[test]
-    fn pending_frame_state_tracks_source_presence() {
-        let mailbox = LatestFrameMailbox::new();
-        assert!(!mailbox.has_pending_frame("HDMI-A-1"));
-        assert!(mailbox.pending_frame_age("HDMI-A-1").is_none());
-
-        mailbox.publish_frame("HDMI-A-1", test_frame(7));
-        assert!(mailbox.has_pending_frame("HDMI-A-1"));
-        assert!(mailbox.pending_frame_age("HDMI-A-1").is_some());
-        assert!(!mailbox.has_pending_frame("DP-2"));
-
-        let _ = mailbox.take_frame("HDMI-A-1");
-        assert!(!mailbox.has_pending_frame("HDMI-A-1"));
-        assert!(mailbox.pending_frame_age("HDMI-A-1").is_none());
-    }
-
-    #[test]
-    fn deferred_notification_keeps_frame_and_allows_resignal() {
-        let mailbox = LatestFrameMailbox::new();
-        mailbox.publish_frame("HDMI-A-1", test_frame(7));
-        mailbox.clear_signal_pending();
-
-        mailbox.defer_notification("HDMI-A-1");
-
-        assert!(mailbox.has_pending_frame("HDMI-A-1"));
-        assert!(mailbox.pending_frame_age("HDMI-A-1").is_some());
-        assert!(mailbox.pending_sources().is_empty());
-
-        mailbox.publish_frame("HDMI-A-1", test_frame(8));
-
-        assert!(mailbox.has_signal_pending());
-        assert_eq!(mailbox.pending_sources(), vec!["HDMI-A-1".to_string()]);
-        assert_eq!(
-            mailbox.take_frame("HDMI-A-1").map(|frame| frame.session_id),
-            Some(8)
-        );
-    }
 }

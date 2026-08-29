@@ -7,18 +7,18 @@ const MAX_MPV_CAPTURE_FPS: u32 = 120;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MpvRenderApi {
-    ComposedGlExperimental,
-    NativeGlOverlayExperimental,
+    ComposedGl,
+    NativeGlOverlayDiagnostic,
     Software,
 }
 
 impl MpvRenderApi {
     pub(super) fn is_native_gl(self) -> bool {
-        self == Self::NativeGlOverlayExperimental
+        self == Self::NativeGlOverlayDiagnostic
     }
 
     pub(super) fn is_composed_gl(self) -> bool {
-        self == Self::ComposedGlExperimental
+        self == Self::ComposedGl
     }
 }
 
@@ -39,9 +39,9 @@ fn render_api_for_request(
     composed_target_available: bool,
 ) -> MpvRenderApi {
     if request.enables_composed_gl() && composed_target_available {
-        MpvRenderApi::ComposedGlExperimental
+        MpvRenderApi::ComposedGl
     } else if request.enables_native_overlay() && native_target_available {
-        MpvRenderApi::NativeGlOverlayExperimental
+        MpvRenderApi::NativeGlOverlayDiagnostic
     } else {
         MpvRenderApi::Software
     }
@@ -71,12 +71,27 @@ pub(super) fn hwdec_mode() -> String {
 }
 
 pub(super) fn apply_fast_gpu_options(init: &MpvInitializer) {
+    // Kaleidux owns input, scripting, subtitles, and local-file discovery.
+    // Disable mpv subsystems that otherwise create threads or scan adjacent
+    // files despite never being used by a wallpaper render context.
+    set_optional(init, "input-default-bindings", false);
+    set_optional(init, "input-vo-keyboard", false);
+    set_optional(init, "input-media-keys", false);
+    set_optional(init, "input-cursor", false);
+    set_optional(init, "load-scripts", false);
+    set_optional(init, "ytdl", false);
+    set_optional(init, "sub-auto", "no");
+    set_optional(init, "audio-file-auto", "no");
+    set_optional(init, "demuxer-thread", false);
+    set_optional(init, "cache", false);
+    set_optional(init, "vd-lavc-threads", 1i64);
+    set_optional(init, "vd-lavc-fast", true);
+
     if mpv_quality_mode().eq_ignore_ascii_case("default") {
         return;
     }
 
     set_optional(init, "vd-lavc-dr", "yes");
-    set_optional(init, "video-timing-offset", 0.0f64);
     set_optional(init, "interpolation", false);
     set_optional(init, "scale", "bilinear");
     set_optional(init, "cscale", "bilinear");
@@ -115,35 +130,27 @@ mod tests {
     #[test]
     fn native_gl_overlay_requires_explicit_request_and_target() {
         assert_eq!(
-            render_api_for_request(
-                MpvRenderApiRequest::NativeGlOverlayExperimental,
-                true,
-                false
-            ),
-            MpvRenderApi::NativeGlOverlayExperimental
+            render_api_for_request(MpvRenderApiRequest::NativeGlOverlayDiagnostic, true, false),
+            MpvRenderApi::NativeGlOverlayDiagnostic
         );
         assert_eq!(
             render_api_for_request(MpvRenderApiRequest::ComposedSoftware, true, true),
             MpvRenderApi::Software
         );
         assert_eq!(
-            render_api_for_request(
-                MpvRenderApiRequest::NativeGlOverlayExperimental,
-                false,
-                false
-            ),
+            render_api_for_request(MpvRenderApiRequest::NativeGlOverlayDiagnostic, false, false),
             MpvRenderApi::Software
         );
     }
 
     #[test]
-    fn composed_gl_requires_explicit_request_and_target() {
+    fn composed_gl_requires_a_created_target() {
         assert_eq!(
-            render_api_for_request(MpvRenderApiRequest::ComposedGlExperimental, false, true),
-            MpvRenderApi::ComposedGlExperimental
+            render_api_for_request(MpvRenderApiRequest::ComposedGl, false, true),
+            MpvRenderApi::ComposedGl
         );
         assert_eq!(
-            render_api_for_request(MpvRenderApiRequest::ComposedGlExperimental, false, false),
+            render_api_for_request(MpvRenderApiRequest::ComposedGl, false, false),
             MpvRenderApi::Software
         );
     }

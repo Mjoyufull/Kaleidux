@@ -205,7 +205,7 @@ fn dummy_frame(session_id: u64) -> VideoFrame {
     init_gst_for_tests();
     let buffer = gst::Buffer::with_size(4).expect("buffer allocation should succeed");
     VideoFrame {
-        buffer,
+        storage: buffer.into(),
         width: 1,
         height: 1,
         stride: 4,
@@ -213,6 +213,8 @@ fn dummy_frame(session_id: u64) -> VideoFrame {
         session_id,
         pts_ns: None,
         duration_ns: None,
+        color: Default::default(),
+        geometry: crate::video::VideoGeometry::for_dimensions(1, 1),
     }
 }
 

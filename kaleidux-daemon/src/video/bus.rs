@@ -16,6 +16,7 @@ impl BusWatchHandle {
     }
 }
 
+#[cfg_attr(not(feature = "backend-appsink"), allow(dead_code))]
 struct BusDispatcher {
     context: gst::glib::MainContext,
     main_loop: gst::glib::MainLoop,
@@ -62,6 +63,7 @@ impl BusDispatcher {
         }
     }
 
+    #[cfg_attr(not(feature = "backend-appsink"), allow(dead_code))]
     fn shutdown(&self, timeout: std::time::Duration) {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return;
@@ -93,5 +95,14 @@ pub(super) fn attach_bus_watch(source: gst::glib::Source) -> BusWatchHandle {
 }
 
 pub fn shutdown_bus_dispatcher(timeout: std::time::Duration) {
-    BUS_DISPATCHER.shutdown(timeout);
+    #[cfg(not(feature = "backend-appsink"))]
+    {
+        let _ = timeout;
+        return;
+    }
+
+    #[cfg(feature = "backend-appsink")]
+    if let Some(dispatcher) = once_cell::sync::Lazy::get(&BUS_DISPATCHER) {
+        dispatcher.shutdown(timeout);
+    }
 }

@@ -1,4 +1,4 @@
-use libmpv2::{Format, Mpv, events};
+use libmpv2::{Mpv, events};
 use libmpv2_sys as sys;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,9 +9,11 @@ use tracing::{info, trace, warn};
 use crate::metrics::PerformanceMetrics;
 use crate::observability::video_backend::VideoBackendMetricKind;
 
+use super::mpv_native::render_wake::RenderWake;
 use super::mpv_native::{
     MpvComposedRenderThreadConfig, MpvComposedVideoTarget, MpvNativeRenderThreadConfig,
-    MpvNativeVideoTarget, RenderReadySignal, run_composed_render_thread, run_native_render_thread,
+    MpvNativeVideoTarget, MpvRenderApiRequest, RenderReadySignal, run_composed_render_thread,
+    run_native_render_thread,
 };
 use super::{
     LatestFrameMailbox, PlayerEvent, PlayerEventKind, VideoFrame, publish_interval_ns,
@@ -22,6 +24,8 @@ use super::{
 mod config;
 #[path = "mpv_backend/software_render.rs"]
 mod software_render;
+#[path = "mpv_backend/threads.rs"]
+mod threads;
 use config::{
     apply_fast_gpu_options, capture_fps as mpv_capture_fps, hwdec_mode as mpv_hwdec_mode,
     normalized_render_bounds, render_api as mpv_render_api,
@@ -44,7 +48,7 @@ pub struct MpvPlayer {
     source_id: Arc<String>,
     session_id: u64,
     frame_mailbox: LatestFrameMailbox,
-    player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+    player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
     metrics: Arc<PerformanceMetrics>,
     stop_requested: Arc<AtomicBool>,
     first_frame_logged: Arc<AtomicBool>,
@@ -58,6 +62,7 @@ pub struct MpvPlayer {
     /// Deferred until the GL render context exists; see `start`.
     pending_uri: Option<String>,
     render_ready: Arc<RenderReadySignal>,
+    render_stop_wake: Option<Arc<RenderWake>>,
 }
 
 impl MpvPlayer {
@@ -68,7 +73,7 @@ impl MpvPlayer {
         session_id: u64,
         volume: f64,
         frame_mailbox: LatestFrameMailbox,
-        player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+        player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
         metrics: Arc<PerformanceMetrics>,
         max_publish_fps: Option<u32>,
         render_size: Option<(u32, u32)>,
@@ -76,6 +81,11 @@ impl MpvPlayer {
         composed_target: Option<MpvComposedVideoTarget>,
         start_time: Instant,
     ) -> anyhow::Result<Self> {
+        if MpvRenderApiRequest::from_env().enables_composed_gl() && composed_target.is_none() {
+            anyhow::bail!(
+                "production mpv GL/WGPU target is unavailable; refusing the software-render fallback"
+            );
+        }
         let mpv = Mpv::with_initializer(|init| {
             init.set_option("vo", "libmpv")?;
             if volume > f64::EPSILON {
@@ -128,11 +138,9 @@ impl MpvPlayer {
             warn!("[VIDEO] libmpv log message request failed: {log_result}");
         }
         mpv.enable_event(events::mpv_event_id::EndFile)?;
-        mpv.enable_event(events::mpv_event_id::FileLoaded)?;
         mpv.enable_event(events::mpv_event_id::PlaybackRestart)?;
         mpv.enable_event(events::mpv_event_id::VideoReconfig)?;
         mpv.enable_event(events::mpv_event_id::Shutdown)?;
-        mpv.observe_property("time-pos", Format::Double, 1)?;
 
         let render_api = mpv_render_api(native_target.as_ref(), composed_target.as_ref());
         let use_native_gl = render_api.is_native_gl();
@@ -148,20 +156,30 @@ impl MpvPlayer {
         } else {
             Some(SoftwareRenderContext::new(&mpv)?)
         };
+        let render_stop_wake = if use_native_gl || use_composed_gl {
+            Some(Arc::new(RenderWake::new()?))
+        } else {
+            None
+        };
         let capture_fps = mpv_capture_fps(max_publish_fps);
         let normalized_render_size = normalized_render_bounds(render_size);
+        let cadence = if use_composed_gl || use_native_gl {
+            "source".to_string()
+        } else {
+            format!("{capture_fps}fps")
+        };
         info!(
-            "[VIDEO] {}: VideoPlayer created with libmpv experimental backend (session={} render_api={} capture_fps={} max_publish_fps={:?} render_size={:?} native_target={:?} sw_format={} hwdec={} uri={})",
+            "[VIDEO] {}: VideoPlayer created with libmpv backend (session={} render_api={} cadence={} max_publish_fps={:?} render_size={:?} native_target={:?} sw_format={} hwdec={} uri={})",
             source_id,
             session_id,
             if use_native_gl {
-                "opengl-wayland-overlay-experimental"
+                "opengl-wayland-overlay-diagnostic"
             } else if use_composed_gl {
-                "opengl-vulkan-shared-composed-experimental"
+                "opengl-vulkan-zero-copy-composed"
             } else {
                 "software"
             },
-            capture_fps,
+            cadence,
             max_publish_fps,
             normalized_render_size,
             active_native_target,
@@ -198,6 +216,7 @@ impl MpvPlayer {
             start_time,
             pending_uri: None,
             render_ready: Arc::new(RenderReadySignal::new()),
+            render_stop_wake,
         };
         if defers_load {
             player.pending_uri = Some(uri.to_string());
@@ -270,7 +289,7 @@ impl MpvPlayer {
         }
         self.mpv.set_property("pause", false)?;
         info!(
-            "[VIDEO] {}: libmpv experimental backend started (session={})",
+            "[VIDEO] {}: libmpv backend started (session={})",
             self.source_id, self.session_id
         );
         Ok(())
@@ -286,6 +305,9 @@ impl MpvPlayer {
 
     pub fn stop(&mut self) -> anyhow::Result<()> {
         self.stop_requested.store(true, Ordering::SeqCst);
+        if let Some(wake) = &self.render_stop_wake {
+            wake.signal();
+        }
         self.frame_mailbox.clear_source(self.source_id.as_ref());
         let _ = self.mpv.command("stop", &[]);
         let _ = self.mpv.command("quit", &[]);
@@ -335,227 +357,6 @@ impl MpvPlayer {
     fn load_file(&self, uri: &str) -> anyhow::Result<()> {
         self.mpv.command("loadfile", &[uri, "replace"])?;
         Ok(())
-    }
-
-    fn spawn_event_thread(&mut self) {
-        if self.event_thread.is_some() {
-            return;
-        }
-        let event_handle = self.mpv.clone();
-        let source_id = self.source_id.clone();
-        let session_id = self.session_id;
-        let player_event_tx = self.player_event_tx.clone();
-        let stop_requested = self.stop_requested.clone();
-        let first_hwdec_logged = self.first_hwdec_logged.clone();
-        self.event_thread = std::thread::Builder::new()
-            .name(format!("kld-mpv-events-{}", source_id))
-            .spawn(move || {
-                while !stop_requested.load(Ordering::SeqCst) {
-                    let Some(event) = event_handle.wait_event(0.25) else {
-                        continue;
-                    };
-                    match event {
-                        Ok(events::Event::EndFile(reason)) => {
-                            trace!(
-                                "[VIDEO] {}: libmpv EndFile event session={} reason={:?}",
-                                source_id, session_id, reason
-                            );
-                        }
-                        Ok(events::Event::PlaybackRestart) => {
-                            trace!(
-                                "[VIDEO] {}: libmpv PlaybackRestart session={}",
-                                source_id, session_id
-                            );
-                            log_decode_path_once(
-                                &event_handle,
-                                &source_id,
-                                session_id,
-                                &first_hwdec_logged,
-                            );
-                        }
-                        Ok(events::Event::VideoReconfig) => {
-                            trace!(
-                                "[VIDEO] {}: libmpv VideoReconfig session={}",
-                                source_id, session_id
-                            );
-                            // PlaybackRestart is not guaranteed (e.g. VO probe
-                            // raced render-context creation), so also log here.
-                            log_decode_path_once(
-                                &event_handle,
-                                &source_id,
-                                session_id,
-                                &first_hwdec_logged,
-                            );
-                        }
-                        Ok(events::Event::Shutdown) => break,
-                        Ok(events::Event::LogMessage {
-                            prefix,
-                            level,
-                            text,
-                            ..
-                        }) => {
-                            let text = text.trim_end();
-                            // mpv probes every registered hwdec driver at render
-                            // context creation. The drmprime-overlay probe errors
-                            // when the DRM params carry no KMS card fd (we pass a
-                            // render node for VA-API only). That driver is unused
-                            // on this path, so keep the noise out of ERROR/WARN.
-                            if prefix.contains("drmprime-overlay") {
-                                tracing::debug!("[MPV:{}] {}", prefix, text);
-                                continue;
-                            }
-                            match level {
-                                "error" => tracing::error!("[MPV:{}] {}", prefix, text),
-                                "warn" => tracing::warn!("[MPV:{}] {}", prefix, text),
-                                "info" => tracing::info!("[MPV:{}] {}", prefix, text),
-                                _ => tracing::debug!("[MPV:{}] {}", prefix, text),
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            if is_ignorable_event_error(&e) {
-                                trace!(
-                                    "[VIDEO] {}: ignoring libmpv non-fatal event error: {}",
-                                    source_id, e
-                                );
-                                continue;
-                            }
-                            let reason = format!("libmpv event error: {}", e);
-                            warn!("[VIDEO] {}: {}", source_id, reason);
-                            let _ = player_event_tx.send(PlayerEvent {
-                                source_id: source_id.to_string(),
-                                session_id,
-                                backend_kind: super::VideoBackendKind::MpvExperimental,
-                                kind: PlayerEventKind::Error,
-                                reason,
-                            });
-                        }
-                    }
-                }
-            })
-            .ok();
-    }
-
-    fn spawn_frame_thread(&mut self) {
-        if self.frame_thread.is_some() {
-            return;
-        }
-        let mpv = self.mpv.clone();
-        let Some(render_context) = self.render_context.take() else {
-            warn!(
-                "[VIDEO] {}: libmpv frame thread not started; render context missing",
-                self.source_id
-            );
-            return;
-        };
-        let source_id = self.source_id.clone();
-        let session_id = self.session_id;
-        let frame_mailbox = self.frame_mailbox.clone();
-        let metrics = self.metrics.clone();
-        let stop_requested = self.stop_requested.clone();
-        let first_frame_logged = self.first_frame_logged.clone();
-        let interval = self.capture_interval;
-        let start_time = self.start_time;
-        let publish_interval_ns = publish_interval_ns(self.max_publish_fps);
-        let render_size = self.render_size;
-        let last_publish_ns =
-            Arc::new(std::sync::atomic::AtomicU64::new(super::NEVER_PUBLISHED_NS));
-        self.frame_thread = std::thread::Builder::new()
-            .name(format!("kld-mpv-frames-{}", source_id))
-            .spawn(move || {
-                let render_context = render_context;
-                while !stop_requested.load(Ordering::SeqCst) {
-                    let frame_start = Instant::now();
-                    let elapsed_ns = start_time.elapsed().as_nanos() as u64;
-                    if should_publish_now(&last_publish_ns, publish_interval_ns, elapsed_ns) {
-                        metrics
-                            .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureAttempt);
-                        match capture_video_frame_with_context(
-                            &mpv,
-                            session_id,
-                            &render_context,
-                            render_size,
-                            false,
-                        ) {
-                            Ok(Some(frame)) => {
-                                if !first_frame_logged.swap(true, Ordering::SeqCst) {
-                                    info!(
-                                        "[ASSET] {}: First libmpv frame captured in {:.3}ms",
-                                        source_id,
-                                        start_time.elapsed().as_secs_f64() * 1000.0
-                                    );
-                                }
-                                frame_mailbox.publish_frame(source_id.as_ref(), frame);
-                                metrics.record_video_backend_metric(
-                                    VideoBackendMetricKind::MpvFramePublished,
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                metrics.record_video_backend_metric(
-                                    VideoBackendMetricKind::MpvCaptureError,
-                                );
-                                trace!("[VIDEO] {}: libmpv capture skipped: {}", source_id, e);
-                            }
-                        }
-                    }
-                    std::thread::sleep(interval.saturating_sub(frame_start.elapsed()));
-                }
-            })
-            .ok();
-    }
-
-    fn spawn_native_render_thread(&mut self) {
-        if self.frame_thread.is_some() {
-            return;
-        }
-        let Some(target) = self.native_target.clone() else {
-            return;
-        };
-        let config = MpvNativeRenderThreadConfig {
-            mpv: self.mpv.clone(),
-            source_id: self.source_id.clone(),
-            session_id: self.session_id,
-            target,
-            stop_requested: self.stop_requested.clone(),
-            first_frame_logged: self.first_frame_logged.clone(),
-            metrics: self.metrics.clone(),
-            player_event_tx: self.player_event_tx.clone(),
-            start_time: self.start_time,
-            render_interval: self.capture_interval,
-            render_ready: self.render_ready.clone(),
-        };
-        self.frame_thread = std::thread::Builder::new()
-            .name(format!("kld-mpv-gl-{}", self.source_id))
-            .spawn(move || run_native_render_thread(config))
-            .ok();
-    }
-
-    fn spawn_composed_render_thread(&mut self) {
-        if self.frame_thread.is_some() {
-            return;
-        }
-        let Some(target) = self.composed_target.clone() else {
-            return;
-        };
-        let config = MpvComposedRenderThreadConfig {
-            mpv: self.mpv.clone(),
-            source_id: self.source_id.clone(),
-            session_id: self.session_id,
-            target,
-            frame_mailbox: self.frame_mailbox.clone(),
-            stop_requested: self.stop_requested.clone(),
-            first_frame_logged: self.first_frame_logged.clone(),
-            metrics: self.metrics.clone(),
-            player_event_tx: self.player_event_tx.clone(),
-            start_time: self.start_time,
-            render_interval: self.capture_interval,
-            render_ready: self.render_ready.clone(),
-        };
-        self.frame_thread = std::thread::Builder::new()
-            .name(format!("kld-mpv-gpu-{}", self.source_id))
-            .spawn(move || run_composed_render_thread(config))
-            .ok();
     }
 
     fn log_first_frame(&self, phase: &str) {

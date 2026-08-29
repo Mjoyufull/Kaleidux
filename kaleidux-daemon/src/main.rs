@@ -1,13 +1,16 @@
 use chrono::Local;
 use clap::Parser;
 use kaleidux_common::Transition;
+#[cfg(feature = "backend-appsink")]
 use std::time::Instant;
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::{EnvFilter, Registry, prelude::*};
 
-// Use jemalloc for better memory fragmentation handling in long-running processes
+// Jemalloc is opt-in; production defaults use the system allocator because
+// the measured cold-start/RSS trade-off favored it on the reference system.
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -23,12 +26,16 @@ impl tracing_subscriber::fmt::time::FormatTime for CustomTimer {
 #[derive(Parser, Debug)]
 #[command(author, about, long_about = None)]
 struct Args {
+    /// Diagnostic verbosity from 1 (warnings) through 5 (trace-all).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     log: Option<u8>,
+    /// Run the built-in transition demo.
     #[arg(long)]
     demo: bool,
+    /// Force video memory/decode mode: auto, cpu, cuda, dmabuf, nv12, or rgba.
     #[arg(long)]
     video_mode: Option<String>,
+    /// Select backend: auto (FFmpeg, then mpv, then appsink), mpv, appsink, or ffmpeg.
     #[arg(long)]
     video_backend: Option<String>,
 }
@@ -36,6 +43,8 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(1)
+        .max_blocking_threads(16)
         .thread_name("kaleidux-main")
         .build()?;
     let result = runtime.block_on(async_main());
@@ -64,9 +73,14 @@ async fn async_main() -> anyhow::Result<()> {
     let config = load_config(args.demo).await?;
     let gstreamer_duration = init_gstreamer()?;
 
-    if should_use_x11() {
+    if selected_display_is_x11()? {
         info!("Starting X11 Backend...");
-        kaleidux_daemon::x11_loop::run(config, log_level, gstreamer_duration).await
+        #[cfg(feature = "display-x11")]
+        {
+            kaleidux_daemon::x11_loop::run(config, log_level, gstreamer_duration).await
+        }
+        #[cfg(not(feature = "display-x11"))]
+        unreachable!("display selection rejects a disabled X11 backend");
     } else {
         info!("Starting Wayland Backend...");
         kaleidux_daemon::wayland_loop::run(config, log_level, gstreamer_duration).await
@@ -132,9 +146,30 @@ fn init_file_logging(
         .join("logs");
     std::fs::create_dir_all(&config_dir)?;
 
-    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let log_path = config_dir.join(format!("kaleidux-daemon-{}.log", timestamp));
-    let file = std::fs::File::create(&log_path)?;
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S%.3f");
+    // Fast supervised restart loops can launch more than once per second.
+    // Never truncate a prior diagnostic capture if a name collision occurs.
+    let (log_path, file) = (0_u8..=99)
+        .find_map(|suffix| {
+            let suffix = (suffix != 0).then(|| format!("-{suffix}"));
+            let log_path = config_dir.join(format!(
+                "kaleidux-daemon-{}-{}{}.log",
+                timestamp,
+                std::process::id(),
+                suffix.as_deref().unwrap_or_default()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&log_path)
+            {
+                Ok(file) => Some(Ok((log_path, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("could not allocate a unique daemon log filename"))?;
     println!("Logging to file: {}", log_path.display());
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file);
 
@@ -201,17 +236,25 @@ fn apply_video_backend(video_backend: Option<&str>) {
         return;
     };
 
+    let legacy_mpv_alias = backend_str.eq_ignore_ascii_case("mpv-experimental");
+    let legacy_ffmpeg_alias = matches!(
+        backend_str.to_lowercase().as_str(),
+        "native" | "native-experimental" | "ffmpeg-native"
+    );
     let request = match backend_str.to_lowercase().as_str() {
         "auto" => kaleidux_daemon::video::VideoBackendRequest::Auto,
         "appsink" | "gst" | "gstreamer" => {
             kaleidux_daemon::video::VideoBackendRequest::ForceAppsink
         }
         "mpv" | "libmpv" | "mpv-experimental" => {
-            kaleidux_daemon::video::VideoBackendRequest::ForceMpvExperimental
+            kaleidux_daemon::video::VideoBackendRequest::ForceMpv
+        }
+        "ffmpeg" | "libav" | "native" | "native-experimental" | "ffmpeg-native" => {
+            kaleidux_daemon::video::VideoBackendRequest::ForceFfmpeg
         }
         other => {
             let msg = format!(
-                "ERROR: Unknown --video-backend '{}', valid: auto, appsink, mpv",
+                "ERROR: Unknown --video-backend '{}', valid: auto, appsink, mpv, ffmpeg",
                 other
             );
             eprintln!("{}", msg);
@@ -219,6 +262,30 @@ fn apply_video_backend(video_backend: Option<&str>) {
             std::process::exit(1);
         }
     };
+    if request != kaleidux_daemon::video::VideoBackendRequest::Auto
+        && !kaleidux_daemon::video::video_backend_is_enabled(request)
+    {
+        let msg = format!(
+            "ERROR: --video-backend '{}' is disabled in this build; rebuild with --features {} (enabled backends: {:?})",
+            backend_str,
+            kaleidux_daemon::video::video_backend_feature(request),
+            kaleidux_daemon::video::enabled_video_backend_labels(),
+        );
+        eprintln!("{msg}");
+        error!("{msg}");
+        std::process::exit(2);
+    }
+    if legacy_ffmpeg_alias {
+        warn!(
+            "[VIDEO] --video-backend {} is deprecated; the FFmpeg backend is now selected with --video-backend ffmpeg",
+            backend_str
+        );
+    }
+    if legacy_mpv_alias {
+        warn!(
+            "[VIDEO] --video-backend mpv-experimental is deprecated; use --video-backend mpv to force the compatibility backend"
+        );
+    }
     kaleidux_daemon::video::set_video_backend_request(request);
 }
 
@@ -245,23 +312,44 @@ async fn load_config(demo: bool) -> anyhow::Result<kaleidux_daemon::orchestratio
 }
 
 fn init_gstreamer() -> anyhow::Result<std::time::Duration> {
-    let gstreamer_start = Instant::now();
-    gstreamer::init()?;
-    if kaleidux_daemon::observability::trace_all::trace_all_enabled() {
-        gstreamer::log::set_active(true);
-        gstreamer::log::set_default_threshold(gstreamer::DebugLevel::Trace);
-        info!("[TRACE5] GStreamer debug threshold set to TRACE");
+    #[cfg(not(feature = "backend-appsink"))]
+    {
+        info!("GStreamer appsink backend is disabled; skipping initialization.");
+        return Ok(std::time::Duration::ZERO);
     }
-    kaleidux_daemon::video::configure_hw_decoders();
-    kaleidux_daemon::video::validate_selected_video_mode(kaleidux_daemon::video::get_video_mode())?;
-    kaleidux_daemon::video::validate_selected_video_backend(
-        kaleidux_daemon::video::get_video_backend_request(),
-    )?;
-    let gstreamer_duration = gstreamer_start.elapsed();
-    info!("GStreamer initialized.");
-    Ok(gstreamer_duration)
+
+    #[cfg(feature = "backend-appsink")]
+    {
+        let gstreamer_start = Instant::now();
+        gstreamer::init()?;
+        if kaleidux_daemon::observability::trace_all::trace_all_enabled() {
+            gstreamer::log::set_active(true);
+            gstreamer::log::set_default_threshold(gstreamer::DebugLevel::Trace);
+            info!("[TRACE5] GStreamer debug threshold set to TRACE");
+        }
+        kaleidux_daemon::video::configure_hw_decoders();
+        kaleidux_daemon::video::validate_selected_video_mode(
+            kaleidux_daemon::video::get_video_mode(),
+        )?;
+        let gstreamer_duration = gstreamer_start.elapsed();
+        info!("GStreamer initialized.");
+        Ok(gstreamer_duration)
+    }
 }
 
-fn should_use_x11() -> bool {
-    std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_ok()
+fn selected_display_is_x11() -> anyhow::Result<bool> {
+    let x11_requested =
+        std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_ok();
+    if x11_requested {
+        anyhow::ensure!(
+            cfg!(feature = "display-x11"),
+            "X11 is the active display but this build disabled it; rebuild with --features display-x11 or use the full build"
+        );
+        return Ok(true);
+    }
+    anyhow::ensure!(
+        cfg!(feature = "display-wayland"),
+        "Wayland is the active display but this build disabled it; rebuild with --features display-wayland or use the full build"
+    );
+    Ok(false)
 }

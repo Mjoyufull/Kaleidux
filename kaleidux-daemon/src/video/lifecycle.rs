@@ -4,7 +4,7 @@ use gstreamer_app as gst_app;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 
-use super::appsink::{maybe_log_decode_path, sample_to_video_frame};
+use super::appsink::{AppsinkNegotiatedState, maybe_log_decode_path, sample_to_video_frame};
 use super::bus::attach_bus_watch;
 use super::{PlayerEvent, PlayerEventKind, VideoFrame, VideoPlayer};
 
@@ -47,6 +47,9 @@ pub struct AppsinkQueueLevels {
     pub buffers: u64,
     pub bytes: u64,
     pub time_ns: u64,
+    pub input: u64,
+    pub output: u64,
+    pub dropped: u64,
 }
 
 impl VideoPlayer {
@@ -55,7 +58,23 @@ impl VideoPlayer {
         F: Fn() -> bool,
     {
         debug!("[VIDEO] {}: Pre-buffering video pipeline", self.source_id);
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_mut() {
+            let pull_preroll_start = std::time::Instant::now();
+            let frame = native.prebuffer(&should_abort)?;
+            let pull_preroll = pull_preroll_start.elapsed();
+            return Ok(VideoPrebufferResult {
+                frame,
+                profile: VideoPrebufferProfile {
+                    set_state: std::time::Duration::ZERO,
+                    state_wait: std::time::Duration::ZERO,
+                    pull_preroll,
+                    set_state_result: "native-paused",
+                    state_wait_settled: true,
+                    current_state: gst::State::Paused,
+                    pending_state: gst::State::VoidPending,
+                },
+            });
+        }
         if let Some(mpv) = self.mpv.as_mut() {
             let pull_preroll_start = std::time::Instant::now();
             let frame = mpv.prebuffer(should_abort)?;
@@ -136,6 +155,7 @@ impl VideoPlayer {
         let preroll_budget = std::time::Duration::from_millis(250);
         let preroll_slice = std::time::Duration::from_millis(50);
         let mut preroll = None;
+        let mut negotiated_state = AppsinkNegotiatedState::default();
         if let Some(appsink) = self.appsink.as_ref() {
             while pull_preroll_start.elapsed() < preroll_budget {
                 if should_abort() {
@@ -150,17 +170,21 @@ impl VideoPlayer {
                     continue;
                 };
 
-                preroll =
-                    match sample_to_video_frame(self.source_id.as_ref(), sample, self.session_id) {
-                        Ok(frame) => Some(frame),
-                        Err(e) => {
-                            debug!(
-                                "[VIDEO] {}: Failed to decode preroll sample: {:?}",
-                                self.source_id, e
-                            );
-                            None
-                        }
-                    };
+                preroll = match sample_to_video_frame(
+                    self.source_id.as_ref(),
+                    sample,
+                    self.session_id,
+                    &mut negotiated_state,
+                ) {
+                    Ok(frame) => Some(frame),
+                    Err(e) => {
+                        debug!(
+                            "[VIDEO] {}: Failed to decode preroll sample: {:?}",
+                            self.source_id, e
+                        );
+                        None
+                    }
+                };
                 break;
             }
         }
@@ -218,7 +242,14 @@ impl VideoPlayer {
         );
         self.log_backend_snapshot("start");
 
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_ref() {
+            native.start();
+            if let Some(position_ns) = self.pending_start_position_ns.take() {
+                native.seek_to_position_ns(position_ns);
+            }
+            self.is_running.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         if let Some(mpv) = self.mpv.as_mut() {
             mpv.start()?;
             if let Some(position_ns) = self.pending_start_position_ns.take()
@@ -327,7 +358,7 @@ impl VideoPlayer {
                         );
                     }
                     MessageView::Eos(..) => {
-                        let _ = player_event_tx.send(PlayerEvent {
+                        let _ = player_event_tx.blocking_send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
                             backend_kind,
@@ -337,7 +368,7 @@ impl VideoPlayer {
                         if let Err(reason) =
                             restart_pipeline_after_eos(&pipeline, source_id.as_ref(), backend_kind)
                         {
-                            let _ = player_event_tx.send(PlayerEvent {
+                            let _ = player_event_tx.blocking_send(PlayerEvent {
                                 source_id: source_id.to_string(),
                                 session_id,
                                 backend_kind,
@@ -357,7 +388,7 @@ impl VideoPlayer {
                             .is_err() =>
                     {
                         let reason = "failed to restart segment loop".to_string();
-                        let _ = player_event_tx.send(PlayerEvent {
+                        let _ = player_event_tx.blocking_send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
                             backend_kind,
@@ -376,7 +407,7 @@ impl VideoPlayer {
                             err.debug()
                         );
                         tracing::error!("[VIDEO] {}: {}", source_id, error_msg);
-                        let _ = player_event_tx.send(PlayerEvent {
+                        let _ = player_event_tx.blocking_send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
                             backend_kind,
@@ -420,6 +451,18 @@ impl VideoPlayer {
                 .find_property("current-level-time")
                 .map(|_| appsink.property::<u64>("current-level-time"))
                 .unwrap_or_default(),
+            input: appsink
+                .find_property("in")
+                .map(|_| appsink.property::<u64>("in"))
+                .unwrap_or_default(),
+            output: appsink
+                .find_property("out")
+                .map(|_| appsink.property::<u64>("out"))
+                .unwrap_or_default(),
+            dropped: appsink
+                .find_property("dropped")
+                .map(|_| appsink.property::<u64>("dropped"))
+                .unwrap_or_default(),
         })
     }
 
@@ -428,7 +471,10 @@ impl VideoPlayer {
         self.remove_bus_watch();
         self.accept_samples.store(false, Ordering::SeqCst);
         self.frame_mailbox.clear_source(self.source_id.as_ref());
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_mut() {
+            native.stop()?;
+            return Ok(());
+        }
         if let Some(mpv) = self.mpv.as_mut() {
             mpv.stop()?;
             return Ok(());
@@ -465,7 +511,10 @@ impl VideoPlayer {
     }
 
     pub fn set_volume(&mut self, volume: f64) {
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_mut() {
+            native.set_volume(volume);
+            return;
+        }
         if let Some(mpv) = self.mpv.as_ref() {
             mpv.set_volume(volume);
             return;
@@ -478,7 +527,10 @@ impl VideoPlayer {
     }
 
     pub fn pause(&self) -> anyhow::Result<()> {
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_ref() {
+            native.pause();
+            return Ok(());
+        }
         if let Some(mpv) = self.mpv.as_ref() {
             return mpv.pause();
         }
@@ -490,7 +542,10 @@ impl VideoPlayer {
     }
 
     pub fn resume(&self) -> anyhow::Result<()> {
-        #[cfg(feature = "mpv-backend")]
+        if let Some(native) = self.native.as_ref() {
+            native.resume();
+            return Ok(());
+        }
         if let Some(mpv) = self.mpv.as_ref() {
             return mpv.resume();
         }

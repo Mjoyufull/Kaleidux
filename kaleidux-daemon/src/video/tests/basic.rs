@@ -1,8 +1,8 @@
 use super::super::appsink::should_warn_about_cpu_video_path;
 use super::super::*;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Once;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Once};
 
 fn init_gst_for_basic_video_tests() {
     static INIT: Once = Once::new();
@@ -47,27 +47,49 @@ fn local_video_paths_are_percent_encoded_in_file_uris() {
 
 #[test]
 fn dmabuf_try_clone_preserves_dmabuf_format() {
-    let y_file = std::fs::File::open("/dev/null").expect("should open /dev/null");
-    let uv_file = std::fs::File::open("/dev/null").expect("should open /dev/null");
-    let y_fd: OwnedFd = y_file.into();
-    let uv_fd: OwnedFd = uv_file.into();
-    let original_y = y_fd.as_raw_fd();
-    let original_uv = uv_fd.as_raw_fd();
-
+    let fd: OwnedFd = std::fs::File::open("/dev/null")
+        .expect("should open /dev/null")
+        .into();
+    let objects: Arc<[NativeDmaBufObject]> = vec![NativeDmaBufObject {
+        fd,
+        size: 4096,
+        modifier: 0,
+    }]
+    .into();
+    let original_objects = objects.clone();
     let format = VideoFrameFormat::DmaBufNv12 {
-        y_fd,
-        y_stride: 64,
-        y_offset: 0,
-        uv_fd,
-        uv_stride: 64,
-        uv_offset: 128,
+        frame: NativeDmaBufNv12 {
+            surface_id: 7,
+            objects,
+            planes: [
+                NativeDmaBufPlane {
+                    layer_index: 0,
+                    object_index: 0,
+                    offset: 0,
+                    pitch: 64,
+                    drm_fourcc: super::super::dmabuf::DRM_FORMAT_NV12,
+                },
+                NativeDmaBufPlane {
+                    layer_index: 0,
+                    object_index: 0,
+                    offset: 128,
+                    pitch: 64,
+                    drm_fourcc: super::super::dmabuf::DRM_FORMAT_NV12,
+                },
+            ],
+            acquire_fence: None,
+            drm_syncobj: None,
+        },
     };
 
     let cloned = format.try_clone().expect("dma-buf clone should succeed");
     match cloned {
-        VideoFrameFormat::DmaBufNv12 { y_fd, uv_fd, .. } => {
-            assert_ne!(y_fd.as_raw_fd(), original_y);
-            assert_ne!(uv_fd.as_raw_fd(), original_uv);
+        VideoFrameFormat::DmaBufNv12 { frame } => {
+            assert!(Arc::ptr_eq(&frame.objects, &original_objects));
+            assert_eq!(
+                frame.objects[0].fd.as_raw_fd(),
+                original_objects[0].fd.as_raw_fd()
+            );
         }
         other => panic!("expected DMA-BUF clone, got {:?}", other),
     }
