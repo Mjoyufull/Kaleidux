@@ -13,6 +13,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         naersk-lib = pkgs.callPackage naersk { };
+        projectSource = self.outPath;
         rustMinVersion = "1.89.0";
         vaDriverDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
           pkgs.intel-media-driver
@@ -114,7 +115,10 @@
           in naersk-lib.buildPackage {
           inherit pname;
           version = "0.0.1-kneecap";
-          src = ./.;
+          # Reuse the already materialized Git-filtered flake tree. Passing the
+          # same stable path as root and src avoids a second cleanSource tree.
+          root = projectSource;
+          src = projectSource;
           cargoBuildOptions = options: options ++ featureArgs;
           cargoTestOptions = options: options ++ featureArgs;
           
