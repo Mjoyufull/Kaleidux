@@ -18,6 +18,7 @@ fn test_output_config(duration: Duration) -> OutputConfig {
         performance: crate::orchestration::PerformanceProfile::Balanced,
         video_fps: crate::orchestration::VideoFpsProfile::Unlimited,
         frame_latency: None,
+        pause_on_fullscreen: false,
     }
 }
 
@@ -35,6 +36,7 @@ fn output_partial(config: &OutputConfig) -> PartialOutputConfig {
         performance: Some(config.performance),
         video_fps: Some(config.video_fps),
         frame_latency: config.frame_latency,
+        pause_on_fullscreen: Some(config.pause_on_fullscreen),
     }
 }
 
@@ -85,6 +87,7 @@ fn unique_test_dir(name: &str) -> PathBuf {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("test dir should be created");
     dir
 }
@@ -162,8 +165,49 @@ fn make_test_manager(
         cache,
         metrics: None,
         paused: false,
+        power_suspended: false,
         discovered_files_cache: HashMap::new(),
     }
+}
+
+#[test]
+fn display_power_suspend_stops_and_rearms_content_deadlines() {
+    let temp = unique_test_dir("display-power-deadline");
+    let cache = Arc::new(
+        FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
+    );
+    let duration = Duration::from_secs(60);
+    let mut config = test_output_config(duration);
+    config.performance = crate::orchestration::PerformanceProfile::LowPower;
+    let orchestrator = OutputOrchestrator {
+        _name: "eDP-1".to_string(),
+        description: "Internal panel".to_string(),
+        phase_offset: Duration::ZERO,
+        config: config.clone(),
+        queue: None,
+        current_path: Some(PathBuf::from("/tmp/current.png")),
+        next_path: None,
+        next_content_type: None,
+        next_change: Some(Instant::now()),
+        display_start_time: Some(Instant::now()),
+    };
+    let mut manager = make_test_manager(
+        "eDP-1",
+        cache,
+        orchestrator,
+        config_for_output("eDP-1", &config),
+    );
+
+    manager.set_power_suspended(true);
+    assert_eq!(manager.next_switch_deadline(), None);
+    assert!(!manager.tick_due(Instant::now()));
+    assert!(manager.due_low_power_outputs(Instant::now()).is_empty());
+
+    manager.set_power_suspended(false);
+    let resumed_deadline = manager
+        .next_switch_deadline()
+        .expect("resume re-arms a deadline");
+    assert!(resumed_deadline > Instant::now());
 }
 
 #[test]
@@ -274,6 +318,7 @@ fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
         cache,
         metrics: None,
         paused: false,
+        power_suspended: false,
         discovered_files_cache: HashMap::new(),
     };
 
@@ -338,6 +383,7 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         cache,
         metrics: None,
         paused: false,
+        power_suspended: false,
         discovered_files_cache: HashMap::new(),
     };
 

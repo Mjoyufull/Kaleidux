@@ -16,11 +16,11 @@ pub fn trace_all_enabled() -> bool {
         })
 }
 
-pub fn trace_idle_poll_interval() -> std::time::Duration {
+pub fn trace_idle_poll_interval() -> Option<std::time::Duration> {
     if trace_all_enabled() {
-        std::time::Duration::from_millis(1)
+        Some(std::time::Duration::from_millis(1))
     } else {
-        std::time::Duration::from_millis(250)
+        None
     }
 }
 
@@ -37,18 +37,15 @@ mod tests {
         assert!(trace_all_enabled());
         assert_eq!(
             trace_idle_poll_interval(),
-            std::time::Duration::from_millis(1)
+            Some(std::time::Duration::from_millis(1))
         );
         set_trace_all_enabled(false);
     }
 
     #[test]
-    fn normal_idle_poll_stays_performance_safe() {
+    fn normal_idle_has_no_periodic_poll() {
         let _guard = TRACE_TEST_LOCK.lock().expect("trace test lock poisoned");
         set_trace_all_enabled(false);
-        assert_eq!(
-            trace_idle_poll_interval(),
-            std::time::Duration::from_millis(250)
-        );
+        assert_eq!(trace_idle_poll_interval(), None);
     }
 }

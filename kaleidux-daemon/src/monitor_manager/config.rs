@@ -239,6 +239,7 @@ impl MonitorManager {
             cache,
             metrics,
             paused: false,
+            power_suspended: false,
             discovered_files_cache: HashMap::new(),
         })
     }

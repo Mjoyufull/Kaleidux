@@ -2,7 +2,7 @@ use crate::background;
 use crate::main_loop::MainLoopContext;
 use crate::renderer;
 use crate::video;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 
 impl MainLoopContext {
@@ -32,16 +32,15 @@ impl MainLoopContext {
         }
 
         // Process directory watcher events and apply pool updates
-        if self.last_dir_watch_poll.elapsed() >= Duration::from_millis(250) {
-            if let Some(ref mut watcher) = self.dir_watcher {
-                let pool_events = watcher.process_events().await;
-                self.monitor_manager.apply_pool_events(pool_events);
-            }
-            self.last_dir_watch_poll = Instant::now();
+        if let Some(ref mut watcher) = self.dir_watcher {
+            let pool_events = watcher.process_events();
+            self.monitor_manager.apply_pool_events(pool_events);
         }
 
         // Log metrics summary every 10 seconds
-        if self.last_metrics_log.elapsed().as_secs() >= 10 {
+        if tracing::enabled!(tracing::Level::INFO)
+            && self.last_metrics_log.elapsed().as_secs() >= 10
+        {
             let log_window = self.last_metrics_log.elapsed();
             let loop_counts = self.metrics.wayland_loop_counts();
             let idle_delta = loop_counts.0.saturating_sub(self.last_loop_rate_counts.0);
@@ -65,13 +64,34 @@ impl MainLoopContext {
                 self.metrics.record_texture_count(texture_count);
                 self.metrics.record_pipeline_count(pipeline_count);
                 let active_video_players = self.video_players.len();
-                let active_appsink_video_players = active_video_players;
                 let pending_video_stops = self.pending_image_video_stops.len();
                 let pending_video_switches = self.pending_video_switches.len();
                 let latest_frame_slots = self.latest_video_frames.occupancy();
+                let process_fds = std::fs::read_dir("/proc/self/fd")
+                    .ok()
+                    .map(|entries| entries.filter_map(Result::ok).count());
                 let background_snapshot = background::snapshot();
-                let appsink_queue_levels = video::AppsinkQueueLevels::default();
-                let appsink_queue_players = 0usize;
+                let mut appsink_queue_levels = video::AppsinkQueueLevels::default();
+                let mut appsink_queue_players = 0usize;
+                for player in self.video_players.values() {
+                    let Some(levels) = player.appsink_queue_levels() else {
+                        continue;
+                    };
+                    appsink_queue_players += 1;
+                    appsink_queue_levels.buffers =
+                        appsink_queue_levels.buffers.saturating_add(levels.buffers);
+                    appsink_queue_levels.bytes =
+                        appsink_queue_levels.bytes.saturating_add(levels.bytes);
+                    appsink_queue_levels.time_ns =
+                        appsink_queue_levels.time_ns.saturating_add(levels.time_ns);
+                    appsink_queue_levels.input =
+                        appsink_queue_levels.input.saturating_add(levels.input);
+                    appsink_queue_levels.output =
+                        appsink_queue_levels.output.saturating_add(levels.output);
+                    appsink_queue_levels.dropped =
+                        appsink_queue_levels.dropped.saturating_add(levels.dropped);
+                }
+                let active_appsink_video_players = appsink_queue_players;
                 let mut retained = renderer::RetainedTextureFootprint::default();
                 let mut per_renderer = Vec::new();
                 let to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
@@ -96,13 +116,16 @@ impl MainLoopContext {
                     ));
                 }
                 info!(
-                    "[MEMORY] Renderer retained textures: total={:.1}MB current={:.1}MB prev={:.1}MB composition={:.1}MB video_aux={:.1}MB pool={:.1}MB | video_players={} appsink={} pending_switches={} pending_stops={} latest_frame_slots={} appsink={}q/{}b/{:.1}ms@{}p | background={} | {}",
+                    "[MEMORY] Renderer retained textures: total={:.1}MB current={:.1}MB prev={:.1}MB composition={:.1}MB video_aux={:.1}MB pool={:.1}MB | process_fds={} video_players={} appsink={} pending_switches={} pending_stops={} latest_frame_slots={} appsink={}q/{}b/{:.1}ms in={} out={} dropped={} @{}p | background={} | {}",
                     to_mb(retained.total_bytes()),
                     to_mb(retained.current_bytes),
                     to_mb(retained.prev_bytes),
                     to_mb(retained.composition_bytes),
                     to_mb(retained.video_aux_bytes),
                     to_mb(texture_pool_bytes),
+                    process_fds
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
                     active_video_players,
                     active_appsink_video_players,
                     pending_video_switches,
@@ -111,6 +134,9 @@ impl MainLoopContext {
                     appsink_queue_levels.buffers,
                     appsink_queue_levels.bytes,
                     appsink_queue_levels.time_ns as f64 / 1_000_000.0,
+                    appsink_queue_levels.input,
+                    appsink_queue_levels.output,
+                    appsink_queue_levels.dropped,
                     appsink_queue_players,
                     background_snapshot.format_compact(),
                     per_renderer.join(" | ")

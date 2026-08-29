@@ -32,7 +32,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LoadedImage {
     pub name: String,
     pub session_id: u64,
@@ -41,6 +41,7 @@ pub struct LoadedImage {
     pub height: u32,
     pub profile: Option<ImageLoadProfile>,
     pub _path: PathBuf,
+    pub(crate) _byte_permit: Option<crate::image::channel_budget::ImageChannelPermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,16 @@ pub(crate) struct PendingContentSwitch {
 /// Type aliases to reduce verbosity in signatures
 pub type CmdMsg = (Request, tokio::sync::oneshot::Sender<Response>);
 pub type PlayerEventMsg = video::PlayerEvent;
+pub type CommandSender = tokio::sync::mpsc::Sender<CmdMsg>;
+pub type PlayerReadySender = tokio::sync::mpsc::Sender<VideoPlayerResult>;
+pub type PlayerEventSender = tokio::sync::mpsc::Sender<PlayerEventMsg>;
+
+const COMMAND_CHANNEL_CAPACITY: usize = 64;
+const PLAYER_READY_CHANNEL_CAPACITY: usize = 32;
+const PLAYER_EVENT_CHANNEL_CAPACITY: usize = 128;
+const IPC_CONCURRENCY_LIMIT: usize = 32;
+const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct CommandContext<'a> {
     pub(crate) monitor_manager: &'a mut monitor_manager::MonitorManager,
@@ -68,14 +79,13 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) metrics: &'a Arc<metrics::PerformanceMetrics>,
     pub(crate) frame_mailbox: &'a video::LatestFrameMailbox,
     pub(crate) image_tx: &'a tokio::sync::mpsc::Sender<LoadedImage>,
-    pub(crate) player_tx: &'a tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
-    pub(crate) player_event_tx: &'a tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
+    pub(crate) player_tx: &'a PlayerReadySender,
+    pub(crate) player_event_tx: &'a PlayerEventSender,
     pub(crate) next_session_id: &'a mut u64,
     pub(crate) loop_start: Instant,
     pub(crate) shutdown_flag: &'a Arc<AtomicBool>,
-    #[cfg(feature = "mpv-backend")]
+    pub(crate) display_power_suspended: bool,
     pub(crate) mpv_native_targets: Option<&'a HashMap<String, video::MpvNativeVideoTarget>>,
-    #[cfg(feature = "mpv-backend")]
     pub(crate) mpv_composed_targets: Option<&'a HashMap<String, video::MpvComposedVideoTarget>>,
 }
 
@@ -89,33 +99,31 @@ pub struct MainLoopContext {
     pub pending_image_video_stops: HashMap<String, video::VideoPlayer>,
     pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
-    #[cfg(feature = "mpv-backend")]
     pub mpv_native_targets: HashMap<String, video::MpvNativeVideoTarget>,
-    #[cfg(feature = "mpv-backend")]
     pub mpv_composed_targets: HashMap<String, video::MpvComposedVideoTarget>,
     pub startup_present_barrier: Option<StartupPresentBarrier>,
     pub latest_video_frames: video::LatestFrameMailbox,
 
-    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<CmdMsg>,
+    pub cmd_rx: tokio::sync::mpsc::Receiver<CmdMsg>,
     pub image_rx: tokio::sync::mpsc::Receiver<LoadedImage>,
     pub image_tx: tokio::sync::mpsc::Sender<LoadedImage>,
-    pub player_rx: tokio::sync::mpsc::UnboundedReceiver<VideoPlayerResult>,
-    pub player_tx: tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
-    pub player_event_rx: tokio::sync::mpsc::UnboundedReceiver<PlayerEventMsg>,
-    pub player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
+    pub player_rx: tokio::sync::mpsc::Receiver<VideoPlayerResult>,
+    pub player_tx: PlayerReadySender,
+    pub player_event_rx: tokio::sync::mpsc::Receiver<PlayerEventMsg>,
+    pub player_event_tx: PlayerEventSender,
 
     pub dir_watcher: Option<cache::DirectoryWatcher>,
     pub script_manager: scripting::ScriptManager,
     pub shutdown_flag: Arc<AtomicBool>,
+    pub(crate) display_power_suspended: bool,
 
     pub next_session_id: u64,
     pub first_frame_recorded: bool,
     pub last_metrics_log: Instant,
     pub last_stats_flush: Instant,
     pub last_pool_cleanup: Instant,
-    pub last_dir_watch_poll: Instant,
-    pub(crate) last_loop_rate_counts: (u64, u64),
     pub last_device_poll: Instant,
+    pub(crate) last_loop_rate_counts: (u64, u64),
     pub last_script_tick: Instant,
     pub script_tick_interval: u64,
     pub target_frame_time: std::time::Duration,
@@ -131,15 +139,20 @@ impl MainLoopContext {
     ) -> anyhow::Result<Self> {
         let script_path = config.global.script_path.clone();
         let script_tick_interval = config.global.script_tick_interval;
-        let metrics = Arc::new(metrics::PerformanceMetrics::new());
+        let metrics = Arc::new(metrics::PerformanceMetrics::new_with_diagnostics(
+            tracing::enabled!(tracing::Level::INFO),
+        ));
         metrics.record_startup_start();
         metrics.record_gstreamer_init(gstreamer_duration);
 
-        // Start resource monitor with metrics
-        let sys_monitor = monitor::SystemMonitor::new_with_metrics(Some(metrics.clone()));
-        tokio::spawn(async move {
-            sys_monitor.run().await;
-        });
+        // Detailed process/GPU sampling is diagnostic work. Do not retain the
+        // sysinfo/NVML task or wake every ten seconds when INFO is disabled.
+        if tracing::enabled!(tracing::Level::INFO) {
+            let sys_monitor = monitor::SystemMonitor::new_with_metrics(Some(metrics.clone()));
+            tokio::spawn(async move {
+                sys_monitor.run().await;
+            });
+        }
 
         let monitor_manager = monitor_manager::MonitorManager::new_with_metrics(
             config.clone(),
@@ -178,10 +191,11 @@ impl MainLoopContext {
         let latest_video_frames = video::LatestFrameMailbox::new();
         // Image channel: bounded to prevent memory spikes from large images accumulating
         let (image_tx, image_rx) = tokio::sync::mpsc::channel::<LoadedImage>(16);
-        let (player_tx, player_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPlayerResult>();
+        let (player_tx, player_rx) =
+            tokio::sync::mpsc::channel::<VideoPlayerResult>(PLAYER_READY_CHANNEL_CAPACITY);
         let (player_event_tx, player_event_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PlayerEventMsg>();
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<CmdMsg>();
+            tokio::sync::mpsc::channel::<PlayerEventMsg>(PLAYER_EVENT_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<CmdMsg>(COMMAND_CHANNEL_CAPACITY);
 
         // IPC Socket Setup
         info!("[STARTUP] Setting up IPC socket");
@@ -209,29 +223,58 @@ impl MainLoopContext {
 
         // Spawn IPC Listener
         let cmd_tx_clone = cmd_tx.clone();
+        let ipc_permits = Arc::new(tokio::sync::Semaphore::new(IPC_CONCURRENCY_LIMIT));
         tokio::spawn(async move {
             loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let cmd_tx = cmd_tx_clone.clone();
-                    tokio::spawn(async move {
-                        const MAX_MESSAGE_SIZE: usize = 8192;
-                        let Some(req_str) =
-                            read_ipc_request_line(&mut stream, MAX_MESSAGE_SIZE).await
-                        else {
-                            return;
-                        };
-                        let Ok(req) = serde_json::from_str::<Request>(req_str.trim()) else {
-                            warn!("[IPC] Failed to parse control request JSON");
-                            return;
-                        };
-                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                        if cmd_tx.send((req, resp_tx)).is_ok()
-                            && let Ok(response) = resp_rx.await
-                            && let Ok(json) = serde_json::to_string(&response)
-                        {
-                            let _ = stream.write_all(json.as_bytes()).await;
-                        }
-                    });
+                let permit = match ipc_permits.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        let cmd_tx = cmd_tx_clone.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            const MAX_MESSAGE_SIZE: usize = 8192;
+                            let Ok(Some(req_str)) = tokio::time::timeout(
+                                IPC_REQUEST_TIMEOUT,
+                                read_ipc_request_line(&mut stream, MAX_MESSAGE_SIZE),
+                            )
+                            .await
+                            else {
+                                warn!("[IPC] Request timed out or was invalid");
+                                return;
+                            };
+                            let Ok(req) = serde_json::from_str::<Request>(req_str.trim()) else {
+                                warn!("[IPC] Failed to parse control request JSON");
+                                return;
+                            };
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                            let response = match cmd_tx.try_send((req, resp_tx)) {
+                                Ok(()) => tokio::time::timeout(IPC_RESPONSE_TIMEOUT, resp_rx)
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok),
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    Some(Response::Error(
+                                        "control queue busy; retry shortly".to_string(),
+                                    ))
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    Some(Response::Error("daemon is shutting down".to_string()))
+                                }
+                            };
+                            if let Some(response) = response
+                                && let Ok(json) = serde_json::to_string(&response)
+                            {
+                                let _ = stream.write_all(json.as_bytes()).await;
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        drop(permit);
+                        warn!("[IPC] Failed to accept control connection: {}", error);
+                    }
                 }
             }
         });
@@ -266,9 +309,7 @@ impl MainLoopContext {
             pending_image_video_stops: HashMap::new(),
             pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
-            #[cfg(feature = "mpv-backend")]
             mpv_native_targets: HashMap::new(),
-            #[cfg(feature = "mpv-backend")]
             mpv_composed_targets: HashMap::new(),
             startup_present_barrier: None,
             latest_video_frames,
@@ -282,14 +323,14 @@ impl MainLoopContext {
             dir_watcher,
             script_manager,
             shutdown_flag,
+            display_power_suspended: false,
             next_session_id: 1,
             first_frame_recorded: false,
             last_metrics_log: now,
             last_stats_flush: now,
             last_pool_cleanup: now,
-            last_dir_watch_poll: now,
-            last_loop_rate_counts: (0, 0),
             last_device_poll: now,
+            last_loop_rate_counts: (0, 0),
             last_script_tick: now,
             script_tick_interval,
             target_frame_time: std::time::Duration::from_micros(16667), // ~60 FPS
@@ -319,26 +360,25 @@ impl MainLoopContext {
 
     /// Record frame time, clean up texture pool, flush stats, process dir watcher,
     /// log metrics summary. Called at the end of each loop iteration.
-    /// Sleep at vsync rate if actively rendering, then poll device.
+    /// Sleep at vsync rate if actively rendering and periodically service WGPU
+    /// resource retirement without returning to an unconditional per-loop poll.
     pub async fn timing_and_poll(&mut self, any_active: bool, loop_start: Instant) {
-        let elapsed = loop_start.elapsed();
-        if any_active && elapsed < self.target_frame_time {
-            tokio::time::sleep(self.target_frame_time - elapsed).await;
+        if let Some(ctx) = &self.wgpu_ctx {
+            let requested = ctx.poll_device_if_requested();
+            if requested || self.last_device_poll.elapsed() >= Duration::from_millis(100) {
+                if !requested {
+                    ctx.device.poll(wgpu::Maintain::Poll);
+                }
+                self.last_device_poll = Instant::now();
+            }
         }
-
-        let poll_interval = if any_active {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(100)
-        };
-        if self.last_device_poll.elapsed() < poll_interval {
+        if !any_active {
             return;
         }
-
-        if let Some(ctx) = &self.wgpu_ctx {
-            ctx.device.poll(wgpu::Maintain::Poll);
+        let elapsed = loop_start.elapsed();
+        if elapsed < self.target_frame_time {
+            tokio::time::sleep(self.target_frame_time - elapsed).await;
         }
-        self.last_device_poll = Instant::now();
     }
 
     /// Perform the initial content load.
@@ -371,7 +411,10 @@ impl MainLoopContext {
         let bus_shutdown_duration = bus_shutdown_start.elapsed();
 
         let cache_start = Instant::now();
-        // Drop renderer-owned wgpu surfaces while the backend connection still exists.
+        // Drop every target retaining WGPU/EGL state while the backend connection
+        // is still alive. Some EGL destructors may marshal Wayland requests.
+        self.mpv_native_targets.clear();
+        self.mpv_composed_targets.clear();
         self.renderers.clear();
         if let Some(ctx) = &self.wgpu_ctx {
             ctx.persist_pipeline_cache();

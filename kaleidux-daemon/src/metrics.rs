@@ -19,6 +19,10 @@ pub struct MonitorStageTimings {
 
 /// Performance metrics for monitoring
 pub struct PerformanceMetrics {
+    /// Detailed samples and per-event counters are disabled for the normal
+    /// warning-only runtime. This keeps observability out of frame hot paths
+    /// unless an INFO/DEBUG/TRACE subscriber will actually consume it.
+    detailed_enabled: bool,
     // Frame timing
     pub frame_times: Arc<parking_lot::Mutex<VecDeque<f64>>>, // Last 100 frame times in ms
     pub avg_frame_time: Arc<AtomicU64>,                      // Average in microseconds
@@ -46,6 +50,11 @@ pub struct PerformanceMetrics {
     pub frame_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, frames in channel)
     pub image_channel_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, images in channel)
     pub texture_pool_size_samples: Arc<parking_lot::Mutex<VecDeque<(std::time::Instant, usize)>>>, // (timestamp, textures in pool)
+    command_channel_high_water: Arc<AtomicU64>,
+    image_channel_high_water: Arc<AtomicU64>,
+    player_ready_channel_high_water: Arc<AtomicU64>,
+    player_event_channel_high_water: Arc<AtomicU64>,
+    frame_mailbox_high_water: Arc<AtomicU64>,
 
     // Uptime tracking
     start_time: std::time::Instant,
@@ -100,6 +109,7 @@ pub struct PerformanceMetrics {
     shared_broker_hits: Arc<AtomicU64>,
     shared_broker_misses: Arc<AtomicU64>,
     video_backend_metrics: Arc<[AtomicU64; VIDEO_BACKEND_METRIC_KIND_COUNT]>,
+    native_sync_blocked_ns: Arc<AtomicU64>,
 
     // Component CPU tracking (time spent in each component in milliseconds)
     renderer_cpu_time: Arc<AtomicU64>, // Total CPU time in microseconds
@@ -150,7 +160,12 @@ pub struct StartupMetrics {
 
 impl PerformanceMetrics {
     pub fn new() -> Self {
+        Self::new_with_diagnostics(true)
+    }
+
+    pub fn new_with_diagnostics(detailed_enabled: bool) -> Self {
         Self {
+            detailed_enabled,
             frame_times: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(100))),
             avg_frame_time: Arc::new(AtomicU64::new(0)),
             texture_pool_hits: Arc::new(AtomicU64::new(0)),
@@ -171,6 +186,11 @@ impl PerformanceMetrics {
             texture_pool_size_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
                 100,
             ))),
+            command_channel_high_water: Arc::new(AtomicU64::new(0)),
+            image_channel_high_water: Arc::new(AtomicU64::new(0)),
+            player_ready_channel_high_water: Arc::new(AtomicU64::new(0)),
+            player_event_channel_high_water: Arc::new(AtomicU64::new(0)),
+            frame_mailbox_high_water: Arc::new(AtomicU64::new(0)),
             start_time: std::time::Instant::now(),
             startup_metrics: Arc::new(parking_lot::Mutex::new(StartupMetrics {
                 startup_start: Some(std::time::Instant::now()),
@@ -218,6 +238,7 @@ impl PerformanceMetrics {
             shared_broker_hits: Arc::new(AtomicU64::new(0)),
             shared_broker_misses: Arc::new(AtomicU64::new(0)),
             video_backend_metrics: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            native_sync_blocked_ns: Arc::new(AtomicU64::new(0)),
             renderer_cpu_time: Arc::new(AtomicU64::new(0)),
             video_cpu_time: Arc::new(AtomicU64::new(0)),
             file_discovery_cpu_time: Arc::new(AtomicU64::new(0)),
@@ -261,6 +282,11 @@ impl PerformanceMetrics {
             monitor_logging_samples: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(20))),
             previous_thread_cpu_snapshot: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    #[inline]
+    pub(crate) fn detailed_enabled(&self) -> bool {
+        self.detailed_enabled
     }
 }
 

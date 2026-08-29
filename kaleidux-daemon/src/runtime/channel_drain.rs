@@ -16,7 +16,6 @@ use crate::renderer;
 use crate::runtime::commands::handle_command;
 use crate::runtime::timing::duration_ms;
 use crate::video;
-use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
@@ -80,9 +79,7 @@ impl MainLoopContext {
                         player_tx: &self.player_tx,
                         player_event_tx: &self.player_event_tx,
                         shutdown_flag: &self.shutdown_flag,
-                        #[cfg(feature = "mpv-backend")]
                         mpv_native_targets: Some(&self.mpv_native_targets),
-                        #[cfg(feature = "mpv-backend")]
                         mpv_composed_targets: Some(&self.mpv_composed_targets),
                     },
                 );
@@ -135,7 +132,7 @@ impl MainLoopContext {
 
     /// Process script tick.
     pub fn process_script_tick(&mut self) {
-        if !self.script_manager.is_loaded() {
+        if !self.script_manager.has_tick() {
             return;
         }
         if self.last_script_tick.elapsed().as_secs() >= self.script_tick_interval {
@@ -167,9 +164,8 @@ impl MainLoopContext {
                     next_session_id: &mut self.next_session_id,
                     loop_start,
                     shutdown_flag: &self.shutdown_flag,
-                    #[cfg(feature = "mpv-backend")]
+                    display_power_suspended: self.display_power_suspended,
                     mpv_native_targets: Some(&self.mpv_native_targets),
-                    #[cfg(feature = "mpv-backend")]
                     mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             )
@@ -183,8 +179,8 @@ impl MainLoopContext {
         &mut self,
         should_check_mailbox: bool,
         hold_video_until_callback: bool,
-    ) -> (HashMap<String, video::VideoFrame>, usize, usize) {
-        let mut latest_frames: HashMap<String, video::VideoFrame> = HashMap::new();
+    ) -> (Vec<(std::sync::Arc<str>, video::VideoFrame)>, usize, usize) {
+        let mut latest_frames = Vec::new();
         let mut frames_received = 0;
         let mut frames_discarded = 0;
         let mut stale_session_discards = 0;
@@ -192,9 +188,10 @@ impl MainLoopContext {
 
         if should_check_mailbox {
             self.latest_video_frames.clear_signal_pending();
-            for source_id in self.latest_video_frames.pending_sources() {
-                let frame_state = self.latest_video_frames.inspect_frame(&source_id, |frame| {
-                    let renderer = self.renderers.get(source_id.as_str());
+            let drained = self
+                .latest_video_frames
+                .drain_pending_frames(|source_id, frame| {
+                    let renderer = self.renderers.get(source_id);
                     let should_accept = renderer.is_some_and(|r| {
                         should_accept_video_frame(
                             r.valid_content_type,
@@ -209,19 +206,7 @@ impl MainLoopContext {
 
                     (should_accept, hold_for_callback)
                 });
-
-                let Some((should_accept, hold_for_callback)) = frame_state else {
-                    continue;
-                };
-
-                if hold_for_callback {
-                    self.latest_video_frames.defer_notification(&source_id);
-                    continue;
-                }
-
-                let Some(frame) = self.latest_video_frames.take_frame(&source_id) else {
-                    continue;
-                };
+            for (source_id, frame, should_accept) in drained {
                 frames_received += 1;
                 self.metrics.record_video_frame_received();
                 if !should_accept {
@@ -229,7 +214,7 @@ impl MainLoopContext {
                     stale_session_discards += 1;
                     self.metrics.record_video_frame_stale_skipped();
                 } else {
-                    latest_frames.insert(source_id, frame);
+                    latest_frames.push((source_id, frame));
                 }
             }
         }
@@ -267,15 +252,11 @@ impl MainLoopContext {
         F: FnMut(&mut renderer::Renderer, &str, Instant),
     {
         let mut images_received = 0;
-        let mut pending_images = Vec::new();
-        if let Some(msg) = image_buf {
-            pending_images.push(msg);
-        }
-        while let Ok(msg) = self.image_rx.try_recv() {
-            pending_images.push(msg);
-        }
-
-        for msg in pending_images {
+        let mut next_image = image_buf;
+        loop {
+            let Some(msg) = next_image.take().or_else(|| self.image_rx.try_recv().ok()) else {
+                break;
+            };
             images_received += 1;
             let barrier_blocks = self.startup_barrier_blocks_output(&msg.name, loop_start);
             let mut release_pending_video = false;

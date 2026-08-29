@@ -5,6 +5,18 @@ use super::{
 use crate::shaders::Transition;
 
 #[test]
+fn zero_script_tick_interval_is_rejected() {
+    let error = toml::from_str::<super::GlobalConfig>("script-tick-interval = 0")
+        .expect_err("a zero-second script tick would hot-loop");
+    assert!(error.to_string().contains("at least one second"));
+}
+
+#[test]
+fn global_default_uses_one_second_script_tick() {
+    assert_eq!(super::GlobalConfig::default().script_tick_interval, 1);
+}
+
+#[test]
 fn parses_legacy_nested_transition_tables() {
     let cfg: PartialOutputConfig = toml::from_str(
         r#"
@@ -200,7 +212,7 @@ fn performance_profiles_choose_video_fps_defaults() {
     )
     .unwrap()
     .get_config_for_output("DP-1", "Side Display");
-    assert_eq!(quality.video_fps, VideoFpsProfile::High);
+    assert_eq!(quality.video_fps, VideoFpsProfile::Unlimited);
 
     let balanced = Config::parse_str(
         r#"
@@ -227,6 +239,43 @@ fn explicit_frame_latency_overrides_profile_default() {
     let matched = cfg.get_config_for_output("DP-1", "Side Display");
     assert_eq!(matched.performance, PerformanceProfile::LowPower);
     assert_eq!(matched.frame_latency, Some(2));
+}
+
+#[test]
+fn pause_on_fullscreen_defaults_off() {
+    let config = Config::parse_str("")
+        .unwrap()
+        .get_config_for_output("DP-1", "Primary Display");
+
+    assert!(!config.pause_on_fullscreen);
+}
+
+#[test]
+fn pause_on_fullscreen_merges_global_any_and_output() {
+    let config = Config::parse_str(
+        r#"
+            [global]
+            pause-on-fullscreen = true
+
+            [any]
+            pause-on-fullscreen = false
+
+            [DP-2]
+            pause-on-fullscreen = true
+            "#,
+    )
+    .unwrap();
+
+    assert!(
+        !config
+            .get_config_for_output("DP-1", "Side Display")
+            .pause_on_fullscreen
+    );
+    assert!(
+        config
+            .get_config_for_output("DP-2", "Primary Display")
+            .pause_on_fullscreen
+    );
 }
 
 #[test]

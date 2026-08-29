@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 use wayland_client::{Connection, QueueHandle};
 
-const DEFAULT_STEADY_VIDEO_CALLBACK_UPLOAD_MS: u64 = 75;
+const DEFAULT_STEADY_VIDEO_CALLBACK_UPLOAD_MS: u64 = 0;
 
 static STEADY_VIDEO_CALLBACK_UPLOAD_INTERVAL: once_cell::sync::Lazy<std::time::Duration> =
     once_cell::sync::Lazy::new(|| {
@@ -32,8 +32,8 @@ pub(crate) fn process_frame_callbacks(
     backend: &mut crate::wayland::WaylandBackend,
     qh: &QueueHandle<crate::wayland::WaylandBackend>,
     conn: &Connection,
+    power_monitor: &crate::hyprland_power::HyprlandPowerMonitor,
     callback_flush_needed: &mut bool,
-    connection_dead: bool,
     loop_start: Instant,
 ) {
     // ─── Wayland frame callback rendering ───────────────────────────
@@ -41,9 +41,20 @@ pub(crate) fn process_frame_callbacks(
     let frame_ready_names: Vec<String> = backend.frame_callback_ready.drain().collect();
     for name in frame_ready_names {
         ctx.metrics.record_wayland_callback_wake();
+        if !power_monitor.is_powered(&name) {
+            if let Some(renderer) = ctx.renderers.get_mut(&name) {
+                renderer.frame_callback_pending = false;
+                renderer.last_frame_request = None;
+            }
+            continue;
+        }
+        if let Some(player) = ctx.video_players.get(&name) {
+            player.request_video_frame();
+        }
         let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
         let mut mark_presented = false;
         if let Some(r) = ctx.renderers.get_mut(&name) {
+            let mut native_surface_presented = false;
             let should_upload_pending_video = r.should_upload_video_frame_on_callback()
                 || ctx
                     .latest_video_frames
@@ -57,10 +68,24 @@ pub(crate) fn process_frame_callbacks(
                     frame.session_id,
                 )
             {
-                let upload_start = std::time::Instant::now();
-                r.upload_frame(&frame);
-                ctx.metrics.record_video_cpu_time(upload_start.elapsed());
-                ctx.metrics.record_video_frame_uploaded();
+                native_surface_presented = super::native_dmabuf_surface::present_native_frame(
+                    backend,
+                    r,
+                    qh,
+                    conn,
+                    &name,
+                    &frame,
+                    (r.config.width, r.config.height),
+                );
+                if native_surface_presented {
+                    *callback_flush_needed = true;
+                }
+                if !native_surface_presented {
+                    let upload_start = std::time::Instant::now();
+                    r.upload_frame(&frame);
+                    ctx.metrics.record_video_cpu_time(upload_start.elapsed());
+                    ctx.metrics.record_video_frame_uploaded();
+                }
             }
             if let Some(wait_duration) = r.frame_callback_pending_duration() {
                 if wait_duration > std::time::Duration::from_millis(250) {
@@ -82,11 +107,14 @@ pub(crate) fn process_frame_callbacks(
             r.frame_callback_pending = false;
             r.last_frame_request = None;
             if !barrier_blocks {
-                if let Some(layer_surface) = backend.surfaces.get(&name) {
+                if native_surface_presented {
+                    mark_presented = true;
+                } else if let Some(layer_surface) = backend.surfaces.get(&name) {
                     let _ = r.render(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
                             qh,
+                            presentation: backend.presentation_proxy(),
                         },
                         loop_start,
                     );
@@ -122,17 +150,21 @@ pub(crate) fn process_frame_callbacks(
         })
         .unwrap_or_default();
     for (name, r) in ctx.renderers.iter_mut() {
+        if !power_monitor.is_powered(name) {
+            continue;
+        }
         let barrier_blocks = blocked_outputs.contains(name);
-        let should_request =
-            r.has_any_content() && (r.needs_redraw || r.transition_active) && !barrier_blocks;
+        let pending_video = r.steady_video_uses_frame_callbacks()
+            && r.valid_content_type == crate::queue::ContentType::Video
+            && ctx.latest_video_frames.pending_frame_age(name).is_some();
+        let should_request = r.has_any_content()
+            && (r.needs_redraw || r.transition_active || pending_video)
+            && !barrier_blocks;
         if should_request {
             if let Some(layer_surface) = backend.surfaces.get(name) {
                 *callback_flush_needed |= r.request_frame_callback(layer_surface, qh);
             }
         }
-    }
-    if *callback_flush_needed && !connection_dead {
-        let _ = conn.flush();
     }
 }
 
@@ -141,10 +173,10 @@ mod tests {
     use super::parse_steady_video_callback_upload_interval;
 
     #[test]
-    fn steady_video_callback_upload_interval_defaults_to_half_rate() {
+    fn steady_video_callback_upload_interval_defaults_to_unlimited() {
         assert_eq!(
             parse_steady_video_callback_upload_interval(None),
-            std::time::Duration::from_millis(75)
+            std::time::Duration::ZERO
         );
     }
 

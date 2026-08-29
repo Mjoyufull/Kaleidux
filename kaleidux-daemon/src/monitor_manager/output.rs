@@ -55,6 +55,22 @@ pub struct OutputOrchestrator {
 }
 
 impl OutputOrchestrator {
+    pub(super) fn without_queue(name: String, description: String, config: OutputConfig) -> Self {
+        let phase_offset = independent_phase_offset(&name, config.duration);
+        Self {
+            _name: name,
+            description,
+            config,
+            queue: None,
+            current_path: None,
+            next_path: None,
+            next_content_type: None,
+            next_change: None,
+            display_start_time: None,
+            phase_offset,
+        }
+    }
+
     pub(super) fn cycle_duration(&self) -> Duration {
         self.config.duration.saturating_add(self.phase_offset)
     }
@@ -112,20 +128,9 @@ impl OutputOrchestrator {
             None
         };
 
-        let phase_offset = independent_phase_offset(&name, config.duration);
-
-        Self {
-            _name: name,
-            description,
-            config,
-            queue,
-            current_path: None,
-            next_path: None,
-            next_content_type: None,
-            next_change: None,
-            display_start_time: None,
-            phase_offset,
-        }
+        let mut orchestrator = Self::without_queue(name, description, config);
+        orchestrator.queue = queue;
+        orchestrator
     }
 
     pub fn tick(&mut self) -> Option<(PathBuf, ContentType)> {
