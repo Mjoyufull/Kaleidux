@@ -16,6 +16,11 @@ impl PerformanceMetrics {
             format!("video_backend={}", self.video_backend_summary()),
             format!("present={}", self.present_source_summary()),
             format!("image_cache={}", self.image_cache_summary()),
+            format!("channel_high_water={}", self.channel_high_water_summary()),
+            format!(
+                "background={}",
+                crate::background::snapshot().format_compact()
+            ),
             format!(
                 "wake={} {}",
                 self.wake_reason_summary(),
@@ -60,7 +65,7 @@ impl PerformanceMetrics {
     }
 
     fn video_backend_summary(&self) -> String {
-        VIDEO_BACKEND_METRIC_KINDS
+        let mut entries = VIDEO_BACKEND_METRIC_KINDS
             .iter()
             .map(|kind| {
                 format!(
@@ -69,8 +74,12 @@ impl PerformanceMetrics {
                     self.video_backend_metrics[kind.as_index()].load(Ordering::Relaxed)
                 )
             })
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect::<Vec<_>>();
+        entries.push(format!(
+            "native_sync_blocked_ns={}",
+            self.native_sync_blocked_ns.load(Ordering::Relaxed)
+        ));
+        entries.join(" ")
     }
 
     fn present_source_summary(&self) -> String {
@@ -122,7 +131,25 @@ impl PerformanceMetrics {
         )
     }
 
+    fn channel_high_water_summary(&self) -> String {
+        let image_bytes = crate::image::channel_budget::snapshot();
+        format!(
+            "command={} image={} image_bytes={}/{} current={} player_ready={} player_event={} frame_mailbox={}",
+            self.command_channel_high_water.load(Ordering::Relaxed),
+            self.image_channel_high_water.load(Ordering::Relaxed),
+            image_bytes.high_water_bytes,
+            image_bytes.capacity_bytes,
+            image_bytes.current_bytes,
+            self.player_ready_channel_high_water.load(Ordering::Relaxed),
+            self.player_event_channel_high_water.load(Ordering::Relaxed),
+            self.frame_mailbox_high_water.load(Ordering::Relaxed)
+        )
+    }
+
     pub fn log_summary(&self) {
+        if !tracing::enabled!(tracing::Level::INFO) {
+            return;
+        }
         let thread_cpu_info = self.thread_cpu_summary();
         let leak_warning = self.check_resource_leaks();
         let leak_msg = leak_warning
@@ -169,6 +196,7 @@ impl PerformanceMetrics {
         let wake_info = self.wake_reason_summary();
         let present_info = self.present_source_summary();
         let image_cache_info = self.image_cache_summary();
+        let persistent_cache = crate::image::persistent_cache::snapshot();
         let shared_broker_info = format!(
             " shared_broker=hit:{} miss:{}",
             self.shared_broker_hits.load(Ordering::Relaxed),
@@ -239,7 +267,19 @@ impl PerformanceMetrics {
         tracing::info!("[METRICS] Present sources: {}", present_info);
         tracing::info!("[PRESENT] {}", present_info);
         tracing::info!("[METRICS] Image cache: {}", image_cache_info);
-        tracing::info!("[IMAGE-CACHE] {}", image_cache_info);
+        tracing::info!(
+            "[IMAGE-CACHE] {} persistent=count:{} bytes:{} evictions:{} corruptions:{}",
+            image_cache_info,
+            persistent_cache.count,
+            persistent_cache.bytes,
+            persistent_cache.evictions,
+            persistent_cache.corruptions
+        );
+        tracing::info!(
+            "[RESOURCES] channels={} background={}",
+            self.channel_high_water_summary(),
+            crate::background::snapshot().format_compact()
+        );
         tracing::info!(
             "[METRICS] Monitor self-cost: {}",
             self.get_monitor_stage_summary()

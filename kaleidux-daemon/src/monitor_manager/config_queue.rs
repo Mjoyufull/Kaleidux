@@ -1,5 +1,4 @@
 use super::{MonitorManager, OutputOrchestrator};
-use crate::background::{self, BackgroundWorkKind};
 use crate::cache::FileCache;
 use crate::metrics::PerformanceMetrics;
 use crate::orchestration::OutputConfig;
@@ -88,47 +87,7 @@ impl MonitorManager {
         let name_owned = name.to_string();
         let output_config_owned = output_config.clone();
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                let cache_for_spawn = cache.clone();
-                let metrics_for_spawn = metrics.clone();
-                let name_for_spawn = name_owned.clone();
-                let config_for_spawn = output_config_owned.clone();
-
-                match background::spawn_blocking_tracked(
-                    BackgroundWorkKind::QueueDiscovery,
-                    move || {
-                        Self::build_refreshed_queue_sync(
-                            cache_for_spawn,
-                            metrics_for_spawn,
-                            &name_for_spawn,
-                            &config_for_spawn,
-                        )
-                    },
-                ) {
-                    Some(join_handle) => match handle.block_on(join_handle) {
-                        Ok(queue) => queue,
-                        Err(e) => {
-                            tracing::warn!(
-                                "[CONFIG] Queue refresh worker failed for {}: {}",
-                                name_owned,
-                                e
-                            );
-                            None
-                        }
-                    },
-                    None => Self::build_refreshed_queue_sync(
-                        cache,
-                        metrics,
-                        &name_owned,
-                        &output_config_owned,
-                    ),
-                }
-            }),
-            Err(_) => {
-                Self::build_refreshed_queue_sync(cache, metrics, &name_owned, &output_config_owned)
-            }
-        }
+        Self::build_refreshed_queue_sync(cache, metrics, &name_owned, &output_config_owned)
     }
 
     pub(super) fn flush_queue_stats(queue: &mut SmartQueue, label: &str) {

@@ -102,15 +102,11 @@ impl MonitorManager {
                         }
                     }
                 }
-                let mut orch = OutputOrchestrator::new(
+                let orch = OutputOrchestrator::without_queue(
                     name.to_string(),
                     description.to_string(),
                     output_config,
-                    self.cache.clone(),
-                    self.metrics.clone(),
-                )
-                .await;
-                orch.queue = None; // Will use shared queue
+                );
                 self.outputs.insert(name.to_string(), orch);
             }
             MonitorBehavior::Grouped(groups) => {
@@ -146,15 +142,11 @@ impl MonitorManager {
                         }
                     }
 
-                    let mut orch = OutputOrchestrator::new(
+                    let orch = OutputOrchestrator::without_queue(
                         name.to_string(),
                         description.to_string(),
                         output_config,
-                        self.cache.clone(),
-                        self.metrics.clone(),
-                    )
-                    .await;
-                    orch.queue = None; // Will use group queue
+                    );
                     self.outputs.insert(name.to_string(), orch);
                 } else {
                     // Output not in any group, treat as independent

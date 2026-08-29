@@ -8,7 +8,7 @@ impl MonitorManager {
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
         // Don't cycle wallpapers when paused
-        if self.paused {
+        if self.paused || self.power_suspended {
             return changes;
         }
         let now = Instant::now();

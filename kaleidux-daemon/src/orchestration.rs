@@ -37,14 +37,14 @@ pub enum PerformanceProfile {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VideoFpsProfile {
-    #[default]
     Low,
     Medium,
     High,
+    #[default]
     Unlimited,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutputConfig {
     pub path: Option<PathBuf>,
@@ -67,6 +67,10 @@ pub struct OutputConfig {
     pub video_fps: VideoFpsProfile,
     #[serde(default)]
     pub frame_latency: Option<u32>,
+    /// On Wayland, pace steady video through compositor frame callbacks so an
+    /// occluded background naturally holds its current frame.
+    #[serde(default)]
+    pub pause_on_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -128,7 +132,7 @@ struct RegexOutputOverride {
     config: PartialOutputConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalConfig {
     #[serde(default)]
@@ -141,16 +145,53 @@ pub struct GlobalConfig {
     pub script_path: Option<PathBuf>,
     pub sorting: Option<SortingStrategy>,
     /// How often to tick Rhai scripts (in seconds), default 1
-    #[serde(default = "default_script_tick_interval")]
+    #[serde(
+        default = "default_script_tick_interval",
+        deserialize_with = "deserialize_script_tick_interval"
+    )]
     pub script_tick_interval: u64,
     pub default_playlist: Option<String>,
     pub performance: Option<PerformanceProfile>,
     pub video_fps: Option<VideoFpsProfile>,
     pub frame_latency: Option<u32>,
+    pub pause_on_fullscreen: Option<bool>,
 }
 
 fn default_script_tick_interval() -> u64 {
     1
+}
+
+fn deserialize_script_tick_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let interval = u64::deserialize(deserializer)?;
+    if interval == 0 {
+        return Err(serde::de::Error::custom(
+            "script-tick-interval must be at least one second",
+        ));
+    }
+    Ok(interval)
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            monitor_behavior: MonitorBehavior::default(),
+            _custom_transitions: false,
+            video_ratio: None,
+            transition_time: None,
+            volume: None,
+            script_path: None,
+            sorting: None,
+            script_tick_interval: default_script_tick_interval(),
+            default_playlist: None,
+            performance: None,
+            video_fps: None,
+            frame_latency: None,
+            pause_on_fullscreen: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -173,6 +214,7 @@ pub struct PartialOutputConfig {
     pub performance: Option<PerformanceProfile>,
     pub video_fps: Option<VideoFpsProfile>,
     pub frame_latency: Option<u32>,
+    pub pause_on_fullscreen: Option<bool>,
 }
 
 impl Config {
@@ -321,6 +363,7 @@ impl Config {
             performance: self.global.performance,
             video_fps: self.global.video_fps,
             frame_latency: self.global.frame_latency,
+            pause_on_fullscreen: self.global.pause_on_fullscreen,
         };
 
         // 2. Merge [any] fallback
@@ -379,6 +422,9 @@ impl PartialOutputConfig {
         if other.frame_latency.is_some() {
             self.frame_latency = other.frame_latency;
         }
+        if other.pause_on_fullscreen.is_some() {
+            self.pause_on_fullscreen = other.pause_on_fullscreen;
+        }
     }
 
     fn into_output_config(self) -> OutputConfig {
@@ -396,16 +442,16 @@ impl PartialOutputConfig {
             performance,
             video_fps: self.video_fps.unwrap_or(match performance {
                 PerformanceProfile::LowPower => VideoFpsProfile::Low,
-                PerformanceProfile::Quality => VideoFpsProfile::High,
-                PerformanceProfile::Balanced | PerformanceProfile::Debug => {
-                    VideoFpsProfile::Unlimited
-                }
+                PerformanceProfile::Quality
+                | PerformanceProfile::Balanced
+                | PerformanceProfile::Debug => VideoFpsProfile::Unlimited,
             }),
             frame_latency: self.frame_latency.or(match performance {
                 PerformanceProfile::LowPower => Some(1),
                 PerformanceProfile::Quality => Some(2),
                 PerformanceProfile::Balanced | PerformanceProfile::Debug => None,
             }),
+            pause_on_fullscreen: self.pause_on_fullscreen.unwrap_or(false),
         }
     }
 }

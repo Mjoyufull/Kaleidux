@@ -29,7 +29,13 @@ impl MainLoopContext {
 
         for res in pending_players {
             match res {
-                VideoPlayerResult::Success(name, session_id, player, preroll_frame) => {
+                VideoPlayerResult::Success(success) => {
+                    let crate::content::sessions::VideoPlayerSuccess {
+                        name,
+                        session_id,
+                        player,
+                        preroll_frame,
+                    } = *success;
                     let mut player = *player;
                     let renders_natively = player.renders_natively();
                     let barrier_blocks = self.startup_barrier_blocks_output(&name, loop_start);
@@ -87,6 +93,17 @@ impl MainLoopContext {
                         self.video_players.insert(name.clone(), player);
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);
+                        }
+
+                        // The preroll is rendered before the player is installed in
+                        // `video_players`.  Callback-driven Wayland will naturally ask
+                        // for the next frame, but X11 has no callback at this boundary;
+                        // seed one bounded native demand so its later presents can keep
+                        // the request/present chain moving.  Non-native backends ignore
+                        // this request.
+                        if should_render && let Some(active_player) = self.video_players.get(&name)
+                        {
+                            active_player.request_video_frame();
                         }
 
                         if should_render {
@@ -147,6 +164,11 @@ impl MainLoopContext {
                         self.video_players.insert(name.clone(), player);
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);
+                        }
+                        if preroll_frame.is_some()
+                            && let Some(active_player) = self.video_players.get(&name)
+                        {
+                            active_player.request_video_frame();
                         }
                         self.mark_output_presented_if_ready(&name);
                     } else {
@@ -303,9 +325,7 @@ impl MainLoopContext {
                     player_tx: &self.player_tx,
                     player_event_tx: &self.player_event_tx,
                     shutdown_flag: &self.shutdown_flag,
-                    #[cfg(feature = "mpv-backend")]
                     mpv_native_targets: Some(&self.mpv_native_targets),
-                    #[cfg(feature = "mpv-backend")]
                     mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             );

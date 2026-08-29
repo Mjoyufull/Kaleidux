@@ -68,6 +68,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_frame_time(&self, duration: std::time::Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let ms = duration.as_secs_f64() * 1000.0;
         let mut times = self.frame_times.lock();
         times.push_back(ms);
@@ -82,14 +85,23 @@ impl PerformanceMetrics {
     }
 
     pub fn record_texture_pool_hit(&self) {
+        if !self.detailed_enabled() {
+            return;
+        }
         self.texture_pool_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_texture_pool_miss(&self) {
+        if !self.detailed_enabled() {
+            return;
+        }
         self.texture_pool_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_transition(&self, duration: std::time::Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         self.transition_count.fetch_add(1, Ordering::Relaxed);
         let ms = duration.as_secs_f64() * 1000.0;
         let mut times = self.transition_times.lock();
@@ -100,6 +112,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_video_first_frame(&self, duration: std::time::Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let ms = duration.as_secs_f64() * 1000.0;
         let mut times = self.video_first_frame_times.lock();
         times.push_back(ms);
@@ -109,10 +124,16 @@ impl PerformanceMetrics {
     }
 
     pub fn record_cache_hit(&self) {
+        if !self.detailed_enabled() {
+            return;
+        }
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_cache_miss(&self) {
+        if !self.detailed_enabled() {
+            return;
+        }
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -166,6 +187,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_texture_count(&self, count: usize) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.texture_count_samples.lock();
         samples.push_back((std::time::Instant::now(), count));
         if samples.len() > 100 {
@@ -174,6 +198,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_pipeline_count(&self, count: usize) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.pipeline_count_samples.lock();
         samples.push_back((std::time::Instant::now(), count));
         if samples.len() > 100 {
@@ -182,6 +209,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_frame_channel_size(&self, size: usize) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.frame_channel_size_samples.lock();
         samples.push_back((std::time::Instant::now(), size));
         if samples.len() > 100 {
@@ -190,6 +220,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_image_channel_size(&self, size: usize) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.image_channel_size_samples.lock();
         samples.push_back((std::time::Instant::now(), size));
         if samples.len() > 100 {
@@ -197,7 +230,33 @@ impl PerformanceMetrics {
         }
     }
 
+    pub fn record_channel_levels(
+        &self,
+        commands: usize,
+        images: usize,
+        player_ready: usize,
+        player_events: usize,
+        frame_mailbox: usize,
+    ) {
+        if !self.detailed_enabled() {
+            return;
+        }
+        self.command_channel_high_water
+            .fetch_max(commands as u64, Ordering::Relaxed);
+        self.image_channel_high_water
+            .fetch_max(images as u64, Ordering::Relaxed);
+        self.player_ready_channel_high_water
+            .fetch_max(player_ready as u64, Ordering::Relaxed);
+        self.player_event_channel_high_water
+            .fetch_max(player_events as u64, Ordering::Relaxed);
+        self.frame_mailbox_high_water
+            .fetch_max(frame_mailbox as u64, Ordering::Relaxed);
+    }
+
     pub fn record_texture_pool_size(&self, size: usize) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.texture_pool_size_samples.lock();
         samples.push_back((std::time::Instant::now(), size));
         if samples.len() > 100 {

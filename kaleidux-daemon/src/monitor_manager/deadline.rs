@@ -5,27 +5,48 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 impl MonitorManager {
+    fn reset_display_timers(&mut self) {
+        let now = Instant::now();
+        for orch in self.outputs.values_mut() {
+            orch.display_start_time = Some(now);
+            orch.next_change = Some(now + orch.cycle_duration());
+        }
+        self.shared_display_start_time = Some(now);
+        for start in self.group_display_start_times.values_mut() {
+            *start = now;
+        }
+    }
+
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         if paused {
             info!("[MONITOR_MANAGER] Wallpaper cycling paused");
         } else {
             // When resuming, reset timers so content doesn't immediately switch
-            let now = Instant::now();
-            for orch in self.outputs.values_mut() {
-                orch.display_start_time = Some(now);
-                orch.next_change = Some(now + orch.cycle_duration());
-            }
-            self.shared_display_start_time = Some(now);
-            for start in self.group_display_start_times.values_mut() {
-                *start = now;
-            }
+            self.reset_display_timers();
             info!("[MONITOR_MANAGER] Wallpaper cycling resumed (timers reset)");
         }
     }
 
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub(crate) fn set_power_suspended(&mut self, suspended: bool) {
+        if self.power_suspended == suspended {
+            return;
+        }
+        self.power_suspended = suspended;
+        if suspended {
+            info!("[MONITOR_MANAGER] Wallpaper cycling suspended for display power");
+        } else {
+            self.reset_display_timers();
+            info!("[MONITOR_MANAGER] Wallpaper cycling resumed after display power (timers reset)");
+        }
+    }
+
     pub fn next_switch_deadline(&self) -> Option<Instant> {
-        if self.paused {
+        if self.paused || self.power_suspended {
             return None;
         }
 
@@ -90,7 +111,7 @@ impl MonitorManager {
     }
 
     pub fn tick_due(&self, now: Instant) -> bool {
-        if self.paused {
+        if self.paused || self.power_suspended {
             return false;
         }
 
@@ -104,7 +125,7 @@ impl MonitorManager {
     }
 
     pub fn due_low_power_outputs(&self, now: Instant) -> Vec<String> {
-        if self.paused {
+        if self.paused || self.power_suspended {
             return Vec::new();
         }
 

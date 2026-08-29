@@ -35,9 +35,18 @@ impl MainLoopContext {
         if initial_changes.is_empty() {
             warn!("[STARTUP] No initial content changes - wallpapers may not load!");
         }
+        self.load_content_changes(initial_changes, "STARTUP", true);
+    }
+
+    pub(crate) fn load_content_changes(
+        &mut self,
+        changes: HashMap<String, (std::path::PathBuf, crate::queue::ContentType)>,
+        log_prefix: &'static str,
+        arm_barrier: bool,
+    ) {
         let batch_id = rand::random::<u64>();
         let mut startup_outputs = Vec::new();
-        let ordered_changes = ordered_pending_content_switches(&self.renderers, initial_changes);
+        let ordered_changes = ordered_pending_content_switches(&self.renderers, changes);
         for change in ordered_changes {
             if !self.renderers.contains_key(&change.name) {
                 warn!(
@@ -55,7 +64,7 @@ impl MainLoopContext {
                     batch_id: Some(batch_id),
                     batch_trigger_time: None,
                     shared_image_target: change.shared_image_target,
-                    log_prefix: "STARTUP",
+                    log_prefix,
                 },
                 ContentSwitchContext {
                     metrics: &self.metrics,
@@ -71,14 +80,12 @@ impl MainLoopContext {
                     player_tx: &self.player_tx,
                     player_event_tx: &self.player_event_tx,
                     shutdown_flag: &self.shutdown_flag,
-                    #[cfg(feature = "mpv-backend")]
                     mpv_native_targets: Some(&self.mpv_native_targets),
-                    #[cfg(feature = "mpv-backend")]
                     mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },
             );
         }
-        if startup_outputs.len() > 1 {
+        if arm_barrier && startup_outputs.len() > 1 {
             self.arm_startup_present_barrier(batch_id, startup_outputs);
         }
     }

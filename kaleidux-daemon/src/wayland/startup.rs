@@ -5,15 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
-#[cfg(feature = "mpv-backend")]
 use wayland_client::Proxy;
 use wayland_client::{Connection, QueueHandle};
 
-#[cfg(feature = "mpv-backend")]
-fn should_create_mpv_native_surfaces() -> bool {
+pub(crate) fn should_create_mpv_native_surfaces() -> bool {
     if !matches!(
-        crate::video::get_video_backend_request(),
-        crate::video::VideoBackendRequest::ForceMpvExperimental
+        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
+        crate::video::VideoBackendRequest::ForceMpv
     ) {
         return false;
     }
@@ -21,11 +19,10 @@ fn should_create_mpv_native_surfaces() -> bool {
     crate::video::MpvRenderApiRequest::from_env().enables_native_overlay()
 }
 
-#[cfg(feature = "mpv-backend")]
-fn should_create_mpv_composed_targets() -> bool {
+pub(crate) fn should_create_mpv_composed_targets() -> bool {
     matches!(
-        crate::video::get_video_backend_request(),
-        crate::video::VideoBackendRequest::ForceMpvExperimental
+        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
+        crate::video::VideoBackendRequest::ForceMpv
     ) && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl()
 }
 
@@ -43,10 +40,9 @@ pub(crate) async fn initialize_outputs_and_renderers(
         backend_ref.display_ptr() as *mut std::ffi::c_void
     };
 
-    #[cfg(feature = "mpv-backend")]
     match crate::video::MpvRenderApiRequest::from_env() {
         crate::video::MpvRenderApiRequest::DeprecatedNativeGlAlias => warn!(
-            "[VIDEO] KLD_MPV_RENDER_API=gl|opengl|native|wayland no longer enables the native Wayland overlay experiment because it bypasses wallpaper composition and transitions; use gl-overlay only for isolated visual diagnostics"
+            "[VIDEO] KLD_MPV_RENDER_API=gl|opengl|native|wayland does not enable the native Wayland overlay because it bypasses wallpaper composition and transitions; use gl-overlay only for isolated visual diagnostics"
         ),
         crate::video::MpvRenderApiRequest::Unknown => warn!(
             "[VIDEO] Ignoring unknown KLD_MPV_RENDER_API value; using WGPU-composed libmpv software rendering"
@@ -103,7 +99,6 @@ pub(crate) async fn initialize_outputs_and_renderers(
             output_config.layer.clone().into(),
         )?;
 
-        #[cfg(feature = "mpv-backend")]
         if should_create_mpv_native_surfaces() {
             use smithay_client_toolkit::shell::WaylandSurface;
 
@@ -168,7 +163,6 @@ pub(crate) async fn initialize_outputs_and_renderers(
         let wgpu_duration = wgpu_start.elapsed();
         ctx.metrics.record_wgpu_init(wgpu_duration);
         let adapter_name = wgpu_ctx.adapter.get_info().name.clone();
-        #[cfg(feature = "mpv-backend")]
         if should_create_mpv_composed_targets() {
             for (name, _description, _output, output_size) in &output_infos {
                 if let Some(target) = crate::video::MpvComposedVideoTarget::new(
@@ -208,7 +202,7 @@ pub(crate) async fn initialize_outputs_and_renderers(
                 info!("[STARTUP] Initializing renderer for {}", name);
 
                 let name_for_bg = name.clone();
-                let Some(spawn_handler) = background::spawn_blocking_tracked(
+                let Some(spawn_handler) = background::spawn_blocking_tracked_wait(
                     BackgroundWorkKind::RendererInit,
                     move || {
                         renderer::Renderer::new(
@@ -219,7 +213,9 @@ pub(crate) async fn initialize_outputs_and_renderers(
                             Some(metrics_clone),
                         )
                     },
-                ) else {
+                )
+                .await
+                else {
                     error!(
                         "[STARTUP] Renderer initialization skipped for {}: shutdown in progress",
                         name
@@ -381,6 +377,7 @@ pub(crate) async fn initialize_outputs_and_renderers(
                         renderer::BackendContext::Wayland {
                             surface: layer_surface,
                             qh,
+                            presentation: backend.presentation_proxy(),
                         },
                         Instant::now(),
                     );

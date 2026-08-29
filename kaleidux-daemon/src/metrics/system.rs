@@ -3,6 +3,9 @@ use std::time::Duration;
 
 impl PerformanceMetrics {
     pub fn record_gpu_utilization(&self, percent: f64) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.gpu_util_samples.lock();
         samples.push_back((std::time::Instant::now(), percent));
         if samples.len() > 100 {
@@ -20,6 +23,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_memory_usage(&self, mb: f64) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let mut samples = self.memory_samples.lock();
         samples.push_back((std::time::Instant::now(), mb));
         if samples.len() > 100 {
@@ -28,6 +34,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_monitor_stage_timings(&self, timings: MonitorStageTimings) {
+        if !self.detailed_enabled() {
+            return;
+        }
         Self::push_sample(
             &self.monitor_refresh_cpu_samples,
             timings.refresh_cpu.as_secs_f64() * 1000.0,

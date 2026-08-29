@@ -32,12 +32,24 @@ pub struct MonitorManager {
     cache: Arc<FileCache>,                              // Shared cache instance for all queues
     metrics: Option<Arc<PerformanceMetrics>>,           // Shared metrics instance
     paused: bool,                                       // Global pause state for wallpaper cycling
+    power_suspended: bool, // Automatic pause while every compositor output is powered off
     // In-memory cache of discovered file lists per directory path.
     // Avoids re-scanning the same directory when multiple outputs share the same path.
     discovered_files_cache: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl MonitorManager {
+    pub fn remove_output(&mut self, name: &str) {
+        self.outputs.remove(name);
+        let Some(group_id) = self.output_groups.remove(name) else {
+            return;
+        };
+        if !self.output_groups.values().any(|id| *id == group_id) {
+            self.group_queues.remove(&group_id);
+            self.group_display_start_times.remove(&group_id);
+        }
+    }
+
     pub fn love_file(&mut self, path: String, multiplier: f32) -> Result<()> {
         let path = PathBuf::from(path);
         if let Some(queue) = &mut self.shared_queue {
@@ -345,18 +357,44 @@ impl MonitorManager {
                 | crate::cache::PoolEvent::Modified(path) => {
                     self.invalidate_cache(path);
                 }
+                crate::cache::PoolEvent::Rescan(_) => {
+                    self.discovered_files_cache.clear();
+                }
             }
         }
 
+        let mut pending_rescans: std::collections::HashSet<PathBuf> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::cache::PoolEvent::Rescan(root) => Some(root.clone()),
+                _ => None,
+            })
+            .collect();
+        let events_for_queue =
+            |queue: &SmartQueue, pending: &mut std::collections::HashSet<PathBuf>| {
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        crate::cache::PoolEvent::Rescan(root) => (root == &queue.root_path
+                            && pending.remove(root))
+                        .then(|| event.clone()),
+                        _ => Some(event.clone()),
+                    })
+                    .collect()
+            };
+
         if let Some(q) = &mut self.shared_queue {
-            q.apply_pool_events(events.clone());
+            let queue_events = events_for_queue(q, &mut pending_rescans);
+            q.apply_pool_events(queue_events);
         }
         for q in self.group_queues.values_mut() {
-            q.apply_pool_events(events.clone());
+            let queue_events = events_for_queue(q, &mut pending_rescans);
+            q.apply_pool_events(queue_events);
         }
         for orch in self.outputs.values_mut() {
             if let Some(q) = &mut orch.queue {
-                q.apply_pool_events(events.clone());
+                let queue_events = events_for_queue(q, &mut pending_rescans);
+                q.apply_pool_events(queue_events);
             }
         }
     }

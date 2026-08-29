@@ -25,8 +25,18 @@ impl MainLoopContext {
     }
 
     pub fn renderer_activity_snapshot(&self) -> RendererActivitySnapshot {
+        self.renderer_activity_snapshot_for(|_| true)
+    }
+
+    pub(crate) fn renderer_activity_snapshot_for(
+        &self,
+        mut output_is_visible: impl FnMut(&str) -> bool,
+    ) -> RendererActivitySnapshot {
         let mut snapshot = RendererActivitySnapshot::default();
-        for renderer in self.renderers.values() {
+        for (name, renderer) in &self.renderers {
+            if !output_is_visible(name) {
+                continue;
+            }
             snapshot.any_active |= renderer.transition_active || renderer.needs_redraw;
             snapshot.wayland_hot |= renderer.needs_wayland_immediate_work();
             snapshot.next_wayland_retry_deadline = min_instant(
@@ -42,7 +52,7 @@ impl MainLoopContext {
             .monitor_manager
             .next_switch_deadline()
             .map(|deadline| (deadline, DeadlineReason::ContentSwitch));
-        if self.script_manager.is_loaded() {
+        if self.script_manager.has_tick() {
             let script_deadline = (
                 self.last_script_tick + Duration::from_secs(self.script_tick_interval),
                 DeadlineReason::ScriptTick,
@@ -56,6 +66,29 @@ impl MainLoopContext {
                 .and_then(|barrier| startup_barrier_next_deadline(barrier, now))
                 .map(|deadline| (deadline, DeadlineReason::StartupBarrier)),
         );
+        deadline = min_deadline_with_reason(
+            deadline,
+            Some((
+                self.last_pool_cleanup + Duration::from_secs(3),
+                DeadlineReason::PoolCleanup,
+            )),
+        );
+        deadline = min_deadline_with_reason(
+            deadline,
+            Some((
+                self.last_stats_flush + Duration::from_secs(5),
+                DeadlineReason::StatsFlush,
+            )),
+        );
+        if tracing::enabled!(tracing::Level::INFO) {
+            deadline = min_deadline_with_reason(
+                deadline,
+                Some((
+                    self.last_metrics_log + Duration::from_secs(10),
+                    DeadlineReason::Metrics,
+                )),
+            );
+        }
         deadline
     }
 
@@ -90,6 +123,11 @@ impl MainLoopContext {
         let mut image_buf = None;
         let mut player_buf = None;
         let mut player_event_buf = None;
+        let mut watcher_ready = false;
+        let watcher_notify = self
+            .dir_watcher
+            .as_ref()
+            .map(crate::cache::DirectoryWatcher::event_ready_handle);
 
         let now = Instant::now();
         if self.latest_video_frames.has_signal_pending() {
@@ -114,7 +152,7 @@ impl MainLoopContext {
         });
         let selected_deadline = next_idle_wake_deadline(
             now,
-            Some(crate::observability::trace_all::trace_idle_poll_interval()),
+            crate::observability::trace_all::trace_idle_poll_interval(),
             wake_deadline.map(|(deadline, _reason)| deadline),
         );
         let deadline_reason = selected_deadline
@@ -159,6 +197,15 @@ impl MainLoopContext {
                     player_event_buf = Some(event);
                 }
             }
+            _ = async {
+                match watcher_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                wake_reason = WakeReason::Watcher;
+                watcher_ready = true;
+            }
             result = fd.readable() => {
                 if let Ok(mut guard) = result {
                     guard.clear_ready();
@@ -174,7 +221,7 @@ impl MainLoopContext {
         let actual_sleep = wait_started.elapsed();
         if crate::observability::trace_all::trace_all_enabled() {
             tracing::trace!(
-                "[TRACE5][WAKE] reason={} deadline={} requested_ms={:.3} actual_ms={:.3} frame_signal={} fd_ready={} cmd={} image={} player={} player_event={}",
+                "[TRACE5][WAKE] reason={} deadline={} requested_ms={:.3} actual_ms={:.3} frame_signal={} fd_ready={} cmd={} image={} player={} player_event={} watcher={}",
                 wake_reason.label(),
                 deadline_reason.label(),
                 requested_sleep.as_secs_f64() * 1000.0,
@@ -184,7 +231,8 @@ impl MainLoopContext {
                 cmd_buf.is_some(),
                 image_buf.is_some(),
                 player_buf.is_some(),
-                player_event_buf.is_some()
+                player_event_buf.is_some(),
+                watcher_ready
             );
         }
         self.metrics
@@ -192,6 +240,13 @@ impl MainLoopContext {
         if selected_deadline.is_some() || wake_reason == WakeReason::Deadline {
             self.metrics.record_deadline_reason(deadline_reason);
         }
+        self.metrics.record_channel_levels(
+            self.cmd_rx.len() + usize::from(cmd_buf.is_some()),
+            self.image_rx.len() + usize::from(image_buf.is_some()),
+            self.player_rx.len() + usize::from(player_buf.is_some()),
+            self.player_event_rx.len() + usize::from(player_event_buf.is_some()),
+            self.latest_video_frames.occupancy(),
+        );
 
         IdleWaitResult {
             cmd: cmd_buf,
@@ -200,6 +255,7 @@ impl MainLoopContext {
             image: image_buf,
             player: player_buf,
             player_event: player_event_buf,
+            watcher_ready,
             wake_reason,
             requested_sleep,
             deadline_reason,

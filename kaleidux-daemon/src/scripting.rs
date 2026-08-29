@@ -8,10 +8,11 @@ pub struct ScriptManager {
     engine: Engine,
     ast: Option<AST>,
     scope: Scope<'static>,
+    has_tick: bool,
 }
 
 impl ScriptManager {
-    pub fn new(cmd_tx: mpsc::UnboundedSender<(Request, oneshot::Sender<Response>)>) -> Self {
+    pub fn new(cmd_tx: mpsc::Sender<(Request, oneshot::Sender<Response>)>) -> Self {
         let mut engine = Engine::new();
 
         engine.register_fn("print", |text: String| {
@@ -22,31 +23,35 @@ impl ScriptManager {
         engine.register_fn("next", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
             let out = if output == "*" { None } else { Some(output) };
-            let _ = tx.send((Request::Next { output: out }, resp_tx));
+            let _ = tx.try_send((Request::Next { output: out }, resp_tx));
         });
 
         let tx = cmd_tx.clone();
         engine.register_fn("pause", move || {
             let (resp_tx, _) = oneshot::channel();
-            let _ = tx.send((Request::Pause, resp_tx));
+            let _ = tx.try_send((Request::Pause, resp_tx));
         });
 
         let tx = cmd_tx.clone();
         engine.register_fn("resume", move || {
             let (resp_tx, _) = oneshot::channel();
-            let _ = tx.send((Request::Resume, resp_tx));
+            let _ = tx.try_send((Request::Resume, resp_tx));
         });
 
         Self {
             engine,
             ast: None,
             scope: Scope::new(),
+            has_tick: false,
         }
     }
 
     pub async fn load(&mut self, path: &PathBuf) -> anyhow::Result<()> {
         let content = tokio::fs::read_to_string(path).await?;
         let ast = self.engine.compile(content)?;
+        self.has_tick = ast
+            .iter_functions()
+            .any(|function| function.name == "on_tick" && function.params.is_empty());
         self.ast = Some(ast);
         info!("Rhai script loaded from {:?}", path);
 
@@ -75,7 +80,7 @@ impl ScriptManager {
         }
     }
 
-    pub fn is_loaded(&self) -> bool {
-        self.ast.is_some()
+    pub fn has_tick(&self) -> bool {
+        self.has_tick
     }
 }

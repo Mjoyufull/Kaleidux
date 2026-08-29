@@ -17,6 +17,9 @@ impl PerformanceMetrics {
     }
 
     pub fn record_renderer_cpu_time(&self, duration: Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let us = duration.as_micros() as u64;
         self.renderer_cpu_time.fetch_add(us, Ordering::Relaxed);
         self.renderer_ops.fetch_add(1, Ordering::Relaxed);
@@ -30,6 +33,9 @@ impl PerformanceMetrics {
 
     /// Record CPU time spent in video operations
     pub fn record_video_cpu_time(&self, duration: Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let us = duration.as_micros() as u64;
         self.video_cpu_time.fetch_add(us, Ordering::Relaxed);
         self.video_ops.fetch_add(1, Ordering::Relaxed);
@@ -43,6 +49,9 @@ impl PerformanceMetrics {
 
     /// Record CPU time spent in file discovery
     pub fn record_file_discovery_cpu_time(&self, duration: Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let us = duration.as_micros() as u64;
         self.file_discovery_cpu_time
             .fetch_add(us, Ordering::Relaxed);
@@ -57,6 +66,9 @@ impl PerformanceMetrics {
 
     /// Record CPU time spent in shader compilation
     pub fn record_shader_compile_cpu_time(&self, duration: Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let us = duration.as_micros() as u64;
         self.shader_compile_cpu_time
             .fetch_add(us, Ordering::Relaxed);
@@ -78,6 +90,9 @@ impl PerformanceMetrics {
         expand: Duration,
         upload: Duration,
     ) {
+        if !self.detailed_enabled() {
+            return;
+        }
         let total = permit_wait + decode + convert + resize + expand + upload;
         Self::push_sample(&self.image_total_samples, total.as_secs_f64() * 1000.0, 100);
         Self::push_sample(
@@ -114,6 +129,9 @@ impl PerformanceMetrics {
 
     #[allow(dead_code)]
     pub fn record_image_upload_cpu_time(&self, duration: Duration) {
+        if !self.detailed_enabled() {
+            return;
+        }
         Self::push_sample(
             &self.image_upload_samples,
             duration.as_secs_f64() * 1000.0,
@@ -129,6 +147,9 @@ impl PerformanceMetrics {
         convert_submit: Duration,
         total: Duration,
     ) {
+        if !self.detailed_enabled() {
+            return;
+        }
         Self::push_sample(
             &self.video_cuda_map_samples,
             map.as_secs_f64() * 1000.0,

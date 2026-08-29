@@ -26,9 +26,8 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         next_session_id,
         loop_start,
         shutdown_flag,
-        #[cfg(feature = "mpv-backend")]
+        display_power_suspended,
         mpv_native_targets,
-        #[cfg(feature = "mpv-backend")]
         mpv_composed_targets,
     } = ctx;
     match req {
@@ -77,9 +76,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                         player_tx,
                         player_event_tx,
                         shutdown_flag,
-                        #[cfg(feature = "mpv-backend")]
                         mpv_native_targets,
-                        #[cfg(feature = "mpv-backend")]
                         mpv_composed_targets,
                     },
                 );
@@ -115,9 +112,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                         player_tx,
                         player_event_tx,
                         shutdown_flag,
-                        #[cfg(feature = "mpv-backend")]
                         mpv_native_targets,
-                        #[cfg(feature = "mpv-backend")]
                         mpv_composed_targets,
                     },
                 );
@@ -171,12 +166,19 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         }
         Request::Resume => {
             info!("[CMD] Resuming all video players and wallpaper cycling");
-            for (name, player) in video_players.iter() {
-                if let Err(e) = player.resume() {
-                    error!("[CMD] Failed to resume video for {}: {}", name, e);
+            monitor_manager.set_paused(false);
+            if display_power_suspended {
+                info!("[CMD] Video resume deferred until compositor outputs are powered on");
+            } else {
+                for (name, player) in video_players.iter() {
+                    if let Err(e) = player.resume() {
+                        error!("[CMD] Failed to resume video for {}: {}", name, e);
+                    } else {
+                        // Demand-driven native playback needs one seed credit after pause.
+                        player.request_video_frame();
+                    }
                 }
             }
-            monitor_manager.set_paused(false);
             Response::Ok
         }
         Request::Stop => {
