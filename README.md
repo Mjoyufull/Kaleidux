@@ -89,18 +89,25 @@ $ paru -S kaleidux-git
   }
   ```
 
+- Reduced packages are also available as `.#wayland-only`, `.#ffmpeg`,
+  `.#mpv`, `.#appsink`, and `.#minimal-static`. On non-NixOS NVIDIA systems,
+  run the Nix package through nixGL; the wrapper intentionally does not add
+  host `/usr/lib` to `LD_LIBRARY_PATH`, because mixing the host and Nix glibc
+  makes the executable unsafe and can fail at startup.
+
 ### Option 3: Build from Source
 
 **Build Requirements:**
 
 - Rust 1.89+ **stable**
+- mpv/libmpv with development headers
 - GStreamer 1.20+ with dev plugins
 - Wayland and/or X11 development headers
 
 **Arch Linux Setup:**
 
 ```bash
-sudo pacman -S gstreamer gst-plugins-base gst-plugins-good \
+sudo pacman -S mpv gstreamer gst-plugins-base gst-plugins-good \
                gst-plugins-bad gst-libav wayland libx11 \
                vulkan-devel pkgconf cmake
 ```
@@ -111,6 +118,29 @@ sudo pacman -S gstreamer gst-plugins-base gst-plugins-good \
 git clone https://github.com/Mjoyufull/Kaleidux && cd Kaleidux
 cargo build --release
 ```
+
+The default release contains all three video backends and both display paths.
+Smaller supported builds use explicit feature bundles:
+
+```bash
+# All video backends, Wayland only
+cargo build --release -p kaleidux-daemon --no-default-features --features wayland-only
+
+# Static images on Wayland; no video backend
+cargo build --release -p kaleidux-daemon --no-default-features --features minimal-static
+
+# One video backend on Wayland
+cargo build --release -p kaleidux-daemon --no-default-features \
+  --features display-wayland,backend-ffmpeg
+```
+
+Individual backend features are `backend-appsink`, `backend-mpv`, and
+`backend-ffmpeg`; display features are `display-wayland` and `display-x11`.
+The optional `jemalloc` feature is available for allocator experiments, but
+the measured production default uses the system allocator. Nix exposes the
+same variants as `.#wayland-only`, `.#minimal-static`, `.#appsink`, `.#mpv`,
+and `.#ffmpeg`. Selecting a backend omitted at build time exits immediately
+with the Cargo feature required to enable it.
 
 ## Usage Breakdown
 
@@ -125,6 +155,8 @@ Options:
       --demo              Run in demo mode (rotating built-in shaders)
       --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
       --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
+      --video-backend <BACKEND>
+                          Force backend: auto, ffmpeg, mpv, appsink (default: auto)
   -h, --help              Show help
 ```
 
@@ -171,6 +203,7 @@ Default location: `~/.config/kaleidux/config.toml`
 monitor-behavior = "independent"
 sorting = "loveit"
 video-ratio = 50
+pause-on-fullscreen = false
 
 [any]
 transition = { type = "cube", duration = 1000 }
@@ -181,16 +214,22 @@ See [USAGE.MD](./USAGE.MD) for full configuration reference.
 Operational defaults to know:
 
 - Console logging defaults to `WARN`; use `--log 1..4` for progressively more verbose daemon diagnostics.
+- `video-fps = "unlimited"` is the production default and follows the source video's cadence; finite FPS modes are compatibility and smoke-test profiles.
+- Backend `auto` uses the measured ladder FFmpeg → mpv → appsink. The native FFmpeg path hardware-decodes with libavcodec/VA-API and uses direct or persistently bridged DRM-PRIME presentation on Wayland. MPV retains its OpenGL/Vulkan shared composition path, and appsink remains the broad GStreamer fallback.
+- `pause-on-fullscreen = false` keeps Wayland video source-driven so it advances even when the desktop is otherwise idle. Opting in makes steady video wait for compositor frame callbacks and hold the current frame while the wallpaper is occluded; it has no effect on X11.
+- The default build includes every backend; reduced packages can omit backends with the Cargo features documented under Installation. Forcing a backend disables automatic demotion and makes failures actionable.
 - Exact output-name sections override regex sections, so `[DP-1]` wins over a matching `["re:.*"]`.
 - Independent monitor mode applies a small deterministic phase offset to avoid synchronized image/video swaps across all outputs.
 - `loveit` stats are LRU-bounded; loved entries stay weighted while retained in the stats cache and can age out when the cache exceeds capacity.
+- Prepared-image disk cache defaults are 2 GiB, 4096 entries, 180 days, and a 2 GiB free-space floor. Override them with `KALEIDUX_IMAGE_CACHE_MAX_MIB`, `KALEIDUX_IMAGE_CACHE_MAX_ENTRIES`, `KALEIDUX_IMAGE_CACHE_MAX_AGE_DAYS`, and `KALEIDUX_IMAGE_CACHE_MIN_FREE_MIB`; zero disables the corresponding limit, while `KALEIDUX_IMAGE_CACHE_UNLIMITED=1` is the explicit compatibility mode. `KALEIDUX_IMAGE_CACHE_FSYNC=1` trades write latency for payload durability before atomic rename.
+- Decoded images waiting for renderer upload have both a 16-message limit and a 256 MiB weighted byte budget. `KALEIDUX_IMAGE_CHANNEL_MAX_MIB` changes the byte budget; a single image can temporarily consume the whole budget but cannot make the queue unbounded.
 
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **High CPU or blank video wallpaper**: The production path is still appsink/WGPU. On NVIDIA, use `--video-mode cuda` to force the CUDA zero-copy decode path when auto mode cannot infer it. An experimental libmpv backend can be built with `--features mpv-backend` and selected with `--video-backend mpv`; its default software target keeps final composition and transitions under WGPU but is meant for correctness testing, not CPU wins. `KLD_MPV_RENDER_API=gl-overlay` enables a separate native EGL/OpenGL overlay experiment only for diagnostics. That overlay is intentionally not the default because it bypasses WGPU wallpaper composition and shader transitions. Production mpv-level CPU requires GL/WGPU/DMA-BUF interop or a controlled FFmpeg/libav GPU-frame backend.
-- **Video looks too choppy in low-power mode**: set `video-fps = "medium"` for 24 FPS publishing, `video-fps = "high"` for 48 FPS, or `video-fps = "unlimited"` to publish every decoded frame. The live FPS-tier benchmark contract is full video on every configured output: low/12 FPS under 4% CPU, medium/24 FPS under 8%, high/48 FPS under 13%, and unlimited/source-rate under 18%, with the same p95 budget per tier. The default `video-fps = "low"` has the most CPU headroom; the Wayland path uses minimal steady-video frame-callback damage by default. Set `KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full` only when debugging compositor damage behavior.
-- **Full-rate video CPU tuning**: appsink mailbox backpressure is enabled by default so a decoded sample is not converted again while the renderer already has an unconsumed frame. Finite FPS tiers also install a drop-only `videorate` filter before appsink so excess frames are discarded before callback/conversion work; set `KLD_VIDEO_RATE_FILTER=0` only when debugging that path. Set `KLD_APPSINK_DROP_IF_MAILBOX_PENDING=0` only for visual debugging; local one-video testing showed it raised CPU substantially. Uncapped appsink backpressure uses a slower `KLD_APPSINK_PENDING_REFRESH_MS` default than capped playback, and steady Wayland callback uploads use the same CPU-shield cadence by default; override with `KLD_VIDEO_CALLBACK_UPLOAD_INTERVAL_MS=0` for old full-callback behavior while debugging. Appsink remains the only production video path; the libmpv backend is experimental and still keeps final presentation under the WGPU renderer. Video players are stopped immediately when switching to images so stale decoders do not keep publishing during image prep; set `KLD_STOP_VIDEO_ON_IMAGE_SWITCH=legacy` only when debugging old crossfade behavior.
+- **High CPU or blank video wallpaper**: leave the backend on `auto` first so Kaleidux can demote through FFmpeg, mpv, and appsink when a driver or codec path is unavailable. Force one backend only for diagnosis. `KLD_NATIVE_GL_SURFACE=1` enables the experimental native EGL subsurface path; the reliable composed path is the default because some Wayland compositors stop repainting that subsurface while the desktop is otherwise idle. `KLD_MPV_RENDER_API=gl-overlay` is likewise diagnostic because it bypasses WGPU wallpaper composition and shader transitions.
+- **Video looks too choppy in low-power mode**: the production default is `video-fps = "unlimited"`, which publishes at the video's source cadence. `low`, `medium`, and `high` remain finite-rate smoke profiles. The Wayland path follows backend frame demand rather than a fixed capture poll.
+- **Full-rate video CPU tuning**: the production path avoids a per-frame CPU readback, CPU pixel conversion, and intermediate GPU blit. Three shared slots are preallocated, their views and bind groups are reused, and steady uniform-buffer writes are suppressed. `KLD_MPV_GL_SYNC=finish` is a slow diagnostic synchronization mode; production uses external semaphores. Video players are stopped immediately when switching to images so stale decoders do not keep publishing during image preparation.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
 ## Sub-5 Benchmark Harness
@@ -201,7 +240,11 @@ Use the in-tree benchmark harness to evaluate architecture changes against the s
 bash tools/sub5/run_benchmark.sh three_video_mixed_res kaleidux-daemon-2026-04-26_13-26-27.log
 ```
 
-Artifacts are written under `unattended_runs/<date>/sub5_<scenario>/` with machine-readable JSON and a short summary. Live matrix runs build `target/release/kaleidux-daemon` first by default so CPU gates do not accidentally test a stale binary; set `KLD_LIVE_MATRIX_SKIP_BUILD=1` only when intentionally reusing an existing release build. `tools/sub5/run_live_matrix.sh fps-tiers` pins `KLD_VIDEO_BACKEND=appsink` unless `KLD_LIVE_MATRIX_VIDEO_BACKEND` is explicitly set, so an experimental mpv shell environment cannot accidentally satisfy or poison the production CPU gate.
+Artifacts are written under `unattended_runs/<date>/sub5_<scenario>/` with machine-readable JSON and a short summary. Live matrix runs build `target/release/kaleidux-daemon` first by default so CPU gates do not accidentally test a stale binary; set `KLD_LIVE_MATRIX_SKIP_BUILD=1` only when intentionally reusing an existing release build.
+
+The production CPU gate is measured with `video-fps = "unlimited"`; finite FPS
+modes are compatibility smoke profiles rather than substitutes for source-rate
+performance.
 
 ## Contributing
 
