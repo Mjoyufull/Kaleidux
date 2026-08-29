@@ -2,7 +2,6 @@ use crate::background::{self, BackgroundWorkKind};
 use crate::content::sessions::{
     PendingVideoSessions, VideoPlayerResult, pending_video_session_matches,
 };
-use crate::main_loop::PlayerEventMsg;
 use crate::metrics;
 use crate::runtime::timing::duration_ms;
 use crate::video;
@@ -19,19 +18,18 @@ pub(crate) struct VideoPlayerStartRequest {
     pub(crate) session_id: u64,
     pub(crate) volume: f64,
     pub(crate) backend_request: video::VideoBackendRequest,
+    pub(crate) decode_group_id: Option<u64>,
     pub(crate) start_position_ns: Option<u64>,
     pub(crate) max_publish_fps: Option<u32>,
     pub(crate) render_size: Option<(u32, u32)>,
-    #[cfg(feature = "mpv-backend")]
     pub(crate) mpv_native_target: Option<video::MpvNativeVideoTarget>,
-    #[cfg(feature = "mpv-backend")]
     pub(crate) mpv_composed_target: Option<video::MpvComposedVideoTarget>,
 }
 
 pub(crate) struct VideoPlayerStartContext<'a> {
     pub(crate) frame_mailbox: &'a video::LatestFrameMailbox,
-    pub(crate) player_tx: &'a tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
-    pub(crate) player_event_tx: &'a tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
+    pub(crate) player_tx: &'a crate::main_loop::PlayerReadySender,
+    pub(crate) player_event_tx: &'a crate::main_loop::PlayerEventSender,
     pub(crate) metrics: Arc<metrics::PerformanceMetrics>,
     pub(crate) pending_video_sessions: PendingVideoSessions,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
@@ -47,12 +45,11 @@ pub(crate) fn create_and_start_video_player(
         session_id,
         volume,
         backend_request,
+        decode_group_id,
         start_position_ns,
         max_publish_fps,
         render_size,
-        #[cfg(feature = "mpv-backend")]
         mpv_native_target,
-        #[cfg(feature = "mpv-backend")]
         mpv_composed_target,
     } = request;
     let VideoPlayerStartContext {
@@ -107,11 +104,10 @@ pub(crate) fn create_and_start_video_player(
                     player_event_tx_clone,
                     metrics.clone(),
                     backend_request,
+                    decode_group_id,
                     max_publish_fps,
                     render_size,
-                    #[cfg(feature = "mpv-backend")]
                     mpv_native_target,
-                    #[cfg(feature = "mpv-backend")]
                     mpv_composed_target,
                 ) {
                     Ok(mut vp) => {
@@ -200,11 +196,13 @@ pub(crate) fn create_and_start_video_player(
                         let _ = vp.stop();
                         return;
                     }
-                    if let Err(e) = player_tx_clone.send(VideoPlayerResult::Success(
-                        name_str,
-                        session_id,
-                        Box::new(vp),
-                        preroll_frame,
+                    if let Err(e) = player_tx_clone.blocking_send(VideoPlayerResult::Success(
+                        Box::new(crate::content::sessions::VideoPlayerSuccess {
+                            name: name_str,
+                            session_id,
+                            player: Box::new(vp),
+                            preroll_frame,
+                        }),
                     )) {
                         error!("[VIDEO] Failed to send video player back: {}", e);
                     }
@@ -217,8 +215,10 @@ pub(crate) fn create_and_start_video_player(
                     if result.is_err() {
                         error!("[VIDEO] {}: Video player task panicked!", name_for_panic);
                     }
-                    let _ = player_tx_panic
-                        .send(VideoPlayerResult::Failure(name_for_panic, session_id_panic));
+                    let _ = player_tx_panic.blocking_send(VideoPlayerResult::Failure(
+                        name_for_panic,
+                        session_id_panic,
+                    ));
                 }
             }
         },

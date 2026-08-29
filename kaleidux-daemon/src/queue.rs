@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Stats capacity for LRU eviction — entries beyond this are auto-evicted
-const STATS_LRU_CAP: usize = 5000;
+pub(crate) const STATS_LRU_CAP: usize = 5000;
 
 #[derive(Debug)]
 pub struct LoveitData {
@@ -48,6 +48,8 @@ pub struct SmartQueue {
     pending_stats_updates: HashMap<PathBuf, FileStats>,
     // In-memory cache of content types to avoid file I/O on every pick (P-01)
     content_type_cache: HashMap<PathBuf, ContentType>,
+    root_index: Arc<media_index::RootMediaIndex>,
+    root_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,7 @@ impl ContentType {
 }
 
 mod discovery;
+mod media_index;
 mod picking;
 mod pool_events;
 mod stats;

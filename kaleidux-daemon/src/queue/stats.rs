@@ -115,6 +115,10 @@ impl SmartQueue {
             )?;
             self.pool = pool;
             self.content_type_cache = ct_cache;
+            let snapshot = self
+                .root_index
+                .replace(&self.pool, &self.content_type_cache);
+            self.root_generation = snapshot.generation;
         }
 
         self.active_playlist = name;
@@ -127,6 +131,11 @@ impl SmartQueue {
     pub fn blacklist_file(&mut self, path: PathBuf) -> Result<()> {
         self.stats.blacklist.insert(path.clone());
         self.pool.retain(|p| p != &path);
+        self.content_type_cache.remove(&path);
+        let snapshot = self
+            .root_index
+            .replace(&self.pool, &self.content_type_cache);
+        self.root_generation = snapshot.generation;
         self.save_stats()
     }
 

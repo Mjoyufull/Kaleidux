@@ -10,19 +10,50 @@ impl SmartQueue {
         self.content_type_cache
             .get(path)
             .copied()
+            .or_else(|| self.root_index.content_type(path))
             .or_else(|| Self::get_content_type(path))
+    }
+
+    pub(super) fn sync_root_index_if_needed(&mut self) {
+        if self.active_playlist.is_some() {
+            return;
+        }
+        let snapshot = self.root_index.snapshot();
+        if snapshot.generation == self.root_generation {
+            return;
+        }
+        self.pool = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.content_type_cache = snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.content_type))
+            .collect();
+        self.root_generation = snapshot.generation;
+        self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
+        self.planned_sequential_type = None;
     }
 
     /// Apply incremental pool events from the filesystem watcher
     pub fn apply_pool_events(&mut self, events: Vec<crate::cache::PoolEvent>) {
         use crate::cache::PoolEvent;
 
+        self.sync_root_index_if_needed();
+
         let mut added = 0usize;
         let mut removed = 0usize;
+        let mut index_changed = false;
+        let mut cache_updates = Vec::new();
 
         for event in events {
             match event {
                 PoolEvent::Added(path) => {
+                    if !path.starts_with(&self.root_path) {
+                        continue;
+                    }
                     // Only add if it's a supported media file and not blacklisted
                     if self.stats.blacklist.contains(&path) {
                         continue;
@@ -32,23 +63,24 @@ impl SmartQueue {
                             self.pool.push(path.clone());
                             self.content_type_cache.insert(path.clone(), ct);
                             added += 1;
+                            index_changed = true;
 
                             // Update cache metadata
                             if let Ok(meta) = std::fs::metadata(&path) {
-                                let mtime = meta
+                                let modified = meta
                                     .modified()
                                     .ok()
                                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
+                                    .unwrap_or_default();
                                 let now_secs = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .map(|d| d.as_secs())
                                     .unwrap_or(0);
-                                let _ = self.cache.set_file_metadata(
-                                    &path,
-                                    &crate::cache::FileMetadata {
-                                        mtime,
+                                cache_updates.push((
+                                    path.clone(),
+                                    crate::cache::FileMetadata {
+                                        mtime: modified.as_secs(),
+                                        mtime_nanos: modified.subsec_nanos(),
                                         size: meta.len(),
                                         content_type: match ct {
                                             ContentType::Image => 0,
@@ -56,17 +88,21 @@ impl SmartQueue {
                                         },
                                         discovered_at: now_secs,
                                     },
-                                );
+                                ));
                             }
                         }
                     }
                 }
                 PoolEvent::Removed(path) => {
+                    if !path.starts_with(&self.root_path) {
+                        continue;
+                    }
                     let before = self.pool.len();
                     self.pool.retain(|p| p != &path);
                     if self.pool.len() < before {
                         removed += 1;
                         self.content_type_cache.remove(&path);
+                        index_changed = true;
                         // Clamp current_index if it's now out of bounds
                         if !self.pool.is_empty() {
                             self.current_index = self.current_index.min(self.pool.len() - 1);
@@ -74,25 +110,34 @@ impl SmartQueue {
                     }
                 }
                 PoolEvent::Modified(path) => {
+                    if !path.starts_with(&self.root_path) {
+                        continue;
+                    }
                     // File content may have changed — re-check if it's still valid media
                     if let Some(ct) = Self::get_content_type(&path) {
-                        self.content_type_cache.insert(path.clone(), ct);
+                        if !self.pool.contains(&path) && !self.stats.blacklist.contains(&path) {
+                            self.pool.push(path.clone());
+                            added += 1;
+                            index_changed = true;
+                        }
+                        index_changed |=
+                            self.content_type_cache.insert(path.clone(), ct) != Some(ct);
                         // Still valid, cache metadata was already invalidated by the watcher
                         if let Ok(meta) = std::fs::metadata(&path) {
-                            let mtime = meta
+                            let modified = meta
                                 .modified()
                                 .ok()
                                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
+                                .unwrap_or_default();
                             let now_secs = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            let _ = self.cache.set_file_metadata(
-                                &path,
-                                &crate::cache::FileMetadata {
-                                    mtime,
+                            cache_updates.push((
+                                path.clone(),
+                                crate::cache::FileMetadata {
+                                    mtime: modified.as_secs(),
+                                    mtime_nanos: modified.subsec_nanos(),
                                     size: meta.len(),
                                     content_type: match ct {
                                         ContentType::Image => 0,
@@ -100,20 +145,57 @@ impl SmartQueue {
                                     },
                                     discovered_at: now_secs,
                                 },
-                            );
+                            ));
                         }
                     } else {
                         // No longer valid media, remove from pool
+                        let before = self.pool.len();
                         self.pool.retain(|p| p != &path);
                         self.content_type_cache.remove(&path);
-                        removed += 1;
+                        if self.pool.len() < before {
+                            removed += 1;
+                            index_changed = true;
+                        }
 
                         // Clamp index to avoid panics if we removed the last item
                         self.current_index =
                             self.current_index.min(self.pool.len().saturating_sub(1));
                     }
                 }
+                PoolEvent::Rescan(root) => {
+                    if root != self.root_path {
+                        continue;
+                    }
+                    match Self::discover_content(
+                        &self.root_path,
+                        &self.stats.blacklist,
+                        self.cache.clone(),
+                        None,
+                    ) {
+                        Ok((pool, content_types)) => {
+                            self.pool = pool;
+                            self.content_type_cache = content_types;
+                            let snapshot = self
+                                .root_index
+                                .replace(&self.pool, &self.content_type_cache);
+                            self.root_generation = snapshot.generation;
+                            self.current_index =
+                                self.current_index.min(self.pool.len().saturating_sub(1));
+                            self.planned_sequential_type = None;
+                            let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
+                        }
+                        Err(error) => tracing::warn!(
+                            "[QUEUE] Failed full rescan for {} after watcher overflow: {}",
+                            self.root_path.display(),
+                            error
+                        ),
+                    }
+                }
             }
+        }
+
+        if let Err(error) = self.cache.batch_set_file_metadata(&cache_updates) {
+            tracing::warn!("[QUEUE] Failed to batch-update watcher metadata: {error}");
         }
 
         if added > 0 || removed > 0 {
@@ -128,6 +210,12 @@ impl SmartQueue {
                 removed,
                 self.pool.len()
             );
+        }
+        if index_changed {
+            let snapshot = self
+                .root_index
+                .replace(&self.pool, &self.content_type_cache);
+            self.root_generation = snapshot.generation;
         }
     }
 }

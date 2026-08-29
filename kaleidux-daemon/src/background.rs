@@ -19,6 +19,9 @@ pub enum BackgroundWorkKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackgroundWorkSnapshot {
     pub total_in_flight: u64,
+    pub high_water: u64,
+    pub rejected: u64,
+    pub limit: u64,
     pub video_prepare: u64,
     pub player_stop: u64,
     pub image_decode: u64,
@@ -31,8 +34,11 @@ pub struct BackgroundWorkSnapshot {
 impl BackgroundWorkSnapshot {
     pub fn format_compact(self) -> String {
         format!(
-            "total={} video_prepare={} player_stop={} image_decode={} image_prefetch={} queue_discovery={} renderer_init={} cuda_warmup={}",
+            "total={}/{} high_water={} rejected={} video_prepare={} player_stop={} image_decode={} image_prefetch={} queue_discovery={} renderer_init={} cuda_warmup={}",
             self.total_in_flight,
+            self.limit,
+            self.high_water,
+            self.rejected,
             self.video_prepare,
             self.player_stop,
             self.image_decode,
@@ -47,6 +53,8 @@ impl BackgroundWorkSnapshot {
 #[derive(Default)]
 struct BackgroundWorkCounters {
     total_in_flight: AtomicU64,
+    high_water: AtomicU64,
+    rejected: AtomicU64,
     video_prepare: AtomicU64,
     player_stop: AtomicU64,
     image_decode: AtomicU64,
@@ -69,9 +77,12 @@ impl BackgroundWorkCounters {
         }
     }
 
-    fn snapshot(&self) -> BackgroundWorkSnapshot {
+    fn snapshot(&self, limit: u64) -> BackgroundWorkSnapshot {
         BackgroundWorkSnapshot {
             total_in_flight: self.total_in_flight.load(Ordering::Relaxed),
+            high_water: self.high_water.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            limit,
             video_prepare: self.video_prepare.load(Ordering::Relaxed),
             player_stop: self.player_stop.load(Ordering::Relaxed),
             image_decode: self.image_decode.load(Ordering::Relaxed),
@@ -85,6 +96,7 @@ impl BackgroundWorkCounters {
 
 struct BackgroundWorkInner {
     accepting_new: AtomicBool,
+    limit: u64,
     counters: BackgroundWorkCounters,
     notify: Notify,
 }
@@ -96,9 +108,17 @@ pub struct BackgroundWorkRegistry {
 
 impl BackgroundWorkRegistry {
     pub fn new() -> Self {
+        let available = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2);
+        Self::with_limit((available.saturating_mul(2)).clamp(4, 16) as u64)
+    }
+
+    fn with_limit(limit: u64) -> Self {
         Self {
             inner: Arc::new(BackgroundWorkInner {
                 accepting_new: AtomicBool::new(true),
+                limit: limit.max(1),
                 counters: BackgroundWorkCounters::default(),
                 notify: Notify::new(),
             }),
@@ -115,18 +135,44 @@ impl BackgroundWorkRegistry {
     }
 
     pub fn snapshot(&self) -> BackgroundWorkSnapshot {
-        self.inner.counters.snapshot()
+        self.inner.counters.snapshot(self.inner.limit)
     }
 
     fn try_begin(&self, kind: BackgroundWorkKind) -> Option<BackgroundWorkGuard> {
+        self.try_begin_inner(kind, true)
+    }
+
+    fn try_begin_inner(
+        &self,
+        kind: BackgroundWorkKind,
+        record_rejection: bool,
+    ) -> Option<BackgroundWorkGuard> {
         if !self.is_accepting_new() {
             return None;
         }
 
+        let mut current = self.inner.counters.total_in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= self.inner.limit {
+                if record_rejection {
+                    self.inner.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                }
+                return None;
+            }
+            match self.inner.counters.total_in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.inner
             .counters
-            .total_in_flight
-            .fetch_add(1, Ordering::SeqCst);
+            .high_water
+            .fetch_max(current + 1, Ordering::Relaxed);
         self.inner
             .counters
             .counter(kind)
@@ -140,6 +186,21 @@ impl BackgroundWorkRegistry {
         } else {
             self.finish(kind);
             None
+        }
+    }
+
+    async fn begin_wait(&self, kind: BackgroundWorkKind) -> Option<BackgroundWorkGuard> {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(guard) = self.try_begin_inner(kind, false) {
+                return Some(guard);
+            }
+            if !self.is_accepting_new() {
+                return None;
+            }
+            notified.await;
         }
     }
 
@@ -227,6 +288,24 @@ where
     }))
 }
 
+/// Wait for bounded blocking capacity instead of dropping required work.
+/// Speculative work should continue to use `spawn_blocking_tracked`.
+pub async fn spawn_blocking_tracked_wait<T, F>(
+    kind: BackgroundWorkKind,
+    work: F,
+) -> Option<JoinHandle<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let registry = global_registry();
+    let guard = registry.begin_wait(kind).await?;
+    Some(tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        work()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +328,28 @@ mod tests {
         assert_eq!(registry.snapshot().total_in_flight, 0);
     }
 
+    #[tokio::test]
+    async fn required_work_waits_for_capacity() {
+        let registry = BackgroundWorkRegistry::with_limit(1);
+        let first = registry
+            .try_begin(BackgroundWorkKind::ImageDecode)
+            .expect("first slot");
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .begin_wait(BackgroundWorkKind::VideoPrepare)
+                .await
+                .expect("registry remains open")
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        let second = waiter.await.expect("waiter task");
+        assert_eq!(registry.snapshot().total_in_flight, 1);
+        drop(second);
+        assert_eq!(registry.snapshot().total_in_flight, 0);
+    }
+
     #[test]
     fn closing_registry_rejects_new_work() {
         let registry = BackgroundWorkRegistry::new();
@@ -258,5 +359,27 @@ mod tests {
                 .try_begin(BackgroundWorkKind::VideoPrepare)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn registry_enforces_in_flight_limit_and_tracks_high_water() {
+        let registry = BackgroundWorkRegistry::with_limit(2);
+        let first = registry
+            .try_begin(BackgroundWorkKind::ImageDecode)
+            .expect("first slot");
+        let second = registry
+            .try_begin(BackgroundWorkKind::QueueDiscovery)
+            .expect("second slot");
+        assert!(
+            registry
+                .try_begin(BackgroundWorkKind::VideoPrepare)
+                .is_none()
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.total_in_flight, 2);
+        assert_eq!(snapshot.high_water, 2);
+        assert_eq!(snapshot.rejected, 1);
+        drop((first, second));
+        assert_eq!(registry.snapshot().total_in_flight, 0);
     }
 }

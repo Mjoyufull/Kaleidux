@@ -31,6 +31,10 @@ pub(crate) fn image_prefetch_generation_matches(name: &str, generation: u64) -> 
         == generation
 }
 
+pub(crate) fn remove_image_prefetch_generation(name: &str) {
+    IMAGE_PREFETCH_GENERATIONS.lock().remove(name);
+}
+
 pub(crate) fn schedule_image_prefetch_plan(
     trigger_output: &str,
     generation: u64,
@@ -87,4 +91,18 @@ pub(crate) fn schedule_image_prefetch_plan(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_teardown_removes_prefetch_generation() {
+        let output = "KLD-PREFETCH-TEARDOWN-TEST";
+        let generation = begin_image_prefetch_generation(output);
+        assert!(image_prefetch_generation_matches(output, generation));
+        remove_image_prefetch_generation(output);
+        assert!(!image_prefetch_generation_matches(output, generation));
+    }
 }

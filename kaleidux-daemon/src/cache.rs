@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -13,7 +14,7 @@ const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("histor
 const POOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_cache");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
-const CACHE_VERSION: u64 = 4;
+const CACHE_VERSION: u64 = 5;
 
 fn path_from_redb_key(key: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
@@ -36,11 +37,14 @@ pub enum PoolEvent {
     Removed(PathBuf),
     /// A file was modified in a watched directory
     Modified(PathBuf),
+    /// The bounded watcher queue overflowed; rebuild this root from disk.
+    Rescan(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
-    pub mtime: u64, // Unix timestamp
+    pub mtime: u64, // Whole Unix timestamp seconds
+    pub mtime_nanos: u32,
     pub size: u64,
     pub content_type: u8,   // 0 = Image, 1 = Video
     pub discovered_at: u64, // Unix timestamp
@@ -157,6 +161,32 @@ impl FileCache {
         }
     }
 
+    /// Read all requested metadata rows under one redb snapshot transaction.
+    /// Missing paths are omitted from the returned map.
+    pub fn batch_get_file_metadata(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, FileMetadata>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FILE_CACHE_TABLE)?;
+        let mut metadata = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            if let Some(data) = table.get(path_bytes)? {
+                match postcard::from_bytes(data.value()) {
+                    Ok(value) => {
+                        metadata.insert(path.clone(), value);
+                    }
+                    Err(error) => tracing::warn!(
+                        "[CACHE] Ignoring corrupt metadata row for {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        Ok(metadata)
+    }
+
     pub fn set_file_metadata(&self, path: &Path, metadata: &FileMetadata) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -240,10 +270,12 @@ impl FileCache {
     #[allow(dead_code)]
     pub fn is_file_valid(&self, path: &Path) -> Result<bool> {
         let metadata = std::fs::metadata(path)?;
-        let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+        let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
 
         if let Some(cached) = self.get_file_metadata(path)? {
-            Ok(cached.mtime == mtime)
+            Ok(cached.mtime == modified.as_secs()
+                && cached.mtime_nanos == modified.subsec_nanos()
+                && cached.size == metadata.len())
         } else {
             Ok(false)
         }
@@ -266,15 +298,7 @@ impl FileCache {
 
     #[allow(dead_code)]
     pub fn set_file_stats(&self, path: &Path, stats: &crate::queue::FileStats) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
-            let path_bytes = path.as_os_str().as_encoded_bytes();
-            let data = postcard::to_allocvec(stats)?;
-            table.insert(path_bytes, data.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.batch_set_file_stats(&[(path.to_path_buf(), stats.clone())])
     }
 
     pub fn batch_set_file_stats(
@@ -291,12 +315,39 @@ impl FileCache {
             }
         }
         write_txn.commit()?;
+        self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
+        Ok(())
+    }
+
+    fn prune_file_stats(&self, limit: usize) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+            let len = usize::try_from(table.len()?).unwrap_or(usize::MAX);
+            if len > limit {
+                let mut rows = Vec::with_capacity(len);
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let last_seen = postcard::from_bytes::<crate::queue::FileStats>(value.value())
+                        .ok()
+                        .and_then(|stats| stats.last_seen)
+                        .map_or(i64::MIN, |timestamp| timestamp.timestamp_millis());
+                    rows.push((last_seen, key.value().to_vec()));
+                }
+                rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (_, key) in rows.into_iter().take(len.saturating_sub(limit)) {
+                    table.remove(key.as_slice())?;
+                }
+            }
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     pub fn get_all_file_stats(
         &self,
     ) -> Result<std::collections::HashMap<PathBuf, crate::queue::FileStats>> {
+        self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
         let mut stats = std::collections::HashMap::new();
@@ -458,8 +509,23 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
-            let path_bytes = path.as_os_str().as_encoded_bytes();
-            table.remove(path_bytes)?;
+            table.remove(path.as_os_str().as_encoded_bytes())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_invalidate_files(&self, paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
+            for path in paths {
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                table.remove(path_bytes)?;
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -469,3 +535,56 @@ impl FileCache {
 /// Directory watcher for cache invalidation
 mod watcher;
 pub use watcher::DirectoryWatcher;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_cache(label: &str) -> FileCache {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-redb-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        FileCache::new_test(&dir.join("cache.redb")).expect("test cache")
+    }
+
+    #[test]
+    fn persisted_file_stats_prune_oldest_rows() {
+        let cache = test_cache("stats-bound");
+        for second in 1..=3 {
+            cache
+                .set_file_stats(
+                    Path::new(&format!("/media/{second}")),
+                    &crate::queue::FileStats {
+                        count: second,
+                        last_seen: Utc.timestamp_opt(second.into(), 0).single(),
+                        love_multiplier: 1.0,
+                    },
+                )
+                .expect("insert stats");
+        }
+        cache.prune_file_stats(2).expect("prune stats");
+        assert!(
+            cache
+                .get_file_stats(Path::new("/media/1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_file_stats(Path::new("/media/2"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_file_stats(Path::new("/media/3"))
+                .unwrap()
+                .is_some()
+        );
+    }
+}

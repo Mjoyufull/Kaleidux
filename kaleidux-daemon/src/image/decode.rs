@@ -204,51 +204,97 @@ pub(crate) fn prepare_source_image_for_output(
     target_width: u32,
     target_height: u32,
 ) -> anyhow::Result<DecodedImagePayload> {
-    let (data, width, height, resize_duration, expand_duration, resize_filter) =
-        match &source.pixels {
-            DecodedSourcePixels::Rgb(pixels) => crate::image::prepare::prepare_rgb_image(
-                pixels,
+    let (data, width, height, resize_duration, expand_duration, resize_filter): (
+        std::sync::Arc<[u8]>,
+        u32,
+        u32,
+        Duration,
+        Duration,
+        Option<String>,
+    ) = match &source.pixels {
+        DecodedSourcePixels::Rgb(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_rgb_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+        DecodedSourcePixels::Rgba(pixels) => {
+            if crate::image::prepare::compute_upload_downscale_dimensions(
                 source.width,
                 source.height,
                 target_width,
                 target_height,
-            )?,
-            DecodedSourcePixels::Rgba(pixels) => {
-                let (prepared, width, height, resize_duration, resize_filter) =
-                    crate::image::prepare::prepare_rgba_image(
-                        pixels,
-                        source.width,
-                        source.height,
-                        target_width,
-                        target_height,
-                    )?;
-                (
-                    prepared,
-                    width,
-                    height,
-                    resize_duration,
-                    Duration::ZERO,
-                    resize_filter,
-                )
+            )
+            .is_none()
+            {
+                // The decoded source is already upload-ready RGBA. Keep the
+                // same allocation through prepared-cache publication and
+                // the image channel instead of cloning every pixel.
+                return Ok(DecodedImagePayload {
+                    data: pixels.clone(),
+                    width: source.width,
+                    height: source.height,
+                    profile: ImageLoadProfile {
+                        format: source.format.clone(),
+                        source_width: source.width,
+                        source_height: source.height,
+                        permit_wait: Duration::ZERO,
+                        decode: source.decode,
+                        convert: source.convert,
+                        resize: Duration::ZERO,
+                        expand: Duration::ZERO,
+                        resize_filter: None,
+                    },
+                });
             }
-            DecodedSourcePixels::Luma(pixels) => crate::image::prepare::prepare_luma_image(
-                pixels,
-                source.width,
-                source.height,
-                target_width,
-                target_height,
-            )?,
-            DecodedSourcePixels::LumaA(pixels) => crate::image::prepare::prepare_lumaa_image(
-                pixels,
-                source.width,
-                source.height,
-                target_width,
-                target_height,
-            )?,
-        };
+            let (prepared, width, height, resize_duration, resize_filter) =
+                crate::image::prepare::prepare_rgba_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (
+                prepared.into(),
+                width,
+                height,
+                resize_duration,
+                Duration::ZERO,
+                resize_filter,
+            )
+        }
+        DecodedSourcePixels::Luma(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_luma_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+        DecodedSourcePixels::LumaA(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_lumaa_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+    };
 
     Ok(DecodedImagePayload {
-        data: data.into(),
+        data,
         width,
         height,
         profile: ImageLoadProfile {
@@ -263,6 +309,29 @@ pub(crate) fn prepare_source_image_for_output(
             resize_filter,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_rgba_prepare_reuses_source_allocation() {
+        let pixels: std::sync::Arc<[u8]> = vec![1_u8; 4 * 4 * 4].into();
+        let source = DecodedSourceImage {
+            pixels: DecodedSourcePixels::Rgba(pixels.clone()),
+            width: 4,
+            height: 4,
+            format: "test-rgba".to_string(),
+            decode: Duration::ZERO,
+            convert: Duration::ZERO,
+        };
+
+        let prepared = prepare_source_image_for_output(&source, 8, 8)
+            .expect("unchanged RGBA preparation should succeed");
+
+        assert!(std::sync::Arc::ptr_eq(&pixels, &prepared.data));
+    }
 }
 
 pub(crate) fn prepare_image_for_output_uncached(

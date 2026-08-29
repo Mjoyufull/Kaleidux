@@ -4,14 +4,18 @@ use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+static EMPTY_EXCLUSIONS: LazyLock<HashSet<PathBuf>> = LazyLock::new(HashSet::new);
 
 impl SmartQueue {
     #[inline]
     pub fn pick_next(&mut self) -> Option<PathBuf> {
-        self.pick_next_excluding(&HashSet::new())
+        self.pick_next_excluding(&EMPTY_EXCLUSIONS)
     }
 
     pub fn pick_next_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
+        self.sync_root_index_if_needed();
         if self.pool.is_empty() {
             return None;
         }
@@ -117,6 +121,7 @@ impl SmartQueue {
 
     #[inline]
     pub fn pick_prev(&mut self) -> Option<PathBuf> {
+        self.sync_root_index_if_needed();
         if self.pool.is_empty() {
             return None;
         }
@@ -160,35 +165,9 @@ impl SmartQueue {
 
     fn pick_random_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
-        let is_video_cycle = self.choose_cycle_content_type(&mut rng) == ContentType::Video;
-
-        let sub_pool: Vec<&PathBuf> = self
-            .pool
-            .iter()
-            .filter(|p| {
-                if excluded.contains(p.as_path()) {
-                    return false;
-                }
-                let is_video = matches!(self.cached_content_type(p), Some(ContentType::Video));
-                is_video == is_video_cycle
-            })
-            .collect();
-
-        let active_pool = if sub_pool.is_empty() {
-            self.pool
-                .iter()
-                .filter(|p| !excluded.contains(p.as_path()))
-                .collect::<Vec<_>>()
-        } else {
-            sub_pool
-        };
-
-        if active_pool.is_empty() {
-            return None;
-        }
-
-        let idx = rng.gen_range(0..active_pool.len());
-        Some(active_pool[idx].clone())
+        let requested_type = self.choose_cycle_content_type(&mut rng);
+        self.reservoir_random_path(excluded, Some(requested_type), &mut rng)
+            .or_else(|| self.reservoir_random_path(excluded, None, &mut rng))
     }
 
     fn pick_sequential_excluding(
@@ -221,56 +200,56 @@ impl SmartQueue {
 
     fn pick_loveit_excluding(&mut self, excluded: &HashSet<PathBuf>) -> Option<PathBuf> {
         let mut rng = rand::thread_rng();
-
-        // 1. Filter by video_ratio probability
-        let is_video_cycle = self.choose_cycle_content_type(&mut rng) == ContentType::Video;
-
-        let sub_pool: Vec<&PathBuf> = self
-            .pool
-            .iter()
-            .filter(|p| {
-                if excluded.contains(p.as_path()) {
-                    return false;
-                }
-                let content_type = self.cached_content_type(p);
-                let is_video = matches!(content_type, Some(ContentType::Video));
-                is_video == is_video_cycle
-            })
-            .collect();
-
-        // Fallback if sub_pool is empty
-        let active_pool = if sub_pool.is_empty() {
-            self.pool
-                .iter()
-                .filter(|p| !excluded.contains(p.as_path()))
-                .collect::<Vec<_>>()
-        } else {
-            sub_pool
-        };
-
-        if active_pool.is_empty() {
-            return None;
-        }
-
-        // 2. Weighted Random Selection (Loveit + Recency)
-        let mut weights = Vec::new();
         let now = Utc::now();
+        let requested_type = self.choose_cycle_content_type(&mut rng);
+        self.reservoir_weighted_path(excluded, Some(requested_type), now, &mut rng)
+            .or_else(|| self.reservoir_weighted_path(excluded, None, now, &mut rng))
+    }
 
-        for path in &active_pool {
-            weights.push(self.loveit_weight_for_path(path, now));
-        }
-
-        let total_weight: f32 = weights.iter().sum();
-        let mut choice = rng.gen_range(0.0..total_weight);
-
-        for (i, weight) in weights.iter().enumerate() {
-            choice -= weight;
-            if choice <= 0.0 {
-                return Some(active_pool[i].clone());
+    fn reservoir_random_path<R: Rng + ?Sized>(
+        &self,
+        excluded: &HashSet<PathBuf>,
+        requested_type: Option<ContentType>,
+        rng: &mut R,
+    ) -> Option<PathBuf> {
+        let mut selected = None;
+        let mut eligible = 0_u64;
+        for path in &self.pool {
+            if excluded.contains(path.as_path())
+                || requested_type.is_some_and(|kind| self.cached_content_type(path) != Some(kind))
+            {
+                continue;
+            }
+            eligible += 1;
+            if rng.gen_range(0..eligible) == 0 {
+                selected = Some(path.clone());
             }
         }
+        selected
+    }
 
-        Some(active_pool[0].clone())
+    fn reservoir_weighted_path<R: Rng + ?Sized>(
+        &self,
+        excluded: &HashSet<PathBuf>,
+        requested_type: Option<ContentType>,
+        now: DateTime<Utc>,
+        rng: &mut R,
+    ) -> Option<PathBuf> {
+        let mut selected = None;
+        let mut total_weight = 0.0_f64;
+        for path in &self.pool {
+            if excluded.contains(path.as_path())
+                || requested_type.is_some_and(|kind| self.cached_content_type(path) != Some(kind))
+            {
+                continue;
+            }
+            let weight = f64::from(self.loveit_weight_for_path(path, now)).max(f64::EPSILON);
+            total_weight += weight;
+            if rng.gen_range(0.0..total_weight) < weight {
+                selected = Some(path.clone());
+            }
+        }
+        selected
     }
 
     fn loveit_weight_for_path(&self, path: &PathBuf, now: DateTime<Utc>) -> f32 {
@@ -294,21 +273,22 @@ impl SmartQueue {
 
     fn peek_loveit_images(&self, limit: usize) -> Vec<PathBuf> {
         let now = Utc::now();
-        let mut weighted_images: Vec<(PathBuf, f32)> = self
-            .pool
-            .iter()
-            .filter(|path| matches!(self.cached_content_type(path), Some(ContentType::Image)))
-            .map(|path| (path.clone(), self.loveit_weight_for_path(path, now)))
-            .collect();
-
-        weighted_images.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-                .then(Ordering::Equal)
-        });
-        weighted_images.truncate(limit);
+        let mut weighted_images: Vec<(PathBuf, f32)> = Vec::with_capacity(limit);
+        for path in &self.pool {
+            if self.cached_content_type(path) != Some(ContentType::Image) {
+                continue;
+            }
+            let candidate = (path.clone(), self.loveit_weight_for_path(path, now));
+            let position = weighted_images
+                .binary_search_by(|existing| compare_weighted_paths(existing, &candidate))
+                .unwrap_or_else(|position| position);
+            if position < limit {
+                weighted_images.insert(position, candidate);
+                if weighted_images.len() > limit {
+                    weighted_images.pop();
+                }
+            }
+        }
         weighted_images
             .into_iter()
             .map(|(path, _weight)| path)
@@ -375,7 +355,7 @@ impl SmartQueue {
     }
 
     fn pick_sequential_raw(&mut self, descending: bool) -> Option<PathBuf> {
-        self.pick_sequential_raw_excluding(descending, &HashSet::new())
+        self.pick_sequential_raw_excluding(descending, &EMPTY_EXCLUSIONS)
     }
 
     fn advance_index(&self, idx: usize, descending: bool) -> usize {
@@ -429,7 +409,14 @@ impl SmartQueue {
             start_idx,
             descending,
             requested_type,
-            &HashSet::new(),
+            &EMPTY_EXCLUSIONS,
         )
     }
+}
+
+fn compare_weighted_paths(left: &(PathBuf, f32), right: &(PathBuf, f32)) -> Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
 }

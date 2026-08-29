@@ -2,14 +2,18 @@ use super::{FileCache, PoolEvent};
 use anyhow::Result;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 pub struct DirectoryWatcher {
     watcher: RecommendedWatcher,
     event_rx: mpsc::Receiver<notify::Result<Event>>,
+    event_ready: Arc<Notify>,
+    overflowed: Arc<AtomicBool>,
     cache: Arc<FileCache>,
     watched_dirs: Vec<PathBuf>,
     known_files: HashSet<PathBuf>,
@@ -18,14 +22,28 @@ pub struct DirectoryWatcher {
 impl DirectoryWatcher {
     pub fn new(cache: Arc<FileCache>) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
+        let event_ready = Arc::new(Notify::new());
+        let callback_ready = event_ready.clone();
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let callback_overflowed = overflowed.clone();
 
-        let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            let _ = event_tx.blocking_send(res);
-        })?;
+        let watcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| {
+                match event_tx.try_send(res) {
+                    Ok(()) => callback_ready.notify_one(),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        callback_overflowed.store(true, Ordering::Release);
+                        callback_ready.notify_one();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            })?;
 
         Ok(Self {
             watcher,
             event_rx,
+            event_ready,
+            overflowed,
             cache,
             watched_dirs: Vec::new(),
             known_files: HashSet::new(),
@@ -57,26 +75,12 @@ impl DirectoryWatcher {
     fn emit_modified_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
         if path.is_file() {
             self.known_files.insert(path.clone());
-            if let Err(e) = self.cache.invalidate_file(&path) {
-                tracing::warn!(
-                    "[CACHE] Failed to invalidate cache for {}: {}",
-                    path.display(),
-                    e
-                );
-            }
             pool_events.push(PoolEvent::Modified(path));
         }
     }
 
     fn emit_removed_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
         if self.known_files.remove(&path) || self.is_known_file(&path) {
-            if let Err(e) = self.cache.invalidate_file(&path) {
-                tracing::debug!(
-                    "[CACHE] Invalidation for removed path {}: {}",
-                    path.display(),
-                    e
-                );
-            }
             pool_events.push(PoolEvent::Removed(path));
         }
     }
@@ -139,7 +143,23 @@ impl DirectoryWatcher {
     }
 
     /// Process file system events, invalidate cache entries, and return pool-affecting events
-    pub async fn process_events(&mut self) -> Vec<PoolEvent> {
+    pub fn event_ready_handle(&self) -> Arc<Notify> {
+        self.event_ready.clone()
+    }
+
+    pub fn process_events(&mut self) -> Vec<PoolEvent> {
+        if self.overflowed.swap(false, Ordering::AcqRel) {
+            while self.event_rx.try_recv().is_ok() {}
+            tracing::warn!(
+                "[CACHE] Watcher event queue overflowed; scheduling full watched-root rescan"
+            );
+            return self
+                .watched_dirs
+                .iter()
+                .cloned()
+                .map(PoolEvent::Rescan)
+                .collect();
+        }
         let mut pool_events = Vec::new();
 
         loop {
@@ -154,8 +174,48 @@ impl DirectoryWatcher {
             }
         }
 
+        self.finalize_pool_events(pool_events)
+    }
+
+    fn finalize_pool_events(&self, pool_events: Vec<PoolEvent>) -> Vec<PoolEvent> {
+        let pool_events = coalesce_events(pool_events);
+        let invalidated: Vec<PathBuf> = pool_events
+            .iter()
+            .filter_map(|event| match event {
+                PoolEvent::Modified(path) | PoolEvent::Removed(path) => Some(path.clone()),
+                PoolEvent::Added(_) | PoolEvent::Rescan(_) => None,
+            })
+            .collect();
+        if let Err(error) = self.cache.batch_invalidate_files(&invalidated) {
+            tracing::warn!("[CACHE] Failed to batch-invalidate watcher events: {error}");
+        }
         pool_events
     }
+}
+
+fn coalesce_events(events: Vec<PoolEvent>) -> Vec<PoolEvent> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    let mut positions = HashMap::<PathBuf, usize>::with_capacity(events.len());
+    for event in events {
+        let path = match &event {
+            PoolEvent::Added(path)
+            | PoolEvent::Removed(path)
+            | PoolEvent::Modified(path)
+            | PoolEvent::Rescan(path) => path.clone(),
+        };
+        if let Some(position) = positions.get(&path).copied() {
+            let replacement = match (&coalesced[position], event) {
+                (PoolEvent::Added(_), PoolEvent::Modified(path)) => PoolEvent::Added(path),
+                (PoolEvent::Removed(_), PoolEvent::Added(path)) => PoolEvent::Modified(path),
+                (_, latest) => latest,
+            };
+            coalesced[position] = replacement;
+        } else {
+            positions.insert(path, coalesced.len());
+            coalesced.push(event);
+        }
+    }
+    coalesced
 }
 
 #[cfg(test)]
@@ -172,6 +232,7 @@ mod tests {
     fn sample_metadata() -> FileMetadata {
         FileMetadata {
             mtime: 1,
+            mtime_nanos: 0,
             size: 2,
             content_type: 0,
             discovered_at: 3,
@@ -209,6 +270,7 @@ mod tests {
             Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path.clone()),
             &mut pool_events,
         );
+        let pool_events = watcher.finalize_pool_events(pool_events);
 
         assert_eq!(pool_events, vec![PoolEvent::Removed(path.clone())]);
         assert!(
@@ -242,6 +304,7 @@ mod tests {
                 .add_path(new_path.clone()),
             &mut pool_events,
         );
+        let pool_events = watcher.finalize_pool_events(pool_events);
 
         assert_eq!(
             pool_events,
@@ -291,5 +354,28 @@ mod tests {
             pool_events,
             vec![PoolEvent::Modified(path.clone()), PoolEvent::Removed(path)]
         );
+    }
+
+    #[test]
+    fn watcher_overflow_requests_full_root_rescan() {
+        let temp = unique_test_dir("overflow");
+        let cache = Arc::new(
+            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
+        );
+        let mut watcher = DirectoryWatcher::new(cache).expect("directory watcher");
+        watcher.watched_dirs.push(temp.clone());
+        watcher.overflowed.store(true, Ordering::Release);
+
+        assert_eq!(watcher.process_events(), vec![PoolEvent::Rescan(temp)]);
+    }
+
+    #[test]
+    fn watcher_storm_coalesces_repeated_path_events() {
+        let path = PathBuf::from("/tmp/kaleidux-watch-storm.png");
+        let mut events = Vec::with_capacity(10_000);
+        events.push(PoolEvent::Added(path.clone()));
+        events.extend((1..10_000).map(|_| PoolEvent::Modified(path.clone())));
+
+        assert_eq!(coalesce_events(events), vec![PoolEvent::Added(path)]);
     }
 }

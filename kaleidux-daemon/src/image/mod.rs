@@ -1,3 +1,4 @@
+pub(crate) mod channel_budget;
 pub(crate) mod decode;
 pub(crate) mod descriptor;
 pub(crate) mod persistent_cache;
