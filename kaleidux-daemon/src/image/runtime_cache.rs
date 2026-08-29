@@ -130,6 +130,10 @@ pub(crate) fn try_load_prepared_image_cache_by_key(
     image_pipeline::persistent_cache::load_by_key(key)
 }
 
+pub(crate) fn probe_prepared_image_cache_by_key(key: &PreparedImageKey) -> bool {
+    image_pipeline::persistent_cache::probe_by_key(key)
+}
+
 #[cfg(test)]
 pub(crate) fn try_load_prepared_image_cache(
     path: &Path,
@@ -213,7 +217,7 @@ pub(crate) fn prepared_image_available_for_output(
             prepared_height,
         )
         .is_some()
-        || try_load_prepared_image_cache_by_key(&key).is_some()
+        || probe_prepared_image_cache_by_key(&key)
 }
 
 pub(crate) fn store_prepared_image_memory(key: PreparedImageKey, payload: &DecodedImagePayload) {
@@ -335,7 +339,7 @@ pub(crate) fn prepare_image_for_output_uncached(
 }
 
 pub(crate) use super::runtime_prefetch::{
-    begin_image_prefetch_generation, schedule_image_prefetch_plan,
+    begin_image_prefetch_generation, remove_image_prefetch_generation, schedule_image_prefetch_plan,
 };
 pub(crate) use super::runtime_request::request_prepared_image_payload;
 pub(crate) use super::runtime_switch::ordered_pending_content_switches;

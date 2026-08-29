@@ -5,10 +5,20 @@ use anyhow::Result;
 use jwalk::WalkDir;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 impl SmartQueue {
+    fn root_index_fields(
+        path: &Path,
+        pool: &[PathBuf],
+        content_types: &HashMap<PathBuf, ContentType>,
+    ) -> (Arc<super::media_index::RootMediaIndex>, u64) {
+        let index = super::media_index::shared_root_index(path);
+        let snapshot = index.install_if_empty(pool, content_types);
+        (index, snapshot.generation)
+    }
+
     fn content_type_from_metadata(meta: crate::cache::FileMetadata) -> ContentType {
         if meta.content_type == 0 {
             ContentType::Image
@@ -22,11 +32,14 @@ impl SmartQueue {
         pool: &[PathBuf],
     ) -> HashMap<PathBuf, ContentType> {
         let mut init_map = HashMap::with_capacity(pool.len());
+        let cached_metadata = cache.batch_get_file_metadata(pool).unwrap_or_else(|error| {
+            tracing::warn!("[QUEUE] Failed to batch-read cached media types: {error}");
+            HashMap::new()
+        });
         for path in pool {
-            let content_type = cache
-                .get_file_metadata(path)
-                .ok()
-                .flatten()
+            let content_type = cached_metadata
+                .get(path)
+                .cloned()
                 .map(Self::content_type_from_metadata)
                 .or_else(|| Self::get_content_type(path));
             if let Some(content_type) = content_type {
@@ -61,6 +74,43 @@ impl SmartQueue {
             stats.blacklist.len()
         );
 
+        let shared_index = super::media_index::shared_root_index(path);
+        let shared_snapshot = shared_index.snapshot();
+        if !shared_snapshot.entries.is_empty() {
+            let mut pool = Vec::with_capacity(shared_snapshot.entries.len());
+            let mut content_type_cache = HashMap::with_capacity(shared_snapshot.entries.len());
+            for entry in shared_snapshot.entries.iter() {
+                if !stats.blacklist.contains(&entry.path) {
+                    pool.push(entry.path.clone());
+                    content_type_cache.insert(entry.path.clone(), entry.content_type);
+                }
+            }
+            pool.sort();
+            let current_index = Self::fallback_current_index(strategy, pool.len());
+            tracing::info!(
+                "[QUEUE] Reusing shared root media index generation {} ({} files) for {:?}",
+                shared_snapshot.generation,
+                pool.len(),
+                path
+            );
+            return Ok(Self {
+                pool,
+                stats,
+                video_ratio,
+                strategy,
+                current_index,
+                planned_sequential_type: None,
+                history: VecDeque::new(),
+                root_path: path.to_path_buf(),
+                active_playlist: None,
+                cache,
+                pending_stats_updates: HashMap::new(),
+                content_type_cache,
+                root_index: shared_index,
+                root_generation: shared_snapshot.generation,
+            });
+        }
+
         // Try loading cached pool from redb first (near-instant)
         let ct_cache_init: Option<HashMap<PathBuf, ContentType>>;
         let pool = match cache.get_cached_pool(path) {
@@ -69,18 +119,22 @@ impl SmartQueue {
                 let valid_pool = {
                     let cp = cached_pool.clone();
                     let bl = stats.blacklist.clone();
-                    let Some(handle) = background::spawn_blocking_tracked(
+                    let Some(handle) = background::spawn_blocking_tracked_wait(
                         BackgroundWorkKind::QueueDiscovery,
                         move || {
                             cp.into_iter()
                                 .filter(|p| p.exists() && !bl.contains(p))
                                 .collect::<Vec<PathBuf>>()
                         },
-                    ) else {
+                    )
+                    .await
+                    else {
                         tracing::warn!(
                             "[QUEUE] Skipping cached pool validation for {:?}: shutdown in progress",
                             path
                         );
+                        let root_index = super::media_index::shared_root_index(path);
+                        let root_generation = root_index.snapshot().generation;
                         return Ok(Self {
                             pool: Vec::new(),
                             stats,
@@ -94,6 +148,8 @@ impl SmartQueue {
                             cache,
                             pending_stats_updates: HashMap::new(),
                             content_type_cache: HashMap::new(),
+                            root_index,
+                            root_generation,
                         });
                     };
                     handle.await?
@@ -180,6 +236,9 @@ impl SmartQueue {
 
         let current_index = Self::fallback_current_index(strategy, pool.len());
 
+        let content_type_cache = ct_cache_init.unwrap_or_default();
+        let (root_index, root_generation) =
+            Self::root_index_fields(path, &pool, &content_type_cache);
         Ok(Self {
             pool,
             stats,
@@ -192,7 +251,9 @@ impl SmartQueue {
             active_playlist: None,
             cache,
             pending_stats_updates: HashMap::new(),
-            content_type_cache: ct_cache_init.unwrap_or_default(),
+            content_type_cache,
+            root_index,
+            root_generation,
         })
     }
 
@@ -205,10 +266,11 @@ impl SmartQueue {
     ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
         let path_buf = path.to_path_buf();
         let blacklist_clone = blacklist.clone();
-        let Some(handle) =
-            background::spawn_blocking_tracked(BackgroundWorkKind::QueueDiscovery, move || {
-                Self::discover_content(&path_buf, &blacklist_clone, cache, metrics)
-            })
+        let Some(handle) = background::spawn_blocking_tracked_wait(
+            BackgroundWorkKind::QueueDiscovery,
+            move || Self::discover_content(&path_buf, &blacklist_clone, cache, metrics),
+        )
+        .await
         else {
             return Ok((Vec::new(), HashMap::new()));
         };
@@ -229,8 +291,11 @@ impl SmartQueue {
 
         let current_index = Self::fallback_current_index(strategy, pool.len());
 
+        let content_type_cache = Self::populate_content_type_cache_from_pool(&cache, &pool);
+        let (root_index, root_generation) =
+            Self::root_index_fields(path, &pool, &content_type_cache);
         Ok(Self {
-            content_type_cache: Self::populate_content_type_cache_from_pool(&cache, &pool),
+            content_type_cache,
             pool,
             stats,
             video_ratio,
@@ -242,6 +307,8 @@ impl SmartQueue {
             active_playlist: None,
             cache,
             pending_stats_updates: HashMap::new(),
+            root_index,
+            root_generation,
         })
     }
 
@@ -300,46 +367,60 @@ impl SmartQueue {
         let mut ct_cache: HashMap<PathBuf, ContentType> = HashMap::new();
         let mut cache_updates: Vec<(PathBuf, crate::cache::FileMetadata)> = Vec::new();
 
-        // Use jwalk for parallel directory traversal
-        let walk_dir = WalkDir::new(path)
-            .follow_links(true)
-            .parallelism(jwalk::Parallelism::RayonNewPool(0));
+        // Reuse one small process-wide pool. Creating a Rayon pool for every
+        // discovery burst caused thread churn and defeated the thread bound.
+        let walk_dir = WalkDir::new(path).follow_links(true).parallelism(
+            jwalk::Parallelism::RayonExistingPool {
+                pool: DIRECTORY_POOL.clone(),
+                busy_timeout: Some(Duration::from_secs(1)),
+            },
+        );
 
-        // Collect entries in parallel
-        let entries: Vec<_> = walk_dir
+        // Consume the walker directly into the metadata needed by the final
+        // index. Keeping `DirEntry` objects around duplicates path and walk
+        // state for large roots.
+        let candidates: Vec<_> = walk_dir
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
+            .filter_map(|entry| {
+                let path = entry.path();
+                if blacklist.contains(path.as_path()) {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .unwrap_or_default();
+                Some((
+                    path,
+                    metadata.len(),
+                    modified.as_secs(),
+                    modified.subsec_nanos(),
+                ))
+            })
             .collect();
+
+        let candidate_paths: Vec<PathBuf> = candidates
+            .iter()
+            .map(|(path, _size, _secs, _nanos)| path.clone())
+            .collect();
+        let cached_metadata = cache.batch_get_file_metadata(&candidate_paths)?;
 
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        for entry in entries {
-            let p = entry.path().to_path_buf();
-            if blacklist.contains(&p) {
-                continue;
-            }
-
-            // Single fs::metadata call per file — reused for both validation and cache update
-            let fs_meta = match std::fs::metadata(&p) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let fs_mtime = fs_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            // Check cache: single redb read, inline validity check using fs_mtime
-            let (content_type, needs_cache_update) = match cache.get_file_metadata(&p) {
-                Ok(Some(cached)) => {
-                    if cached.mtime == fs_mtime {
+        for (p, fs_size, fs_mtime, fs_mtime_nanos) in candidates {
+            let (content_type, needs_cache_update) = match cached_metadata.get(&p) {
+                Some(cached) => {
+                    if cached.mtime == fs_mtime
+                        && cached.mtime_nanos == fs_mtime_nanos
+                        && cached.size == fs_size
+                    {
                         // Cache hit — mtime matches, file unchanged
                         if let Some(m) = &metrics {
                             m.record_cache_hit();
@@ -377,7 +458,8 @@ impl SmartQueue {
                         p,
                         crate::cache::FileMetadata {
                             mtime: fs_mtime,
-                            size: fs_meta.len(),
+                            mtime_nanos: fs_mtime_nanos,
+                            size: fs_size,
                             content_type: match ct {
                                 ContentType::Image => 0,
                                 ContentType::Video => 1,
@@ -399,6 +481,8 @@ impl SmartQueue {
             tracing::warn!("[QUEUE] Failed to cache file pool: {}", e);
         }
 
+        super::media_index::shared_root_index(path).replace(&files, &ct_cache);
+
         if files.is_empty() {
             anyhow::bail!("No supported images or videos found in {:?}", path);
         }
@@ -418,3 +502,12 @@ impl SmartQueue {
         Ok((files, ct_cache))
     }
 }
+static DIRECTORY_POOL: LazyLock<Arc<jwalk::rayon::ThreadPool>> = LazyLock::new(|| {
+    Arc::new(
+        jwalk::rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|index| format!("kld-directory-{index}"))
+            .build()
+            .expect("bounded directory worker pool should initialize"),
+    )
+});

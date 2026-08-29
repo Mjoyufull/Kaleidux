@@ -11,13 +11,15 @@ use tracing::debug;
 pub type PendingVideoSessions = Arc<Mutex<HashMap<String, u64>>>;
 
 pub enum VideoPlayerResult {
-    Success(
-        String,
-        u64,
-        Box<video::VideoPlayer>,
-        Option<video::VideoFrame>,
-    ),
+    Success(Box<VideoPlayerSuccess>),
     Failure(String, u64),
+}
+
+pub struct VideoPlayerSuccess {
+    pub name: String,
+    pub session_id: u64,
+    pub player: Box<video::VideoPlayer>,
+    pub preroll_frame: Option<video::VideoFrame>,
 }
 
 #[derive(Debug, Clone)]

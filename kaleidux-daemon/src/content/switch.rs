@@ -1,6 +1,6 @@
 use crate::background::{self, BackgroundWorkKind};
 use crate::content::sessions::{
-    PendingVideoSessions, PendingVideoSwitch, VideoPlayerResult, set_pending_video_session,
+    PendingVideoSessions, PendingVideoSwitch, set_pending_video_session,
     stop_video_player_in_background,
 };
 use crate::content::video_start::{
@@ -10,7 +10,7 @@ use crate::image::prefetch;
 use crate::image::runtime_cache::{
     begin_image_prefetch_generation, request_prepared_image_payload, schedule_image_prefetch_plan,
 };
-use crate::main_loop::{LoadedImage, PlayerEventMsg};
+use crate::main_loop::LoadedImage;
 use crate::metrics;
 use crate::monitor_manager;
 use crate::orchestration::VideoFpsProfile;
@@ -99,12 +99,10 @@ pub(crate) struct ContentSwitchContext<'a> {
     pub(crate) pending_image_video_stops: &'a mut HashMap<String, video::VideoPlayer>,
     pub(crate) pending_video_sessions: &'a PendingVideoSessions,
     pub(crate) image_tx: &'a tokio::sync::mpsc::Sender<LoadedImage>,
-    pub(crate) player_tx: &'a tokio::sync::mpsc::UnboundedSender<VideoPlayerResult>,
-    pub(crate) player_event_tx: &'a tokio::sync::mpsc::UnboundedSender<PlayerEventMsg>,
+    pub(crate) player_tx: &'a crate::main_loop::PlayerReadySender,
+    pub(crate) player_event_tx: &'a crate::main_loop::PlayerEventSender,
     pub(crate) shutdown_flag: &'a Arc<AtomicBool>,
-    #[cfg(feature = "mpv-backend")]
     pub(crate) mpv_native_targets: Option<&'a HashMap<String, video::MpvNativeVideoTarget>>,
-    #[cfg(feature = "mpv-backend")]
     pub(crate) mpv_composed_targets: Option<&'a HashMap<String, video::MpvComposedVideoTarget>>,
 }
 
@@ -159,9 +157,7 @@ pub(crate) fn switch_wallpaper_content(
         player_tx,
         player_event_tx,
         shutdown_flag,
-        #[cfg(feature = "mpv-backend")]
         mpv_native_targets,
-        #[cfg(feature = "mpv-backend")]
         mpv_composed_targets,
     } = ctx;
 
@@ -172,6 +168,45 @@ pub(crate) fn switch_wallpaper_content(
         content_type,
         renderers.contains_key(&name)
     );
+
+    if content_type == queue::ContentType::Video
+        && video_players.get(&name).is_some_and(|player| {
+            player.is_native_experimental_backend()
+                && std::path::Path::new(player.source_uri()) == path.as_path()
+        })
+        && let Some(renderer) = renderers.get_mut(&name)
+    {
+        let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
+        renderer.active_batch_id = batch_id;
+        renderer.batch_start_time = batch_trigger_time;
+        renderer.active_transition = resolved_transition;
+        renderer.set_content_type(queue::ContentType::Video);
+        renderer.switch_content();
+        frame_mailbox.clear_source(&name);
+        pending_video_switches.remove(&name);
+        set_pending_video_session(pending_video_sessions, &name, None);
+        let player = video_players
+            .get(&name)
+            .expect("same-source native player was checked above");
+        if let Err(error) = player
+            .pause()
+            .and_then(|()| player.seek_to_position_ns(0))
+            .and_then(|()| player.resume())
+        {
+            warn!(
+                "[NATIVE-REUSE] {} session={}: same-source restart failed: {error:#}; retaining current session",
+                name,
+                player.session_id()
+            );
+        } else {
+            info!(
+                "[NATIVE-REUSE] {} session={}: reused demux/decoder/device/import contexts for same-source switch",
+                name,
+                player.session_id()
+            );
+        }
+        return;
+    }
 
     let session_id = *next_session_id;
     *next_session_id += 1;
@@ -261,6 +296,12 @@ pub(crate) fn switch_wallpaper_content(
                         let observed_total = request_start.elapsed();
                         payload.profile.permit_wait =
                             observed_total.saturating_sub(payload.profile.cpu_duration());
+                        let byte_permit =
+                            crate::image::channel_budget::acquire(payload.data.len()).await;
+                        if byte_permit.is_none() {
+                            debug!("[ASSET] {}: Image channel budget closed", name_clone);
+                            return;
+                        }
                         if let Err(e) = tx
                             .send(LoadedImage {
                                 name: name_clone.clone(),
@@ -270,6 +311,7 @@ pub(crate) fn switch_wallpaper_content(
                                 height: payload.height,
                                 profile: Some(payload.profile),
                                 _path: path_clone,
+                                _byte_permit: byte_permit,
                             })
                             .await
                         {
@@ -290,6 +332,7 @@ pub(crate) fn switch_wallpaper_content(
                                 height: 0,
                                 profile: None,
                                 _path: path_clone,
+                                _byte_permit: None,
                             })
                             .await;
                     }
@@ -366,9 +409,7 @@ pub(crate) fn switch_wallpaper_content(
             .outputs
             .get(&name)
             .and_then(|output| configured_max_publish_fps(output.config.video_fps));
-        #[cfg(feature = "mpv-backend")]
         let mpv_native_target = mpv_native_targets.and_then(|targets| targets.get(&name).cloned());
-        #[cfg(feature = "mpv-backend")]
         let mpv_composed_target =
             mpv_composed_targets.and_then(|targets| targets.get(&name).cloned());
         create_and_start_video_player(
@@ -378,12 +419,11 @@ pub(crate) fn switch_wallpaper_content(
                 session_id,
                 volume,
                 backend_request,
+                decode_group_id: batch_id,
                 start_position_ns: broker_start_position_ns,
                 max_publish_fps,
                 render_size: video_render_size,
-                #[cfg(feature = "mpv-backend")]
                 mpv_native_target,
-                #[cfg(feature = "mpv-backend")]
                 mpv_composed_target,
             },
             VideoPlayerStartContext {

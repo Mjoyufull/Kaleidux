@@ -17,6 +17,15 @@ fn make_test_queue(
     video_ratio: u8,
     content_type_cache: HashMap<PathBuf, ContentType>,
 ) -> SmartQueue {
+    let root_path = PathBuf::from(format!(
+        "/tmp/kaleidux-queue-unit-root-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let root_index = media_index::shared_root_index(&root_path);
+    let root_generation = root_index
+        .install_if_empty(&pool, &content_type_cache)
+        .generation;
     SmartQueue {
         current_index: SmartQueue::fallback_current_index(strategy, pool.len()),
         planned_sequential_type: None,
@@ -25,11 +34,13 @@ fn make_test_queue(
         video_ratio,
         strategy,
         history: VecDeque::new(),
-        root_path: PathBuf::from("/tmp"),
+        root_path,
         active_playlist: None,
         cache: test_cache(),
         pending_stats_updates: HashMap::new(),
         content_type_cache,
+        root_index,
+        root_generation,
     }
 }
 
@@ -48,6 +59,39 @@ fn unique_test_dir(name: &str) -> PathBuf {
 fn test_cache() -> Arc<FileCache> {
     let db_path = unique_test_dir("cache-db").join("cache.redb");
     Arc::new(FileCache::new_test(&db_path).unwrap())
+}
+
+#[test]
+#[ignore = "explicit 100k-file Phase 7 discovery gate"]
+fn discovery_handles_100k_files_with_one_root_index() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let root = unique_test_dir("100k-discovery");
+    let _cleanup = Cleanup(root.clone());
+    let header = [0x89, b'P', b'N', b'G', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for directory in 0..100_u32 {
+        let shard = root.join(format!("{directory:03}"));
+        std::fs::create_dir(&shard).expect("shard directory");
+        for file in 0..1_000_u32 {
+            std::fs::write(shard.join(format!("{file:04}.png")), header).expect("fixture file");
+        }
+    }
+
+    let root_index = media_index::shared_root_index(&root);
+    let cache = test_cache();
+    let (pool, content_types) =
+        SmartQueue::discover_content(&root, &std::collections::HashSet::new(), cache, None)
+            .expect("100k discovery should complete");
+
+    assert_eq!(pool.len(), 100_000);
+    assert_eq!(content_types.len(), 100_000);
+    let snapshot = root_index.snapshot();
+    assert_eq!(snapshot.entries.len(), 100_000);
 }
 
 #[test]

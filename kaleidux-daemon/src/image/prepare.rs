@@ -113,7 +113,7 @@ fn resize_image_buffer(
 
 fn expand_rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((rgb.len() / 3) * 4);
-    for chunk in rgb.chunks_exact(3) {
+    for chunk in rgb.as_chunks::<3>().0 {
         rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
     }
     rgba
@@ -129,7 +129,7 @@ fn expand_luma_to_rgba(luma: &[u8]) -> Vec<u8> {
 
 fn expand_lumaa_to_rgba(lumaa: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((lumaa.len() / 2) * 4);
-    for chunk in lumaa.chunks_exact(2) {
+    for chunk in lumaa.as_chunks::<2>().0 {
         rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
     }
     rgba

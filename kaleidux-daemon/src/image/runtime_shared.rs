@@ -5,10 +5,13 @@ pub(crate) async fn wait_for_shared_result<T>(
     state: Arc<InFlightSharedResult<T>>,
 ) -> Result<Arc<T>, String> {
     loop {
+        let notified = state.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(result) = state.result.lock().clone() {
             return result;
         }
-        state.notify.notified().await;
+        notified.await;
     }
 }
 
