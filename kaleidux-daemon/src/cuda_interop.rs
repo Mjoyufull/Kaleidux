@@ -7,6 +7,8 @@ use tracing::{error, info};
 type CUresult = i32;
 type CUdevice = i32;
 type CUcontext = *mut std::ffi::c_void;
+type CUstream = *mut std::ffi::c_void;
+type CUexternalSemaphore = *mut std::ffi::c_void;
 type CUdeviceptr = u64;
 type CUmemGenericAllocationHandle = u64;
 
@@ -17,6 +19,8 @@ const CU_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 const CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: u32 = 1;
 const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: u32 = 3;
 const CU_MEM_ALLOC_GRANULARITY_MINIMUM: u32 = 0;
+const CU_STREAM_NON_BLOCKING: u32 = 1;
+const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD: u32 = 9;
 
 // ── FFI function types ──────────────────────────────────────────────────
 
@@ -26,7 +30,27 @@ type FnCuCtxCreate = unsafe extern "C" fn(*mut CUcontext, u32, CUdevice) -> CUre
 type FnCuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
 type FnCuCtxDestroy = unsafe extern "C" fn(CUcontext) -> CUresult;
 type FnCuMemcpy2D = unsafe extern "C" fn(*const CudaMemcpy2D) -> CUresult;
+type FnCuMemcpy2DAsync = unsafe extern "C" fn(*const CudaMemcpy2D, CUstream) -> CUresult;
 type FnCuCtxSynchronize = unsafe extern "C" fn() -> CUresult;
+type FnCuStreamCreate = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
+type FnCuStreamDestroy = unsafe extern "C" fn(CUstream) -> CUresult;
+type FnCuImportExternalSemaphore = unsafe extern "C" fn(
+    *mut CUexternalSemaphore,
+    *const CudaExternalSemaphoreHandleDesc,
+) -> CUresult;
+type FnCuDestroyExternalSemaphore = unsafe extern "C" fn(CUexternalSemaphore) -> CUresult;
+type FnCuSignalExternalSemaphoresAsync = unsafe extern "C" fn(
+    *const CUexternalSemaphore,
+    *const CudaExternalSemaphoreSignalParams,
+    u32,
+    CUstream,
+) -> CUresult;
+type FnCuWaitExternalSemaphoresAsync = unsafe extern "C" fn(
+    *const CUexternalSemaphore,
+    *const CudaExternalSemaphoreWaitParams,
+    u32,
+    CUstream,
+) -> CUresult;
 
 // Virtual memory management (CUDA 10.2+)
 type FnCuMemGetAllocationGranularity =
@@ -76,6 +100,49 @@ struct CudaMemcpy2D {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<CudaMemcpy2D>() == 128);
 
+/// CUDA 13.x driver ABI. The handle union's largest Linux-visible member is
+/// the two-pointer Win32 form, so it occupies 16 bytes even when `fd` is used.
+#[repr(C)]
+struct CudaExternalSemaphoreHandleDesc {
+    type_: u32,
+    _type_padding: u32,
+    handle: CudaExternalSemaphoreHandle,
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_padding: u32,
+}
+
+#[repr(C)]
+union CudaExternalSemaphoreHandle {
+    fd: i32,
+    _win32: [*mut std::ffi::c_void; 2],
+}
+
+/// Signal/wait parameter structs each contain a 72-byte `params` aggregate,
+/// followed by flags and 16 reserved words. The timeline fence value is the
+/// first field in that aggregate.
+#[repr(C, align(8))]
+struct CudaExternalSemaphoreSignalParams {
+    value: u64,
+    params_reserved: [u8; 64],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_padding: u32,
+}
+
+#[repr(C, align(8))]
+struct CudaExternalSemaphoreWaitParams {
+    value: u64,
+    params_reserved: [u8; 64],
+    flags: u32,
+    reserved: [u32; 16],
+    _tail_padding: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<CudaExternalSemaphoreHandleDesc>() == 96);
+const _: () = assert!(std::mem::size_of::<CudaExternalSemaphoreSignalParams>() == 144);
+const _: () = assert!(std::mem::size_of::<CudaExternalSemaphoreWaitParams>() == 144);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CUmemLocation {
@@ -115,6 +182,13 @@ pub struct ExportableCudaAllocation {
     alloc_size: usize,
 }
 
+pub struct CudaTimelineSemaphore {
+    // Store the opaque driver token as an integer so the owning renderer can
+    // move between its initialization worker and main thread. CUDA access is
+    // still serialized by CudaInterop::op_lock.
+    handle: usize,
+}
+
 impl ExportableCudaAllocation {
     pub fn alloc_size(&self) -> usize {
         self.alloc_size
@@ -129,6 +203,10 @@ pub struct CudaInterop {
     cu_ctx_destroy: FnCuCtxDestroy,
     cu_ctx_synchronize: FnCuCtxSynchronize,
     cu_memcpy_2d: FnCuMemcpy2D,
+    cu_memcpy_2d_async: FnCuMemcpy2DAsync,
+    cu_stream_destroy: FnCuStreamDestroy,
+    stream: CUstream,
+    external_semaphore_fns: Option<ExternalSemaphoreFns>,
     cu_mem_get_allocation_granularity: FnCuMemGetAllocationGranularity,
     cu_mem_create: FnCuMemCreate,
     cu_mem_export_to_shareable_handle: FnCuMemExportToShareableHandle,
@@ -139,6 +217,14 @@ pub struct CudaInterop {
     cu_mem_address_free: FnCuMemAddressFree,
     cu_mem_release: FnCuMemRelease,
     op_lock: parking_lot::Mutex<()>,
+}
+
+#[derive(Clone, Copy)]
+struct ExternalSemaphoreFns {
+    import: FnCuImportExternalSemaphore,
+    destroy: FnCuDestroyExternalSemaphore,
+    signal_async: FnCuSignalExternalSemaphoresAsync,
+    wait_async: FnCuWaitExternalSemaphoresAsync,
 }
 
 // SAFETY: all CUDA driver entry points on `CudaInterop` acquire `op_lock` before
@@ -176,6 +262,28 @@ impl CudaInterop {
             let cu_ctx_destroy: FnCuCtxDestroy = load_fn!(lib, b"cuCtxDestroy_v2\0");
             let cu_ctx_synchronize: FnCuCtxSynchronize = load_fn!(lib, b"cuCtxSynchronize\0");
             let cu_memcpy_2d: FnCuMemcpy2D = load_fn!(lib, b"cuMemcpy2D_v2\0");
+            let cu_memcpy_2d_async: FnCuMemcpy2DAsync = load_fn!(lib, b"cuMemcpy2DAsync_v2\0");
+            let cu_stream_create: FnCuStreamCreate = load_fn!(lib, b"cuStreamCreate\0");
+            let cu_stream_destroy: FnCuStreamDestroy = load_fn!(lib, b"cuStreamDestroy_v2\0");
+
+            let external_semaphore_fns = (|| {
+                Some(ExternalSemaphoreFns {
+                    import: *lib
+                        .get::<FnCuImportExternalSemaphore>(b"cuImportExternalSemaphore\0")
+                        .ok()?,
+                    destroy: *lib
+                        .get::<FnCuDestroyExternalSemaphore>(b"cuDestroyExternalSemaphore\0")
+                        .ok()?,
+                    signal_async: *lib
+                        .get::<FnCuSignalExternalSemaphoresAsync>(
+                            b"cuSignalExternalSemaphoresAsync\0",
+                        )
+                        .ok()?,
+                    wait_async: *lib
+                        .get::<FnCuWaitExternalSemaphoresAsync>(b"cuWaitExternalSemaphoresAsync\0")
+                        .ok()?,
+                })
+            })();
 
             let cu_mem_get_allocation_granularity: FnCuMemGetAllocationGranularity =
                 load_fn!(lib, b"cuMemGetAllocationGranularity\0");
@@ -207,7 +315,17 @@ impl CudaInterop {
                 return Err(cuda_err("cuCtxCreate", res));
             }
 
-            info!("[CUDA] Interop context created on device {device}");
+            let mut stream = std::ptr::null_mut();
+            let res = cu_stream_create(&mut stream, CU_STREAM_NON_BLOCKING);
+            if res != CUDA_SUCCESS {
+                cu_ctx_destroy(ctx);
+                return Err(cuda_err("cuStreamCreate", res));
+            }
+
+            info!(
+                "[CUDA] Shared interop context created on device {device} (external_timeline={})",
+                external_semaphore_fns.is_some()
+            );
 
             Ok(Self {
                 _lib: lib,
@@ -217,6 +335,10 @@ impl CudaInterop {
                 cu_ctx_destroy,
                 cu_ctx_synchronize,
                 cu_memcpy_2d,
+                cu_memcpy_2d_async,
+                cu_stream_destroy,
+                stream,
+                external_semaphore_fns,
                 cu_mem_get_allocation_granularity,
                 cu_mem_create,
                 cu_mem_export_to_shareable_handle,
@@ -369,6 +491,113 @@ impl CudaInterop {
         Ok(())
     }
 
+    pub fn supports_external_timeline(&self) -> bool {
+        self.external_semaphore_fns.is_some()
+    }
+
+    /// Import a Vulkan timeline semaphore. CUDA takes ownership of `fd` only
+    /// after a successful import; the failure path closes it here.
+    pub fn import_timeline_semaphore(&self, fd: RawFd) -> Result<CudaTimelineSemaphore, String> {
+        let Some(fns) = self.external_semaphore_fns else {
+            // SAFETY: fd is still caller-owned because no CUDA import occurred.
+            unsafe { libc::close(fd) };
+            return Err("[CUDA] external timeline semaphore APIs are unavailable".into());
+        };
+        let _guard = self.op_lock.lock();
+        if let Err(error) = self.push_context() {
+            // SAFETY: no CUDA import occurred, so fd remains caller-owned.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let desc = CudaExternalSemaphoreHandleDesc {
+            type_: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
+            _type_padding: 0,
+            handle: CudaExternalSemaphoreHandle { fd },
+            flags: 0,
+            reserved: [0; 16],
+            _tail_padding: 0,
+        };
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: desc exactly matches CUDA's documented driver ABI and owns
+        // a live OPAQUE_FD exported from a Vulkan timeline semaphore.
+        let result = unsafe { (fns.import)(&mut handle, &desc) };
+        if result != CUDA_SUCCESS {
+            // SAFETY: CUDA only consumes the fd on successful import.
+            unsafe { libc::close(fd) };
+            return Err(cuda_err("cuImportExternalSemaphore(timeline)", result));
+        }
+        Ok(CudaTimelineSemaphore {
+            handle: handle as usize,
+        })
+    }
+
+    pub fn destroy_timeline_semaphore(&self, semaphore: CudaTimelineSemaphore) {
+        let Some(fns) = self.external_semaphore_fns else {
+            return;
+        };
+        let _guard = self.op_lock.lock();
+        let _ = self.push_context();
+        // SAFETY: the handle came from this context's successful import and is
+        // consumed exactly once by this method.
+        let result = unsafe { (fns.destroy)(semaphore.handle as CUexternalSemaphore) };
+        if result != CUDA_SUCCESS {
+            error!("{}", cuda_err("cuDestroyExternalSemaphore", result));
+        }
+    }
+
+    pub fn wait_timeline_async(
+        &self,
+        semaphore: &CudaTimelineSemaphore,
+        value: u64,
+    ) -> Result<(), String> {
+        let Some(fns) = self.external_semaphore_fns else {
+            return Err("[CUDA] external timeline semaphore APIs are unavailable".into());
+        };
+        let _guard = self.op_lock.lock();
+        self.push_context()?;
+        let params = CudaExternalSemaphoreWaitParams {
+            value,
+            params_reserved: [0; 64],
+            flags: 0,
+            reserved: [0; 16],
+            _tail_padding: 0,
+        };
+        // SAFETY: the imported handle is live, the parameter ABI is asserted
+        // above, and CUDA copies the one-element arrays during this call.
+        let handle = semaphore.handle as CUexternalSemaphore;
+        let result = unsafe { (fns.wait_async)(&handle, &params, 1, self.stream) };
+        if result != CUDA_SUCCESS {
+            return Err(cuda_err("cuWaitExternalSemaphoresAsync", result));
+        }
+        Ok(())
+    }
+
+    pub fn signal_timeline_async(
+        &self,
+        semaphore: &CudaTimelineSemaphore,
+        value: u64,
+    ) -> Result<(), String> {
+        let Some(fns) = self.external_semaphore_fns else {
+            return Err("[CUDA] external timeline semaphore APIs are unavailable".into());
+        };
+        let _guard = self.op_lock.lock();
+        self.push_context()?;
+        let params = CudaExternalSemaphoreSignalParams {
+            value,
+            params_reserved: [0; 64],
+            flags: 0,
+            reserved: [0; 16],
+            _tail_padding: 0,
+        };
+        // SAFETY: same ownership and ABI conditions as wait_timeline_async.
+        let handle = semaphore.handle as CUexternalSemaphore;
+        let result = unsafe { (fns.signal_async)(&handle, &params, 1, self.stream) };
+        if result != CUDA_SUCCESS {
+            return Err(cuda_err("cuSignalExternalSemaphoresAsync", result));
+        }
+        Ok(())
+    }
+
     pub fn free_exportable(&self, alloc: ExportableCudaAllocation) {
         let _guard = self.op_lock.lock();
         let _ = self.push_context();
@@ -422,12 +651,53 @@ impl CudaInterop {
         }
         Ok(())
     }
+
+    pub fn copy_2d_async(
+        &self,
+        src_device_ptr: u64,
+        src_pitch: usize,
+        dst_device_ptr: u64,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> Result<(), String> {
+        let _guard = self.op_lock.lock();
+        self.push_context()?;
+        let params = CudaMemcpy2D {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: CU_MEMORYTYPE_DEVICE,
+            _pad0: 0,
+            src_host: std::ptr::null(),
+            src_device: src_device_ptr,
+            src_array: std::ptr::null_mut(),
+            src_pitch,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: CU_MEMORYTYPE_DEVICE,
+            _pad1: 0,
+            dst_host: std::ptr::null_mut(),
+            dst_device: dst_device_ptr,
+            dst_array: std::ptr::null_mut(),
+            dst_pitch,
+            width_in_bytes: width_bytes,
+            height,
+        };
+        // SAFETY: the pointers describe live device allocations and the
+        // operation is enqueued on this context's persistent stream.
+        let result = unsafe { (self.cu_memcpy_2d_async)(&params, self.stream) };
+        if result != CUDA_SUCCESS {
+            return Err(cuda_err("cuMemcpy2DAsync", result));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CudaInterop {
     fn drop(&mut self) {
         // SAFETY: `ctx` was created by this object and is destroyed exactly once in `Drop`.
         unsafe {
+            let _ = (self.cu_stream_destroy)(self.stream);
             (self.cu_ctx_destroy)(self.ctx);
         }
         info!("[CUDA] Interop context destroyed");

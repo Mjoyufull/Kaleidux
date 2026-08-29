@@ -42,19 +42,33 @@ impl super::Renderer {
         layer_surface: &LayerSurface,
         qh: &QueueHandle<crate::wayland::WaylandBackend>,
     ) -> bool {
-        if self.frame_callback_pending {
-            // Check failsafe: if pending for > 500ms, assume lost and allow re-request
-            if let Some(r) = self.last_frame_request {
-                if r.elapsed().as_millis() > 500 {
-                    warn!(
-                        "[FRAME] {}: Frame callback stuck for 500ms, re-requesting!",
-                        self.name
-                    );
-                    self.frame_callback_pending = false; // Reset to allow re-request
-                } else {
-                    return false; // Truly pending
-                }
-            }
+        if !self.arm_frame_callback(layer_surface, qh) {
+            return false;
+        }
+
+        // This path is used when no renderer present is about to commit the
+        // surface. Normal rendering arms the callback before output.present(),
+        // allowing WGPU's buffer attach and this callback request to land in
+        // one atomic Wayland commit.
+        layer_surface.wl_surface().commit();
+        true
+    }
+
+    pub(super) fn arm_frame_callback_for_present(
+        &mut self,
+        layer_surface: &LayerSurface,
+        qh: &QueueHandle<crate::wayland::WaylandBackend>,
+    ) -> bool {
+        self.arm_frame_callback(layer_surface, qh)
+    }
+
+    fn arm_frame_callback(
+        &mut self,
+        layer_surface: &LayerSurface,
+        qh: &QueueHandle<crate::wayland::WaylandBackend>,
+    ) -> bool {
+        if !self.can_request_frame_callback() {
+            return false;
         }
 
         let wl_surface = layer_surface.wl_surface();
@@ -71,18 +85,7 @@ impl super::Renderer {
             wl_surface.damage_buffer(0, 0, 1, 1);
         }
 
-        // Commit after requesting the callback. Static clean frames and steady video callbacks
-        // use minimal damage; content swaps, transitions, and first presents use full damage.
-        // KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full restores historical full-surface video
-        // callback damage for compositor debugging.
-        wl_surface.commit();
-
-        self.frame_callback_pending = true;
-        self.last_frame_request = Some(std::time::Instant::now());
-        if let Some(metrics) = &self.metrics {
-            metrics.record_frame_callback_request(self.frame_callback_kind());
-            metrics.record_frame_callback_damage(full_surface_damage);
-        }
+        self.mark_frame_callback_pending(full_surface_damage);
         if trace_frame_events_enabled() {
             tracing::trace!(
                 "[FRAME] {}: Requested frame callback (configured={}, needs_redraw={}, transition_progress={:.3})",
@@ -110,12 +113,39 @@ impl super::Renderer {
         true
     }
 
+    fn can_request_frame_callback(&mut self) -> bool {
+        if !self.frame_callback_pending {
+            return true;
+        }
+        if self
+            .last_frame_request
+            .is_some_and(|requested| requested.elapsed().as_millis() > 500)
+        {
+            warn!(
+                "[FRAME] {}: Frame callback stuck for 500ms, re-requesting!",
+                self.name
+            );
+            self.frame_callback_pending = false;
+            return true;
+        }
+        false
+    }
+
+    fn mark_frame_callback_pending(&mut self, full_surface_damage: bool) {
+        self.frame_callback_pending = true;
+        self.last_frame_request = Some(std::time::Instant::now());
+        if let Some(metrics) = &self.metrics {
+            metrics.record_frame_callback_request(self.frame_callback_kind());
+            metrics.record_frame_callback_damage(full_surface_damage);
+        }
+    }
+
     fn needs_full_frame_callback_damage(&self) -> bool {
         self.transition_active
             || self.content_swap_pending
             || (self.valid_content_type == crate::queue::ContentType::Video
                 && video_callback_full_damage_enabled())
-            || self.current_texture.is_none()
+            || !self.has_current_texture()
             || self.prev_texture.is_some()
     }
 

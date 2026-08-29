@@ -3,7 +3,7 @@ use tracing::error;
 
 impl super::Renderer {
     pub(super) fn upload_plane_texture(
-        queue: &wgpu::Queue,
+        ctx: &super::WgpuContext,
         stride_temp_buffer: &mut Vec<u8>,
         renderer_name: &str,
         texture: &wgpu::Texture,
@@ -35,7 +35,7 @@ impl super::Renderer {
                 return false;
             }
 
-            queue.write_texture(
+            ctx.write_texture(
                 wgpu::ImageCopyTexture {
                     texture,
                     mip_level: 0,
@@ -83,7 +83,7 @@ impl super::Renderer {
             }
         }
 
-        queue.write_texture(
+        ctx.write_texture(
             wgpu::ImageCopyTexture {
                 texture,
                 mip_level: 0,
@@ -111,13 +111,13 @@ impl super::Renderer {
     pub(super) fn upload_frame_nv12(
         &mut self,
         frame: &crate::video::VideoFrame,
-        output: &wgpu::Texture,
+        output: Option<&wgpu::Texture>,
         width: u32,
         height: u32,
         y_stride: u32,
         uv_offset: u32,
         uv_stride: u32,
-    ) {
+    ) -> bool {
         let (uv_width, uv_height) = chroma_plane_extent(width, height);
 
         if self.nv12_staging_size != Some((width, height)) {
@@ -158,23 +158,15 @@ impl super::Renderer {
             self.nv12_y_texture = Some(y_tex);
             self.nv12_uv_texture = Some(uv_tex);
             self.nv12_staging_size = Some((width, height));
+            self.create_nv12_bind_groups();
         }
 
         let y_tex = self.nv12_y_texture.as_ref().unwrap();
         let uv_tex = self.nv12_uv_texture.as_ref().unwrap();
 
-        {
-            let map = match frame.buffer.map_readable() {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to map NV12 video buffer: {}", e);
-                    return;
-                }
-            };
-            let src = map.as_slice();
-
+        let uploaded = frame.storage.with_readable_bytes(|src| {
             if !Self::upload_plane_texture(
-                &self.ctx.queue,
+                &self.ctx,
                 &mut self.stride_temp_buffer,
                 self.name.as_str(),
                 y_tex,
@@ -186,10 +178,10 @@ impl super::Renderer {
                 1,
                 "NV12 Y",
             ) {
-                return;
+                return false;
             }
             if !Self::upload_plane_texture(
-                &self.ctx.queue,
+                &self.ctx,
                 &mut self.stride_temp_buffer,
                 self.name.as_str(),
                 uv_tex,
@@ -201,52 +193,200 @@ impl super::Renderer {
                 2,
                 "NV12 UV",
             ) {
-                return;
+                return false;
+            }
+            true
+        });
+        match uploaded {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                error!("Failed to read NV12 video buffer: {}", error);
+                return false;
+            }
+        }
+        if let Some(output) = output {
+            self.active_yuv_source = None;
+            self.render_nv12_to_rgba(output, "NV12 Convert Pass");
+        } else {
+            self.active_yuv_source = Some(super::YuvSource {
+                format: super::YuvFormat::Nv12,
+                origin: super::YuvOrigin::Cpu,
+                width,
+                height,
+            });
+        }
+        true
+    }
+
+    /// Upload little-endian P010 into persistent 16-bit normalized textures.
+    /// P010 stores each 10-bit sample in bits 15..6, so R16/RG16 normalized
+    /// sampling recovers the original normalized code value without a
+    /// precision-losing repack or an output-sized intermediate.
+    pub(super) fn upload_frame_p010(
+        &mut self,
+        frame: &crate::video::VideoFrame,
+        output: Option<&wgpu::Texture>,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_offset: u32,
+        uv_stride: u32,
+    ) -> bool {
+        if !self
+            .ctx
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
+            error!(
+                "[VIDEO] {}: refusing P010 upload because the WGPU device lacks TEXTURE_FORMAT_16BIT_NORM",
+                self.name
+            );
+            return false;
+        }
+        let (uv_width, uv_height) = chroma_plane_extent(width, height);
+        if self.p010_staging_size != Some((width, height)) {
+            self.p010_y_view = None;
+            self.p010_uv_view = None;
+            let y_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("P010 Y Plane"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R16Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let uv_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("P010 UV Plane"),
+                size: wgpu::Extent3d {
+                    width: uv_width,
+                    height: uv_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg16Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.p010_y_view = Some(y_tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.p010_uv_view = Some(uv_tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.p010_y_texture = Some(y_tex);
+            self.p010_uv_texture = Some(uv_tex);
+            self.p010_staging_size = Some((width, height));
+            self.create_p010_final_bind_group();
+        }
+
+        let uploaded = frame.storage.with_readable_bytes(|src| {
+            Self::upload_plane_texture(
+                &self.ctx,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                self.p010_y_texture.as_ref().expect("P010 Y texture exists"),
+                src,
+                0,
+                y_stride,
+                width,
+                height,
+                2,
+                "P010 Y",
+            ) && Self::upload_plane_texture(
+                &self.ctx,
+                &mut self.stride_temp_buffer,
+                self.name.as_str(),
+                self.p010_uv_texture
+                    .as_ref()
+                    .expect("P010 UV texture exists"),
+                src,
+                uv_offset as usize,
+                uv_stride,
+                uv_width,
+                uv_height,
+                4,
+                "P010 UV",
+            )
+        });
+        match uploaded {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                error!("Failed to read P010 video buffer: {error}");
+                return false;
             }
         }
 
-        let y_view = self.nv12_y_view.as_ref().unwrap();
-        let uv_view = self.nv12_uv_view.as_ref().unwrap();
-
-        let output_view = output.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("NV12 Convert Output View"),
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
+        self.active_yuv_source = Some(super::YuvSource {
+            format: super::YuvFormat::P010,
+            origin: super::YuvOrigin::Cpu,
+            width,
+            height,
         });
+        if let Some(output) = output {
+            self.render_p010_to_rgba(output);
+            self.active_yuv_source = None;
+        }
+        true
+    }
 
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("NV12 Convert Bind Group"),
-                layout: &self.ctx.nv12_bind_group_layout,
+    fn create_p010_final_bind_group(&mut self) {
+        self.final_p010_bind_group = Some(std::sync::Arc::new(self.ctx.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("P010 Final Blit Bind Group"),
+                layout: &self.ctx.native_nv12_blit_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(y_view),
+                        resource: self.yuv_uniform_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(uv_view),
+                        resource: wgpu::BindingResource::TextureView(
+                            self.p010_y_view.as_ref().expect("P010 Y view exists"),
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.p010_uv_view.as_ref().expect("P010 UV view exists"),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
                     },
                 ],
-            });
+            },
+        )));
+    }
 
+    pub(super) fn render_p010_to_rgba(&self, output: &wgpu::Texture) {
+        let view = output.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("P010 transition snapshot"),
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
+        let pipeline = self
+            .ctx
+            .get_native_nv12_blit_pipeline(wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut encoder = self
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("NV12 Convert Encoder"),
+                label: Some("P010 transition snapshot"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("NV12 Convert Pass"),
+                label: Some("P010 transition snapshot"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -257,11 +397,18 @@ impl super::Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.ctx.nv12_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(
+                0,
+                self.final_p010_bind_group
+                    .as_ref()
+                    .expect("P010 final bind group exists")
+                    .as_ref(),
+                &[],
+            );
             pass.draw(0..3, 0..1);
         }
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.submit(std::iter::once(encoder.finish()));
     }
 
     /// Upload an I420 frame: write Y/U/V planes to staging textures, then
@@ -270,7 +417,7 @@ impl super::Renderer {
     pub(super) fn upload_frame_i420(
         &mut self,
         frame: &crate::video::VideoFrame,
-        output: &wgpu::Texture,
+        output: Option<&wgpu::Texture>,
         width: u32,
         height: u32,
         y_stride: u32,
@@ -278,7 +425,7 @@ impl super::Renderer {
         u_stride: u32,
         v_offset: u32,
         v_stride: u32,
-    ) {
+    ) -> bool {
         let (chroma_width, chroma_height) = chroma_plane_extent(width, height);
 
         if self.i420_staging_size != Some((width, height)) {
@@ -336,24 +483,16 @@ impl super::Renderer {
             self.i420_u_texture = Some(u_tex);
             self.i420_v_texture = Some(v_tex);
             self.i420_staging_size = Some((width, height));
+            self.create_i420_final_bind_group();
         }
 
         let y_tex = self.i420_y_texture.as_ref().unwrap();
         let u_tex = self.i420_u_texture.as_ref().unwrap();
         let v_tex = self.i420_v_texture.as_ref().unwrap();
 
-        {
-            let map = match frame.buffer.map_readable() {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to map I420 video buffer: {}", e);
-                    return;
-                }
-            };
-            let src = map.as_slice();
-
+        let uploaded = frame.storage.with_readable_bytes(|src| {
             if !Self::upload_plane_texture(
-                &self.ctx.queue,
+                &self.ctx,
                 &mut self.stride_temp_buffer,
                 self.name.as_str(),
                 y_tex,
@@ -365,10 +504,10 @@ impl super::Renderer {
                 1,
                 "I420 Y",
             ) {
-                return;
+                return false;
             }
             if !Self::upload_plane_texture(
-                &self.ctx.queue,
+                &self.ctx,
                 &mut self.stride_temp_buffer,
                 self.name.as_str(),
                 u_tex,
@@ -380,10 +519,10 @@ impl super::Renderer {
                 1,
                 "I420 U",
             ) {
-                return;
+                return false;
             }
             if !Self::upload_plane_texture(
-                &self.ctx.queue,
+                &self.ctx,
                 &mut self.stride_temp_buffer,
                 self.name.as_str(),
                 v_tex,
@@ -395,7 +534,16 @@ impl super::Renderer {
                 1,
                 "I420 V",
             ) {
-                return;
+                return false;
+            }
+            true
+        });
+        match uploaded {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                error!("Failed to read I420 video buffer: {}", error);
+                return false;
             }
         }
 
@@ -403,11 +551,24 @@ impl super::Renderer {
         let u_view = self.i420_u_view.as_ref().unwrap();
         let v_view = self.i420_v_view.as_ref().unwrap();
 
-        let output_view = output.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("I420 Convert Output View"),
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
-        });
+        if output.is_none() {
+            self.active_yuv_source = Some(super::YuvSource {
+                format: super::YuvFormat::I420,
+                origin: super::YuvOrigin::Cpu,
+                width,
+                height,
+            });
+            return true;
+        }
+        self.active_yuv_source = None;
+        let output_view =
+            output
+                .expect("checked above")
+                .create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("I420 Convert Output View"),
+                    format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                    ..Default::default()
+                });
 
         let bind_group = self
             .ctx
@@ -460,6 +621,44 @@ impl super::Renderer {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.submit(std::iter::once(encoder.finish()));
+        true
+    }
+
+    fn create_i420_final_bind_group(&mut self) {
+        self.final_i420_bind_group = Some(std::sync::Arc::new(self.ctx.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("I420 Final Blit Bind Group"),
+                layout: &self.ctx.final_i420_blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.yuv_uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.i420_y_view.as_ref().expect("I420 Y view exists"),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.i420_u_view.as_ref().expect("I420 U view exists"),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.i420_v_view.as_ref().expect("I420 V view exists"),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                    },
+                ],
+            },
+        )));
     }
 }

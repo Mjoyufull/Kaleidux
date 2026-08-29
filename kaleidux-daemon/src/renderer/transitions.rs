@@ -130,7 +130,6 @@ impl super::Renderer {
         // Explicitly drop textures to free GPU memory
         self.current_texture = None;
         self.current_texture_view = None;
-        #[cfg(feature = "mpv-backend")]
         {
             self.current_external_view = None;
             let frame = self.current_external_frame.take();
@@ -138,7 +137,6 @@ impl super::Renderer {
         }
         self.prev_texture = None;
         self.prev_texture_view = None;
-        #[cfg(feature = "mpv-backend")]
         {
             self.prev_external_view = None;
             let frame = self.prev_external_frame.take();
@@ -165,7 +163,7 @@ impl super::Renderer {
         // rather than waiting for WGPU's automatic cleanup
         self.active_video_session_id = 0; // Invalidate current video session
         self.configured = false; // Force re-config next time
-        self.ctx.device.poll(wgpu::Maintain::Poll);
+        self.ctx.request_device_poll();
     }
 
     #[allow(dead_code)]
@@ -186,7 +184,6 @@ impl super::Renderer {
             self.prev_aspect = self.current_aspect;
             self.prev_texture_size = self.current_texture_size.take();
         } else if self.current_external_view_available() {
-            #[cfg(feature = "mpv-backend")]
             {
                 self.prev_external_view = self.current_external_view.take();
                 self.prev_external_frame = self.current_external_frame.take();
@@ -298,14 +295,8 @@ impl super::Renderer {
             .or_else(|| self.current_external_transition_view())
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn current_external_transition_view(&self) -> Option<&wgpu::TextureView> {
-        self.current_external_view.as_ref()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn current_external_transition_view(&self) -> Option<&wgpu::TextureView> {
-        None
+        self.current_external_view.as_deref()
     }
 
     fn prev_transition_view(&self) -> Option<&wgpu::TextureView> {
@@ -314,14 +305,8 @@ impl super::Renderer {
             .or_else(|| self.prev_external_transition_view())
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn prev_external_transition_view(&self) -> Option<&wgpu::TextureView> {
-        self.prev_external_view.as_ref()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn prev_external_transition_view(&self) -> Option<&wgpu::TextureView> {
-        None
+        self.prev_external_view.as_deref()
     }
 }
 

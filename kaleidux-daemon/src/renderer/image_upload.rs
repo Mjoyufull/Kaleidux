@@ -45,7 +45,7 @@ impl super::Renderer {
             self.metrics.as_deref(),
         );
 
-        self.ctx.queue.write_texture(
+        self.ctx.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
                 mip_level: 0,

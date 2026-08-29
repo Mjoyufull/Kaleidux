@@ -4,6 +4,7 @@ use tracing::{error, info};
 ///
 /// Returns `None` if the current backend is not Vulkan or if any Vulkan call fails.
 /// The caller should fall back to a CPU upload path in that case.
+#[allow(dead_code)]
 pub(super) fn import_dmabuf_as_texture(
     device: &wgpu::Device,
     fd: std::os::unix::io::RawFd,
@@ -266,6 +267,171 @@ fn find_memory_type(type_bits: u32) -> Option<u32> {
 pub(super) struct CudaTexLayout {
     pub(super) row_pitch: usize,
     pub(super) offset: usize,
+}
+
+pub(super) struct CudaVulkanTimeline {
+    device: ash::Device,
+    queue: ash::vk::Queue,
+    semaphore: ash::vk::Semaphore,
+    cuda: Option<crate::cuda_interop::CudaTimelineSemaphore>,
+    next_value: u64,
+}
+
+impl CudaVulkanTimeline {
+    pub(super) fn new(
+        ci: &crate::cuda_interop::CudaInterop,
+        device: &wgpu::Device,
+    ) -> anyhow::Result<Self> {
+        use ash::vk;
+        anyhow::ensure!(
+            ci.supports_external_timeline(),
+            "CUDA driver does not expose external timeline semaphore APIs"
+        );
+        // SAFETY: handles are cloned from the live WGPU Vulkan device. The
+        // semaphore is retained by this object and destroyed before that
+        // device is released.
+        let (raw_device, queue, semaphore, fd) = unsafe {
+            device
+                .as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_device| {
+                    let hal_device =
+                        hal_device.ok_or_else(|| anyhow::anyhow!("WGPU is not using Vulkan"))?;
+                    let instance = hal_device.shared_instance().raw_instance().clone();
+                    let raw_device = hal_device.raw_device().clone();
+                    let queue = hal_device.raw_queue();
+                    let mut export = vk::ExportSemaphoreCreateInfo::default()
+                        .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+                    let mut timeline = vk::SemaphoreTypeCreateInfo::default()
+                        .semaphore_type(vk::SemaphoreType::TIMELINE)
+                        .initial_value(0);
+                    let create_info = vk::SemaphoreCreateInfo::default()
+                        .push_next(&mut export)
+                        .push_next(&mut timeline);
+                    let semaphore =
+                        raw_device
+                            .create_semaphore(&create_info, None)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "creating CUDA/Vulkan timeline semaphore: {error:?}"
+                                )
+                            })?;
+                    let external =
+                        ash::khr::external_semaphore_fd::Device::new(&instance, &raw_device);
+                    let fd_info = vk::SemaphoreGetFdInfoKHR::default()
+                        .semaphore(semaphore)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+                    let fd = match external.get_semaphore_fd(&fd_info) {
+                        Ok(fd) => fd,
+                        Err(error) => {
+                            raw_device.destroy_semaphore(semaphore, None);
+                            return Err(anyhow::anyhow!(
+                                "exporting CUDA/Vulkan timeline semaphore: {error:?}"
+                            ));
+                        }
+                    };
+                    Ok::<_, anyhow::Error>((raw_device, queue, semaphore, fd))
+                })
+                .ok_or_else(|| anyhow::anyhow!("WGPU Vulkan HAL device is unavailable"))??
+        };
+        let cuda = match ci.import_timeline_semaphore(fd) {
+            Ok(cuda) => cuda,
+            Err(error) => {
+                // SAFETY: CUDA did not import the handle, and the Vulkan
+                // semaphore has no pending submissions yet.
+                unsafe { raw_device.destroy_semaphore(semaphore, None) };
+                anyhow::bail!(error);
+            }
+        };
+        info!("[CUDA-VK] explicit timeline semaphore handoff enabled");
+        Ok(Self {
+            device: raw_device,
+            queue,
+            semaphore,
+            cuda: Some(cuda),
+            next_value: 1,
+        })
+    }
+
+    pub(super) fn next_frame_values(&mut self) -> (u64, u64) {
+        let release = self.next_value;
+        let ready = release + 1;
+        self.next_value = ready.checked_add(1).unwrap_or(1);
+        (release, ready)
+    }
+
+    pub(super) fn cuda(&self) -> &crate::cuda_interop::CudaTimelineSemaphore {
+        self.cuda.as_ref().expect("timeline CUDA handle is live")
+    }
+
+    pub(super) fn signal_vulkan_release(&self, value: u64) -> anyhow::Result<()> {
+        use ash::vk;
+        let values = [value];
+        let semaphores = [self.semaphore];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let submit = vk::SubmitInfo::default()
+            .signal_semaphores(&semaphores)
+            .push_next(&mut timeline);
+        // SAFETY: queue and timeline semaphore belong to this live device;
+        // queue access is serialized by WgpuContext::queue_lock at the caller.
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit], vk::Fence::null())
+        }
+        .map_err(|error| anyhow::anyhow!("signaling Vulkan release timeline: {error:?}"))
+    }
+
+    pub(super) fn wait_vulkan_ready(&self, value: u64) -> anyhow::Result<()> {
+        use ash::vk;
+        let values = [value];
+        let semaphores = [self.semaphore];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&semaphores)
+            .wait_dst_stage_mask(&stages)
+            .push_next(&mut timeline);
+        // SAFETY: same queue-serialization and ownership contract as above.
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit], vk::Fence::null())
+        }
+        .map_err(|error| anyhow::anyhow!("waiting on CUDA-ready timeline: {error:?}"))
+    }
+
+    pub(super) fn completed_value(&self) -> anyhow::Result<u64> {
+        // SAFETY: semaphore is a live timeline object on this device.
+        unsafe { self.device.get_semaphore_counter_value(self.semaphore) }
+            .map_err(|error| anyhow::anyhow!("querying CUDA/Vulkan timeline: {error:?}"))
+    }
+
+    pub(super) fn destroy(mut self, ci: &crate::cuda_interop::CudaInterop) {
+        // Cache retirement is rare (resize/backend teardown). Ensure no queue
+        // operation still references the semaphore or shared allocations.
+        // SAFETY: this is the owning logical device.
+        if let Err(error) = unsafe { self.device.device_wait_idle() } {
+            error!("[CUDA-VK] device-idle wait during timeline teardown failed: {error:?}");
+        }
+        if let Some(cuda) = self.cuda.take() {
+            ci.destroy_timeline_semaphore(cuda);
+        }
+        // SAFETY: the queue is idle and this object owns the semaphore.
+        unsafe { self.device.destroy_semaphore(self.semaphore, None) };
+        self.semaphore = ash::vk::Semaphore::null();
+    }
+}
+
+impl Drop for CudaVulkanTimeline {
+    fn drop(&mut self) {
+        if self.semaphore != ash::vk::Semaphore::null() {
+            // This is a last-resort cleanup path; normal renderer teardown
+            // calls destroy() so the CUDA handle is released first.
+            unsafe {
+                let _ = self.device.device_wait_idle();
+                self.device.destroy_semaphore(self.semaphore, None);
+            }
+        }
+    }
 }
 
 pub(super) fn create_cuda_backed_texture(

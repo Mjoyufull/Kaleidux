@@ -12,7 +12,10 @@ pub(super) enum BlitSource {
 
 impl super::Renderer {
     pub(super) fn select_blit_source(&self) -> Option<BlitSource> {
-        if self.current_texture.is_some() || self.current_external_view_available() {
+        if self.current_texture.is_some()
+            || self.current_external_view_available()
+            || self.active_yuv_source.is_some()
+        {
             if !self.transition_active
                 || (self.prev_texture.is_none() && !self.prev_external_view_available())
             {
@@ -90,7 +93,7 @@ impl super::Renderer {
             });
         }
 
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.submit(std::iter::once(encoder.finish()));
         output.present();
         self.last_present_time = std::time::Instant::now();
         self.needs_redraw = false;
@@ -112,6 +115,13 @@ impl super::Renderer {
             return true;
         }
 
+        if let Some(key) = self.external_view_key(blit_source)
+            && let Some(bind_group) = self.external_blit_bind_groups.get(&key).cloned()
+        {
+            self.store_blit_bind_group(bind_group, is_comp, is_prev);
+            return true;
+        }
+
         let texture_view = match blit_source {
             BlitSource::Current => self.current_blit_view(),
             BlitSource::Prev => self.prev_blit_view(),
@@ -121,6 +131,13 @@ impl super::Renderer {
         match texture_view {
             Some(view) => {
                 let bind_group = self.build_blit_bind_group(view, "Blit Bind Group");
+                if let Some(key) = self.external_view_key(blit_source) {
+                    if self.external_blit_bind_groups.len() >= 12 {
+                        self.external_blit_bind_groups.clear();
+                    }
+                    self.external_blit_bind_groups
+                        .insert(key, bind_group.clone());
+                }
                 self.store_blit_bind_group(bind_group, is_comp, is_prev);
                 true
             }
@@ -134,14 +151,8 @@ impl super::Renderer {
             .or_else(|| self.current_external_blit_view())
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn current_external_blit_view(&self) -> Option<&wgpu::TextureView> {
-        self.current_external_view.as_ref()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn current_external_blit_view(&self) -> Option<&wgpu::TextureView> {
-        None
+        self.current_external_view.as_deref()
     }
 
     fn prev_blit_view(&self) -> Option<&wgpu::TextureView> {
@@ -150,14 +161,8 @@ impl super::Renderer {
             .or_else(|| self.prev_external_blit_view())
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn prev_external_blit_view(&self) -> Option<&wgpu::TextureView> {
-        self.prev_external_view.as_ref()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn prev_external_blit_view(&self) -> Option<&wgpu::TextureView> {
-        None
+        self.prev_external_view.as_deref()
     }
 
     fn create_fallback_blit_bind_group(&mut self, blit_source: BlitSource) -> bool {
@@ -212,37 +217,48 @@ impl super::Renderer {
         &self,
         texture_view: &wgpu::TextureView,
         label: &'static str,
-    ) -> wgpu::BindGroup {
-        self.ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.ctx.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            })
+    ) -> std::sync::Arc<wgpu::BindGroup> {
+        std::sync::Arc::new(
+            self.ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.ctx.blit_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                        },
+                    ],
+                }),
+        )
     }
 
     fn store_blit_bind_group(
         &mut self,
-        bind_group: wgpu::BindGroup,
+        bind_group: std::sync::Arc<wgpu::BindGroup>,
         is_composition: bool,
         is_prev: bool,
     ) {
         self.blit_bind_group = Some(bind_group);
         self.blit_source_is_composition = is_composition;
         self.blit_source_is_prev = is_prev;
+    }
+
+    fn external_view_key(&self, source: BlitSource) -> Option<usize> {
+        let view = match source {
+            BlitSource::Current => self.current_external_view.as_ref(),
+            BlitSource::Prev => self.prev_external_view.as_ref(),
+            BlitSource::Composition => None,
+        }?;
+        Some(std::sync::Arc::as_ptr(view) as usize)
     }
 }
