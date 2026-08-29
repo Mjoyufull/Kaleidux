@@ -7,8 +7,27 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = []
-mpv-backend = ["dep:khronos-egl", "dep:libmpv2", "dep:libmpv2-sys", "dep:wayland-egl"]
+default = ["full"]
+full = [
+    "backend-appsink",
+    "backend-mpv",
+    "backend-ffmpeg",
+    "display-wayland",
+    "display-x11",
+]
+wayland-only = [
+    "backend-appsink",
+    "backend-mpv",
+    "backend-ffmpeg",
+    "display-wayland",
+]
+minimal-static = ["display-wayland"]
+backend-appsink = []
+backend-mpv = ["dep:libmpv2", "dep:libmpv2-sys"]
+backend-ffmpeg = ["dep:ffmpeg-next", "dep:libva-sys"]
+display-wayland = []
+display-x11 = ["dep:x11rb"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 kaleidux-common = { workspace = true }
@@ -18,9 +37,10 @@ gstreamer = { workspace = true }
 gstreamer-video = { workspace = true }
 gstreamer-app = { workspace = true }
 gstreamer-allocators = { workspace = true }
+glib = { workspace = true }
 ash = { workspace = true }
 naga = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "fs", "time", "sync", "signal", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -31,7 +51,6 @@ toml = { workspace = true }
 humantime-serde = { workspace = true }
 regex = { workspace = true }
 dirs = { workspace = true }
-walkdir = { workspace = true }
 jwalk = { workspace = true }
 redb = { workspace = true }
 once_cell = { workspace = true }
@@ -42,28 +61,32 @@ anyhow = "1.0"
 raw-window-handle.workspace = true
 libmpv2 = { version = "6.0.0", default-features = false, optional = true }
 libmpv2-sys = { version = "4.0.1", optional = true }
-khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
-wayland-egl = { version = "0.32.11", optional = true }
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
+wayland-egl = "0.32.11"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+libva-sys = { version = "0.1.2", optional = true }
+glow = "0.14.2"
+drm = "0.14.1"
 
 # Specifically for Wayland and X11
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb", "randr"] }
-image = { version = "0.25", features = ["avif-native"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb", "dri3", "present", "randr"], optional = true }
+image = { version = "0.25", default-features = false, features = ["avif-native", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 rhai = { workspace = true }
 bytemuck = { version = "1.25", features = ["derive"] }
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads_runtime_support"] }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["unprefixed_malloc_on_supported_platforms", "background_threads_runtime_support"] }
 
 libc = "0.2"
-libloading = "0.9"
-sysinfo = { version = "0.38", features = ["component"] }
+libloading = "0.8.9"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 parking_lot = "0.12"
-futures = "0.3"
 notify = { workspace = true }
 nvml-wrapper = "0.12"
 lru = "0.17"
-fast_image_resize = { version = "6", features = ["image"] }
+fast_image_resize = "6"
 zune-core = "0.5.1"
 zune-jpeg = "0.5.12"
 zune-png = "0.5.2"

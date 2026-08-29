@@ -69,11 +69,27 @@ pub(super) fn configure_pipeline_element(
     }
 
     if is_nvcodec_decoder_factory(factory_name.as_str()) {
+        let output_surfaces = nvdec_output_surfaces();
+        set_if_present(element, "num-output-surfaces", output_surfaces);
         debug!(
-            "[VIDEO] {}: Keeping decoder {} on default scheduling/presentation settings",
-            source_id, factory_name
+            "[VIDEO] {}: Configured decoder {} with bounded CUDA output surfaces={}",
+            source_id, factory_name, output_surfaces
         );
     }
+}
+
+fn nvdec_output_surfaces() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("KLD_NVDEC_OUTPUT_SURFACES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map(|value| value.min(16))
+            // Two direct output surfaces allow one frame to remain in the
+            // CUDA/Vulkan timeline while NVDEC advances, without the decoder's
+            // default forced copy for a one-surface pool.
+            .unwrap_or(2)
+    })
 }
 
 fn configure_video_only_decodebin(source_id: &str, factory_name: &str, element: &gst::Element) {

@@ -39,7 +39,7 @@ fn render_video_frame(
     };
     let buffer = gst::Buffer::from_mut_slice(data);
     Ok(Some(VideoFrame {
-        buffer,
+        storage: buffer.into(),
         width,
         height,
         stride,
@@ -47,6 +47,8 @@ fn render_video_frame(
         session_id,
         pts_ns: None,
         duration_ns: None,
+        color: Default::default(),
+        geometry: crate::video::VideoGeometry::for_dimensions(width, height),
     }))
 }
 

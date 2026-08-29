@@ -1,4 +1,5 @@
 use libmpv2::Mpv;
+use libmpv2_sys as sys;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,12 +18,16 @@ use egl_render::NativeGlRenderContext;
 #[path = "mpv_native/offscreen_gl.rs"]
 mod offscreen_gl;
 use offscreen_gl::ComposedGlRenderContext;
+#[path = "mpv_native/offscreen_gl_support.rs"]
+mod offscreen_gl_support;
+#[path = "mpv_native/render_wake.rs"]
+pub(super) mod render_wake;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MpvRenderApiRequest {
     ComposedSoftware,
-    ComposedGlExperimental,
-    NativeGlOverlayExperimental,
+    ComposedGl,
+    NativeGlOverlayDiagnostic,
     DeprecatedNativeGlAlias,
     Unknown,
 }
@@ -34,25 +39,23 @@ impl MpvRenderApiRequest {
 
     fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            None => Self::ComposedGlExperimental,
+            None => Self::ComposedGl,
             Some("" | "sw" | "software" | "cpu" | "composed") => Self::ComposedSoftware,
-            Some("gl-composed" | "opengl-composed" | "gpu-composed") => {
-                Self::ComposedGlExperimental
-            }
+            Some("gl-composed" | "opengl-composed" | "gpu-composed") => Self::ComposedGl,
             Some(
                 "overlay" | "gl-overlay" | "opengl-overlay" | "native-overlay" | "wayland-overlay",
-            ) => Self::NativeGlOverlayExperimental,
+            ) => Self::NativeGlOverlayDiagnostic,
             Some("gl" | "opengl" | "native" | "wayland") => Self::DeprecatedNativeGlAlias,
             Some(_) => Self::Unknown,
         }
     }
 
     pub(crate) fn enables_native_overlay(self) -> bool {
-        self == Self::NativeGlOverlayExperimental
+        self == Self::NativeGlOverlayDiagnostic
     }
 
     pub(crate) fn enables_composed_gl(self) -> bool {
-        self == Self::ComposedGlExperimental
+        self == Self::ComposedGl
     }
 }
 
@@ -67,9 +70,17 @@ pub struct MpvNativeVideoTarget {
 #[derive(Clone)]
 pub struct MpvComposedVideoTarget {
     display_ptr: usize,
+    display_platform: MpvComposedDisplayPlatform,
     wgpu_ctx: Arc<crate::renderer::WgpuContext>,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MpvComposedDisplayPlatform {
+    Wayland,
+    #[cfg(feature = "display-x11")]
+    Xcb,
 }
 
 impl std::fmt::Debug for MpvComposedVideoTarget {
@@ -77,6 +88,7 @@ impl std::fmt::Debug for MpvComposedVideoTarget {
         formatter
             .debug_struct("MpvComposedVideoTarget")
             .field("display_ptr", &self.display_ptr)
+            .field("display_platform", &self.display_platform)
             .field("width", &self.width)
             .field("height", &self.height)
             .finish_non_exhaustive()
@@ -95,6 +107,26 @@ impl MpvComposedVideoTarget {
         }
         Some(Self {
             display_ptr: display_ptr as usize,
+            display_platform: MpvComposedDisplayPlatform::Wayland,
+            wgpu_ctx,
+            width: width.max(1),
+            height: height.max(1),
+        })
+    }
+
+    #[cfg(feature = "display-x11")]
+    pub(crate) fn new_xcb(
+        connection_ptr: *mut c_void,
+        wgpu_ctx: Arc<crate::renderer::WgpuContext>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if connection_ptr.is_null() {
+            return None;
+        }
+        Some(Self {
+            display_ptr: connection_ptr as usize,
+            display_platform: MpvComposedDisplayPlatform::Xcb,
             wgpu_ctx,
             width: width.max(1),
             height: height.max(1),
@@ -107,6 +139,28 @@ impl MpvComposedVideoTarget {
 
     pub(super) fn size(&self) -> (i32, i32) {
         (self.width as i32, self.height as i32)
+    }
+
+    pub(super) fn egl_platform(&self) -> u32 {
+        match self.display_platform {
+            MpvComposedDisplayPlatform::Wayland => 0x31D8, // EGL_PLATFORM_WAYLAND_KHR
+            #[cfg(feature = "display-x11")]
+            MpvComposedDisplayPlatform::Xcb => 0x31DC, // EGL_PLATFORM_XCB_EXT
+        }
+    }
+
+    pub(super) fn mpv_native_display_param(&self) -> Option<(u32, *mut c_void)> {
+        match self.display_platform {
+            MpvComposedDisplayPlatform::Wayland => Some((
+                sys::mpv_render_param_type_MPV_RENDER_PARAM_WL_DISPLAY,
+                self.display_ptr(),
+            )),
+            // MPV_RENDER_PARAM_X11_DISPLAY requires an Xlib Display*, not an
+            // xcb_connection_t*. Hardware probing uses DRM_DISPLAY_V2 when a
+            // render node is available; software decoding needs no X display.
+            #[cfg(feature = "display-x11")]
+            MpvComposedDisplayPlatform::Xcb => None,
+        }
     }
 }
 
@@ -206,10 +260,10 @@ pub(crate) struct MpvNativeRenderThreadConfig {
     pub(crate) stop_requested: Arc<AtomicBool>,
     pub(crate) first_frame_logged: Arc<AtomicBool>,
     pub(crate) metrics: Arc<PerformanceMetrics>,
-    pub(crate) player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+    pub(crate) player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
     pub(crate) start_time: Instant,
-    pub(crate) render_interval: Duration,
     pub(crate) render_ready: Arc<RenderReadySignal>,
+    pub(crate) stop_wake: Arc<render_wake::RenderWake>,
 }
 
 pub(crate) struct MpvComposedRenderThreadConfig {
@@ -221,10 +275,11 @@ pub(crate) struct MpvComposedRenderThreadConfig {
     pub(crate) stop_requested: Arc<AtomicBool>,
     pub(crate) first_frame_logged: Arc<AtomicBool>,
     pub(crate) metrics: Arc<PerformanceMetrics>,
-    pub(crate) player_event_tx: tokio::sync::mpsc::UnboundedSender<PlayerEvent>,
+    pub(crate) player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
     pub(crate) start_time: Instant,
-    pub(crate) render_interval: Duration,
+    pub(crate) min_render_interval: Option<Duration>,
     pub(crate) render_ready: Arc<RenderReadySignal>,
+    pub(crate) stop_wake: Arc<render_wake::RenderWake>,
 }
 
 pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) {
@@ -245,13 +300,20 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
         "[VIDEO] {}: composed libmpv GL render thread started (session={} size={}x{})",
         config.source_id, config.session_id, config.target.width, config.target.height
     );
+    let mut last_published = None::<Instant>;
     while !config.stop_requested.load(Ordering::SeqCst) {
-        let frame_start = Instant::now();
+        if !renderer.wait_for_update_or_stop(&config.stop_wake) {
+            break;
+        }
         config
             .metrics
             .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureAttempt);
-        match renderer.render_frame(config.session_id) {
+        let publish = config
+            .min_render_interval
+            .is_none_or(|interval| last_published.is_none_or(|last| last.elapsed() >= interval));
+        match renderer.render_frame(config.session_id, publish) {
             Ok(Some(frame)) => {
+                last_published = Some(Instant::now());
                 if !config.first_frame_logged.swap(true, Ordering::SeqCst) {
                     info!(
                         "[ASSET] {}: First composed libmpv GL frame published in {:.3}ms",
@@ -276,7 +338,6 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
                 break;
             }
         }
-        std::thread::sleep(config.render_interval.saturating_sub(frame_start.elapsed()));
     }
     debug!(
         "[VIDEO] {}: composed libmpv GL render thread stopped (session={})",
@@ -292,10 +353,14 @@ fn report_gl_renderer_failure(config: &MpvComposedRenderThreadConfig, error: &an
     config
         .metrics
         .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
-    let _ = config.player_event_tx.send(PlayerEvent {
+    if !super::mpv_backend_is_explicitly_forced() {
+        warn!("[VIDEO] Switching automatic backend selection to appsink after mpv GL failure");
+        super::set_video_backend_request(super::VideoBackendRequest::ForceAppsink);
+    }
+    let _ = config.player_event_tx.blocking_send(PlayerEvent {
         source_id: config.source_id.to_string(),
         session_id: config.session_id,
-        backend_kind: VideoBackendKind::MpvExperimental,
+        backend_kind: VideoBackendKind::Mpv,
         kind: PlayerEventKind::Error,
         reason: format!("composed libmpv GL renderer failed to initialize: {error}"),
     });
@@ -312,8 +377,8 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
         metrics,
         player_event_tx,
         start_time,
-        render_interval,
         render_ready,
+        stop_wake,
     } = config;
 
     let mut renderer = match NativeGlRenderContext::new(&mpv, &target) {
@@ -326,10 +391,16 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
                 source_id, error
             );
             metrics.record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
-            let _ = player_event_tx.send(PlayerEvent {
+            if !super::mpv_backend_is_explicitly_forced() {
+                warn!(
+                    "[VIDEO] Switching automatic backend selection to appsink after native mpv GL failure"
+                );
+                super::set_video_backend_request(super::VideoBackendRequest::ForceAppsink);
+            }
+            let _ = player_event_tx.blocking_send(PlayerEvent {
                 source_id: source_id.to_string(),
                 session_id,
-                backend_kind: VideoBackendKind::MpvExperimental,
+                backend_kind: VideoBackendKind::Mpv,
                 kind: PlayerEventKind::Error,
                 reason: format!("native libmpv GL renderer failed to initialize: {error}"),
             });
@@ -345,14 +416,15 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
     );
 
     while !stop_requested.load(Ordering::SeqCst) {
-        let frame_start = Instant::now();
-        renderer.drain_pending_updates();
+        if !renderer.wait_for_update_or_stop(&stop_wake) {
+            break;
+        }
         if stop_requested.load(Ordering::SeqCst) {
             break;
         }
 
         metrics.record_video_backend_metric(VideoBackendMetricKind::MpvCaptureAttempt);
-        match renderer.render(true) {
+        match renderer.render(false) {
             Ok(true) => {
                 if !first_frame_logged.swap(true, Ordering::SeqCst) {
                     info!(
@@ -373,7 +445,6 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
                 std::thread::sleep(Duration::from_millis(16));
             }
         }
-        std::thread::sleep(render_interval.saturating_sub(frame_start.elapsed()));
     }
 
     debug!(
@@ -392,7 +463,7 @@ mod tests {
     fn native_overlay_requires_explicit_overlay_name() {
         assert_eq!(
             MpvRenderApiRequest::parse(Some("gl-overlay")),
-            MpvRenderApiRequest::NativeGlOverlayExperimental
+            MpvRenderApiRequest::NativeGlOverlayDiagnostic
         );
         assert!(MpvRenderApiRequest::parse(Some("overlay")).enables_native_overlay());
     }
@@ -401,7 +472,7 @@ mod tests {
     fn default_and_software_names_keep_wgpu_composition() {
         assert_eq!(
             MpvRenderApiRequest::parse(None),
-            MpvRenderApiRequest::ComposedGlExperimental
+            MpvRenderApiRequest::ComposedGl
         );
         assert_eq!(
             MpvRenderApiRequest::parse(Some("software")),
@@ -410,10 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn composed_gl_requires_explicit_name_during_bringup() {
+    fn composed_gl_production_name_is_supported() {
         assert_eq!(
             MpvRenderApiRequest::parse(Some("gl-composed")),
-            MpvRenderApiRequest::ComposedGlExperimental
+            MpvRenderApiRequest::ComposedGl
         );
     }
 

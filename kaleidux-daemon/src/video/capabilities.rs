@@ -1,7 +1,6 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tracing::info;
 
@@ -17,24 +16,43 @@ pub enum VideoMode {
 
 static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
 static VIDEO_BACKEND_REQUEST: AtomicU8 = AtomicU8::new(0);
+// 0 = renderer has not selected an adapter yet, 1 = supported, 2 = unsupported.
+// Capability logging happens before WGPU initialization, so unknown remains
+// optimistic; sink caps are built only after the renderer has resolved it.
+static P010_SAMPLING_SUPPORT: AtomicU8 = AtomicU8::new(0);
 static VIDEO_CAPABILITIES: once_cell::sync::Lazy<parking_lot::Mutex<Option<VideoCapabilities>>> =
     once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 pub(super) static CPU_VIDEO_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
-pub(super) static CUDA_LAYOUT_LOG_SIGNATURES: once_cell::sync::Lazy<
-    parking_lot::Mutex<HashMap<String, String>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub fn set_p010_sampling_supported(supported: bool) {
+    P010_SAMPLING_SUPPORT.store(if supported { 1 } else { 2 }, Ordering::Release);
+}
+
+pub fn p010_sampling_supported() -> Option<bool> {
+    match P010_SAMPLING_SUPPORT.load(Ordering::Acquire) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn p010_may_be_negotiated() -> bool {
+    p010_sampling_supported() != Some(false)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoBackendKind {
     Appsink,
-    MpvExperimental,
+    Mpv,
+    Ffmpeg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoBackendRequest {
     Auto,
     ForceAppsink,
-    ForceMpvExperimental,
+    ForceMpv,
+    ForceFfmpeg,
 }
 
 const NVCODEC_DECODER_FACTORIES: [&str; 5] =
@@ -92,7 +110,8 @@ pub fn set_video_backend_request(request: VideoBackendRequest) {
     let value = match request {
         VideoBackendRequest::Auto => 0,
         VideoBackendRequest::ForceAppsink => 1,
-        VideoBackendRequest::ForceMpvExperimental => 2,
+        VideoBackendRequest::ForceMpv => 2,
+        VideoBackendRequest::ForceFfmpeg => 3,
     };
     VIDEO_BACKEND_REQUEST.store(value, Ordering::Relaxed);
 }
@@ -100,27 +119,68 @@ pub fn set_video_backend_request(request: VideoBackendRequest) {
 pub fn get_video_backend_request() -> VideoBackendRequest {
     match VIDEO_BACKEND_REQUEST.load(Ordering::Relaxed) {
         1 => VideoBackendRequest::ForceAppsink,
-        2 => VideoBackendRequest::ForceMpvExperimental,
+        2 => VideoBackendRequest::ForceMpv,
+        3 => VideoBackendRequest::ForceFfmpeg,
         _ => VideoBackendRequest::Auto,
     }
 }
 
 pub fn resolve_video_backend_request(request: VideoBackendRequest) -> VideoBackendRequest {
     match request {
-        VideoBackendRequest::Auto => get_video_backend_request(),
+        VideoBackendRequest::Auto => match get_video_backend_request() {
+            VideoBackendRequest::Auto => default_video_backend_request(),
+            selected => selected,
+        },
         forced => forced,
     }
 }
 
-pub fn validate_selected_video_backend(request: VideoBackendRequest) -> anyhow::Result<()> {
-    if matches!(request, VideoBackendRequest::ForceMpvExperimental)
-        && !cfg!(feature = "mpv-backend")
-    {
-        anyhow::bail!(
-            "--video-backend mpv requires building kaleidux-daemon with the mpv-backend Cargo feature"
-        );
+pub fn default_video_backend_request() -> VideoBackendRequest {
+    if cfg!(feature = "backend-ffmpeg") {
+        VideoBackendRequest::ForceFfmpeg
+    } else if cfg!(feature = "backend-mpv") {
+        VideoBackendRequest::ForceMpv
+    } else if cfg!(feature = "backend-appsink") {
+        VideoBackendRequest::ForceAppsink
+    } else {
+        VideoBackendRequest::Auto
     }
-    Ok(())
+}
+
+pub fn video_backend_is_enabled(request: VideoBackendRequest) -> bool {
+    match request {
+        VideoBackendRequest::Auto => default_video_backend_request() != VideoBackendRequest::Auto,
+        VideoBackendRequest::ForceAppsink => cfg!(feature = "backend-appsink"),
+        VideoBackendRequest::ForceMpv => cfg!(feature = "backend-mpv"),
+        VideoBackendRequest::ForceFfmpeg => cfg!(feature = "backend-ffmpeg"),
+    }
+}
+
+pub fn video_backend_feature(request: VideoBackendRequest) -> &'static str {
+    match request {
+        VideoBackendRequest::Auto => "one of backend-ffmpeg, backend-mpv, or backend-appsink",
+        VideoBackendRequest::ForceAppsink => "backend-appsink",
+        VideoBackendRequest::ForceMpv => "backend-mpv",
+        VideoBackendRequest::ForceFfmpeg => "backend-ffmpeg",
+    }
+}
+
+pub fn enabled_video_backend_labels() -> Vec<&'static str> {
+    let mut enabled = Vec::with_capacity(3);
+    if cfg!(feature = "backend-ffmpeg") {
+        enabled.push("ffmpeg");
+    }
+    if cfg!(feature = "backend-mpv") {
+        enabled.push("mpv");
+    }
+    if cfg!(feature = "backend-appsink") {
+        enabled.push("appsink");
+    }
+    enabled
+}
+
+pub fn mpv_backend_is_explicitly_forced() -> bool {
+    matches!(get_video_backend_request(), VideoBackendRequest::ForceMpv)
 }
 
 pub fn set_video_mode(mode: VideoMode) {
@@ -164,10 +224,26 @@ fn nv12_caps() -> gst::Caps {
         .build()
 }
 
+fn p010_caps() -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .field("format", "P010_10LE")
+        .build()
+}
+
 fn dmabuf_nv12_caps() -> gst::Caps {
     gst::Caps::builder("video/x-raw")
         .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
         .field("format", "NV12")
+        .build()
+}
+
+fn dmabuf_dma_drm_caps() -> gst::Caps {
+    // Leave drm-format unconstrained: the exporter fixes an NV12
+    // FOURCC:modifier pair during negotiation and GstVideoInfoDmaDrm validates
+    // the concrete result before any frame reaches Vulkan.
+    gst::Caps::builder("video/x-raw")
+        .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
+        .field("format", "DMA_DRM")
         .build()
 }
 
@@ -218,16 +294,27 @@ pub fn current_video_capabilities() -> VideoCapabilities {
 fn caps_ladder_for_mode(mode: VideoMode, capabilities: &VideoCapabilities) -> Vec<gst::Caps> {
     match mode {
         VideoMode::ForceRgba => vec![rgba_caps()],
-        VideoMode::ForceCpu => vec![nv12_caps(), i420_caps(), rgba_caps()],
+        VideoMode::ForceCpu => {
+            let mut ladder = Vec::new();
+            if p010_may_be_negotiated() {
+                ladder.push(p010_caps());
+            }
+            ladder.extend([nv12_caps(), i420_caps(), rgba_caps()]);
+            ladder
+        }
         VideoMode::ForceNv12 => vec![nv12_caps()],
-        VideoMode::ForceDmaBuf => vec![dmabuf_nv12_caps()],
+        VideoMode::ForceDmaBuf => vec![dmabuf_dma_drm_caps(), dmabuf_nv12_caps()],
         VideoMode::StrictCuda => vec![cuda_nv12_caps()],
         VideoMode::Auto => {
             let mut ladder = Vec::new();
             if capabilities.has_cuda_path() {
                 ladder.push(cuda_nv12_caps());
             }
+            ladder.push(dmabuf_dma_drm_caps());
             ladder.push(dmabuf_nv12_caps());
+            if p010_may_be_negotiated() {
+                ladder.push(p010_caps());
+            }
             ladder.push(nv12_caps());
             ladder.push(i420_caps());
             ladder.push(rgba_caps());
@@ -239,16 +326,27 @@ fn caps_ladder_for_mode(mode: VideoMode, capabilities: &VideoCapabilities) -> Ve
 pub fn caps_ladder_labels(mode: VideoMode, capabilities: &VideoCapabilities) -> Vec<&'static str> {
     match mode {
         VideoMode::ForceRgba => vec!["RGBA"],
-        VideoMode::ForceCpu => vec!["NV12", "I420", "RGBA"],
+        VideoMode::ForceCpu => {
+            let mut labels = Vec::new();
+            if p010_may_be_negotiated() {
+                labels.push("P010");
+            }
+            labels.extend(["NV12", "I420", "RGBA"]);
+            labels
+        }
         VideoMode::ForceNv12 => vec!["NV12"],
-        VideoMode::ForceDmaBuf => vec!["DMABuf NV12"],
+        VideoMode::ForceDmaBuf => vec!["DMA_DRM NV12", "linear DMABuf NV12"],
         VideoMode::StrictCuda => vec!["CUDAMemory NV12"],
         VideoMode::Auto => {
             let mut labels = Vec::new();
             if capabilities.has_cuda_path() {
                 labels.push("CUDAMemory NV12");
             }
-            labels.push("DMABuf NV12");
+            labels.push("DMA_DRM NV12");
+            labels.push("linear DMABuf NV12");
+            if p010_may_be_negotiated() {
+                labels.push("P010");
+            }
             labels.push("NV12");
             labels.push("I420");
             labels.push("RGBA");
@@ -367,5 +465,53 @@ pub fn configure_hw_decoders() {
             "[VIDEO] Non-NVIDIA GPU: VA-API decoders preferred for DMA-BUF zero-copy (vaapi={:?})",
             capabilities.vaapi_decoders
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        VideoBackendRequest, VideoCapabilities, VideoMode, build_video_sink_caps,
+        default_video_backend_request,
+    };
+    use gstreamer as gst;
+    use gstreamer_allocators as gst_alloc;
+
+    #[test]
+    fn default_backend_respects_the_compiled_feature_set() {
+        let expected = if cfg!(feature = "backend-ffmpeg") {
+            VideoBackendRequest::ForceFfmpeg
+        } else if cfg!(feature = "backend-mpv") {
+            VideoBackendRequest::ForceMpv
+        } else if cfg!(feature = "backend-appsink") {
+            VideoBackendRequest::ForceAppsink
+        } else {
+            VideoBackendRequest::Auto
+        };
+        assert_eq!(default_video_backend_request(), expected);
+    }
+
+    #[test]
+    fn dmabuf_caps_offer_dma_drm_before_linear_compatibility() {
+        gst::init().expect("GStreamer should initialize");
+        let caps = build_video_sink_caps(VideoMode::ForceDmaBuf, &VideoCapabilities::default());
+        assert_eq!(caps.size(), 2);
+        assert_eq!(
+            caps.structure(0)
+                .expect("modern structure")
+                .get::<&str>("format")
+                .expect("modern format"),
+            "DMA_DRM"
+        );
+        assert_eq!(
+            caps.structure(1)
+                .expect("linear structure")
+                .get::<&str>("format")
+                .expect("linear format"),
+            "NV12"
+        );
+        assert!(caps.features(0).is_some_and(|features| {
+            features.contains(gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str())
+        }));
     }
 }
