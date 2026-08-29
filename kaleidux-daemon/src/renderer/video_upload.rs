@@ -1,4 +1,3 @@
-use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 
 use super::compute_cover_target_dimensions;
@@ -45,14 +44,21 @@ impl super::Renderer {
         }
 
         if is_first_frame_after_switch {
+            self.snapshot_yuv_for_transition();
             self.begin_content_swap();
         }
 
         let source_width = frame.width;
         let source_height = frame.height;
+        if !matches!(
+            frame.format,
+            crate::video::VideoFrameFormat::Rgba
+                | crate::video::VideoFrameFormat::GlExternalRgba { .. }
+        ) {
+            self.write_yuv_uniforms(frame.color, frame.geometry);
+        }
         let (presentation_width, presentation_height) = match frame.format {
             crate::video::VideoFrameFormat::Rgba => (source_width, source_height),
-            #[cfg(feature = "mpv-backend")]
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => (source_width, source_height),
             _ => compute_cover_target_dimensions(
                 source_width,
@@ -62,8 +68,10 @@ impl super::Renderer {
             ),
         };
 
-        #[cfg(feature = "mpv-backend")]
-        if let crate::video::VideoFrameFormat::GlExternalRgba { frame } = &frame.format {
+        if let crate::video::VideoFrameFormat::GlExternalRgba {
+            frame: external_frame,
+        } = &frame.format
+        {
             if is_first_frame_after_switch {
                 info!(
                     "[VIDEO] {}: Frame decode path: libmpv OpenGL-Vulkan shared RGBA source={}x{} presentation={}x{}",
@@ -73,49 +81,76 @@ impl super::Renderer {
             self.last_video_source_size = Some((source_width, source_height));
             self.last_video_presentation_size = Some((presentation_width, presentation_height));
             self.release_video_backend_resources("libmpv GL shared frame path");
-            self.set_current_gl_external_rgba(frame, presentation_width, presentation_height);
-            self.current_aspect = source_width as f32 / source_height as f32;
+            if is_first_frame_after_switch {
+                self.external_blit_bind_groups.clear();
+            }
+            self.set_current_gl_external_rgba(
+                external_frame,
+                presentation_width,
+                presentation_height,
+            );
+            self.current_aspect = frame.geometry.display_aspect();
             self.finish_video_frame_upload(is_first_frame_after_switch);
             return;
         }
 
-        // Get or reuse the RGBA output texture (same size AND single mip level = reuse)
-        let needs_new_texture = match self.current_texture.as_ref() {
-            Some(curr) => {
-                self.current_texture_size != Some((presentation_width, presentation_height))
-                    || curr.mip_level_count() > 1
-            }
-            None => true,
-        };
-        let texture = match self.current_texture.take() {
-            Some(curr) => {
-                if !needs_new_texture {
-                    curr
-                } else {
-                    self.current_texture_view = None;
-                    if let Some((w, h)) = self.current_texture_size {
-                        self.ctx.return_texture_to_pool(curr, w, h);
-                    }
-                    self.ctx.get_texture_from_pool(
-                        presentation_width,
-                        presentation_height,
-                        wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::COPY_DST
-                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        self.metrics.as_deref(),
-                    )
+        let direct_yuv = matches!(
+            frame.format,
+            crate::video::VideoFrameFormat::Nv12 { .. }
+                | crate::video::VideoFrameFormat::P010 { .. }
+                | crate::video::VideoFrameFormat::I420 { .. }
+                | crate::video::VideoFrameFormat::CudaNv12 { .. }
+        ) && !self.transition_active
+            && !self.has_previous_texture();
+
+        // Transitions and RGB inputs need an RGBA texture. Steady CPU YUV is
+        // retained as planes and sampled by the final surface pass.
+        let needs_new_texture = !direct_yuv
+            && match self.current_texture.as_ref() {
+                Some(curr) => {
+                    self.current_texture_size != Some((presentation_width, presentation_height))
+                        || curr.mip_level_count() > 1
+                }
+                None => true,
+            };
+        let mut texture = if direct_yuv {
+            if let Some(curr) = self.current_texture.take() {
+                if let Some((w, h)) = self.current_texture_size.take() {
+                    self.ctx.return_texture_to_pool(curr, w, h);
                 }
             }
-            _ => self.ctx.get_texture_from_pool(
-                presentation_width,
-                presentation_height,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                self.metrics.as_deref(),
-            ),
+            self.current_texture_view = None;
+            None
+        } else {
+            Some(match self.current_texture.take() {
+                Some(curr) => {
+                    if !needs_new_texture {
+                        curr
+                    } else {
+                        self.current_texture_view = None;
+                        if let Some((w, h)) = self.current_texture_size {
+                            self.ctx.return_texture_to_pool(curr, w, h);
+                        }
+                        self.ctx.get_texture_from_pool(
+                            presentation_width,
+                            presentation_height,
+                            wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST
+                                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            self.metrics.as_deref(),
+                        )
+                    }
+                }
+                _ => self.ctx.get_texture_from_pool(
+                    presentation_width,
+                    presentation_height,
+                    wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    self.metrics.as_deref(),
+                ),
+            })
         };
-        #[cfg(feature = "mpv-backend")]
         {
             self.current_external_view = None;
             let frame = self.current_external_frame.take();
@@ -126,10 +161,13 @@ impl super::Renderer {
             let path_name = match &frame.format {
                 crate::video::VideoFrameFormat::CudaNv12 { .. } => "CUDA zero-copy NV12",
                 crate::video::VideoFrameFormat::DmaBufNv12 { .. } => "DMA-BUF zero-copy NV12",
+                crate::video::VideoFrameFormat::NativeDmaBufNv12 { .. } => {
+                    "native cached DMA-BUF NV12 single-GPU-copy"
+                }
                 crate::video::VideoFrameFormat::Nv12 { .. } => "NV12 CPU upload",
+                crate::video::VideoFrameFormat::P010 { .. } => "P010 10-bit CPU upload",
                 crate::video::VideoFrameFormat::I420 { .. } => "I420 CPU upload",
                 crate::video::VideoFrameFormat::Rgba => "RGBA CPU upload (legacy)",
-                #[cfg(feature = "mpv-backend")]
                 crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
                     "libmpv OpenGL-Vulkan shared RGBA"
                 }
@@ -150,24 +188,46 @@ impl super::Renderer {
 
         match &frame.format {
             crate::video::VideoFrameFormat::CudaNv12 { .. } => {
-                self.release_nv12_staging("cuda frame path");
+                if self.nv12_staging_size.is_some() {
+                    self.release_nv12_staging("cuda frame path");
+                }
                 self.release_i420_staging("cuda frame path");
+                self.release_p010_staging("cuda frame path");
+                self.release_dmabuf_cache();
             }
             crate::video::VideoFrameFormat::DmaBufNv12 { .. } => {
-                self.release_video_backend_resources("dmabuf frame path");
+                self.release_i420_staging("GStreamer dmabuf frame path");
+                self.release_p010_staging("GStreamer dmabuf frame path");
+                self.release_cuda_cache();
+                self.release_dmabuf_cache();
+            }
+            crate::video::VideoFrameFormat::NativeDmaBufNv12 { .. } => {
+                self.release_i420_staging("native dmabuf frame path");
+                self.release_p010_staging("native dmabuf frame path");
+                self.release_cuda_cache();
+                self.release_dmabuf_cache();
             }
             crate::video::VideoFrameFormat::Nv12 { .. } => {
                 self.release_i420_staging("nv12 frame path");
+                self.release_p010_staging("nv12 frame path");
                 self.release_cuda_cache();
+                self.release_dmabuf_cache();
+            }
+            crate::video::VideoFrameFormat::P010 { .. } => {
+                self.release_nv12_staging("p010 frame path");
+                self.release_i420_staging("p010 frame path");
+                self.release_cuda_cache();
+                self.release_dmabuf_cache();
             }
             crate::video::VideoFrameFormat::I420 { .. } => {
                 self.release_nv12_staging("i420 frame path");
+                self.release_p010_staging("i420 frame path");
                 self.release_cuda_cache();
+                self.release_dmabuf_cache();
             }
             crate::video::VideoFrameFormat::Rgba => {
                 self.release_video_backend_resources("rgba frame path");
             }
-            #[cfg(feature = "mpv-backend")]
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
                 self.release_video_backend_resources("libmpv GL shared frame path");
             }
@@ -181,7 +241,22 @@ impl super::Renderer {
             } => {
                 self.upload_frame_nv12(
                     frame,
-                    &texture,
+                    texture.as_ref(),
+                    source_width,
+                    source_height,
+                    *y_stride,
+                    *uv_offset,
+                    *uv_stride,
+                );
+            }
+            crate::video::VideoFrameFormat::P010 {
+                y_stride,
+                uv_offset,
+                uv_stride,
+            } => {
+                self.upload_frame_p010(
+                    frame,
+                    texture.as_ref(),
                     source_width,
                     source_height,
                     *y_stride,
@@ -198,7 +273,7 @@ impl super::Renderer {
             } => {
                 self.upload_frame_i420(
                     frame,
-                    &texture,
+                    texture.as_ref(),
                     source_width,
                     source_height,
                     *y_stride,
@@ -209,42 +284,43 @@ impl super::Renderer {
                 );
             }
             crate::video::VideoFrameFormat::Rgba => {
-                self.upload_frame_rgba(frame, &texture, source_width, source_height);
-            }
-            #[cfg(feature = "mpv-backend")]
-            crate::video::VideoFrameFormat::GlExternalRgba { frame } => {
-                self.upload_frame_gl_external_rgba(frame, &texture);
-            }
-            crate::video::VideoFrameFormat::DmaBufNv12 {
-                y_fd,
-                y_stride,
-                y_offset,
-                uv_fd,
-                uv_stride,
-                uv_offset,
-            } => {
-                if !self.upload_frame_dmabuf_nv12(
-                    &texture,
+                self.upload_frame_rgba(
+                    frame,
+                    texture.as_ref().expect("RGBA path allocates a texture"),
                     source_width,
                     source_height,
-                    y_fd.as_raw_fd(),
-                    *y_stride,
-                    *y_offset,
-                    uv_fd.as_raw_fd(),
-                    *uv_stride,
-                    *uv_offset,
+                );
+            }
+            crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
+                unreachable!("external GL frames return before allocating an upload texture");
+            }
+            crate::video::VideoFrameFormat::DmaBufNv12 { frame: dmabuf } => {
+                if !self.upload_frame_native_dmabuf_nv12(
+                    frame,
+                    texture
+                        .as_ref()
+                        .expect("modifier-aware DMA-BUF path primes an RGBA target"),
+                    source_width,
+                    source_height,
+                    dmabuf,
+                    super::YuvOrigin::DmaBuf,
                 ) {
-                    warn!("[VIDEO] DMA-BUF import failed, falling back to NV12 CPU path");
-                    self.upload_frame_nv12(
-                        frame,
-                        &texture,
-                        source_width,
-                        source_height,
-                        *y_stride,
-                        *uv_offset,
-                        *uv_stride,
-                    );
+                    warn!("[VIDEO] modifier-aware GStreamer DMA-BUF import failed");
                 }
+            }
+            crate::video::VideoFrameFormat::NativeDmaBufNv12 {
+                frame: native_dmabuf,
+            } => {
+                let _ = self.upload_frame_native_dmabuf_nv12(
+                    frame,
+                    texture
+                        .as_ref()
+                        .expect("native path currently primes an RGBA target"),
+                    source_width,
+                    source_height,
+                    native_dmabuf,
+                    super::YuvOrigin::NativeDmaBuf,
+                );
             }
             crate::video::VideoFrameFormat::CudaNv12 {
                 y_stride,
@@ -253,7 +329,7 @@ impl super::Renderer {
             } => {
                 if !self.upload_frame_cuda_nv12(
                     frame,
-                    &texture,
+                    texture.as_ref(),
                     source_width,
                     source_height,
                     *y_stride,
@@ -266,7 +342,7 @@ impl super::Renderer {
                     );
                     self.upload_frame_nv12(
                         frame,
-                        &texture,
+                        texture.as_ref(),
                         source_width,
                         source_height,
                         *y_stride,
@@ -277,26 +353,42 @@ impl super::Renderer {
             }
         }
 
-        if needs_new_texture || self.current_texture_view.is_none() {
-            drop(self.current_texture_view.take());
+        if self.active_yuv_source.is_some() && !self.transition_active {
+            if let Some(texture) = texture.take() {
+                self.ctx
+                    .return_texture_to_pool(texture, presentation_width, presentation_height);
+            }
+            self.current_texture_view = None;
+            self.current_texture_size = None;
+        }
 
-            self.current_texture_view = Some(texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("Video Texture View"),
-                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                aspect: wgpu::TextureAspect::All,
-                base_mip_level: 0,
-                mip_level_count: None,
-                base_array_layer: 0,
-                array_layer_count: None,
-            }));
+        if let Some(texture) = texture {
+            if needs_new_texture || self.current_texture_view.is_none() {
+                drop(self.current_texture_view.take());
+
+                self.current_texture_view =
+                    Some(texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Video Texture View"),
+                        format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: 0,
+                        mip_level_count: None,
+                        base_array_layer: 0,
+                        array_layer_count: None,
+                    }));
+                self.transition_bind_group = None;
+                self.blit_bind_group = None;
+            }
+
+            self.current_texture = Some(texture);
+            self.current_texture_size = Some((presentation_width, presentation_height));
+        } else {
+            self.current_texture_size = None;
             self.transition_bind_group = None;
             self.blit_bind_group = None;
         }
-
-        self.current_texture = Some(texture);
-        self.current_texture_size = Some((presentation_width, presentation_height));
-        self.current_aspect = source_width as f32 / source_height as f32;
+        self.current_aspect = frame.geometry.display_aspect();
         self.finish_video_frame_upload(is_first_frame_after_switch);
 
         // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
@@ -353,13 +445,7 @@ impl super::Renderer {
         self.prev_texture.is_some() || self.has_prev_external_texture_for_video()
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn has_prev_external_texture_for_video(&self) -> bool {
         self.prev_external_view.is_some()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn has_prev_external_texture_for_video(&self) -> bool {
-        false
     }
 }

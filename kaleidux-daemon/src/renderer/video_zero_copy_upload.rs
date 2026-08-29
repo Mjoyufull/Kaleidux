@@ -1,5 +1,5 @@
 use super::CudaTextureCache;
-use super::video_interop::{create_cuda_backed_texture, import_dmabuf_as_texture};
+use super::video_interop::create_cuda_backed_texture;
 use super::video_layout::chroma_plane_extent;
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -20,112 +20,6 @@ fn cuda_frame_sync_enabled() -> bool {
 }
 
 impl super::Renderer {
-    pub(super) fn upload_frame_dmabuf_nv12(
-        &mut self,
-        output: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        y_fd: std::os::unix::io::RawFd,
-        y_stride: u32,
-        y_offset: u32,
-        uv_fd: std::os::unix::io::RawFd,
-        uv_stride: u32,
-        uv_offset: u32,
-    ) -> bool {
-        let (uv_width, uv_height) = chroma_plane_extent(width, height);
-
-        // Import Y plane
-        let y_tex = match import_dmabuf_as_texture(
-            &self.ctx.device,
-            y_fd,
-            width,
-            height,
-            y_stride,
-            y_offset,
-            wgpu::TextureFormat::R8Unorm,
-            "DMA-BUF Y Plane",
-        ) {
-            Some(t) => t,
-            None => return false,
-        };
-
-        // Import UV plane
-        let uv_tex = match import_dmabuf_as_texture(
-            &self.ctx.device,
-            uv_fd,
-            uv_width,
-            uv_height,
-            uv_stride,
-            uv_offset,
-            wgpu::TextureFormat::Rg8Unorm,
-            "DMA-BUF UV Plane",
-        ) {
-            Some(t) => t,
-            None => return false,
-        };
-
-        let y_view = y_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let uv_view = uv_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let output_view = output.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("NV12 DMA-BUF Convert Output View"),
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
-        });
-
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("NV12 DMA-BUF Convert Bind Group"),
-                layout: &self.ctx.nv12_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&y_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&uv_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            });
-
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("NV12 DMA-BUF Convert Encoder"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("NV12 DMA-BUF Convert Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.ctx.nv12_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
-
-        // y_tex and uv_tex are dropped here; the drop callbacks free the Vulkan resources
-        true
-    }
-
     /// CUDA zero-copy NV12: map the GStreamer CUDAMemory buffer, GPU-copy to
     /// Vulkan-exported textures via CUDA-Vulkan interop, then run the NV12→RGBA
     /// CUDA zero-copy NV12 upload: allocate CUDA-exportable memory, import into
@@ -135,7 +29,7 @@ impl super::Renderer {
     pub(super) fn upload_frame_cuda_nv12(
         &mut self,
         frame: &crate::video::VideoFrame,
-        output: &wgpu::Texture,
+        output: Option<&wgpu::Texture>,
         width: u32,
         height: u32,
         y_stride: u32,
@@ -169,7 +63,7 @@ impl super::Renderer {
         }
 
         let (uv_width, uv_height) = chroma_plane_extent(width, height);
-        let frame_size = frame.buffer.size();
+        let frame_size = frame.storage.byte_len();
         let min_y_bytes = y_stride as usize * height as usize;
         let min_uv_bytes = uv_stride as usize * uv_height as usize;
         let expected_uv_offset_floor = min_y_bytes;
@@ -207,7 +101,15 @@ impl super::Renderer {
             let ci = ci_guard.as_ref().unwrap();
 
             // Destroy old cache
-            if let Some(old) = self.cuda_textures.take() {
+            if let Some(mut old) = self.cuda_textures.take() {
+                if let Some(timeline) = old.timeline.take() {
+                    timeline.destroy(ci);
+                }
+                old.in_flight_frames.clear();
+                drop(old.y_view);
+                drop(old.uv_view);
+                drop(old.y_texture);
+                drop(old.uv_texture);
                 ci.free_exportable(old.y_cuda_alloc);
                 ci.free_exportable(old.uv_cuda_alloc);
             }
@@ -259,6 +161,17 @@ impl super::Renderer {
 
             let y_view = y_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let uv_view = uv_tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let timeline = match super::video_interop::CudaVulkanTimeline::new(ci, &self.ctx.device)
+            {
+                Ok(timeline) => Some(timeline),
+                Err(error) => {
+                    warn!(
+                        "[CUDA-VK] {}: explicit timeline unavailable ({error:#}); using blocking CUDA synchronization fallback",
+                        self.name
+                    );
+                    None
+                }
+            };
 
             info!(
                 "[VIDEO] {}: CUDA zero-copy textures: {}x{}, Y(pitch={} offset={}) UV(pitch={} offset={})",
@@ -282,80 +195,176 @@ impl super::Renderer {
                 uv_cuda_alloc,
                 uv_pitch: uv_layout.row_pitch,
                 uv_offset: uv_layout.offset,
+                timeline,
+                in_flight_frames: std::collections::VecDeque::with_capacity(6),
                 width,
                 height,
             });
         }
 
-        let cache = self.cuda_textures.as_ref().unwrap();
+        if let Some(cache) = self.cuda_textures.as_mut()
+            && let Some(timeline) = cache.timeline.as_ref()
+        {
+            match timeline.completed_value() {
+                Ok(completed) => {
+                    while cache
+                        .in_flight_frames
+                        .front()
+                        .is_some_and(|(ready, _)| *ready <= completed)
+                    {
+                        cache.in_flight_frames.pop_front();
+                    }
+                }
+                Err(error) => warn!(
+                    "[CUDA-VK] {}: timeline completion query failed: {error:#}",
+                    self.name
+                ),
+            }
+        }
 
         // Map the GStreamer CUDA buffer to get the source device pointer
         let cuda_map_start = Instant::now();
-        let guard = match crate::cuda_interop::map_buffer_cuda(&frame.buffer) {
+        let Some(buffer) = frame.storage.gstreamer_buffer() else {
+            error!(
+                "[VIDEO] {}: CUDA frame did not retain its GStreamer buffer owner",
+                self.name
+            );
+            return false;
+        };
+        let guard = match crate::cuda_interop::map_buffer_cuda(buffer) {
             Some(g) => g,
             None => return false,
         };
         let cuda_map_duration = cuda_map_start.elapsed();
         let base_ptr = guard.device_ptr();
 
-        let (cuda_copy_duration, cuda_sync_duration) = {
+        let (cuda_copy_duration, cuda_sync_duration, used_timeline) = {
             let ci_guard = self.ctx.cuda_interop.lock();
             let ci = ci_guard.as_ref().unwrap();
+            let cache = self.cuda_textures.as_mut().unwrap();
 
-            let cuda_copy_start = Instant::now();
-
-            // GPU-side copy: Y plane (decoded frame → CUDA exportable buffer)
-            // Add Vulkan's layout.offset so data lands where the VkImage expects it
-            if let Err(e) = ci.copy_2d(
-                base_ptr,
-                y_stride as usize,
-                cache.y_cuda_alloc.dev_ptr + cache.y_offset as u64,
-                cache.y_pitch,
-                width as usize,
-                height as usize,
-            ) {
-                error!("[VIDEO] {}: CUDA Y copy failed: {e}", self.name);
-                return false;
-            }
-
-            // GPU-side copy: UV plane
             let uv_row_bytes = (uv_width * 2) as usize;
-            if let Err(e) = ci.copy_2d(
-                base_ptr + uv_offset as u64,
-                uv_stride as usize,
-                cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64,
-                cache.uv_pitch,
-                uv_row_bytes,
-                uv_height as usize,
-            ) {
-                error!("[VIDEO] {}: CUDA UV copy failed: {e}", self.name);
-                return false;
-            }
-
-            let cuda_copy_duration = cuda_copy_start.elapsed();
-
-            // Synchronize CUDA to ensure writes are visible to Vulkan
-            let cuda_sync_start = Instant::now();
-            if cuda_frame_sync_enabled() {
-                if let Err(e) = ci.synchronize() {
-                    error!("[VIDEO] {}: CUDA sync failed: {e}", self.name);
+            let y_destination = cache.y_cuda_alloc.dev_ptr + cache.y_offset as u64;
+            let uv_destination = cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64;
+            let y_pitch = cache.y_pitch;
+            let uv_pitch = cache.uv_pitch;
+            let mut cuda_copy_duration = std::time::Duration::ZERO;
+            let mut cuda_sync_duration;
+            let used_timeline = if let Some(timeline) = cache.timeline.as_mut() {
+                let (release, ready) = timeline.next_frame_values();
+                let handshake_start = Instant::now();
+                let result = self.ctx.with_raw_queue_lock(|| -> Result<(), String> {
+                    timeline
+                        .signal_vulkan_release(release)
+                        .map_err(|error| error.to_string())?;
+                    ci.wait_timeline_async(timeline.cuda(), release)?;
+                    let copy_start = Instant::now();
+                    ci.copy_2d_async(
+                        base_ptr,
+                        y_stride as usize,
+                        y_destination,
+                        y_pitch,
+                        width as usize,
+                        height as usize,
+                    )?;
+                    ci.copy_2d_async(
+                        base_ptr + uv_offset as u64,
+                        uv_stride as usize,
+                        uv_destination,
+                        uv_pitch,
+                        uv_row_bytes,
+                        uv_height as usize,
+                    )?;
+                    cuda_copy_duration = copy_start.elapsed();
+                    ci.signal_timeline_async(timeline.cuda(), ready)?;
+                    timeline
+                        .wait_vulkan_ready(ready)
+                        .map_err(|error| error.to_string())
+                });
+                if let Err(error) = result {
+                    error!(
+                        "[VIDEO] {}: CUDA/Vulkan timeline handoff failed: {error}",
+                        self.name
+                    );
                     return false;
                 }
+                cuda_sync_duration = handshake_start.elapsed().saturating_sub(cuda_copy_duration);
+                cache
+                    .in_flight_frames
+                    .push_back((ready, frame.storage.clone()));
+                true
+            } else {
+                // Compatibility path for pre-timeline drivers. Both copies and
+                // the context synchronization are intentionally synchronous.
+                let copy_start = Instant::now();
+                if let Err(error) = ci.copy_2d(
+                    base_ptr,
+                    y_stride as usize,
+                    cache.y_cuda_alloc.dev_ptr + cache.y_offset as u64,
+                    cache.y_pitch,
+                    width as usize,
+                    height as usize,
+                ) {
+                    error!("[VIDEO] {}: CUDA Y copy failed: {error}", self.name);
+                    return false;
+                }
+                if let Err(error) = ci.copy_2d(
+                    base_ptr + uv_offset as u64,
+                    uv_stride as usize,
+                    cache.uv_cuda_alloc.dev_ptr + cache.uv_offset as u64,
+                    cache.uv_pitch,
+                    uv_row_bytes,
+                    uv_height as usize,
+                ) {
+                    error!("[VIDEO] {}: CUDA UV copy failed: {error}", self.name);
+                    return false;
+                }
+                cuda_copy_duration = copy_start.elapsed();
+                let sync_start = Instant::now();
+                if cuda_frame_sync_enabled()
+                    && let Err(error) = ci.synchronize()
+                {
+                    error!("[VIDEO] {}: CUDA sync failed: {error}", self.name);
+                    return false;
+                }
+                cuda_sync_duration = sync_start.elapsed();
+                false
+            };
+            if cache.in_flight_frames.len() > 6 {
+                warn!(
+                    "[CUDA-VK] {}: more than six source buffers remained in flight; applying bounded synchronization backpressure",
+                    self.name
+                );
+                let backpressure_start = Instant::now();
+                if let Err(error) = ci.synchronize() {
+                    error!(
+                        "[VIDEO] {}: CUDA backpressure sync failed: {error}",
+                        self.name
+                    );
+                    return false;
+                }
+                cuda_sync_duration += backpressure_start.elapsed();
+                cache.in_flight_frames.clear();
             }
-            (cuda_copy_duration, cuda_sync_start.elapsed())
+            (cuda_copy_duration, cuda_sync_duration, used_timeline)
         };
 
         drop(guard);
 
+        if let Some(metrics) = &self.metrics {
+            use crate::observability::video_backend::VideoBackendMetricKind;
+            metrics.record_video_backend_metric(if used_timeline {
+                VideoBackendMetricKind::CudaTimelineHandoff
+            } else {
+                VideoBackendMetricKind::CudaBlockingSync
+            });
+        }
+
         let convert_submit_start = Instant::now();
 
-        // Run NV12→RGBA conversion shader (same as DMA-BUF and CPU NV12 paths)
-        let output_view = output.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("NV12 CUDA Convert Output View"),
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
-        });
+        let cache = self.cuda_textures.as_ref().unwrap();
 
+        // Run NV12→RGBA conversion shader (same as DMA-BUF and CPU NV12 paths)
         if self.cuda_nv12_bind_group.is_none() {
             self.cuda_nv12_bind_group = Some(self.ctx.device.create_bind_group(
                 &wgpu::BindGroupDescriptor {
@@ -377,7 +386,59 @@ impl super::Renderer {
                     ],
                 },
             ));
+            self.final_nv12_bind_group =
+                Some(std::sync::Arc::new(self.ctx.device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("CUDA NV12 Final Blit Bind Group"),
+                        layout: &self.ctx.native_nv12_blit_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.yuv_uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&cache.y_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&cache.uv_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
+                            },
+                        ],
+                    },
+                )));
         }
+        if output.is_none() {
+            self.active_yuv_source = Some(super::YuvSource {
+                format: super::YuvFormat::Nv12,
+                origin: super::YuvOrigin::Cuda,
+                width,
+                height,
+            });
+            if let Some(metrics) = &self.metrics {
+                metrics.record_video_cuda_upload_stages(
+                    cuda_map_duration,
+                    cuda_copy_duration,
+                    cuda_sync_duration,
+                    std::time::Duration::ZERO,
+                    total_start.elapsed(),
+                );
+            }
+            return true;
+        }
+        self.active_yuv_source = None;
+        let output_view =
+            output
+                .expect("checked above")
+                .create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("NV12 CUDA Convert Output View"),
+                    format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                    ..Default::default()
+                });
         let bind_group = self.cuda_nv12_bind_group.as_ref().unwrap();
 
         let mut encoder = self
@@ -405,7 +466,7 @@ impl super::Renderer {
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.submit(std::iter::once(encoder.finish()));
         if let Some(metrics) = &self.metrics {
             metrics.record_video_cuda_upload_stages(
                 cuda_map_duration,

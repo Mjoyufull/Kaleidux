@@ -168,9 +168,7 @@ impl super::Renderer {
                 next_aspect: self.current_aspect,
                 params: bytemuck::cast(raw_params),
             };
-            self.ctx
-                .queue
-                .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            self.write_uniforms_if_changed(uniforms);
 
             // Recreate bind group only if invalidated (set to None when textures change)
             self.update_transition_bind_group();
@@ -231,7 +229,6 @@ impl super::Renderer {
                     }
                     // If size unknown, texture is still dropped here (freed by WGPU)
                 }
-                #[cfg(feature = "mpv-backend")]
                 {
                     self.prev_external_view = None;
                     let frame = self.prev_external_frame.take();
@@ -242,7 +239,6 @@ impl super::Renderer {
                 self.blit_bind_group = None;
                 self.transition_start_time = None;
                 self.transition_active = false;
-                self.release_composition_texture("transition completed");
             }
         }
 

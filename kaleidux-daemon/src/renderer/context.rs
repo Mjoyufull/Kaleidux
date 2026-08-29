@@ -14,6 +14,9 @@ pub struct WgpuContext {
     pub adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
+    /// Serializes WGPU queue access with the raw Vulkan semaphore submits used
+    /// by the mpv GL interop path.
+    pub(super) queue_lock: parking_lot::Mutex<()>,
     pub transition_pipelines: parking_lot::Mutex<PipelineLRU>,
     pub blit_pipelines: parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub mipmap_pipelines:
@@ -24,6 +27,12 @@ pub struct WgpuContext {
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_pipeline: wgpu::RenderPipeline,
+    pub native_nv12_blit_bind_group_layout: wgpu::BindGroupLayout,
+    pub native_nv12_blit_pipelines:
+        parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
+    pub final_i420_blit_bind_group_layout: wgpu::BindGroupLayout,
+    pub final_i420_blit_pipelines:
+        parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub i420_bind_group_layout: wgpu::BindGroupLayout,
     pub i420_pipeline: wgpu::RenderPipeline,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
@@ -33,6 +42,7 @@ pub struct WgpuContext {
     // Shared CUDA interop context (one per GPU, shared across all renderers)
     pub(super) cuda_interop: parking_lot::Mutex<Option<crate::cuda_interop::CudaInterop>>,
     pub(super) cuda_interop_failed: std::sync::atomic::AtomicBool,
+    pub(super) device_poll_requested: std::sync::atomic::AtomicBool,
 }
 
 const MAX_PIPELINE_CACHE_SIZE: usize = 50;
@@ -40,8 +50,13 @@ impl WgpuContext {
     pub async fn with_surface(
         window: Arc<impl HasWindowHandle + HasDisplayHandle + Sync + Send + 'static>,
     ) -> anyhow::Result<(Arc<Self>, Surface<'static>)> {
+        let requested_backends = if super::context_vulkan::external_video_interop_requested() {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        };
         let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: requested_backends,
             ..Default::default()
         });
         let compatible_surface = instance.create_surface(window)?;
@@ -65,6 +80,21 @@ impl WgpuContext {
         if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
+        let p010_sampling_supported = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        crate::video::set_p010_sampling_supported(p010_sampling_supported);
+        if p010_sampling_supported {
+            // P010 is sampled directly from persistent R16/RG16 normalized
+            // planes. WGPU exposes those formats only when this optional
+            // feature is explicitly enabled on the device.
+            required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+            info!("[VIDEO] P010 direct sampling enabled (R16/RG16 normalized textures)");
+        } else {
+            warn!(
+                "[VIDEO] Adapter lacks TEXTURE_FORMAT_16BIT_NORM; P010 direct sampling is unavailable and 10-bit decode must use a compatibility path"
+            );
+        }
 
         let device_descriptor = wgpu::DeviceDescriptor {
             label: Some("Kaleidux Shared Device"),
@@ -75,14 +105,29 @@ impl WgpuContext {
             // RSS anymore, so reducing allocator slack is the next useful lever.
             memory_hints: wgpu::MemoryHints::MemoryUsage,
         };
-        #[cfg(feature = "mpv-backend")]
-        let (device, queue) = if super::context_vulkan::mpv_gl_interop_requested() {
-            super::context_vulkan::create_mpv_gl_interop_device(&adapter, &device_descriptor)?
+        let (device, queue) = if super::context_vulkan::external_video_interop_requested() {
+            match super::context_vulkan::create_external_video_interop_device(
+                &adapter,
+                &device_descriptor,
+            ) {
+                Ok(device) => device,
+                Err(error)
+                    if !super::context_vulkan::native_dmabuf_interop_requested()
+                        && !crate::video::mpv_backend_is_explicitly_forced() =>
+                {
+                    warn!(
+                        "[VIDEO] Default external-video device unavailable ({error:#}); falling back to appsink with the standard WGPU device"
+                    );
+                    crate::video::set_video_backend_request(
+                        crate::video::VideoBackendRequest::ForceAppsink,
+                    );
+                    adapter.request_device(&device_descriptor, None).await?
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             adapter.request_device(&device_descriptor, None).await?
         };
-        #[cfg(not(feature = "mpv-backend"))]
-        let (device, queue) = adapter.request_device(&device_descriptor, None).await?;
 
         let pipeline_cache_path = pipeline_cache::path_for_adapter(&adapter);
         let pipeline_cache_seed = pipeline_cache_path
@@ -284,6 +329,11 @@ impl WgpuContext {
             cache: pipeline_cache.as_ref(),
         });
 
+        let native_nv12_blit_bind_group_layout =
+            super::context_pipelines::create_native_nv12_blit_bind_group_layout(&device);
+        let final_i420_blit_bind_group_layout =
+            super::context_pipelines::create_final_i420_blit_bind_group_layout(&device);
+
         let i420_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("I420 Convert Bind Group Layout"),
@@ -373,6 +423,7 @@ impl WgpuContext {
                 adapter,
                 device,
                 queue,
+                queue_lock: parking_lot::Mutex::new(()),
                 transition_pipelines: parking_lot::Mutex::new(PipelineLRU::new(
                     MAX_PIPELINE_CACHE_SIZE,
                 )),
@@ -383,6 +434,10 @@ impl WgpuContext {
                 mipmap_bind_group_layout,
                 nv12_bind_group_layout,
                 nv12_pipeline,
+                native_nv12_blit_bind_group_layout,
+                native_nv12_blit_pipelines: parking_lot::Mutex::new(HashMap::new()),
+                final_i420_blit_bind_group_layout,
+                final_i420_blit_pipelines: parking_lot::Mutex::new(HashMap::new()),
                 i420_bind_group_layout,
                 i420_pipeline,
                 pipeline_cache,
@@ -390,6 +445,7 @@ impl WgpuContext {
                 texture_pool: parking_lot::Mutex::new(HashMap::new()),
                 cuda_interop: parking_lot::Mutex::new(None),
                 cuda_interop_failed: std::sync::atomic::AtomicBool::new(false),
+                device_poll_requested: std::sync::atomic::AtomicBool::new(false),
             }),
             compatible_surface,
         ))

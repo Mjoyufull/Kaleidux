@@ -6,8 +6,22 @@ use tracing::{debug, warn};
 impl super::Renderer {
     pub(super) fn release_cuda_cache(&mut self) {
         self.cuda_nv12_bind_group = None;
-        if let Some(cuda_cache) = self.cuda_textures.take() {
+        if self
+            .active_yuv_source
+            .is_some_and(|source| source.origin == super::YuvOrigin::Cuda)
+        {
+            self.active_yuv_source = None;
+        }
+        if let Some(mut cuda_cache) = self.cuda_textures.take() {
             if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
+                if let Some(timeline) = cuda_cache.timeline.take() {
+                    timeline.destroy(interop);
+                }
+                cuda_cache.in_flight_frames.clear();
+                drop(cuda_cache.y_view);
+                drop(cuda_cache.uv_view);
+                drop(cuda_cache.y_texture);
+                drop(cuda_cache.uv_texture);
                 interop.free_exportable(cuda_cache.y_cuda_alloc);
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
             } else {
@@ -40,6 +54,17 @@ impl super::Renderer {
         self.nv12_y_view = None;
         self.nv12_uv_view = None;
         self.nv12_staging_size = None;
+        {
+            self.native_nv12_bind_group = None;
+            self.final_nv12_bind_group = None;
+            self.native_wayland_snapshot_frame = None;
+            if self
+                .active_yuv_source
+                .is_some_and(|source| source.format == super::YuvFormat::Nv12)
+            {
+                self.active_yuv_source = None;
+            }
+        }
     }
 
     pub(super) fn release_i420_staging(&mut self, reason: &str) {
@@ -56,12 +81,55 @@ impl super::Renderer {
         self.i420_u_view = None;
         self.i420_v_view = None;
         self.i420_staging_size = None;
+        self.final_i420_bind_group = None;
+        if self
+            .active_yuv_source
+            .is_some_and(|source| source.format == super::YuvFormat::I420)
+        {
+            self.active_yuv_source = None;
+        }
+    }
+
+    pub(super) fn release_p010_staging(&mut self, reason: &str) {
+        if self.p010_staging_size.is_some() {
+            debug!(
+                "[VIDEO] {}: Releasing P010 staging textures ({})",
+                self.name, reason
+            );
+        }
+        self.p010_y_texture = None;
+        self.p010_uv_texture = None;
+        self.p010_y_view = None;
+        self.p010_uv_view = None;
+        self.p010_staging_size = None;
+        self.final_p010_bind_group = None;
+        if self
+            .active_yuv_source
+            .is_some_and(|source| source.format == super::YuvFormat::P010)
+        {
+            self.active_yuv_source = None;
+        }
     }
 
     pub(super) fn release_video_backend_resources(&mut self, reason: &str) {
         self.release_nv12_staging(reason);
+        self.release_p010_staging(reason);
         self.release_i420_staging(reason);
         self.release_cuda_cache();
+        self.release_dmabuf_cache();
+        {
+            self.native_dmabuf_interop = None;
+        }
+    }
+
+    pub(super) fn release_dmabuf_cache(&mut self) {
+        if self
+            .active_yuv_source
+            .is_some_and(|source| source.origin == super::YuvOrigin::DmaBuf)
+        {
+            self.active_yuv_source = None;
+            self.final_nv12_bind_group = None;
+        }
     }
 
     pub(super) fn release_prev_texture(&mut self, reason: &str) {
@@ -75,7 +143,6 @@ impl super::Renderer {
             }
         }
         self.prev_texture_view = None;
-        #[cfg(feature = "mpv-backend")]
         {
             self.prev_external_view = None;
             let frame = self.prev_external_frame.take();
@@ -138,7 +205,9 @@ impl super::Renderer {
 
     /// Check if current_texture exists.
     pub fn has_current_texture(&self) -> bool {
-        self.current_texture.is_some() || self.has_current_external_texture()
+        self.current_texture.is_some()
+            || self.has_current_external_texture()
+            || self.active_yuv_source.is_some()
     }
 
     /// Check if any renderable content exists (current or previous texture)
@@ -147,67 +216,47 @@ impl super::Renderer {
             || self.prev_texture.is_some()
             || self.has_current_external_texture()
             || self.has_prev_external_texture()
+            || self.active_yuv_source.is_some()
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn has_current_external_texture(&self) -> bool {
         self.current_external_view_available()
     }
 
-    #[cfg(feature = "mpv-backend")]
     pub(super) fn drop_external_frame(&self, frame: Option<crate::video::GlExternalFrame>) {
         if let Some(f) = frame {
-            f.release_after_submit(&self.ctx.queue);
+            f.release_after_submit();
         }
     }
 
-    #[cfg(not(feature = "mpv-backend"))]
-    fn has_current_external_texture(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "mpv-backend")]
     fn has_prev_external_texture(&self) -> bool {
         self.prev_external_view_available()
     }
 
-    #[cfg(not(feature = "mpv-backend"))]
-    fn has_prev_external_texture(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "mpv-backend")]
     pub(super) fn current_external_view_available(&self) -> bool {
         self.current_external_view.is_some()
     }
 
-    #[cfg(not(feature = "mpv-backend"))]
-    pub(super) fn current_external_view_available(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "mpv-backend")]
     pub(super) fn prev_external_view_available(&self) -> bool {
         self.prev_external_view.is_some()
     }
 
-    #[cfg(not(feature = "mpv-backend"))]
-    pub(super) fn prev_external_view_available(&self) -> bool {
-        false
-    }
-
     pub fn should_hold_video_frame_for_callback(&self) -> bool {
-        self.valid_content_type == crate::queue::ContentType::Video
+        self.pause_on_fullscreen
+            && self.valid_content_type == crate::queue::ContentType::Video
             && self.has_current_texture()
             && !self.content_swap_pending
             && !self.transition_active
-            && self.frame_callback_pending
             && !self.frame_callback_pending_too_long(1000)
     }
 
     pub fn should_upload_video_frame_on_callback(&self) -> bool {
         self.valid_content_type == crate::queue::ContentType::Video
             && (!self.has_current_texture() || self.content_swap_pending || self.transition_active)
+    }
+
+    pub(crate) fn steady_video_uses_frame_callbacks(&self) -> bool {
+        self.pause_on_fullscreen
     }
 
     pub fn needs_wayland_immediate_work(&self) -> bool {
@@ -232,8 +281,13 @@ impl super::Renderer {
             if self.prev_texture.is_some() {
                 self.release_prev_texture("idle trim");
             }
-            if self.composition_texture.is_some() {
-                self.release_composition_texture("idle trim");
+            // The composition target is only the transient render destination
+            // for an active transition.  Once steady rendering has selected
+            // the current frame again, retaining it costs one full output-sized
+            // RGBA texture without preserving the snapshot used by the next
+            // transition.
+            if !self.blit_source_is_composition && self.composition_texture.is_some() {
+                self.release_composition_texture("completed transition idle trim");
             }
         }
 
@@ -268,8 +322,16 @@ impl Drop for super::Renderer {
         }
 
         // Clean up CUDA exportable allocations (Audit Point 1 in renderer.rs)
-        if let Some(cuda_cache) = self.cuda_textures.take() {
+        if let Some(mut cuda_cache) = self.cuda_textures.take() {
             if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
+                if let Some(timeline) = cuda_cache.timeline.take() {
+                    timeline.destroy(interop);
+                }
+                cuda_cache.in_flight_frames.clear();
+                drop(cuda_cache.y_view);
+                drop(cuda_cache.uv_view);
+                drop(cuda_cache.y_texture);
+                drop(cuda_cache.uv_texture);
                 interop.free_exportable(cuda_cache.y_cuda_alloc);
                 interop.free_exportable(cuda_cache.uv_cuda_alloc);
             } else {
@@ -279,7 +341,6 @@ impl Drop for super::Renderer {
                 );
             }
         }
-        #[cfg(feature = "mpv-backend")]
         {
             let cur = self.current_external_frame.take();
             let prev = self.prev_external_frame.take();
@@ -291,6 +352,19 @@ impl Drop for super::Renderer {
         self.nv12_y_view = None;
         self.nv12_uv_view = None;
         self.nv12_staging_size = None;
+        self.p010_y_texture = None;
+        self.p010_uv_texture = None;
+        self.p010_y_view = None;
+        self.p010_uv_view = None;
+        self.p010_staging_size = None;
+        {
+            self.native_nv12_bind_group = None;
+            self.final_nv12_bind_group = None;
+            self.final_p010_bind_group = None;
+            self.final_i420_bind_group = None;
+            self.active_yuv_source = None;
+            self.native_dmabuf_interop = None;
+        }
         self.i420_y_texture = None;
         self.i420_u_texture = None;
         self.i420_v_texture = None;

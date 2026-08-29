@@ -1,4 +1,5 @@
 use crate::observability::present::RendererPresentKind;
+use smithay_client_toolkit::shell::WaylandSurface;
 use tracing::{debug, error, warn};
 
 use super::{BackendContext, TransitionUniforms, render_blit::BlitSource};
@@ -18,13 +19,6 @@ impl super::Renderer {
         {
             self.release_prev_texture("render idle cleanup");
         }
-        if !self.transition_active
-            && !self.content_swap_pending
-            && self.composition_texture.is_some()
-        {
-            self.release_composition_texture("render idle cleanup");
-        }
-
         // CRITICAL: Reset per-frame state at the start of each render cycle
         // This flag tracks whether a transition was rendered in THIS frame
         self.transition_rendered_this_frame = false;
@@ -89,8 +83,10 @@ impl super::Renderer {
             }
         };
         let surface_acquire_duration = surface_acquire_start.elapsed();
-        if surface_acquire_duration > std::time::Duration::from_millis(8) {
-            debug!(
+        if surface_acquire_duration > std::time::Duration::from_millis(8)
+            && crate::wayland::trace_frame_events_enabled()
+        {
+            tracing::trace!(
                 "[FRAME] {}: Surface acquisition took {:.1}ms",
                 self.name,
                 surface_acquire_duration.as_secs_f64() * 1000.0
@@ -123,9 +119,7 @@ impl super::Renderer {
                 next_aspect: self.current_aspect,
                 params: [[0.0; 4]; 7],
             };
-            self.ctx
-                .queue
-                .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            self.write_uniforms_if_changed(uniforms);
         }
 
         let blit_source = match self.select_blit_source() {
@@ -137,12 +131,28 @@ impl super::Renderer {
         };
 
         let is_comp = blit_source == BlitSource::Composition;
-        if !self.ensure_blit_bind_group(blit_source) {
+        let final_yuv = if blit_source == BlitSource::Current && !self.transition_active {
+            self.active_yuv_source
+        } else {
+            None
+        };
+        if final_yuv.is_none() && !self.ensure_blit_bind_group(blit_source) {
             return Ok(());
         }
 
         // Get format-specific blit pipeline from shared context
-        let blit_pipeline = self.ctx.get_blit_pipeline(self.config.format);
+        let blit_pipeline = match final_yuv.map(|source| source.format) {
+            Some(super::YuvFormat::Nv12) => {
+                self.ctx.get_native_nv12_blit_pipeline(self.config.format)
+            }
+            Some(super::YuvFormat::P010) => {
+                self.ctx.get_native_nv12_blit_pipeline(self.config.format)
+            }
+            Some(super::YuvFormat::I420) => {
+                self.ctx.get_final_i420_blit_pipeline(self.config.format)
+            }
+            None => self.ctx.get_blit_pipeline(self.config.format),
+        };
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -160,20 +170,71 @@ impl super::Renderer {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&blit_pipeline);
-            if let Some(bg) = &self.blit_bind_group {
-                render_pass.set_bind_group(0, bg, &[]);
+            if let Some(source) = final_yuv {
+                let bg = match source.format {
+                    super::YuvFormat::Nv12 => self.final_nv12_bind_group.as_ref(),
+                    super::YuvFormat::P010 => self.final_p010_bind_group.as_ref(),
+                    super::YuvFormat::I420 => self.final_i420_bind_group.as_ref(),
+                }
+                .expect("active final YUV source requires its persistent bind group");
+                render_pass.set_pipeline(&blit_pipeline);
+                render_pass.set_bind_group(0, bg.as_ref(), &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if let Some(bg) = &self.blit_bind_group {
+                render_pass.set_pipeline(&blit_pipeline);
+                render_pass.set_bind_group(0, bg.as_ref(), &[]);
                 render_pass.draw(0..3, 0..1);
             } else {
                 error!(
                     "[RENDER] {}: blit_bind_group is None, cannot render!",
                     self.name
                 );
-                return Ok(()); // Can't render without bind group
+                return Ok(());
             }
         } // render_pass dropped here
 
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.ctx.submit(std::iter::once(encoder.finish()));
+        if let (Some(source), Some(metrics)) = (final_yuv, &self.metrics) {
+            use crate::observability::video_backend::VideoBackendMetricKind;
+            let metric = match source.origin {
+                super::YuvOrigin::Cpu => VideoBackendMetricKind::CpuFinalYuvSample,
+                super::YuvOrigin::DmaBuf => VideoBackendMetricKind::AppsinkFinalYuvSample,
+                super::YuvOrigin::NativeDmaBuf => VideoBackendMetricKind::NativeFinalYuvSample,
+                super::YuvOrigin::Cuda => VideoBackendMetricKind::CudaFinalYuvSample,
+            };
+            metrics.record_video_backend_metric(metric);
+        }
+        // Register the next callback before WGPU attaches/commits this buffer.
+        // A callback requested by a separate damage-only commit after present
+        // is legal in the protocol, but Hyprland can leave it unscheduled when
+        // no new buffer accompanies that commit. That stalled transitions and
+        // starved the demand-driven video decoder after its first frame.
+        if (self.transition_active
+            || (self.valid_content_type == crate::queue::ContentType::Video
+                && self.steady_video_uses_frame_callbacks()))
+            && let super::BackendContext::Wayland { surface, qh, .. } = &context
+        {
+            self.arm_frame_callback_for_present(surface, qh);
+        }
+        if let super::BackendContext::Wayland {
+            surface,
+            qh,
+            presentation: Some(presentation),
+        } = &context
+            && self
+                .last_presentation_feedback_request
+                .is_none_or(|requested| requested.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.last_presentation_feedback_request = Some(std::time::Instant::now());
+            presentation.feedback(
+                surface.wl_surface(),
+                qh,
+                crate::wayland::presentation::FeedbackData {
+                    output: self.name.clone(),
+                    requested_at: std::time::Instant::now(),
+                },
+            );
+        }
         output.present();
         if self.display_timer_pending {
             self.display_timer_pending = false;
@@ -223,13 +284,7 @@ impl super::Renderer {
         self.prev_texture.is_some() || self.has_previous_external_render_texture()
     }
 
-    #[cfg(feature = "mpv-backend")]
     fn has_previous_external_render_texture(&self) -> bool {
         self.prev_external_view.is_some()
-    }
-
-    #[cfg(not(feature = "mpv-backend"))]
-    fn has_previous_external_render_texture(&self) -> bool {
-        false
     }
 }

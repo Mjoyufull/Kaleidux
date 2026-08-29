@@ -3,20 +3,35 @@ use ash::vk;
 use std::ffi::CStr;
 use tracing::info;
 
-pub(super) fn mpv_gl_interop_requested() -> bool {
+fn mpv_gl_interop_requested() -> bool {
     matches!(
-        crate::video::get_video_backend_request(),
-        crate::video::VideoBackendRequest::ForceMpvExperimental
+        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
+        crate::video::VideoBackendRequest::ForceMpv
     ) && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl()
 }
 
-pub(super) fn create_mpv_gl_interop_device(
+pub(super) fn native_dmabuf_interop_requested() -> bool {
+    matches!(
+        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
+        crate::video::VideoBackendRequest::ForceFfmpeg
+    )
+}
+
+pub(super) fn external_video_interop_requested() -> bool {
+    let backend =
+        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto);
+    mpv_gl_interop_requested()
+        || native_dmabuf_interop_requested()
+        || matches!(backend, crate::video::VideoBackendRequest::ForceAppsink)
+}
+
+pub(super) fn create_external_video_interop_device(
     adapter: &wgpu::Adapter,
     descriptor: &wgpu::DeviceDescriptor<'_>,
 ) -> anyhow::Result<(wgpu::Device, wgpu::Queue)> {
     anyhow::ensure!(
         adapter.get_info().backend == wgpu::Backend::Vulkan,
-        "KLD_MPV_RENDER_API=gl-composed currently requires WGPU's Vulkan backend"
+        "GPU video interop currently requires WGPU's Vulkan backend"
     );
     // SAFETY: the HAL adapter is borrowed only while creating an owned HAL device
     // from that same adapter. The returned device is wrapped by the same WGPU adapter.
@@ -32,7 +47,9 @@ pub(super) fn create_mpv_gl_interop_device(
         adapter.create_device_from_hal::<wgpu_hal::vulkan::Api>(hal_device, descriptor, None)
     }
     .context("wrapping Vulkan mpv GL interop device with WGPU")?;
-    info!("[MPV-GL] WGPU Vulkan device enables external memory/semaphore FD interop");
+    info!(
+        "[VIDEO-INTEROP] WGPU Vulkan device enables the requested external-memory interop extensions"
+    );
     Ok(device)
 }
 
@@ -42,11 +59,30 @@ fn create_hal_device(
 ) -> anyhow::Result<wgpu_hal::OpenDevice<wgpu_hal::vulkan::Api>> {
     let mut extensions = adapter.required_device_extensions(descriptor.required_features);
     add_required_extension(adapter, &mut extensions, ash::khr::external_memory_fd::NAME)?;
-    add_required_extension(
-        adapter,
-        &mut extensions,
-        ash::khr::external_semaphore_fd::NAME,
-    )?;
+    if external_video_interop_requested() {
+        add_required_extension(
+            adapter,
+            &mut extensions,
+            ash::khr::external_semaphore_fd::NAME,
+        )?;
+    }
+    if native_dmabuf_interop_requested() {
+        add_required_extension(
+            adapter,
+            &mut extensions,
+            ash::ext::external_memory_dma_buf::NAME,
+        )?;
+        add_required_extension(
+            adapter,
+            &mut extensions,
+            ash::ext::image_drm_format_modifier::NAME,
+        )?;
+        add_required_extension(
+            adapter,
+            &mut extensions,
+            ash::ext::queue_family_foreign::NAME,
+        )?;
+    }
     let mut enabled_features =
         adapter.physical_device_features(&extensions, descriptor.required_features);
     let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -65,7 +101,7 @@ fn create_hal_device(
     // physical device belongs to instance.
     let raw_device =
         unsafe { instance.create_device(adapter.raw_physical_device(), &create_info, None) }
-            .context("creating Vulkan device with mpv GL interop extensions")?;
+            .context("creating Vulkan device with external-video interop extensions")?;
     // SAFETY: raw_device was created from adapter with the declared extension,
     // feature, queue-family, and queue-index values. HAL takes ownership.
     unsafe {
@@ -79,7 +115,7 @@ fn create_hal_device(
             0,
         )
     }
-    .context("creating HAL device with mpv GL interop extensions")
+    .context("creating HAL device with external-video interop extensions")
 }
 
 fn add_required_extension(
@@ -101,7 +137,7 @@ fn add_required_extension(
     });
     anyhow::ensure!(
         is_supported,
-        "Vulkan device does not support required mpv GL interop extension {}",
+        "Vulkan device does not support required external-video interop extension {}",
         required.to_string_lossy()
     );
     extensions.push(required);

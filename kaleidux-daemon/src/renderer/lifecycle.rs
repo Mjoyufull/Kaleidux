@@ -4,6 +4,16 @@ use tracing::{debug, error, info, warn};
 use super::transitions::{random_transition_prewarm_set, transition_prewarm_candidates};
 use crate::shaders::Transition;
 
+fn composition_texture_usage() -> wgpu::TextureUsages {
+    // An interrupted transition promotes this texture into `current_texture`.
+    // The next image can then reuse it as an upload target, so it must satisfy
+    // the same COPY_DST contract as ordinary current image textures.
+    wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::RENDER_ATTACHMENT
+}
+
 impl super::Renderer {
     pub fn resize_checked(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         if width > 0 && height > 0 {
@@ -110,9 +120,7 @@ impl super::Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC,
+                usage: composition_texture_usage(),
                 view_formats: &[],
             });
             self.composition_texture_view =
@@ -137,8 +145,8 @@ impl super::Renderer {
         if !self.configured
             || self.config.width == 0
             || self.config.height == 0
-            || self.prev_texture.is_none()
-            || self.current_texture.is_none()
+            || (self.prev_texture.is_none() && !self.prev_external_view_available())
+            || (self.current_texture.is_none() && !self.current_external_view_available())
         {
             return;
         }
@@ -165,6 +173,7 @@ impl super::Renderer {
     pub fn apply_config(&mut self, config: &crate::orchestration::OutputConfig) {
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
+        self.pause_on_fullscreen = config.pause_on_fullscreen;
         if let Some(frame_latency) = config.frame_latency {
             let clamped = frame_latency.clamp(1, 3);
             if self.config.desired_maximum_frame_latency != clamped {
@@ -412,5 +421,19 @@ impl super::Renderer {
         }
 
         Some(pipeline_arc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composition_texture_can_be_promoted_to_an_image_upload_target() {
+        let usage = composition_texture_usage();
+        assert!(usage.contains(wgpu::TextureUsages::COPY_SRC));
+        assert!(usage.contains(wgpu::TextureUsages::COPY_DST));
+        assert!(usage.contains(wgpu::TextureUsages::TEXTURE_BINDING));
+        assert!(usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
     }
 }
