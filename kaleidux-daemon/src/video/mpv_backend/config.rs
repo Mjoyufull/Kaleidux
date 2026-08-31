@@ -4,6 +4,8 @@ use tracing::warn;
 
 const DEFAULT_MPV_CAPTURE_FPS: u32 = 48;
 const MAX_MPV_CAPTURE_FPS: u32 = 120;
+const PCI_VENDOR_AMD: u32 = 0x1002;
+const PCI_VENDOR_INTEL: u32 = 0x8086;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MpvRenderApi {
@@ -63,11 +65,20 @@ pub(super) fn normalized_render_bounds(render_size: Option<(u32, u32)>) -> Optio
         .map(|(width, height)| (width.max(1), height.max(1)))
 }
 
-pub(super) fn hwdec_mode() -> String {
+fn default_hwdec_mode(adapter_vendor: Option<u32>) -> &'static str {
+    match adapter_vendor {
+        // Avoid auto-safe probing CUDA/NVDEC on adapters that can only use
+        // VA-API. NVIDIA and unknown adapters retain mpv's broad safe probe.
+        Some(PCI_VENDOR_AMD) | Some(PCI_VENDOR_INTEL) => "vaapi",
+        _ => "auto-safe",
+    }
+}
+
+pub(super) fn hwdec_mode(adapter_vendor: Option<u32>) -> String {
     std::env::var("KLD_MPV_HWDEC")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "auto-safe".to_string())
+        .unwrap_or_else(|| default_hwdec_mode(adapter_vendor).to_string())
 }
 
 pub(super) fn apply_fast_gpu_options(init: &MpvInitializer) {
@@ -86,6 +97,10 @@ pub(super) fn apply_fast_gpu_options(init: &MpvInitializer) {
     set_optional(init, "cache", false);
     set_optional(init, "vd-lavc-threads", 1i64);
     set_optional(init, "vd-lavc-fast", true);
+    // mpv otherwise aspect-fits into the offscreen target and permanently
+    // bakes letterboxing into the shared RGBA frame. Kaleidux wallpapers use
+    // centered cover-fill semantics, matching the FFmpeg/appsink paths.
+    set_optional(init, "panscan", 1.0f64);
 
     if mpv_quality_mode().eq_ignore_ascii_case("default") {
         return;
@@ -153,5 +168,17 @@ mod tests {
             render_api_for_request(MpvRenderApiRequest::ComposedGl, false, false),
             MpvRenderApi::Software
         );
+    }
+
+    #[test]
+    fn non_nvidia_adapters_skip_cuda_hwdec_probes() {
+        assert_eq!(default_hwdec_mode(Some(PCI_VENDOR_INTEL)), "vaapi");
+        assert_eq!(default_hwdec_mode(Some(PCI_VENDOR_AMD)), "vaapi");
+    }
+
+    #[test]
+    fn nvidia_and_unknown_adapters_keep_safe_auto_detection() {
+        assert_eq!(default_hwdec_mode(Some(0x10de)), "auto-safe");
+        assert_eq!(default_hwdec_mode(None), "auto-safe");
     }
 }
