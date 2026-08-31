@@ -56,6 +56,10 @@ pub use mpv_native::{MpvComposedVideoTarget, MpvNativeVideoTarget};
 #[path = "video/lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::{AppsinkQueueLevels, VideoPrebufferProfile, VideoPrebufferResult};
+#[path = "video/libva_env.rs"]
+mod libva_env;
+pub(crate) use libva_env::sanitize_libva_driver_env;
+pub use libva_env::sanitize_libva_driver_env_for_gstreamer;
 
 #[path = "video/frame.rs"]
 mod frame;

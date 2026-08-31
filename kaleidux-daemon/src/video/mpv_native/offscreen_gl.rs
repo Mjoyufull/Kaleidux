@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::MpvComposedVideoTarget;
 use super::offscreen_gl_support::{
     EglApi, EglProcLoader, GlApi, GlSyncPolicy, create_mpv_gl_context, render_param,
-    sanitize_libva_driver_env, select_hwdec_display_resource,
+    select_hwdec_display_resource,
 };
 use super::render_wake::{RenderWake, render_update_callback};
 use crate::renderer::{create_exportable_rgba_texture, prime_shared_texture_for_gl};
@@ -109,7 +109,7 @@ impl ComposedGlRenderContext {
         let gl = GlApi::load(&egl)?;
         let proc_loader = Box::new(EglProcLoader::new(egl.as_ref()));
         let adapter_vendor = target.wgpu_ctx.adapter.get_info().vendor;
-        sanitize_libva_driver_env(adapter_vendor);
+        crate::video::sanitize_libva_driver_env(adapter_vendor, "[MPV-GL]");
         let drm_render_fd = select_hwdec_display_resource(Some(adapter_vendor));
         let mpv_context = create_mpv_gl_context(
             mpv,

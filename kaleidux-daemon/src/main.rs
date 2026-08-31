@@ -321,6 +321,7 @@ fn init_gstreamer() -> anyhow::Result<std::time::Duration> {
     #[cfg(feature = "backend-appsink")]
     {
         let gstreamer_start = Instant::now();
+        kaleidux_daemon::video::sanitize_libva_driver_env_for_gstreamer();
         gstreamer::init()?;
         if kaleidux_daemon::observability::trace_all::trace_all_enabled() {
             gstreamer::log::set_active(true);
