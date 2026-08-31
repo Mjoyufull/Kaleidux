@@ -22,35 +22,6 @@ impl EglProcLoader {
     }
 }
 
-/// Defend against a mismatched `LIBVA_DRIVER_NAME` in the user session.
-///
-/// Libva honors that variable over PCI auto-detection, so a wrong value makes
-/// every VA-API probe fail and silently forces software decode. This changes
-/// only the daemon process. NVIDIA is left alone because `nvidia` can be a
-/// deliberate nvidia-vaapi-driver choice.
-pub(super) fn sanitize_libva_driver_env(adapter_vendor: u32) {
-    let Ok(current) = std::env::var("LIBVA_DRIVER_NAME") else {
-        return;
-    };
-    let expected: &[&str] = match adapter_vendor {
-        0x8086 => &["iHD", "i965"],
-        0x1002 => &["radeonsi", "r600"],
-        PCI_VENDOR_NVIDIA => return,
-        _ => return,
-    };
-    if expected.contains(&current.trim()) {
-        return;
-    }
-    tracing::warn!(
-        "[MPV-GL] LIBVA_DRIVER_NAME={current} mismatches adapter vendor \
-         0x{adapter_vendor:04x}; unsetting it for this process so libva \
-         auto-detects the right driver"
-    );
-    // SAFETY: this happens during render-context creation before libva reads
-    // the variable. No other Kaleidux thread reads this variable.
-    unsafe { std::env::remove_var("LIBVA_DRIVER_NAME") };
-}
-
 /// Select the display resource mpv uses for hardware decode probing.
 ///
 /// On non-NVIDIA adapters a DRM render node avoids mpv's failed Wayland VA-API
@@ -70,7 +41,7 @@ pub(super) fn select_hwdec_display_resource(adapter_vendor: Option<u32>) -> Opti
             .and_then(|minor| minor.parse::<u32>().ok())
         && let Some(detected_vendor) = drm_node_vendor(minor)
     {
-        sanitize_libva_driver_env(detected_vendor);
+        crate::video::sanitize_libva_driver_env(detected_vendor, "[MPV-GL]");
     }
     if let Some(adapter_vendor) = adapter_vendor {
         tracing::info!(
