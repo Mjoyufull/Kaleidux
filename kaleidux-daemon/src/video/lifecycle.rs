@@ -42,6 +42,20 @@ fn restart_pipeline_after_eos(
     Err("failed to seek to start after eos".to_string())
 }
 
+fn take_pipeline_error(pipeline: &gst::Element) -> Option<String> {
+    let bus = pipeline.bus()?;
+    let message = bus.pop_filtered(&[gst::MessageType::Error])?;
+    let gst::MessageView::Error(error) = message.view() else {
+        return None;
+    };
+    Some(format!(
+        "error from {:?}: {} ({:?})",
+        error.src().map(|source| source.path_string()),
+        error.error(),
+        error.debug()
+    ))
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppsinkQueueLevels {
     pub buffers: u64,
@@ -120,6 +134,7 @@ impl VideoPlayer {
         let state_wait_budget = std::time::Duration::from_millis(1500);
         let state_wait_slice = std::time::Duration::from_millis(50);
         let mut state_settled = false;
+        let mut state_failed = false;
         let mut current = gst::State::Null;
         let mut pending = gst::State::VoidPending;
         while state_wait_start.elapsed() < state_wait_budget {
@@ -133,12 +148,24 @@ impl VideoPlayer {
                 pipeline.state(gst::ClockTime::from_mseconds(wait_slice.as_millis() as u64));
             current = current_state;
             pending = pending_state;
-            if state_result.is_ok() {
-                state_settled = true;
-                break;
+            match state_result {
+                Ok(_) => {
+                    state_settled = true;
+                    break;
+                }
+                Err(_) if pending != gst::State::VoidPending => {
+                    state_failed = true;
+                    break;
+                }
+                Err(_) => {}
             }
         }
         let state_wait_duration = state_wait_start.elapsed();
+        if state_failed {
+            let detail = take_pipeline_error(pipeline)
+                .unwrap_or_else(|| "pipeline rejected the Paused state".to_string());
+            anyhow::bail!("GStreamer prebuffer failed: {detail}");
+        }
         if state_settled {
             debug!(
                 "[VIDEO] {}: Pre-buffer state settled at {:?} (pending {:?})",

@@ -248,6 +248,7 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeDeps;
           LIBVA_DRIVERS_PATH = "${vaDriverPath}:/run/opengl-driver/lib/dri:/usr/lib/dri";
+          GST_PLUGIN_SYSTEM_PATH_1_0 = gstPluginPath;
         };
 
       in
