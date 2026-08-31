@@ -86,6 +86,10 @@ impl MpvPlayer {
                 "production mpv GL/WGPU target is unavailable; refusing the software-render fallback"
             );
         }
+        let adapter_vendor = composed_target
+            .as_ref()
+            .map(MpvComposedVideoTarget::adapter_vendor);
+        let hwdec_mode = mpv_hwdec_mode(adapter_vendor);
         let mpv = Mpv::with_initializer(|init| {
             init.set_option("vo", "libmpv")?;
             if volume > f64::EPSILON {
@@ -106,7 +110,7 @@ impl MpvPlayer {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "all=warn".to_string());
             init.set_option("msg-level", msg_level.as_str())?;
-            init.set_option("hwdec", mpv_hwdec_mode().as_str())?;
+            init.set_option("hwdec", hwdec_mode.as_str())?;
             apply_fast_gpu_options(&init);
             if let Err(error) = init.set_option("sws-fast", true) {
                 warn!("[VIDEO] libmpv ignored sws-fast option: {}", error);
@@ -169,7 +173,7 @@ impl MpvPlayer {
             format!("{capture_fps}fps")
         };
         info!(
-            "[VIDEO] {}: VideoPlayer created with libmpv backend (session={} render_api={} cadence={} max_publish_fps={:?} render_size={:?} native_target={:?} sw_format={} hwdec={} uri={})",
+            "[VIDEO] {}: VideoPlayer created with libmpv backend (session={} render_api={} cadence={} max_publish_fps={:?} render_size={:?} native_target={:?} sw_format={} hwdec={} fit=cover uri={})",
             source_id,
             session_id,
             if use_native_gl {
@@ -187,7 +191,7 @@ impl MpvPlayer {
                 .as_ref()
                 .map(|context| context.format.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "none".to_string()),
-            mpv_hwdec_mode(),
+            hwdec_mode,
             uri
         );
 

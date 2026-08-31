@@ -141,6 +141,10 @@ impl MpvComposedVideoTarget {
         (self.width as i32, self.height as i32)
     }
 
+    pub(super) fn adapter_vendor(&self) -> u32 {
+        self.wgpu_ctx.adapter.get_info().vendor
+    }
+
     pub(super) fn egl_platform(&self) -> u32 {
         match self.display_platform {
             MpvComposedDisplayPlatform::Wayland => 0x31D8, // EGL_PLATFORM_WAYLAND_KHR
