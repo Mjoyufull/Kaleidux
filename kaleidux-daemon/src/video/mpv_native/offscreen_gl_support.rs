@@ -33,15 +33,16 @@ pub(super) fn select_hwdec_display_resource(adapter_vendor: Option<u32>) -> Opti
         return None;
     }
     let (fd, path) = open_matching_drm_render_node(adapter_vendor)?;
-    if adapter_vendor.is_none()
-        && let Some(minor) = path
-            .file_name()
+    let detected_vendor = adapter_vendor.or_else(|| {
+        path.file_name()
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_prefix("renderD"))
             .and_then(|minor| minor.parse::<u32>().ok())
-        && let Some(detected_vendor) = drm_node_vendor(minor)
-    {
-        crate::video::sanitize_libva_driver_env(detected_vendor, "[MPV-GL]");
+            .and_then(drm_node_vendor)
+    });
+    if detected_vendor == Some(PCI_VENDOR_NVIDIA) {
+        tracing::debug!("[MPV-GL] detected NVIDIA render node; keeping wl_display hwdec resource");
+        return None;
     }
     if let Some(adapter_vendor) = adapter_vendor {
         tracing::info!(

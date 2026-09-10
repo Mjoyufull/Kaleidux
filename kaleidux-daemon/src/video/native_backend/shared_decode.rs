@@ -149,25 +149,26 @@ impl SharedDecodeSession {
     }
 
     pub(super) fn release(self: &Arc<Self>, session_id: u64) -> anyhow::Result<()> {
+        let mut registry = SHARED_DECODERS.lock();
         if !self.fanout.remove_subscriber(session_id) || self.fanout.subscriber_count() != 0 {
             return Ok(());
         }
         if self.stopping.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.control.stop();
-        if let Some(worker) = self.worker.lock().take() {
-            worker.join().map_err(|panic| {
-                anyhow::anyhow!("shared native decoder thread panicked: {panic:?}")
-            })?;
-        }
-        let mut registry = SHARED_DECODERS.lock();
         if registry
             .get(&self.key)
             .and_then(Weak::upgrade)
             .is_some_and(|registered| Arc::ptr_eq(&registered, self))
         {
             registry.remove(&self.key);
+        }
+        drop(registry);
+        self.control.stop();
+        if let Some(worker) = self.worker.lock().take() {
+            worker.join().map_err(|panic| {
+                anyhow::anyhow!("shared native decoder thread panicked: {panic:?}")
+            })?;
         }
         Ok(())
     }

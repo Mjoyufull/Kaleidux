@@ -140,7 +140,7 @@ impl NativePlaybackControl {
         while state.playback == PlaybackState::Paused && state.seek_ns.is_none() {
             self.wake.wait(&mut state);
         }
-        state.playback != PlaybackState::Stopped
+        state.playback == PlaybackState::Playing && state.seek_ns.is_none()
     }
 
     pub fn wait_until(&self, deadline: Instant) -> bool {
@@ -203,6 +203,13 @@ mod tests {
         assert!(control.has_pending_seek());
         assert_eq!(control.take_seek(), Some(42));
         assert!(!control.has_pending_seek());
+    }
+
+    #[test]
+    fn paused_seek_wakes_pacing_without_publishing_the_old_frame() {
+        let control = NativePlaybackControl::new();
+        control.seek(42);
+        assert!(!control.wait_until_playing());
     }
 
     #[test]

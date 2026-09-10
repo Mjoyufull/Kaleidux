@@ -5,10 +5,21 @@ use crate::video::{
 };
 use ffmpeg_next::ffi;
 use ffmpeg_next::util::frame::video::Video;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tracing::warn;
+
+const MAX_CACHED_SURFACE_LAYOUTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SurfaceLayoutKey {
+    api: NativeDecoderApi,
+    frames_context: usize,
+    surface_id: u64,
+    width: u32,
+    height: u32,
+}
 
 const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -24,7 +35,8 @@ struct CachedSurfaceLayout {
 }
 
 pub struct NativeSurfaceExporter {
-    layouts: HashMap<u64, CachedSurfaceLayout>,
+    layouts: HashMap<SurfaceLayoutKey, CachedSurfaceLayout>,
+    layout_order: VecDeque<SurfaceLayoutKey>,
     frame_pool: Arc<parking_lot::Mutex<Vec<Video>>>,
 }
 
@@ -55,6 +67,7 @@ impl NativeSurfaceExporter {
     pub fn new() -> Self {
         Self {
             layouts: HashMap::new(),
+            layout_order: VecDeque::new(),
             frame_pool: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
@@ -100,14 +113,31 @@ impl NativeSurfaceExporter {
                 _ => (*decoded.as_ptr()).data[0] as usize as u64,
             }
         };
-        let layout = if let Some(layout) = self.layouts.get(&surface_id) {
+        let layout_key = SurfaceLayoutKey {
+            api,
+            frames_context: hardware_frames_context_identity(&decoded),
+            surface_id,
+            width,
+            height,
+        };
+        let layout = if let Some(layout) = self.layouts.get(&layout_key) {
+            if let Some(position) = self.layout_order.iter().position(|key| key == &layout_key) {
+                self.layout_order.remove(position);
+            }
+            self.layout_order.push_back(layout_key);
             layout.clone()
         } else {
             let layout = match map_surface_layout(&decoded, api) {
                 Ok(layout) => layout,
                 Err(error) => return Err((error, decoded)),
             };
-            self.layouts.insert(surface_id, layout.clone());
+            if self.layouts.len() >= MAX_CACHED_SURFACE_LAYOUTS {
+                if let Some(oldest_key) = self.layout_order.pop_front() {
+                    self.layouts.remove(&oldest_key);
+                }
+            }
+            self.layouts.insert(layout_key, layout.clone());
+            self.layout_order.push_back(layout_key);
             layout
         };
 
@@ -139,6 +169,18 @@ impl NativeSurfaceExporter {
             color,
             geometry,
         })
+    }
+}
+
+fn hardware_frames_context_identity(decoded: &Video) -> usize {
+    // SAFETY: decoded is a live hardware AVFrame. AVBufferRef::data points to
+    // the stable AVHWFramesContext allocation for this decoder generation.
+    unsafe {
+        let frames_ref = (*decoded.as_ptr()).hw_frames_ctx;
+        if frames_ref.is_null() {
+            return 0;
+        }
+        (*frames_ref).data as usize
     }
 }
 

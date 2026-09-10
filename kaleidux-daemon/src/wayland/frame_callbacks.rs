@@ -52,6 +52,12 @@ pub(crate) fn process_frame_callbacks(
             player.request_video_frame();
         }
         let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
+        let buffer_size = ctx
+            .renderers
+            .get(&name)
+            .map(|renderer| (renderer.config.width, renderer.config.height))
+            .unwrap_or((1, 1));
+        let logical_surface_size = backend.logical_surface_size(&name, buffer_size);
         let mut mark_presented = false;
         if let Some(r) = ctx.renderers.get_mut(&name) {
             let mut native_surface_presented = false;
@@ -75,7 +81,7 @@ pub(crate) fn process_frame_callbacks(
                     conn,
                     &name,
                     &frame,
-                    (r.config.width, r.config.height),
+                    logical_surface_size,
                 );
                 if native_surface_presented {
                     *callback_flush_needed = true;

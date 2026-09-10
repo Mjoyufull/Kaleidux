@@ -113,6 +113,7 @@ impl super::Renderer {
                 }
                 None => true,
             };
+        let mut replaced_texture = None;
         let mut texture = if direct_yuv {
             if let Some(curr) = self.current_texture.take() {
                 if let Some((w, h)) = self.current_texture_size.take() {
@@ -127,9 +128,8 @@ impl super::Renderer {
                     if !needs_new_texture {
                         curr
                     } else {
-                        self.current_texture_view = None;
                         if let Some((w, h)) = self.current_texture_size {
-                            self.ctx.return_texture_to_pool(curr, w, h);
+                            replaced_texture = Some((curr, w, h));
                         }
                         self.ctx.get_texture_from_pool(
                             presentation_width,
@@ -233,7 +233,7 @@ impl super::Renderer {
             }
         }
 
-        match &frame.format {
+        let upload_succeeded = match &frame.format {
             crate::video::VideoFrameFormat::Nv12 {
                 y_stride,
                 uv_offset,
@@ -248,6 +248,7 @@ impl super::Renderer {
                     *uv_offset,
                     *uv_stride,
                 );
+                true
             }
             crate::video::VideoFrameFormat::P010 {
                 y_stride,
@@ -263,6 +264,7 @@ impl super::Renderer {
                     *uv_offset,
                     *uv_stride,
                 );
+                true
             }
             crate::video::VideoFrameFormat::I420 {
                 y_stride,
@@ -282,6 +284,7 @@ impl super::Renderer {
                     *v_offset,
                     *v_stride,
                 );
+                true
             }
             crate::video::VideoFrameFormat::Rgba => {
                 self.upload_frame_rgba(
@@ -290,12 +293,13 @@ impl super::Renderer {
                     source_width,
                     source_height,
                 );
+                true
             }
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
                 unreachable!("external GL frames return before allocating an upload texture");
             }
             crate::video::VideoFrameFormat::DmaBufNv12 { frame: dmabuf } => {
-                if !self.upload_frame_native_dmabuf_nv12(
+                let uploaded = self.upload_frame_native_dmabuf_nv12(
                     frame,
                     texture
                         .as_ref()
@@ -304,14 +308,16 @@ impl super::Renderer {
                     source_height,
                     dmabuf,
                     super::YuvOrigin::DmaBuf,
-                ) {
+                );
+                if !uploaded {
                     warn!("[VIDEO] modifier-aware GStreamer DMA-BUF import failed");
                 }
+                uploaded
             }
             crate::video::VideoFrameFormat::NativeDmaBufNv12 {
                 frame: native_dmabuf,
             } => {
-                let _ = self.upload_frame_native_dmabuf_nv12(
+                let uploaded = self.upload_frame_native_dmabuf_nv12(
                     frame,
                     texture
                         .as_ref()
@@ -321,6 +327,10 @@ impl super::Renderer {
                     native_dmabuf,
                     super::YuvOrigin::NativeDmaBuf,
                 );
+                if !uploaded {
+                    warn!("[VIDEO] native DMA-BUF import failed");
+                }
+                uploaded
             }
             crate::video::VideoFrameFormat::CudaNv12 {
                 y_stride,
@@ -350,7 +360,43 @@ impl super::Renderer {
                         *uv_stride,
                     );
                 }
+                true
             }
+        };
+
+        if !upload_succeeded {
+            if self.active_yuv_source.is_some_and(|source| {
+                matches!(
+                    source.origin,
+                    super::YuvOrigin::DmaBuf | super::YuvOrigin::NativeDmaBuf
+                )
+            }) {
+                self.active_yuv_source = None;
+                self.final_nv12_bind_group = None;
+            }
+            if let Some(failed_texture) = texture.take() {
+                if needs_new_texture {
+                    self.ctx.return_texture_to_pool(
+                        failed_texture,
+                        presentation_width,
+                        presentation_height,
+                    );
+                } else {
+                    self.current_texture = Some(failed_texture);
+                }
+            }
+            if let Some((previous, width, height)) = replaced_texture.take() {
+                self.current_texture = Some(previous);
+                self.current_texture_size = Some((width, height));
+            }
+            // Keep presenting the last valid content while the backend
+            // degrades this source to its CPU upload path.
+            self.needs_redraw = true;
+            return;
+        }
+
+        if let Some((previous, width, height)) = replaced_texture.take() {
+            self.ctx.return_texture_to_pool(previous, width, height);
         }
 
         if self.active_yuv_source.is_some() && !self.transition_active {
