@@ -132,19 +132,35 @@ impl SmartQueue {
         self.stats.blacklist.insert(path.clone());
         self.pool.retain(|p| p != &path);
         self.content_type_cache.remove(&path);
-        let snapshot = self
-            .root_index
-            .replace(&self.pool, &self.content_type_cache);
+        let snapshot = self.root_index.apply_changes(&[(path, None)]);
         self.root_generation = snapshot.generation;
         self.save_stats()
     }
 
     pub fn unblacklist_file(&mut self, path: PathBuf) -> Result<()> {
         if self.stats.blacklist.remove(&path) {
-            // If we are currently in "All" mode (no playlist), add it back if it exists in root
-            // If we are in a playlist, add it back if it's in the playlist
-            // Simplest way is just to reload the current playlist/root
-            self.set_playlist(self.active_playlist.clone())?;
+            if path.starts_with(&self.root_path)
+                && let Some(content_type) = Self::get_content_type(&path)
+            {
+                self.content_type_cache.insert(path.clone(), content_type);
+                let snapshot = self
+                    .root_index
+                    .apply_changes(&[(path.clone(), Some(content_type))]);
+                self.root_generation = snapshot.generation;
+                let belongs_to_active_playlist = self.active_playlist.as_ref().is_none_or(|name| {
+                    self.stats
+                        .playlists
+                        .get(name)
+                        .is_some_and(|playlist| playlist.enabled && playlist.paths.contains(&path))
+                });
+                if belongs_to_active_playlist && !self.pool.contains(&path) {
+                    self.pool.push(path);
+                    self.pool.sort();
+                    self.current_index =
+                        Self::fallback_current_index(self.strategy, self.pool.len());
+                    self.planned_sequential_type = None;
+                }
+            }
             self.save_stats()?;
         }
         Ok(())

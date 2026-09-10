@@ -149,6 +149,88 @@ fn update_config_rebuilds_synchronized_shared_queue() {
 }
 
 #[test]
+fn synchronized_queue_ignores_non_representative_output_queue_changes() {
+    let temp = unique_test_dir("sync-non-representative-change");
+    let cache = Arc::new(
+        FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
+    );
+    let primary_path = temp.join("primary");
+    let secondary_path = temp.join("secondary");
+    std::fs::create_dir_all(&primary_path).expect("primary dir should be created");
+    std::fs::create_dir_all(&secondary_path).expect("secondary dir should be created");
+    let primary_file = write_test_image(&primary_path, "primary.png");
+    let secondary_file = write_test_image(&secondary_path, "secondary.png");
+    cache
+        .set_cached_pool(&primary_path, std::slice::from_ref(&primary_file))
+        .expect("primary pool should be stored");
+    cache
+        .set_cached_pool(&secondary_path, std::slice::from_ref(&secondary_file))
+        .expect("secondary pool should be stored");
+
+    let mut primary_config = test_output_config(Duration::from_secs(60));
+    primary_config.path = Some(primary_path.clone());
+    primary_config.sorting = SortingStrategy::Ascending;
+    let mut secondary_config = test_output_config(Duration::from_secs(60));
+    secondary_config.path = Some(secondary_path);
+    secondary_config.sorting = SortingStrategy::Descending;
+    let shared_queue = make_test_queue(
+        cache.clone(),
+        &primary_path,
+        vec![primary_file.clone()],
+        &primary_config,
+    );
+    let primary = OutputOrchestrator {
+        _name: "DP-1".to_string(),
+        description: "Primary".to_string(),
+        phase_offset: Duration::ZERO,
+        config: primary_config.clone(),
+        queue: None,
+        current_path: Some(primary_file),
+        next_path: None,
+        next_content_type: Some(crate::queue::ContentType::Image),
+        next_change: Some(Instant::now()),
+        display_start_time: Some(Instant::now()),
+    };
+    let secondary = OutputOrchestrator {
+        _name: "DP-2".to_string(),
+        description: "Secondary".to_string(),
+        phase_offset: Duration::ZERO,
+        config: secondary_config.clone(),
+        queue: None,
+        current_path: Some(secondary_file),
+        next_path: None,
+        next_content_type: Some(crate::queue::ContentType::Image),
+        next_change: Some(Instant::now()),
+        display_start_time: Some(Instant::now()),
+    };
+    let initial_config = config_for_outputs_with_behavior(
+        &[("DP-1", &primary_config), ("DP-2", &secondary_config)],
+        MonitorBehavior::Synchronized,
+    );
+    let mut manager = make_test_manager("DP-1", cache, primary, initial_config);
+    manager.outputs.insert("DP-2".to_string(), secondary);
+    manager.shared_queue = Some(shared_queue);
+    let original_start = Instant::now();
+    manager.shared_display_start_time = Some(original_start);
+
+    let mut changed_secondary = secondary_config;
+    changed_secondary.sorting = SortingStrategy::Random;
+    manager.update_config(config_for_outputs_with_behavior(
+        &[("DP-1", &primary_config), ("DP-2", &changed_secondary)],
+        MonitorBehavior::Synchronized,
+    ));
+
+    let shared_queue = manager.shared_queue.as_ref().expect("shared queue remains");
+    assert_eq!(shared_queue.root_path, primary_path);
+    assert_eq!(shared_queue.strategy, SortingStrategy::Ascending);
+    assert_eq!(manager.shared_display_start_time, Some(original_start));
+    assert_eq!(
+        manager.outputs["DP-2"].config.sorting,
+        SortingStrategy::Random
+    );
+}
+
+#[test]
 fn update_config_rebuilds_group_queue() {
     let temp = unique_test_dir("group-reload");
     let cache = Arc::new(
@@ -287,7 +369,7 @@ fn update_config_flushes_pending_stats_before_replacing_queue() {
 }
 
 #[test]
-fn update_config_clears_stale_queue_when_refresh_fails() {
+fn update_config_ignores_corrupt_stats_and_refreshes_queue() {
     let temp = unique_test_dir("refresh-failure");
     let cache = Arc::new(
         FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
@@ -340,13 +422,19 @@ fn update_config_clears_stale_queue_when_refresh_fails() {
 
     let orch = manager.outputs.get("DP-1").expect("output should exist");
     assert!(
-        orch.queue.is_none(),
-        "stale queue should be cleared on refresh failure"
+        orch.queue.is_some(),
+        "new queue should still be constructed"
     );
     assert_eq!(orch.config.path, Some(new_path));
     assert!(orch.current_path.is_none());
     assert!(orch.display_start_time.is_none());
     assert!(orch.next_change.is_none());
+    assert!(
+        cache
+            .get_file_stats(&bad_stats_path)
+            .expect("corrupt stats lookup")
+            .is_none()
+    );
 }
 
 #[test]

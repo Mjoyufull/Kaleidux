@@ -87,12 +87,57 @@ impl RootMediaIndex {
         snapshot_locked(&state)
     }
 
+    pub(crate) fn apply_changes(
+        &self,
+        changes: &[(PathBuf, Option<ContentType>)],
+    ) -> RootMediaSnapshot {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut changed = false;
+        for (path, content_type) in changes {
+            match content_type {
+                Some(content_type) => {
+                    changed |= state.content_types.insert(path.clone(), *content_type)
+                        != Some(*content_type);
+                }
+                None => changed |= state.content_types.remove(path).is_some(),
+            }
+        }
+        if changed {
+            let mut entries = state
+                .content_types
+                .iter()
+                .map(|(path, content_type)| MediaEntry {
+                    path: path.clone(),
+                    content_type: *content_type,
+                })
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            state.entries = entries.into();
+            state.generation = state.generation.saturating_add(1);
+        }
+        snapshot_locked(&state)
+    }
+
     pub(crate) fn content_type(&self, path: &Path) -> Option<ContentType> {
         let state = self
             .state
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
         state.content_types.get(path).copied()
+    }
+}
+
+impl super::SmartQueue {
+    pub(crate) fn root_pool_snapshot(&self) -> Vec<PathBuf> {
+        self.root_index
+            .snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
     }
 }
 
@@ -144,5 +189,40 @@ mod tests {
         let second = shared_root_index(&root).snapshot();
         assert_eq!(first.generation, second.generation);
         assert!(Arc::ptr_eq(&first.entries, &second.entries));
+    }
+
+    #[test]
+    fn incremental_changes_preserve_unrelated_root_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "kaleidux-root-index-changes-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let first = root.join("first.png");
+        let second = root.join("second.mp4");
+        let third = root.join("third.png");
+        let index = shared_root_index(&root);
+        index.replace(
+            &[first.clone(), second.clone()],
+            &HashMap::from([
+                (first.clone(), ContentType::Image),
+                (second.clone(), ContentType::Video),
+            ]),
+        );
+
+        let snapshot = index.apply_changes(&[
+            (first.clone(), None),
+            (third.clone(), Some(ContentType::Image)),
+        ]);
+
+        let entries = snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.content_type))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get(&second), Some(&ContentType::Video));
+        assert_eq!(entries.get(&third), Some(&ContentType::Image));
     }
 }

@@ -313,7 +313,31 @@ impl MonitorManager {
                 }
             }
             MonitorBehavior::Synchronized => {
-                if let Some(representative_name) = changed_names.first().map(String::as_str) {
+                let representative_name = self
+                    .shared_queue
+                    .as_ref()
+                    .and_then(|queue| {
+                        let mut candidates = self
+                            .outputs
+                            .iter()
+                            .filter(|(_, output)| {
+                                output.config.path.as_deref() == Some(queue.root_path.as_path())
+                                    && output.config.sorting == queue.strategy
+                                    && output.config.video_ratio == queue.video_ratio
+                                    && output.config.default_playlist == queue.active_playlist
+                            })
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>();
+                        candidates.sort_unstable();
+                        candidates.into_iter().next()
+                    })
+                    .or_else(|| self.outputs.keys().map(String::as_str).min());
+                let shared_queue_changed = representative_name.is_some_and(|name| {
+                    changed_names
+                        .binary_search_by(|item| item.as_str().cmp(name))
+                        .is_ok()
+                });
+                if shared_queue_changed && let Some(representative_name) = representative_name {
                     if let Some(queue) = &mut self.shared_queue {
                         Self::flush_queue_stats(queue, "synchronized queue");
                     }

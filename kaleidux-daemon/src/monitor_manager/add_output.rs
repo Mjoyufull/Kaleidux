@@ -62,7 +62,7 @@ impl MonitorManager {
                         // Cache the discovered file list for subsequent outputs with the same path
                         if let Some(q) = &orch.queue {
                             self.discovered_files_cache
-                                .insert(path.clone(), q.pool.clone());
+                                .insert(path.clone(), q.root_pool_snapshot());
                         }
                         orch
                     }
