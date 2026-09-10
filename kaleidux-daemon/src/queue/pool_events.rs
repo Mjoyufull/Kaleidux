@@ -46,7 +46,17 @@ impl SmartQueue {
         let mut added = 0usize;
         let mut removed = 0usize;
         let mut index_changed = false;
+        let mut root_changes = Vec::new();
         let mut cache_updates = Vec::new();
+        let active_playlist_paths = self.active_playlist.as_ref().and_then(|name| {
+            self.stats.playlists.get(name).map(|playlist| {
+                playlist
+                    .paths
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            })
+        });
 
         for event in events {
             match event {
@@ -54,11 +64,20 @@ impl SmartQueue {
                     if !path.starts_with(&self.root_path) {
                         continue;
                     }
-                    // Only add if it's a supported media file and not blacklisted
-                    if self.stats.blacklist.contains(&path) {
+                    let content_type = if self.stats.blacklist.contains(&path) {
+                        None
+                    } else {
+                        Self::get_content_type(&path)
+                    };
+                    root_changes.push((path.clone(), content_type));
+                    if active_playlist_paths
+                        .as_ref()
+                        .is_some_and(|paths| !paths.contains(&path))
+                    {
                         continue;
                     }
-                    if let Some(ct) = Self::get_content_type(&path) {
+                    // Only add if it's a supported media file and not blacklisted
+                    if let Some(ct) = content_type {
                         if !self.pool.contains(&path) {
                             self.pool.push(path.clone());
                             self.content_type_cache.insert(path.clone(), ct);
@@ -97,6 +116,7 @@ impl SmartQueue {
                     if !path.starts_with(&self.root_path) {
                         continue;
                     }
+                    root_changes.push((path.clone(), None));
                     let before = self.pool.len();
                     self.pool.retain(|p| p != &path);
                     if self.pool.len() < before {
@@ -113,8 +133,20 @@ impl SmartQueue {
                     if !path.starts_with(&self.root_path) {
                         continue;
                     }
+                    let content_type = if self.stats.blacklist.contains(&path) {
+                        None
+                    } else {
+                        Self::get_content_type(&path)
+                    };
+                    root_changes.push((path.clone(), content_type));
+                    if active_playlist_paths
+                        .as_ref()
+                        .is_some_and(|paths| !paths.contains(&path))
+                    {
+                        continue;
+                    }
                     // File content may have changed — re-check if it's still valid media
-                    if let Some(ct) = Self::get_content_type(&path) {
+                    if let Some(ct) = content_type {
                         if !self.pool.contains(&path) && !self.stats.blacklist.contains(&path) {
                             self.pool.push(path.clone());
                             added += 1;
@@ -173,16 +205,23 @@ impl SmartQueue {
                         None,
                     ) {
                         Ok((pool, content_types)) => {
-                            self.pool = pool;
-                            self.content_type_cache = content_types;
-                            let snapshot = self
-                                .root_index
-                                .replace(&self.pool, &self.content_type_cache);
+                            let snapshot = self.root_index.replace(&pool, &content_types);
+                            root_changes.clear();
                             self.root_generation = snapshot.generation;
+                            let _ = self.cache.set_cached_pool(&self.root_path, &pool);
+                            if let Some(playlist_paths) = active_playlist_paths.as_ref() {
+                                self.pool = pool
+                                    .into_iter()
+                                    .filter(|path| playlist_paths.contains(path))
+                                    .collect();
+                                self.content_type_cache = content_types;
+                            } else {
+                                self.pool = pool;
+                                self.content_type_cache = content_types;
+                            }
                             self.current_index =
                                 self.current_index.min(self.pool.len().saturating_sub(1));
                             self.planned_sequential_type = None;
-                            let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
                         }
                         Err(error) => tracing::warn!(
                             "[QUEUE] Failed full rescan for {} after watcher overflow: {}",
@@ -203,7 +242,9 @@ impl SmartQueue {
             self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
             self.planned_sequential_type = None;
             // Update the cached pool
-            let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
+            if self.active_playlist.is_none() {
+                let _ = self.cache.set_cached_pool(&self.root_path, &self.pool);
+            }
             tracing::info!(
                 "[QUEUE] Pool updated: +{} added, -{} removed, {} total",
                 added,
@@ -211,10 +252,15 @@ impl SmartQueue {
                 self.pool.len()
             );
         }
-        if index_changed {
-            let snapshot = self
-                .root_index
-                .replace(&self.pool, &self.content_type_cache);
+        if self.active_playlist.is_none() {
+            if index_changed {
+                let snapshot = self
+                    .root_index
+                    .replace(&self.pool, &self.content_type_cache);
+                self.root_generation = snapshot.generation;
+            }
+        } else if !root_changes.is_empty() {
+            let snapshot = self.root_index.apply_changes(&root_changes);
             self.root_generation = snapshot.generation;
         }
     }

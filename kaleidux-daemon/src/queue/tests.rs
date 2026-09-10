@@ -276,3 +276,106 @@ fn loveit_peek_upcoming_images_prioritizes_high_weight_images() {
 
     assert_eq!(queue.peek_upcoming_images(2), vec![img_b, img_c]);
 }
+
+#[test]
+fn sequential_previous_uses_display_history_and_preserves_next_position() {
+    for strategy in [
+        crate::orchestration::SortingStrategy::Ascending,
+        crate::orchestration::SortingStrategy::Descending,
+    ] {
+        let paths = ["a.jpg", "b.jpg", "c.jpg"].map(PathBuf::from).to_vec();
+        let content_types = paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ContentType::Image))
+            .collect();
+        let mut queue = make_test_queue(paths, strategy, 0, content_types);
+        let first = queue.pick_next().unwrap();
+        let second = queue.pick_next().unwrap();
+
+        assert_eq!(queue.pick_prev(), Some(first));
+        assert_eq!(queue.pick_next(), Some(second));
+    }
+}
+
+#[test]
+fn sequential_previous_skips_history_entries_removed_from_the_pool() {
+    let first = PathBuf::from("a.jpg");
+    let removed = PathBuf::from("b.jpg");
+    let current = PathBuf::from("c.jpg");
+    let content_types = [first.clone(), removed.clone(), current.clone()]
+        .into_iter()
+        .map(|path| (path, ContentType::Image))
+        .collect();
+    let mut queue = make_test_queue(
+        vec![first.clone(), removed.clone(), current.clone()],
+        crate::orchestration::SortingStrategy::Ascending,
+        0,
+        content_types,
+    );
+    queue.history = VecDeque::from([first.clone(), removed.clone(), current]);
+    queue.pool.retain(|path| path != &removed);
+
+    assert_eq!(queue.pick_prev(), Some(first));
+}
+
+#[test]
+fn playlist_events_do_not_replace_the_shared_root_index() {
+    let root = unique_test_dir("playlist-root-index");
+    let first = root.join("a.jpg");
+    let second = root.join("b.jpg");
+    let third = root.join("c.jpg");
+    for path in [&first, &second, &third] {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(&[0xff, 0xd8, 0xff, 0xd9]);
+        std::fs::write(path, bytes).unwrap();
+    }
+    let cache = test_cache();
+    let mut unfiltered = SmartQueue::new_from_pool(
+        &root,
+        vec![first.clone(), second.clone()],
+        0,
+        crate::orchestration::SortingStrategy::Ascending,
+        cache.clone(),
+    )
+    .unwrap();
+    let mut filtered = SmartQueue::new_from_pool(
+        &root,
+        vec![first.clone(), second.clone()],
+        0,
+        crate::orchestration::SortingStrategy::Ascending,
+        cache,
+    )
+    .unwrap();
+    filtered.stats.playlists.insert(
+        "only-a".into(),
+        Playlist {
+            paths: vec![first.clone()],
+            strategy: crate::orchestration::SortingStrategy::Ascending,
+            enabled: true,
+        },
+    );
+    filtered.set_playlist(Some("only-a".into())).unwrap();
+
+    filtered.apply_pool_events(vec![crate::cache::PoolEvent::Modified(first.clone())]);
+    unfiltered.sync_root_index_if_needed();
+
+    assert_eq!(unfiltered.pool, vec![first.clone(), second.clone()]);
+
+    filtered.apply_pool_events(vec![crate::cache::PoolEvent::Modified(third.clone())]);
+    unfiltered.sync_root_index_if_needed();
+    assert_eq!(filtered.pool, vec![first.clone()]);
+    assert_eq!(
+        unfiltered.pool,
+        vec![first.clone(), second.clone(), third.clone()]
+    );
+
+    filtered.blacklist_file(first.clone()).unwrap();
+    unfiltered.sync_root_index_if_needed();
+    assert_eq!(unfiltered.pool, vec![second.clone(), third.clone()]);
+
+    filtered.unblacklist_file(first.clone()).unwrap();
+    unfiltered.sync_root_index_if_needed();
+    assert_eq!(filtered.pool, vec![first.clone()]);
+    assert_eq!(unfiltered.pool, vec![first, second, third]);
+}

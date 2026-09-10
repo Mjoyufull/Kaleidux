@@ -133,7 +133,28 @@ impl SmartQueue {
                     self.strategy,
                     crate::orchestration::SortingStrategy::Descending
                 );
-                self.pick_sequential_raw(!descending)
+                let mut history_previous = None;
+                if !self.history.is_empty() {
+                    self.history.pop_back();
+                    while let Some(previous) = self.history.back().cloned() {
+                        if let Some(previous_index) = self
+                            .pool
+                            .iter()
+                            .position(|candidate| candidate == &previous)
+                        {
+                            self.current_index = self.advance_index(previous_index, descending);
+                            history_previous = Some(previous);
+                            break;
+                        }
+                        self.history.pop_back();
+                    }
+                }
+                history_previous.or_else(|| {
+                    let current = self.advance_index(self.current_index, !descending);
+                    let previous = self.advance_index(current, !descending);
+                    self.current_index = current;
+                    self.pool.get(previous).cloned()
+                })
             }
             _ => {
                 // For non-sequential, use history
@@ -352,10 +373,6 @@ impl SmartQueue {
         let picked = picked?;
         self.current_index = self.advance_index(idx, descending);
         Some(picked)
-    }
-
-    fn pick_sequential_raw(&mut self, descending: bool) -> Option<PathBuf> {
-        self.pick_sequential_raw_excluding(descending, &EMPTY_EXCLUSIONS)
     }
 
     fn advance_index(&self, idx: usize, descending: bool) -> usize {
