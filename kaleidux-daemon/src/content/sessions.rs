@@ -83,6 +83,21 @@ pub(crate) fn pending_video_session_matches(
         == Some(session_id)
 }
 
+pub(crate) fn clear_pending_video_session_if_matches(
+    pending_video_sessions: &PendingVideoSessions,
+    name: &str,
+    session_id: u64,
+) -> bool {
+    let Ok(mut sessions) = pending_video_sessions.lock() else {
+        return false;
+    };
+    if sessions.get(name).copied() != Some(session_id) {
+        return false;
+    }
+    sessions.remove(name);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +115,19 @@ mod tests {
         assert!(pending_video_session_matches(&sessions, "DP-2", 9));
 
         set_pending_video_session(&sessions, "DP-2", None);
+        assert!(!pending_video_session_matches(&sessions, "DP-2", 9));
+    }
+
+    #[test]
+    fn stale_session_cannot_clear_newer_pending_session() {
+        let sessions: PendingVideoSessions = Arc::new(Mutex::new(HashMap::new()));
+        set_pending_video_session(&sessions, "DP-2", Some(9));
+
+        assert!(!clear_pending_video_session_if_matches(
+            &sessions, "DP-2", 7
+        ));
+        assert!(pending_video_session_matches(&sessions, "DP-2", 9));
+        assert!(clear_pending_video_session_if_matches(&sessions, "DP-2", 9));
         assert!(!pending_video_session_matches(&sessions, "DP-2", 9));
     }
 

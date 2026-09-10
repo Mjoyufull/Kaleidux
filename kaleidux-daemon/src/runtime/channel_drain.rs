@@ -364,7 +364,7 @@ impl MainLoopContext {
                 self.mark_startup_output_ready(&msg.name, loop_start);
             }
             if let Some(reason) = startup_failure_reason {
-                self.handle_startup_content_failure(&msg.name, &reason, loop_start);
+                self.handle_content_failure(&msg.name, &reason, loop_start);
             }
             if release_pending_video {
                 self.release_pending_image_video_stop(&msg.name);

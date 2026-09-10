@@ -214,7 +214,8 @@ impl PerformanceMetrics {
     /// Startup discovery is a one-shot event, so stale samples should age out
     /// instead of showing up forever as active steady-state CPU.
     pub fn get_recent_avg_file_discovery_cpu_time_ms(&self) -> f64 {
-        let cutoff = std::time::Instant::now() - Duration::from_secs(15);
+        let now = std::time::Instant::now();
+        let cutoff = now.checked_sub(Duration::from_secs(15)).unwrap_or(now);
         let samples = self.file_discovery_samples.lock();
         let mut sum = 0.0;
         let mut count = 0usize;

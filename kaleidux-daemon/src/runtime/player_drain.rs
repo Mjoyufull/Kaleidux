@@ -1,10 +1,12 @@
 use crate::content::sessions::{
-    VideoPlayerResult, set_pending_video_session, stop_video_player_in_background,
+    VideoPlayerResult, clear_pending_video_session_if_matches, set_pending_video_session,
+    stop_video_player_in_background,
 };
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,
 };
 use crate::main_loop::MainLoopContext;
+use crate::main_loop::RUNTIME_RECOVERY_LIMIT;
 use crate::renderer;
 use crate::runtime::startup_barrier::{STARTUP_RETRY_LIMIT, StartupOutputPhase};
 use std::time::Instant;
@@ -81,7 +83,7 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
-                            self.handle_startup_content_failure(
+                            self.handle_content_failure(
                                 &name,
                                 &format!("player_start: {}", e),
                                 loop_start,
@@ -134,7 +136,7 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
-                            self.handle_startup_content_failure(
+                            self.handle_content_failure(
                                 &name,
                                 &format!("player_start: {}", e),
                                 loop_start,
@@ -176,22 +178,35 @@ impl MainLoopContext {
                     }
                 }
                 VideoPlayerResult::Failure(name, session_id) => {
-                    if self
+                    let is_pending = self
                         .pending_video_switches
                         .get(&name)
-                        .is_some_and(|p| p.session_id == session_id)
-                    {
-                        self.pending_video_switches.remove(&name);
-                        set_pending_video_session(&self.pending_video_sessions, &name, None);
+                        .is_some_and(|p| p.session_id == session_id);
+                    let is_active = self.renderers.get(&name).map(|r| r.active_video_session_id)
+                        == Some(session_id);
+                    if !is_pending && !is_active {
+                        debug!(
+                            "[VIDEO] Ignoring stale player prepare failure {} session={}",
+                            name, session_id
+                        );
+                        continue;
                     }
-                    if self.renderers.get(&name).map(|r| r.active_video_session_id)
-                        == Some(session_id)
-                    {
+                    if is_pending {
+                        self.pending_video_switches.remove(&name);
+                        clear_pending_video_session_if_matches(
+                            &self.pending_video_sessions,
+                            &name,
+                            session_id,
+                        );
+                    }
+                    if is_active {
                         if let Some(r) = self.renderers.get_mut(&name) {
                             r.abort_transition();
                         }
                     }
-                    self.handle_startup_content_failure(&name, "player_prepare_failed", loop_start);
+                    if !self.pending_video_switches.contains_key(&name) {
+                        self.handle_content_failure(&name, "player_prepare_failed", loop_start);
+                    }
                 }
             }
         }
@@ -204,9 +219,55 @@ impl MainLoopContext {
         let Some(state) = barrier.outputs.get_mut(name) else {
             return;
         };
-        if state.can_block && state.phase != StartupOutputPhase::Presented {
-            state.phase = StartupOutputPhase::Pending;
+        state.phase = StartupOutputPhase::Pending;
+        state.first_ready_at = None;
+        state.first_present_at = None;
+        state.can_block = true;
+    }
+
+    pub(crate) fn handle_content_failure(
+        &mut self,
+        name: &str,
+        reason: &str,
+        loop_start: Instant,
+    ) -> bool {
+        if self.handle_startup_content_failure(name, reason, loop_start) {
+            return true;
         }
+
+        let failed_path = self
+            .monitor_manager
+            .outputs
+            .get(name)
+            .and_then(|output| output.current_path.clone());
+        let Some((attempt, failed_paths)) = self
+            .runtime_recoveries
+            .entry(name.to_string())
+            .or_default()
+            .record_failure(failed_path, loop_start)
+        else {
+            warn!(
+                "[VIDEO] {}: runtime recovery limit {} reached after failure ({})",
+                name, RUNTIME_RECOVERY_LIMIT, reason
+            );
+            return false;
+        };
+        let changes = self
+            .monitor_manager
+            .pick_startup_replacement(name, &failed_paths);
+        if changes.is_empty() {
+            warn!(
+                "[VIDEO] {}: no recovery candidate on attempt {}/{} after failure ({})",
+                name, attempt, RUNTIME_RECOVERY_LIMIT, reason
+            );
+            return false;
+        }
+        info!(
+            "[VIDEO] {}: scheduling runtime recovery {}/{} after failure ({})",
+            name, attempt, RUNTIME_RECOVERY_LIMIT, reason
+        );
+        self.load_content_changes(changes, "VIDEO-RECOVERY", false);
+        true
     }
 
     pub(crate) fn handle_startup_content_failure(
@@ -332,5 +393,39 @@ impl MainLoopContext {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::main_loop::RuntimeRecoveryState;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[test]
+    fn runtime_recovery_is_bounded_and_resets_after_cooldown() {
+        let start = Instant::now();
+        let mut state = RuntimeRecoveryState::default();
+        for attempt in 1..=RUNTIME_RECOVERY_LIMIT {
+            let (recorded, failed) = state
+                .record_failure(Some(PathBuf::from(format!("bad-{attempt}.mp4"))), start)
+                .expect("attempt should remain within the recovery limit");
+            assert_eq!(recorded, attempt);
+            assert_eq!(failed.len(), usize::from(attempt));
+        }
+        assert!(state.record_failure(None, start).is_none());
+
+        let (attempt, failed) = state
+            .record_failure(
+                Some(PathBuf::from("later.mp4")),
+                start + Duration::from_secs(31),
+            )
+            .expect("cooldown should reset the bounded recovery window");
+        assert_eq!(attempt, 1);
+        assert_eq!(
+            failed,
+            std::collections::HashSet::from([PathBuf::from("later.mp4")])
+        );
     }
 }
