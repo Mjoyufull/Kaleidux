@@ -69,12 +69,15 @@ fn video_publish_fps_accepts_bounded_override() {
         set_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", "12");
         assert_eq!(configured_max_publish_fps(VideoFpsProfile::Low), Some(12));
         set_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", "1000");
+        assert_eq!(configured_max_publish_fps(VideoFpsProfile::Low), Some(120));
         assert_eq!(
             configured_max_publish_fps(VideoFpsProfile::Medium),
-            Some(120)
+            Some(24)
         );
         set_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", "0");
-        assert_eq!(configured_max_publish_fps(VideoFpsProfile::High), None);
+        assert_eq!(configured_max_publish_fps(VideoFpsProfile::Low), None);
+        assert_eq!(configured_max_publish_fps(VideoFpsProfile::High), Some(48));
+        assert_eq!(configured_max_publish_fps(VideoFpsProfile::Unlimited), None);
         set_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", "invalid");
         assert_eq!(configured_max_publish_fps(VideoFpsProfile::High), Some(48));
 

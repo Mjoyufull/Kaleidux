@@ -85,7 +85,7 @@ impl MainLoopContext {
                 },
             );
         }
-        if arm_barrier && startup_outputs.len() > 1 {
+        if arm_barrier && !startup_outputs.is_empty() {
             self.arm_startup_present_barrier(batch_id, startup_outputs);
         }
     }
@@ -100,24 +100,27 @@ impl MainLoopContext {
             })
             .map(|name| (name, StartupOutputState::pending()))
             .collect();
-        if output_states.len() <= 1 {
+        if output_states.is_empty() {
             return;
         }
 
         let now = Instant::now();
+        let blocks_present = output_states.len() > 1;
         self.startup_present_barrier = Some(StartupPresentBarrier {
             batch_id,
+            blocks_present,
             armed_at: now,
             first_ready_at: None,
             release_reason: None,
             outputs: output_states,
         });
         info!(
-            "[STARTUP] First-present barrier armed for {} outputs (batch {:x})",
+            "[STARTUP] First-present tracking armed for {} outputs (batch {:x}, synchronized={})",
             self.startup_present_barrier
                 .as_ref()
                 .map_or(0, |b| b.outputs.len()),
-            batch_id
+            batch_id,
+            blocks_present
         );
     }
 
@@ -125,6 +128,9 @@ impl MainLoopContext {
         let Some(barrier) = &self.startup_present_barrier else {
             return false;
         };
+        if !barrier.blocks_present {
+            return false;
+        }
 
         let Some(state) = barrier.outputs.get(name) else {
             return false;

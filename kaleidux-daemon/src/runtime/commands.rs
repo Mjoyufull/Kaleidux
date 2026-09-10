@@ -6,6 +6,7 @@ use crate::image::runtime_cache::ordered_pending_content_switches;
 use crate::main_loop::CommandContext;
 use crate::orchestration;
 use kaleidux_common::{Request, Response};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use tracing::{error, info};
 
@@ -183,7 +184,11 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         }
         Request::Stop => {
             info!("[CMD] Stopping all video players");
-            let names: Vec<String> = video_players.keys().cloned().collect();
+            let names: HashSet<String> = video_players
+                .keys()
+                .chain(pending_video_switches.keys())
+                .cloned()
+                .collect();
             for name in names {
                 set_pending_video_session(pending_video_sessions, &name, None);
                 pending_video_switches.remove(&name);

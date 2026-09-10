@@ -1,4 +1,6 @@
-use crate::content::sessions::{set_pending_video_session, stop_video_player_in_background};
+use crate::content::sessions::{
+    clear_pending_video_session_if_matches, stop_video_player_in_background,
+};
 use crate::main_loop::{MainLoopContext, PlayerEventMsg};
 use crate::video::PlayerEventKind;
 use std::time::Instant;
@@ -49,10 +51,22 @@ impl MainLoopContext {
                         event.source_id, event.session_id, event.kind, event.reason
                     );
                     self.metrics.record_error("video_runtime");
-                    self.pending_video_switches.remove(&event.source_id);
-                    set_pending_video_session(&self.pending_video_sessions, &event.source_id, None);
+                    if is_pending {
+                        self.pending_video_switches.remove(&event.source_id);
+                        clear_pending_video_session_if_matches(
+                            &self.pending_video_sessions,
+                            &event.source_id,
+                            event.session_id,
+                        );
+                    }
 
-                    if let Some(player) = self.video_players.remove(&event.source_id) {
+                    if is_active
+                        && self
+                            .video_players
+                            .get(&event.source_id)
+                            .is_some_and(|player| player.session_id() == event.session_id)
+                        && let Some(player) = self.video_players.remove(&event.source_id)
+                    {
                         stop_video_player_in_background(event.source_id.clone(), player);
                     }
 
@@ -62,11 +76,9 @@ impl MainLoopContext {
                         }
                     }
 
-                    self.handle_startup_content_failure(
-                        &event.source_id,
-                        &event.reason,
-                        loop_start,
-                    );
+                    if !self.pending_video_switches.contains_key(&event.source_id) {
+                        self.handle_content_failure(&event.source_id, &event.reason, loop_start);
+                    }
                 }
             }
         }

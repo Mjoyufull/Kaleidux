@@ -40,6 +40,7 @@ impl StartupOutputState {
 #[derive(Debug, Clone)]
 pub struct StartupPresentBarrier {
     pub batch_id: u64,
+    pub blocks_present: bool,
     pub armed_at: Instant,
     pub first_ready_at: Option<Instant>,
     pub release_reason: Option<&'static str>,
@@ -140,6 +141,7 @@ mod tests {
         let now = Instant::now();
         let barrier = StartupPresentBarrier {
             batch_id: 1,
+            blocks_present: true,
             armed_at: now,
             first_ready_at: Some(now),
             release_reason: None,
@@ -174,6 +176,7 @@ mod tests {
         let now = Instant::now();
         let barrier = StartupPresentBarrier {
             batch_id: 1,
+            blocks_present: true,
             armed_at: now,
             first_ready_at: None,
             release_reason: None,
@@ -201,6 +204,7 @@ mod tests {
         let now = Instant::now();
         let barrier = StartupPresentBarrier {
             batch_id: 1,
+            blocks_present: true,
             armed_at: now,
             first_ready_at: None,
             release_reason: None,

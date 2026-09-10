@@ -32,6 +32,40 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tracing::{info, warn};
 
+pub(crate) const RUNTIME_RECOVERY_LIMIT: u8 = 3;
+const RUNTIME_RECOVERY_RESET_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeRecoveryState {
+    attempts: u8,
+    failed_paths: std::collections::HashSet<PathBuf>,
+    last_failure_at: Option<Instant>,
+}
+
+impl RuntimeRecoveryState {
+    pub(crate) fn record_failure(
+        &mut self,
+        path: Option<PathBuf>,
+        now: Instant,
+    ) -> Option<(u8, std::collections::HashSet<PathBuf>)> {
+        if self.last_failure_at.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed >= RUNTIME_RECOVERY_RESET_AFTER)
+        }) {
+            *self = Self::default();
+        }
+        self.last_failure_at = Some(now);
+        if let Some(path) = path {
+            self.failed_paths.insert(path);
+        }
+        if self.attempts >= RUNTIME_RECOVERY_LIMIT {
+            return None;
+        }
+        self.attempts += 1;
+        Some((self.attempts, self.failed_paths.clone()))
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadedImage {
     pub name: String,
@@ -97,6 +131,7 @@ pub struct MainLoopContext {
     pub video_players: HashMap<String, video::VideoPlayer>,
     pub pending_video_switches: HashMap<String, PendingVideoSwitch>,
     pub pending_image_video_stops: HashMap<String, video::VideoPlayer>,
+    pub(crate) runtime_recoveries: HashMap<String, RuntimeRecoveryState>,
     pub pending_video_sessions: PendingVideoSessions,
     pub wgpu_ctx: Option<Arc<renderer::WgpuContext>>,
     pub mpv_native_targets: HashMap<String, video::MpvNativeVideoTarget>,
@@ -307,6 +342,7 @@ impl MainLoopContext {
             video_players: HashMap::new(),
             pending_video_switches: HashMap::new(),
             pending_image_video_stops: HashMap::new(),
+            runtime_recoveries: HashMap::new(),
             pending_video_sessions: Arc::new(Mutex::new(HashMap::new())),
             wgpu_ctx: None,
             mpv_native_targets: HashMap::new(),
@@ -350,6 +386,7 @@ impl MainLoopContext {
             ready
         });
         if should_mark {
+            self.runtime_recoveries.remove(name);
             self.monitor_manager.mark_transition_completed(name);
             self.mark_startup_output_presented(name, Instant::now());
             self.maybe_clear_startup_present_barrier();

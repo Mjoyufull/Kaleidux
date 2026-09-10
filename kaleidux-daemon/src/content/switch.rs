@@ -63,6 +63,10 @@ fn default_max_publish_fps(profile: VideoFpsProfile) -> Option<u32> {
 }
 
 fn configured_max_publish_fps(profile: VideoFpsProfile) -> Option<u32> {
+    if profile != VideoFpsProfile::Low {
+        return default_max_publish_fps(profile);
+    }
+
     let Ok(value) = std::env::var("KLD_LOW_POWER_MAX_PUBLISH_FPS") else {
         return default_max_publish_fps(profile);
     };
@@ -350,6 +354,7 @@ pub(crate) fn switch_wallpaper_content(
                             .get(output.as_str())
                             .and_then(|o| o.current_path.as_deref())
                             .is_some_and(|p| p == path.as_path())
+                        && std::path::Path::new(player.source_uri()) == path.as_path()
                         && player.current_position_ns().is_some()
                 })
                 .map(|(output, player)| (output.clone(), player))
