@@ -4,6 +4,8 @@ use super::video_layout::chroma_plane_extent;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+const MAX_CUDA_IN_FLIGHT_FRAMES: usize = 6;
+
 fn cuda_frame_sync_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -222,6 +224,30 @@ impl super::Renderer {
             }
         }
 
+        if self
+            .cuda_textures
+            .as_ref()
+            .is_some_and(|cache| cache.in_flight_frames.len() >= MAX_CUDA_IN_FLIGHT_FRAMES)
+        {
+            let ci_guard = self.ctx.cuda_interop.lock();
+            let ci = ci_guard.as_ref().expect("CUDA interop was initialized");
+            if let Err(error) = ci.synchronize() {
+                error!(
+                    "[VIDEO] {}: CUDA in-flight retirement sync failed: {error}",
+                    self.name
+                );
+                self.ctx
+                    .cuda_interop_failed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            self.cuda_textures
+                .as_mut()
+                .expect("CUDA textures are initialized")
+                .in_flight_frames
+                .clear();
+        }
+
         // Map the GStreamer CUDA buffer to get the source device pointer
         let cuda_map_start = Instant::now();
         let Some(buffer) = frame.storage.gstreamer_buffer() else {
@@ -231,12 +257,12 @@ impl super::Renderer {
             );
             return false;
         };
-        let guard = match crate::cuda_interop::map_buffer_cuda(buffer) {
-            Some(g) => g,
+        let mut guard = match crate::cuda_interop::map_buffer_cuda(buffer) {
+            Some(g) => Some(g),
             None => return false,
         };
         let cuda_map_duration = cuda_map_start.elapsed();
-        let base_ptr = guard.device_ptr();
+        let base_ptr = guard.as_ref().expect("CUDA map guard is live").device_ptr();
 
         let (cuda_copy_duration, cuda_sync_duration, used_timeline) = {
             let ci_guard = self.ctx.cuda_interop.lock();
@@ -249,7 +275,7 @@ impl super::Renderer {
             let y_pitch = cache.y_pitch;
             let uv_pitch = cache.uv_pitch;
             let mut cuda_copy_duration = std::time::Duration::ZERO;
-            let mut cuda_sync_duration;
+            let cuda_sync_duration;
             let used_timeline = if let Some(timeline) = cache.timeline.as_mut() {
                 let (release, ready) = timeline.next_frame_values();
                 let handshake_start = Instant::now();
@@ -286,16 +312,32 @@ impl super::Renderer {
                         "[VIDEO] {}: CUDA/Vulkan timeline handoff failed: {error}",
                         self.name
                     );
+                    if let Err(sync_error) = ci.synchronize() {
+                        error!(
+                            "[VIDEO] {}: CUDA recovery sync after handoff failure failed: {sync_error}",
+                            self.name
+                        );
+                        // CUDA may still reference the mapped source. Retain
+                        // the guard in the bounded cache and disable this path
+                        // instead of unmapping it on the error return.
+                        cache
+                            .in_flight_frames
+                            .push_back((u64::MAX, guard.take().expect("CUDA map guard is live")));
+                        self.ctx
+                            .cuda_interop_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     return false;
                 }
                 cuda_sync_duration = handshake_start.elapsed().saturating_sub(cuda_copy_duration);
                 cache
                     .in_flight_frames
-                    .push_back((ready, frame.storage.clone()));
+                    .push_back((ready, guard.take().expect("CUDA map guard is live")));
                 true
             } else {
                 // Compatibility path for pre-timeline drivers. Both copies and
-                // the context synchronization are intentionally synchronous.
+                // cuMemcpy2D calls are synchronous; the optional context fence
+                // below is additional cross-API visibility hardening.
                 let copy_start = Instant::now();
                 if let Err(error) = ci.copy_2d(
                     base_ptr,
@@ -330,22 +372,6 @@ impl super::Renderer {
                 cuda_sync_duration = sync_start.elapsed();
                 false
             };
-            if cache.in_flight_frames.len() > 6 {
-                warn!(
-                    "[CUDA-VK] {}: more than six source buffers remained in flight; applying bounded synchronization backpressure",
-                    self.name
-                );
-                let backpressure_start = Instant::now();
-                if let Err(error) = ci.synchronize() {
-                    error!(
-                        "[VIDEO] {}: CUDA backpressure sync failed: {error}",
-                        self.name
-                    );
-                    return false;
-                }
-                cuda_sync_duration += backpressure_start.elapsed();
-                cache.in_flight_frames.clear();
-            }
             (cuda_copy_duration, cuda_sync_duration, used_timeline)
         };
 

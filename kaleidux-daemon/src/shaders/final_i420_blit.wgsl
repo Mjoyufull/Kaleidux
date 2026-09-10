@@ -79,6 +79,13 @@ fn linearize(value: f32, transfer: f32) -> f32 {
 }
 
 fn to_bt709(rgb: vec3<f32>, primaries: f32) -> vec3<f32> {
+    if (primaries < 0.5) {
+        return vec3<f32>(
+            dot(vec3<f32>(0.939542, 0.050181, 0.010277), rgb),
+            dot(vec3<f32>(0.017772, 0.965792, 0.016436), rgb),
+            dot(vec3<f32>(-0.001622, -0.004371, 1.005993), rgb)
+        );
+    }
     if (primaries < 1.5) { return rgb; }
     if (primaries < 2.5) {
         return vec3<f32>(

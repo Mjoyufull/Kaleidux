@@ -23,7 +23,7 @@ impl NativePathTier {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum NativeDecoderApi {
     VulkanVideo,
     Vaapi,
@@ -288,7 +288,7 @@ fn vaapi_driver_candidates(device: Option<&String>) -> Vec<String> {
         .map(|vendor| vendor.trim().to_ascii_lowercase());
     match vendor.as_deref() {
         Some("0x8086") => vec!["iHD".to_string(), "i965".to_string()],
-        Some("0x1002") => vec!["radeonsi".to_string()],
+        Some("0x1002") => vec!["radeonsi".to_string(), "r600".to_string()],
         Some("0x10de") => vec!["nvidia".to_string()],
         _ => Vec::new(),
     }

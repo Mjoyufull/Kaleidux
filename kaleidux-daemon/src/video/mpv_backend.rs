@@ -269,13 +269,13 @@ impl MpvPlayer {
 
     pub fn start(&mut self) -> anyhow::Result<()> {
         self.stop_requested.store(false, Ordering::SeqCst);
-        self.spawn_event_thread();
+        self.spawn_event_thread()?;
         if self.renders_natively() {
-            self.spawn_native_render_thread();
+            self.spawn_native_render_thread()?;
         } else if self.renders_composed_gl() {
-            self.spawn_composed_render_thread();
+            self.spawn_composed_render_thread()?;
         } else {
-            self.spawn_frame_thread();
+            self.spawn_frame_thread()?;
         }
         // GL paths defer `loadfile` until the render thread reports that mpv's
         // render context exists; loading earlier makes mpv fail VO init and

@@ -130,7 +130,7 @@ fn software_render_format() -> String {
     std::env::var("KLD_MPV_SW_FORMAT")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| matches!(value.as_str(), "rgba" | "rgb0" | "bgra" | "bgr0"))
+        .filter(|value| matches!(value.as_str(), "rgba" | "rgb0"))
         .unwrap_or_else(|| DEFAULT_SOFTWARE_RENDER_FORMAT.to_string())
 }
 
@@ -186,7 +186,7 @@ impl SoftwareRenderContext {
             context,
             update_pending,
             format,
-            fill_alpha: render_format == "rgb0" || render_format == "bgr0",
+            fill_alpha: render_format == "rgb0",
         })
     }
 

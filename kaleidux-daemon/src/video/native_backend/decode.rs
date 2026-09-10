@@ -261,7 +261,7 @@ fn receive_frames(
         let surface_api = decoder.hardware.map(|choice| choice.api).filter(|api| {
             hardware_frame
                 && super::native_storage_format(&decoded) == ffmpeg::format::Pixel::NV12
-                && matches!(api, NativeDecoderApi::VulkanVideo | NativeDecoderApi::Vaapi)
+                && matches!(api, NativeDecoderApi::Vaapi)
                 && surface_export_enabled()
         });
         let (frame, decoded_to_recycle) = if let Some(surface_api) = surface_api {
@@ -342,10 +342,7 @@ fn surface_export_enabled() -> bool {
 pub(super) fn selected_tier(hardware: Option<HardwareDecoderChoice>) -> NativePathTier {
     match hardware {
         Some(choice)
-            if matches!(
-                choice.api,
-                NativeDecoderApi::VulkanVideo | NativeDecoderApi::Vaapi
-            ) && surface_export_enabled() =>
+            if matches!(choice.api, NativeDecoderApi::Vaapi) && surface_export_enabled() =>
         {
             NativePathTier::SingleGpuCopy
         }
@@ -443,6 +440,9 @@ fn pace_frame(
         if !config.control.wait_until(due) {
             return false;
         }
+        if config.control.has_pending_seek() {
+            return false;
+        }
         if !config.control.is_playing() {
             if !config.control.wait_until_playing() {
                 return false;
@@ -451,9 +451,6 @@ fn pace_frame(
             timeline.media_anchor_ns = pts_ns;
             timeline.wall_anchor = Some(Instant::now());
             return true;
-        }
-        if config.control.has_pending_seek() {
-            return false;
         }
     }
     true

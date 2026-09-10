@@ -249,7 +249,7 @@ struct CudaTextureCache {
     uv_pitch: usize,
     uv_offset: usize,
     timeline: Option<video_interop::CudaVulkanTimeline>,
-    in_flight_frames: std::collections::VecDeque<(u64, crate::video::VideoFrameStorage)>,
+    in_flight_frames: std::collections::VecDeque<(u64, crate::cuda_interop::CudaMapGuard)>,
     width: u32,
     height: u32,
 }

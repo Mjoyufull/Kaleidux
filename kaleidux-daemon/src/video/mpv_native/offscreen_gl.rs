@@ -21,7 +21,6 @@ const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 const GL_HANDLE_TYPE_OPAQUE_FD_EXT: u32 = 0x9586;
-const GL_LAYOUT_COLOR_ATTACHMENT_EXT: u32 = 0x958E;
 const GL_LAYOUT_SHADER_READ_ONLY_EXT: u32 = 0x9591;
 
 pub(super) struct ComposedGlRenderContext {
@@ -109,7 +108,6 @@ impl ComposedGlRenderContext {
         let gl = GlApi::load(&egl)?;
         let proc_loader = Box::new(EglProcLoader::new(egl.as_ref()));
         let adapter_vendor = target.wgpu_ctx.adapter.get_info().vendor;
-        crate::video::sanitize_libva_driver_env(adapter_vendor, "[MPV-GL]");
         let drm_render_fd = select_hwdec_display_resource(Some(adapter_vendor));
         let mpv_context = create_mpv_gl_context(
             mpv,
@@ -388,7 +386,7 @@ impl SharedGlSlot {
                 std::ptr::null(),
                 1,
                 &self.gl_texture,
-                &GL_LAYOUT_COLOR_ATTACHMENT_EXT,
+                &GL_LAYOUT_SHADER_READ_ONLY_EXT,
             );
         }
     }
