@@ -15,6 +15,7 @@ const POOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_cac
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 const CACHE_VERSION: u64 = 5;
+const STATS_PRUNE_TRIGGER: usize = crate::queue::STATS_LRU_CAP + crate::queue::STATS_LRU_CAP / 10;
 
 fn path_from_redb_key(key: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
@@ -72,57 +73,73 @@ impl FileCache {
         let db_preexisting = std::fs::metadata(db_path)
             .map(|meta| meta.len() > 0)
             .unwrap_or(false);
-        let mut db = Database::create(db_path)?;
+        let db = Database::create(db_path)?;
 
-        // Check version
-        let mut needs_wipe = false;
-        if db_preexisting {
+        let stored_version = if db_preexisting {
             let read_txn = db.begin_read()?;
             if let Ok(table) = read_txn.open_table(META_TABLE) {
-                if let Some(v) = table.get("version")? {
-                    if v.value() != CACHE_VERSION {
-                        needs_wipe = true;
-                    }
-                } else {
-                    needs_wipe = true;
-                }
+                table.get("version")?.map(|version| version.value())
             } else {
-                needs_wipe = true;
+                None
             }
+        } else {
+            None
+        };
+
+        if stored_version.is_some_and(|version| version > CACHE_VERSION) {
+            bail!(
+                "Cache database version {} is newer than supported version {}",
+                stored_version.unwrap_or_default(),
+                CACHE_VERSION
+            );
         }
 
-        if needs_wipe {
-            tracing::info!("[CACHE] Cache version mismatch or missing, wiping database...");
-            drop(db);
-            match std::fs::remove_file(db_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).context("Failed to remove stale cache database before recreate");
-                }
-            }
-            if std::fs::metadata(db_path).is_ok() {
-                bail!(
-                    "Stale cache file {:?} still exists after remove_file; refusing to recreate to avoid corruption",
-                    db_path
-                );
-            }
-            db = Database::create(db_path)?;
-        }
-
-        // Initialize tables
+        // Schema v5 changed only transient discovery metadata and pool rows. Keep
+        // user history, playlists, blacklist entries, and learned file stats.
         let write_txn = db.begin_write()?;
         {
-            let _ = write_txn.open_table(FILE_CACHE_TABLE)?;
+            let mut file_cache = write_txn.open_table(FILE_CACHE_TABLE)?;
+            if stored_version != Some(CACHE_VERSION) {
+                let keys = file_cache
+                    .iter()?
+                    .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    file_cache.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
             let _ = write_txn.open_table(FILE_STATS_TABLE)?;
             let _ = write_txn.open_table(PLAYLISTS_TABLE)?;
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
             let _ = write_txn.open_table(HISTORY_TABLE)?;
-            let _ = write_txn.open_table(POOL_TABLE)?;
+        }
+        {
+            let mut pools = write_txn.open_table(POOL_TABLE)?;
+            if stored_version != Some(CACHE_VERSION) {
+                let keys = pools
+                    .iter()?
+                    .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    pools.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
             let mut meta = write_txn.open_table(META_TABLE)?;
             meta.insert("version", CACHE_VERSION)?;
         }
         write_txn.commit()?;
+
+        if stored_version != Some(CACHE_VERSION) && db_preexisting {
+            tracing::info!(
+                "[CACHE] Migrated cache schema from {:?} to {} while preserving durable user data",
+                stored_version,
+                CACHE_VERSION
+            );
+        }
 
         Ok(Self { db })
     }
@@ -287,12 +304,28 @@ impl FileCache {
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
 
         let path_bytes = path.as_os_str().as_encoded_bytes();
-        match table.get(path_bytes)? {
-            Some(data) => {
-                let stats: crate::queue::FileStats = postcard::from_bytes(data.value())?;
-                Ok(Some(stats))
+        let decoded = table
+            .get(path_bytes)?
+            .map(|data| postcard::from_bytes(data.value()))
+            .transpose();
+        drop(table);
+        drop(read_txn);
+
+        match decoded {
+            Ok(stats) => Ok(stats),
+            Err(error) => {
+                tracing::warn!(
+                    "[CACHE] Removing corrupt file_stats row for {}: {error}",
+                    path.display()
+                );
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+                    table.remove(path_bytes)?;
+                }
+                write_txn.commit()?;
+                Ok(None)
             }
-            _ => Ok(None),
         }
     }
 
@@ -305,17 +338,23 @@ impl FileCache {
         &self,
         updates: &[(PathBuf, crate::queue::FileStats)],
     ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         let write_txn = self.db.begin_write()?;
-        {
+        let should_prune = {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
             for (path, stats) in updates {
                 let path_bytes = path.as_os_str().as_encoded_bytes();
                 let data = postcard::to_allocvec(stats)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
-        }
+            usize::try_from(table.len()?).unwrap_or(usize::MAX) > STATS_PRUNE_TRIGGER
+        };
         write_txn.commit()?;
-        self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
+        if should_prune {
+            self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
+        }
         Ok(())
     }
 
@@ -347,19 +386,43 @@ impl FileCache {
     pub fn get_all_file_stats(
         &self,
     ) -> Result<std::collections::HashMap<PathBuf, crate::queue::FileStats>> {
-        self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
         let mut stats = std::collections::HashMap::new();
+        let mut corrupt_keys = Vec::new();
 
         for item in table.iter()? {
             let (key, value) = item?;
             let Some(path) = path_from_redb_key(key.value()) else {
                 tracing::warn!("[CACHE] Skipping file_stats row with invalid path encoding");
+                corrupt_keys.push(key.value().to_vec());
                 continue;
             };
-            let file_stats: crate::queue::FileStats = postcard::from_bytes(value.value())?;
-            stats.insert(path, file_stats);
+            match postcard::from_bytes(value.value()) {
+                Ok(file_stats) => {
+                    stats.insert(path, file_stats);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[CACHE] Removing corrupt file_stats row for {}: {error}",
+                        path.display()
+                    );
+                    corrupt_keys.push(key.value().to_vec());
+                }
+            }
+        }
+        drop(table);
+        drop(read_txn);
+
+        if !corrupt_keys.is_empty() {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+                for key in corrupt_keys {
+                    table.remove(key.as_slice())?;
+                }
+            }
+            write_txn.commit()?;
         }
 
         Ok(stats)
@@ -369,13 +432,25 @@ impl FileCache {
     pub fn get_playlist(&self, name: &str) -> Result<Option<crate::queue::Playlist>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
+        let decoded = match table.get(name)? {
+            Some(data) => postcard::from_bytes(data.value()).map(Some),
+            None => Ok(None),
+        };
+        drop(table);
+        drop(read_txn);
 
-        match table.get(name)? {
-            Some(data) => {
-                let playlist: crate::queue::Playlist = postcard::from_bytes(data.value())?;
-                Ok(Some(playlist))
+        match decoded {
+            Ok(playlist) => Ok(playlist),
+            Err(error) => {
+                tracing::warn!("[CACHE] Removing corrupt playlist row {name:?}: {error}");
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(PLAYLISTS_TABLE)?;
+                    table.remove(name)?;
+                }
+                write_txn.commit()?;
+                Ok(None)
             }
-            _ => Ok(None),
         }
     }
 
@@ -396,12 +471,33 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
         let mut playlists = std::collections::HashMap::new();
+        let mut corrupt_names = Vec::new();
 
         for item in table.iter()? {
             let (key, value) = item?;
             let name = key.value().to_string();
-            let playlist: crate::queue::Playlist = postcard::from_bytes(value.value())?;
-            playlists.insert(name, playlist);
+            match postcard::from_bytes(value.value()) {
+                Ok(playlist) => {
+                    playlists.insert(name, playlist);
+                }
+                Err(error) => {
+                    tracing::warn!("[CACHE] Removing corrupt playlist row {name:?}: {error}");
+                    corrupt_names.push(name);
+                }
+            }
+        }
+        drop(table);
+        drop(read_txn);
+
+        if !corrupt_names.is_empty() {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(PLAYLISTS_TABLE)?;
+                for name in corrupt_names {
+                    table.remove(name.as_str())?;
+                }
+            }
+            write_txn.commit()?;
         }
 
         Ok(playlists)
@@ -475,12 +571,25 @@ impl FileCache {
     pub fn get_history(&self, output_name: &str) -> Result<Vec<PathBuf>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(HISTORY_TABLE)?;
-        match table.get(output_name)? {
-            Some(data) => {
-                let paths: Vec<PathBuf> = postcard::from_bytes(data.value())?;
-                Ok(paths)
+        let decoded = match table.get(output_name)? {
+            Some(data) => postcard::from_bytes(data.value()),
+            None => Ok(Vec::new()),
+        };
+        drop(table);
+        drop(read_txn);
+
+        match decoded {
+            Ok(paths) => Ok(paths),
+            Err(error) => {
+                tracing::warn!("[CACHE] Removing corrupt history row {output_name:?}: {error}");
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(HISTORY_TABLE)?;
+                    table.remove(output_name)?;
+                }
+                write_txn.commit()?;
+                Ok(Vec::new())
             }
-            _ => Ok(Vec::new()),
         }
     }
 
@@ -550,6 +659,147 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         FileCache::new_test(&dir.join("cache.redb")).expect("test cache")
+    }
+
+    fn test_cache_path(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(10_000);
+        std::env::temp_dir()
+            .join(format!(
+                "kaleidux-redb-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("cache.redb")
+    }
+
+    #[test]
+    fn schema_migration_preserves_durable_user_tables() {
+        let db_path = test_cache_path("migration");
+        std::fs::create_dir_all(db_path.parent().expect("cache parent")).unwrap();
+        let db = Database::create(&db_path).expect("create old cache");
+        let write_txn = db.begin_write().unwrap();
+        {
+            write_txn
+                .open_table(FILE_CACHE_TABLE)
+                .unwrap()
+                .insert(b"/media/a".as_slice(), b"metadata".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(POOL_TABLE)
+                .unwrap()
+                .insert(b"/media".as_slice(), b"pool".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(FILE_STATS_TABLE)
+                .unwrap()
+                .insert(b"/media/a".as_slice(), b"stats".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(PLAYLISTS_TABLE)
+                .unwrap()
+                .insert("favorites", b"playlist".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(BLACKLIST_TABLE)
+                .unwrap()
+                .insert(b"/media/b".as_slice(), true)
+                .unwrap();
+            write_txn
+                .open_table(HISTORY_TABLE)
+                .unwrap()
+                .insert("DP-1", b"history".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(META_TABLE)
+                .unwrap()
+                .insert("version", 4)
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db);
+
+        let migrated = FileCache::new_test(&db_path).expect("migrate cache");
+        let read_txn = migrated.db.begin_read().unwrap();
+        assert!(
+            read_txn
+                .open_table(FILE_CACHE_TABLE)
+                .unwrap()
+                .get(b"/media/a".as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_txn
+                .open_table(POOL_TABLE)
+                .unwrap()
+                .get(b"/media".as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            read_txn
+                .open_table(FILE_STATS_TABLE)
+                .unwrap()
+                .len()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(PLAYLISTS_TABLE).unwrap().len().unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(BLACKLIST_TABLE).unwrap().len().unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(HISTORY_TABLE).unwrap().len().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_file_stats_are_skipped_and_removed() {
+        let cache = test_cache("corrupt-stats");
+        let path = Path::new("/media/corrupt");
+        cache
+            .insert_invalid_file_stats_bytes(path, &[0xff, 0x00, 0x01])
+            .unwrap();
+
+        assert!(cache.get_file_stats(path).unwrap().is_none());
+        cache
+            .insert_invalid_file_stats_bytes(path, &[0xff, 0x00, 0x01])
+            .unwrap();
+        assert!(cache.get_all_file_stats().unwrap().is_empty());
+        assert!(cache.get_file_stats(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_playlist_and_history_rows_are_skipped_and_removed() {
+        let cache = test_cache("corrupt-durable-rows");
+        let write_txn = cache.db.begin_write().unwrap();
+        {
+            let mut playlists = write_txn.open_table(PLAYLISTS_TABLE).unwrap();
+            playlists.insert("one", &[0xff][..]).unwrap();
+            playlists.insert("two", &[0xfe][..]).unwrap();
+            let mut history = write_txn.open_table(HISTORY_TABLE).unwrap();
+            history.insert("DP-1", &[0xfd][..]).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        assert!(cache.get_playlist("one").unwrap().is_none());
+        assert!(cache.get_all_playlists().unwrap().is_empty());
+        assert!(cache.get_history("DP-1").unwrap().is_empty());
+
+        let read_txn = cache.db.begin_read().unwrap();
+        assert_eq!(
+            read_txn.open_table(PLAYLISTS_TABLE).unwrap().len().unwrap(),
+            0
+        );
+        assert_eq!(
+            read_txn.open_table(HISTORY_TABLE).unwrap().len().unwrap(),
+            0
+        );
     }
 
     #[test]
