@@ -5,19 +5,17 @@ use crate::metrics;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::debug;
 
 static IMAGE_PREFETCH_GENERATIONS: once_cell::sync::Lazy<ParkingMutex<HashMap<String, u64>>> =
     once_cell::sync::Lazy::new(|| ParkingMutex::new(HashMap::new()));
+static NEXT_IMAGE_PREFETCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn begin_image_prefetch_generation(name: &str) -> u64 {
     let mut generations = IMAGE_PREFETCH_GENERATIONS.lock();
-    let next_generation = generations
-        .get(name)
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
+    let next_generation = NEXT_IMAGE_PREFETCH_GENERATION.fetch_add(1, Ordering::Relaxed);
     generations.insert(name.to_string(), next_generation);
     next_generation
 }
@@ -104,5 +102,10 @@ mod tests {
         assert!(image_prefetch_generation_matches(output, generation));
         remove_image_prefetch_generation(output);
         assert!(!image_prefetch_generation_matches(output, generation));
+
+        let replacement_generation = begin_image_prefetch_generation(output);
+        assert_ne!(replacement_generation, generation);
+        assert!(!image_prefetch_generation_matches(output, generation));
+        remove_image_prefetch_generation(output);
     }
 }

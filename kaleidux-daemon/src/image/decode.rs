@@ -8,6 +8,28 @@ use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 
+const MAX_DECODED_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn validate_source_dimensions(path: &Path, width: u32, height: u32) -> anyhow::Result<()> {
+    let decoded_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("image dimensions overflow for {}", path.display()))?;
+    if width == 0 || height == 0 {
+        anyhow::bail!("image has zero dimensions: {}", path.display());
+    }
+    if decoded_bytes > MAX_DECODED_SOURCE_BYTES {
+        anyhow::bail!(
+            "image decoded size exceeds {} MiB safety limit: {}x{} ({})",
+            MAX_DECODED_SOURCE_BYTES / (1024 * 1024),
+            width,
+            height,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> String {
     let label = match format {
         Some(image::ImageFormat::Avif) => "avif",
@@ -55,6 +77,7 @@ fn decode_jpeg_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
         u32::try_from(source_width).map_err(|_| anyhow::anyhow!("jpeg width is too large"))?;
     let source_height =
         u32::try_from(source_height).map_err(|_| anyhow::anyhow!("jpeg height is too large"))?;
+    validate_source_dimensions(path, source_width, source_height)?;
     log_decode_time_downscale_status(path, source_width, source_height);
     let decoded = decoder
         .decode()
@@ -104,6 +127,7 @@ fn decode_png_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
         u32::try_from(source_width).map_err(|_| anyhow::anyhow!("png width is too large"))?;
     let source_height =
         u32::try_from(source_height).map_err(|_| anyhow::anyhow!("png height is too large"))?;
+    validate_source_dimensions(path, source_width, source_height)?;
     let colorspace = decoder
         .colorspace()
         .ok_or_else(|| anyhow::anyhow!("png colorspace missing after header decode"))?;
@@ -140,6 +164,8 @@ fn decode_source_generic(
     format: Option<image::ImageFormat>,
 ) -> anyhow::Result<DecodedSourceImage> {
     let decode_start = Instant::now();
+    let (header_width, header_height) = image::image_dimensions(path)?;
+    validate_source_dimensions(path, header_width, header_height)?;
     let image = image::open(path)?;
     let decode_duration = decode_start.elapsed();
     let source_width = image.width();
@@ -331,6 +357,16 @@ mod tests {
             .expect("unchanged RGBA preparation should succeed");
 
         assert!(std::sync::Arc::ptr_eq(&pixels, &prepared.data));
+    }
+
+    #[test]
+    fn decoded_source_size_is_bounded_before_allocation() {
+        let path = Path::new("oversized.png");
+        assert!(validate_source_dimensions(path, 8_192, 8_192).is_ok());
+        let error = validate_source_dimensions(path, 65_535, 65_535)
+            .expect_err("decompression-bomb dimensions must be rejected");
+        assert!(error.to_string().contains("safety limit"));
+        assert!(validate_source_dimensions(path, 0, 1).is_err());
     }
 }
 

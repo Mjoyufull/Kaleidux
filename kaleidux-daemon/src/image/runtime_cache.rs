@@ -33,6 +33,7 @@ const SOURCE_IMAGE_DESCRIPTOR_CACHE_ENTRIES: usize = 256;
 const SOURCE_IMAGE_DESCRIPTOR_CACHE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const SLOW_IMAGE_PREPARE_MS: f64 = 100.0;
 pub(crate) const LOW_POWER_IMAGE_PREFETCH_DEFER: Duration = Duration::from_millis(250);
+pub(crate) const IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX: &str = "image prefetch capacity:";
 
 static PREPARED_IMAGE_MEMORY_CACHE: once_cell::sync::Lazy<
     ParkingMutex<SizedLruCache<PreparedImageKey, Arc<PreparedImageEntry>>>,
@@ -306,7 +307,8 @@ pub(crate) async fn acquire_image_work_permit(
     if matches!(work_kind, BackgroundWorkKind::ImagePrefetch) {
         return semaphore.try_acquire_owned().map_err(|_| {
             anyhow::anyhow!(
-                "image prefetch {} skipped because decode workers are busy",
+                "{} {} skipped because decode workers are busy",
+                IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX,
                 stage_name
             )
         });

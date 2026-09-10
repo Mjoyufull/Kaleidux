@@ -1,13 +1,14 @@
 use crate::background::{self, BackgroundWorkKind};
 use crate::image as image_pipeline;
 use crate::image::runtime_cache::{
-    acquire_image_work_permit, decode_source_image, load_image_source_descriptor,
-    prepare_image_for_output_uncached, prepare_source_image_for_output,
-    prepared_image_key_for_identity, prepared_target_dimensions_from_descriptor,
-    select_compatible_prepared_key, store_decoded_source_memory, store_prepared_image_cache_by_key,
-    store_prepared_image_memory, store_source_descriptor_memory,
-    try_load_compatible_prepared_image_memory, try_load_decoded_source_memory,
-    try_load_prepared_image_cache_by_key, try_load_prepared_image_memory,
+    IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX, acquire_image_work_permit, decode_source_image,
+    load_image_source_descriptor, prepare_image_for_output_uncached,
+    prepare_source_image_for_output, prepared_image_key_for_identity,
+    prepared_target_dimensions_from_descriptor, select_compatible_prepared_key,
+    store_decoded_source_memory, store_prepared_image_cache_by_key, store_prepared_image_memory,
+    store_source_descriptor_memory, try_load_compatible_prepared_image_memory,
+    try_load_decoded_source_memory, try_load_prepared_image_cache_by_key,
+    try_load_prepared_image_memory,
 };
 use crate::image::runtime_shared::{publish_shared_result, wait_for_shared_result};
 use crate::image::types::{
@@ -19,6 +20,8 @@ use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+const MAX_SPECULATIVE_FAILURE_RETRIES: u8 = 3;
 
 async fn spawn_image_blocking<T, F>(
     work_kind: BackgroundWorkKind,
@@ -59,8 +62,8 @@ impl SourceInFlightGuard {
     }
 
     fn publish(&mut self, result: Result<Arc<DecodedSourceImage>, String>) {
-        publish_shared_result(&self.state, result);
         remove_source_flight_if_current(&self.key, &self.state);
+        publish_shared_result(&self.state, result);
         self.published = true;
     }
 }
@@ -68,11 +71,11 @@ impl SourceInFlightGuard {
 impl Drop for SourceInFlightGuard {
     fn drop(&mut self) {
         if !self.published {
+            remove_source_flight_if_current(&self.key, &self.state);
             publish_shared_result(
                 &self.state,
                 Err("image source leader cancelled before publishing a result".to_string()),
             );
-            remove_source_flight_if_current(&self.key, &self.state);
         }
     }
 }
@@ -93,8 +96,8 @@ impl PreparedInFlightGuard {
     }
 
     fn publish(&mut self, result: Result<Arc<PreparedImageEntry>, String>) {
-        publish_shared_result(&self.state, result);
         remove_prepared_flight_if_current(&self.key, &self.state);
+        publish_shared_result(&self.state, result);
         self.published = true;
     }
 }
@@ -102,11 +105,11 @@ impl PreparedInFlightGuard {
 impl Drop for PreparedInFlightGuard {
     fn drop(&mut self) {
         if !self.published {
+            remove_prepared_flight_if_current(&self.key, &self.state);
             publish_shared_result(
                 &self.state,
                 Err("image prepare leader cancelled before publishing a result".to_string()),
             );
-            remove_prepared_flight_if_current(&self.key, &self.state);
         }
     }
 }
@@ -147,6 +150,12 @@ pub(crate) fn find_compatible_prepared_in_flight_state(
         select_compatible_prepared_key(in_flight.keys(), identity, target_width, target_height)?;
     in_flight.get(&candidate_key).cloned()
 }
+
+fn should_retry_speculative_failure(work_kind: BackgroundWorkKind, error: &str) -> bool {
+    work_kind != BackgroundWorkKind::ImagePrefetch
+        && error.starts_with(IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX)
+}
+
 pub(crate) async fn request_decoded_source_image(
     path: &Path,
     identity: ImageSourceIdentity,
@@ -159,27 +168,48 @@ pub(crate) async fn request_decoded_source_image(
     }
     metrics.record_image_source_decode_miss();
 
-    let (state, leader) = {
-        let mut in_flight = SOURCE_IMAGE_IN_FLIGHT.lock();
-        if let Some(existing) = in_flight.get(&identity) {
-            (existing.clone(), false)
-        } else {
-            let state = Arc::new(InFlightSharedResult::default());
-            in_flight.insert(identity.clone(), state.clone());
-            (state, true)
+    let mut speculative_retries = 0;
+    let (state, leader) = loop {
+        let (state, leader) = {
+            let mut in_flight = SOURCE_IMAGE_IN_FLIGHT.lock();
+            if let Some(existing) = in_flight.get(&identity) {
+                (existing.clone(), false)
+            } else {
+                let state = Arc::new(InFlightSharedResult::default());
+                in_flight.insert(identity.clone(), state.clone());
+                (state, true)
+            }
+        };
+
+        if leader {
+            break (state, true);
+        }
+
+        metrics.record_image_shared_wait();
+        match wait_for_shared_result(state).await {
+            Ok(source) => return Ok(source),
+            Err(error) if should_retry_speculative_failure(work_kind, &error) => {
+                speculative_retries += 1;
+                if speculative_retries >= MAX_SPECULATIVE_FAILURE_RETRIES {
+                    return Err(anyhow::anyhow!(error));
+                }
+                continue;
+            }
+            Err(error) => return Err(anyhow::anyhow!(error)),
         }
     };
-
-    if !leader {
-        metrics.record_image_shared_wait();
-        return wait_for_shared_result(state)
-            .await
-            .map_err(|e| anyhow::anyhow!(e));
-    }
+    debug_assert!(leader);
 
     let mut flight = SourceInFlightGuard::new(identity.clone(), state.clone());
 
-    let _permit = acquire_image_work_permit(work_kind, "decode").await?;
+    let _permit = match acquire_image_work_permit(work_kind, "decode").await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let message = error.to_string();
+            flight.publish(Err(message.clone()));
+            return Err(anyhow::anyhow!(message));
+        }
+    };
     let decode_path = path.to_path_buf();
     let Some(handle) =
         spawn_image_blocking(work_kind, move || decode_source_image(&decode_path)).await
@@ -260,30 +290,44 @@ pub(crate) async fn request_prepared_image_payload(
         prepared_height,
     ) {
         metrics.record_image_shared_wait();
-        let entry = wait_for_shared_result(state)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        return Ok(entry.to_payload("prepared-shared-compatible"));
+        match wait_for_shared_result(state).await {
+            Ok(entry) => return Ok(entry.to_payload("prepared-shared-compatible")),
+            Err(error) if should_retry_speculative_failure(work_kind, &error) => {}
+            Err(error) => return Err(anyhow::anyhow!(error)),
+        }
     }
 
-    let (state, leader) = {
-        let mut in_flight = PREPARED_IMAGE_IN_FLIGHT.lock();
-        if let Some(existing) = in_flight.get(&key) {
-            (existing.clone(), false)
-        } else {
-            let state = Arc::new(InFlightSharedResult::default());
-            in_flight.insert(key.clone(), state.clone());
-            (state, true)
+    let mut speculative_retries = 0;
+    let (state, leader) = loop {
+        let (state, leader) = {
+            let mut in_flight = PREPARED_IMAGE_IN_FLIGHT.lock();
+            if let Some(existing) = in_flight.get(&key) {
+                (existing.clone(), false)
+            } else {
+                let state = Arc::new(InFlightSharedResult::default());
+                in_flight.insert(key.clone(), state.clone());
+                (state, true)
+            }
+        };
+
+        if leader {
+            break (state, true);
+        }
+
+        metrics.record_image_shared_wait();
+        match wait_for_shared_result(state).await {
+            Ok(entry) => return Ok(entry.to_payload("prepared-shared")),
+            Err(error) if should_retry_speculative_failure(work_kind, &error) => {
+                speculative_retries += 1;
+                if speculative_retries >= MAX_SPECULATIVE_FAILURE_RETRIES {
+                    return Err(anyhow::anyhow!(error));
+                }
+                continue;
+            }
+            Err(error) => return Err(anyhow::anyhow!(error)),
         }
     };
-
-    if !leader {
-        metrics.record_image_shared_wait();
-        let entry = wait_for_shared_result(state)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        return Ok(entry.to_payload("prepared-shared"));
-    }
+    debug_assert!(leader);
 
     let mut flight = PreparedInFlightGuard::new(key.clone(), state.clone());
 
@@ -306,8 +350,24 @@ pub(crate) async fn request_prepared_image_payload(
 
     metrics.record_image_prepared_miss();
     let source =
-        request_decoded_source_image(path, descriptor.identity.clone(), work_kind, metrics).await?;
-    let _permit = acquire_image_work_permit(work_kind, "prepare").await?;
+        match request_decoded_source_image(path, descriptor.identity.clone(), work_kind, metrics)
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                let message = error.to_string();
+                flight.publish(Err(message.clone()));
+                return Err(anyhow::anyhow!(message));
+            }
+        };
+    let _permit = match acquire_image_work_permit(work_kind, "prepare").await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let message = error.to_string();
+            flight.publish(Err(message.clone()));
+            return Err(anyhow::anyhow!(message));
+        }
+    };
     let source_for_prepare = source.clone();
     let cache_key = key.clone();
     let Some(handle) = spawn_image_blocking(work_kind, move || {
@@ -395,5 +455,21 @@ mod tests {
             .expect_err("cancelled leader must publish an error");
         assert!(error.contains("cancelled"));
         assert!(!PREPARED_IMAGE_IN_FLIGHT.lock().contains_key(&key));
+    }
+
+    #[test]
+    fn foreground_work_retries_only_prefetch_capacity_failures() {
+        assert!(should_retry_speculative_failure(
+            BackgroundWorkKind::ImageDecode,
+            "image prefetch capacity: decode skipped because decode workers are busy"
+        ));
+        assert!(!should_retry_speculative_failure(
+            BackgroundWorkKind::ImagePrefetch,
+            "image prefetch capacity: decode skipped because decode workers are busy"
+        ));
+        assert!(!should_retry_speculative_failure(
+            BackgroundWorkKind::ImageDecode,
+            "image source decode failed"
+        ));
     }
 }
