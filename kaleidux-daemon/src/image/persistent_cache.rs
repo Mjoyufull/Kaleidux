@@ -18,6 +18,7 @@ const DEFAULT_MAX_ENTRIES: usize = 4096;
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(180 * 24 * 60 * 60);
 const DEFAULT_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PRUNE_BATCH: usize = 64;
+const PREPARED_CACHE_TEMP_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static POLICY: OnceLock<CachePolicy> = OnceLock::new();
@@ -115,35 +116,53 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn env_mib(name: &str, default_bytes: u64) -> Option<u64> {
-    match std::env::var(name).ok() {
-        Some(value) => value
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .and_then(|mib| (mib != 0).then(|| mib.saturating_mul(1024 * 1024))),
-        None => Some(default_bytes),
-    }
+    parse_optional_limit(name, std::env::var(name).ok(), default_bytes, 1024 * 1024)
 }
 
 fn env_usize(name: &str, default: usize) -> Option<usize> {
     match std::env::var(name).ok() {
-        Some(value) => value
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .and_then(|count| (count != 0).then_some(count)),
         None => Some(default),
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(count) => Some(count),
+            Err(error) => {
+                tracing::warn!("[IMAGE] Invalid {name}={value:?} ({error}); using {default}");
+                Some(default)
+            }
+        },
     }
 }
 
 fn env_days(name: &str, default: Duration) -> Option<Duration> {
     match std::env::var(name).ok() {
-        Some(value) => value
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .and_then(|days| (days != 0).then(|| Duration::from_secs(days * 24 * 60 * 60))),
         None => Some(default),
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(days) => Some(Duration::from_secs(days.saturating_mul(24 * 60 * 60))),
+            Err(error) => {
+                tracing::warn!("[IMAGE] Invalid {name}={value:?} ({error}); using {default:?}");
+                Some(default)
+            }
+        },
+    }
+}
+
+fn parse_optional_limit(
+    name: &str,
+    value: Option<String>,
+    default: u64,
+    multiplier: u64,
+) -> Option<u64> {
+    match value {
+        None => Some(default),
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(limit) => Some(limit.saturating_mul(multiplier)),
+            Err(error) => {
+                tracing::warn!("[IMAGE] Invalid {name}={value:?} ({error}); using {default}");
+                Some(default)
+            }
+        },
     }
 }
 
@@ -418,6 +437,16 @@ fn initialize_index(index: &mut CacheIndex, dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("tmp") {
+            let stale = prepared_cache_temp_owner(&path).map_or_else(
+                || prepared_cache_temp_is_old(&path),
+                |owner_pid| prepared_cache_temp_is_stale(&path, owner_pid),
+            );
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rgba") {
             continue;
         }
@@ -434,6 +463,47 @@ fn initialize_index(index: &mut CacheIndex, dir: &Path) {
             },
         );
     }
+}
+
+fn prepared_cache_temp_owner(path: &Path) -> Option<u32> {
+    let parts = path.file_name()?.to_str()?.split('.').collect::<Vec<_>>();
+    let len = parts.len();
+    if len < 5 || parts[len - 1] != "tmp" || parts[len - 4] != "rgba" {
+        return None;
+    }
+    parts[len - 3].parse().ok().filter(|pid| *pid != 0)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs existence/permission checking without sending a signal.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+fn prepared_cache_temp_is_stale(path: &Path, owner_pid: u32) -> bool {
+    if !process_is_alive(owner_pid) {
+        return true;
+    }
+    prepared_cache_temp_is_old(path)
+}
+
+fn prepared_cache_temp_is_old(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= PREPARED_CACHE_TEMP_STALE_AFTER)
 }
 
 fn update_index_entry(path: &Path, bytes: u64, last_access: SystemTime) {
@@ -545,5 +615,87 @@ mod tests {
             fsync: false,
         };
         assert!(!ensure_capacity(dir, &path, 4, tiny));
+    }
+
+    #[test]
+    fn malformed_limits_keep_safe_defaults_and_zero_disables() {
+        assert_eq!(
+            parse_optional_limit("TEST", Some("bad".into()), 1024, 1024),
+            Some(1024)
+        );
+        assert_eq!(
+            parse_optional_limit("TEST", Some("0".into()), 1024, 1024),
+            None
+        );
+        assert_eq!(
+            parse_optional_limit("TEST", Some("2".into()), 1024, 1024),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn dead_writer_temporary_files_are_removed_from_the_cache_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-temp-cleanup-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let child_pid = child.id();
+        child.wait().unwrap();
+        let temporary = dir.join(format!("abc.rgba.{child_pid}.1.tmp"));
+        std::fs::write(&temporary, b"partial").unwrap();
+
+        initialize_index(&mut CacheIndex::default(), &dir);
+
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn old_temporary_files_are_removed_even_when_the_pid_was_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-temp-pid-reuse-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let temporary = dir.join(format!("abc.rgba.{}.1.tmp", std::process::id()));
+        std::fs::write(&temporary, b"partial").unwrap();
+        File::options()
+            .write(true)
+            .open(&temporary)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+
+        initialize_index(&mut CacheIndex::default(), &dir);
+
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn temporary_cleanup_handles_legacy_names_without_touching_active_writers() {
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-temp-legacy-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("legacy-cache-write.tmp");
+        let active = dir.join(format!("active.rgba.{}.1.tmp", std::process::id()));
+        std::fs::write(&legacy, b"old partial").unwrap();
+        std::fs::write(&active, b"active partial").unwrap();
+        File::options()
+            .write(true)
+            .open(&legacy)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+
+        initialize_index(&mut CacheIndex::default(), &dir);
+
+        assert!(!legacy.exists());
+        assert!(active.exists());
     }
 }

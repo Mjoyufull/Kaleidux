@@ -1,6 +1,6 @@
 use super::{FileCache, PoolEvent};
 use anyhow::Result;
-use notify::event::{ModifyKind, RenameMode};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+
+const MAX_KNOWN_FILES: usize = 262_144;
 
 pub struct DirectoryWatcher {
     watcher: RecommendedWatcher,
@@ -66,9 +68,18 @@ impl DirectoryWatcher {
 
     fn emit_added_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
         if path.is_file() {
+            if self.known_files.len() >= MAX_KNOWN_FILES && !self.known_files.contains(&path) {
+                self.known_files.clear();
+                tracing::warn!(
+                    "[CACHE] Watcher file identity cache reached {MAX_KNOWN_FILES} entries; resetting it"
+                );
+            }
             self.known_files.insert(path.clone());
             tracing::debug!("[CACHE] File created: {}", path.display());
-            pool_events.push(PoolEvent::Added(path));
+            // Modified is deliberately upsert-like in SmartQueue: it refreshes
+            // an existing path and adds a genuinely new one. This remains
+            // correct even when a prior batch invalidated the metadata cache.
+            pool_events.push(PoolEvent::Modified(path));
         }
     }
 
@@ -80,9 +91,11 @@ impl DirectoryWatcher {
     }
 
     fn emit_removed_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
-        if self.known_files.remove(&path) || self.is_known_file(&path) {
-            pool_events.push(PoolEvent::Removed(path));
-        }
+        self.known_files.remove(&path);
+        // Watchers are root-scoped and queues independently reject paths
+        // outside their root, so an unconditional remove is safe and avoids
+        // losing deletes after an earlier metadata invalidation.
+        pool_events.push(PoolEvent::Removed(path));
     }
 
     fn process_rename_event(
@@ -93,16 +106,28 @@ impl DirectoryWatcher {
     ) {
         match (rename_mode, paths.as_slice()) {
             (RenameMode::Both, [from, to]) => {
+                if to.is_dir() {
+                    self.emit_root_rescans(to, pool_events);
+                    return;
+                }
                 self.emit_removed_file(from.clone(), pool_events);
                 self.emit_added_file(to.clone(), pool_events);
                 return;
             }
             (RenameMode::From, [from]) => {
-                self.emit_removed_file(from.clone(), pool_events);
+                if self.is_known_file(from) {
+                    self.emit_removed_file(from.clone(), pool_events);
+                } else {
+                    self.emit_root_rescans(from, pool_events);
+                }
                 return;
             }
             (RenameMode::To, [to]) => {
-                self.emit_added_file(to.clone(), pool_events);
+                if to.is_dir() {
+                    self.emit_root_rescans(to, pool_events);
+                } else {
+                    self.emit_added_file(to.clone(), pool_events);
+                }
                 return;
             }
             _ => {}
@@ -117,9 +142,24 @@ impl DirectoryWatcher {
         }
     }
 
+    fn emit_root_rescans(&self, path: &Path, pool_events: &mut Vec<PoolEvent>) {
+        pool_events.extend(
+            self.watched_dirs
+                .iter()
+                .filter(|root| path.starts_with(root.as_path()) || root.starts_with(path))
+                .cloned()
+                .map(PoolEvent::Rescan),
+        );
+    }
+
     fn process_notify_event(&mut self, event: Event, pool_events: &mut Vec<PoolEvent>) {
         let Event { kind, paths, .. } = event;
         match kind {
+            EventKind::Create(CreateKind::Folder) => {
+                for path in paths {
+                    self.emit_root_rescans(&path, pool_events);
+                }
+            }
             EventKind::Create(_) => {
                 for path in paths {
                     self.emit_added_file(path, pool_events);
@@ -131,6 +171,11 @@ impl DirectoryWatcher {
             EventKind::Modify(_) => {
                 for path in paths {
                     self.emit_modified_file(path, pool_events);
+                }
+            }
+            EventKind::Remove(RemoveKind::Folder) => {
+                for path in paths {
+                    self.emit_root_rescans(&path, pool_events);
                 }
             }
             EventKind::Remove(_) => {
@@ -150,6 +195,7 @@ impl DirectoryWatcher {
     pub fn process_events(&mut self) -> Vec<PoolEvent> {
         if self.overflowed.swap(false, Ordering::AcqRel) {
             while self.event_rx.try_recv().is_ok() {}
+            self.known_files.clear();
             tracing::warn!(
                 "[CACHE] Watcher event queue overflowed; scheduling full watched-root rescan"
             );
@@ -177,7 +223,7 @@ impl DirectoryWatcher {
         self.finalize_pool_events(pool_events)
     }
 
-    fn finalize_pool_events(&self, pool_events: Vec<PoolEvent>) -> Vec<PoolEvent> {
+    fn finalize_pool_events(&mut self, pool_events: Vec<PoolEvent>) -> Vec<PoolEvent> {
         let pool_events = coalesce_events(pool_events);
         let invalidated: Vec<PathBuf> = pool_events
             .iter()
@@ -282,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_event_removes_old_path_and_adds_new_path() {
+    fn rename_event_removes_old_path_and_upserts_new_path() {
         let temp = unique_test_dir("rename");
         let cache = Arc::new(
             FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
@@ -310,7 +356,7 @@ mod tests {
             pool_events,
             vec![
                 PoolEvent::Removed(old_path.clone()),
-                PoolEvent::Added(new_path.clone())
+                PoolEvent::Modified(new_path.clone())
             ]
         );
         assert!(
@@ -377,5 +423,50 @@ mod tests {
         events.extend((1..10_000).map(|_| PoolEvent::Modified(path.clone())));
 
         assert_eq!(coalesce_events(events), vec![PoolEvent::Added(path)]);
+    }
+
+    #[test]
+    fn create_for_existing_path_is_a_modification() {
+        let temp = unique_test_dir("replace-existing");
+        let cache = Arc::new(FileCache::new_test(&temp.join("cache.redb")).unwrap());
+        let mut watcher = DirectoryWatcher::new(cache.clone()).unwrap();
+        let path = temp.join("wallpaper.png");
+        std::fs::write(&path, b"replacement").unwrap();
+        cache.set_file_metadata(&path, &sample_metadata()).unwrap();
+
+        let mut events = Vec::new();
+        watcher.process_notify_event(
+            Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone()),
+            &mut events,
+        );
+
+        assert_eq!(
+            watcher.finalize_pool_events(events),
+            vec![PoolEvent::Modified(path)]
+        );
+    }
+
+    #[test]
+    fn directory_rename_requests_a_root_rescan() {
+        let temp = unique_test_dir("rename-directory");
+        let cache = Arc::new(FileCache::new_test(&temp.join("cache.redb")).unwrap());
+        let mut watcher = DirectoryWatcher::new(cache).unwrap();
+        watcher.watched_dirs.push(temp.clone());
+        let from = temp.join("old");
+        let to = temp.join("new");
+        std::fs::create_dir_all(&to).unwrap();
+
+        let mut events = Vec::new();
+        watcher.process_notify_event(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(from)
+                .add_path(to),
+            &mut events,
+        );
+
+        assert_eq!(
+            watcher.finalize_pool_events(events),
+            vec![PoolEvent::Rescan(temp)]
+        );
     }
 }
