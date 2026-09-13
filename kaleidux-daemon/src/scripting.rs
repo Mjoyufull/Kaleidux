@@ -2,7 +2,7 @@ use kaleidux_common::{Request, Response};
 use rhai::{AST, Engine, Scope};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct ScriptManager {
     engine: Engine,
@@ -23,19 +23,19 @@ impl ScriptManager {
         engine.register_fn("next", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
             let out = if output == "*" { None } else { Some(output) };
-            let _ = tx.try_send((Request::Next { output: out }, resp_tx));
+            enqueue_script_command(&tx, Request::Next { output: out }, resp_tx);
         });
 
         let tx = cmd_tx.clone();
         engine.register_fn("pause", move || {
             let (resp_tx, _) = oneshot::channel();
-            let _ = tx.try_send((Request::Pause, resp_tx));
+            enqueue_script_command(&tx, Request::Pause, resp_tx);
         });
 
         let tx = cmd_tx.clone();
         engine.register_fn("resume", move || {
             let (resp_tx, _) = oneshot::channel();
-            let _ = tx.try_send((Request::Resume, resp_tx));
+            enqueue_script_command(&tx, Request::Resume, resp_tx);
         });
 
         Self {
@@ -82,5 +82,15 @@ impl ScriptManager {
 
     pub fn has_tick(&self) -> bool {
         self.has_tick
+    }
+}
+
+fn enqueue_script_command(
+    tx: &mpsc::Sender<(Request, oneshot::Sender<Response>)>,
+    request: Request,
+    response: oneshot::Sender<Response>,
+) {
+    if let Err(error) = tx.try_send((request, response)) {
+        warn!("[Script] Command was not enqueued: {error}");
     }
 }
