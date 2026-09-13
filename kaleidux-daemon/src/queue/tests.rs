@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +35,7 @@ fn make_test_queue(
         video_ratio,
         strategy,
         history: VecDeque::new(),
+        forward_history: VecDeque::new(),
         root_path,
         active_playlist: None,
         cache: test_cache(),
@@ -296,6 +298,57 @@ fn sequential_previous_uses_display_history_and_preserves_next_position() {
         assert_eq!(queue.pick_prev(), Some(first));
         assert_eq!(queue.pick_next(), Some(second));
     }
+}
+
+#[test]
+fn non_sequential_previous_preserves_forward_navigation() {
+    for strategy in [
+        crate::orchestration::SortingStrategy::Random,
+        crate::orchestration::SortingStrategy::Loveit,
+    ] {
+        let paths = ["a.jpg", "b.jpg", "c.jpg"].map(PathBuf::from).to_vec();
+        let content_types = paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ContentType::Image))
+            .collect();
+        let mut queue = make_test_queue(paths, strategy, 0, content_types);
+        let first = PathBuf::from("a.jpg");
+        let second = PathBuf::from("b.jpg");
+        let third = PathBuf::from("c.jpg");
+        queue.history = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+
+        assert_eq!(queue.pick_prev(), Some(second.clone()));
+        assert_eq!(queue.peek_next(), Some((third.clone(), ContentType::Image)));
+        assert_eq!(queue.pick_prev(), Some(first));
+        assert_eq!(queue.pick_next(), Some(second));
+        assert_eq!(queue.pick_next(), Some(third));
+    }
+}
+
+#[test]
+fn forward_navigation_skips_removed_and_excluded_entries() {
+    let first = PathBuf::from("a.jpg");
+    let second = PathBuf::from("b.jpg");
+    let third = PathBuf::from("c.jpg");
+    let content_types = [first.clone(), second.clone(), third.clone()]
+        .into_iter()
+        .map(|path| (path, ContentType::Image))
+        .collect();
+    let mut queue = make_test_queue(
+        vec![first.clone(), second.clone(), third.clone()],
+        crate::orchestration::SortingStrategy::Random,
+        0,
+        content_types,
+    );
+    queue.history = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+
+    assert_eq!(queue.pick_prev(), Some(second.clone()));
+    assert_eq!(queue.pick_prev(), Some(first.clone()));
+    queue.pool.retain(|path| path != &second);
+    let excluded = HashSet::from([third.clone()]);
+
+    assert_eq!(queue.pick_next_excluding(&excluded), Some(first));
 }
 
 #[test]

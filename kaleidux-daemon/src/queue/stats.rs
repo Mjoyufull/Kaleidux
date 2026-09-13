@@ -125,6 +125,8 @@ impl SmartQueue {
         self.pool.sort(); // Always sort generic pool
         self.current_index = Self::fallback_current_index(self.strategy, self.pool.len());
         self.planned_sequential_type = None;
+        self.history.clear();
+        self.forward_history.clear();
         Ok(())
     }
 

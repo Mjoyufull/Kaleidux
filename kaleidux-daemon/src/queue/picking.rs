@@ -20,6 +20,28 @@ impl SmartQueue {
             return None;
         }
 
+        while let Some(path) = self.forward_history.pop_front() {
+            if excluded.contains(path.as_path()) {
+                continue;
+            }
+            let Some(index) = self.pool.iter().position(|candidate| candidate == &path) else {
+                continue;
+            };
+            if matches!(
+                self.strategy,
+                crate::orchestration::SortingStrategy::Ascending
+                    | crate::orchestration::SortingStrategy::Descending
+            ) {
+                let descending = matches!(
+                    self.strategy,
+                    crate::orchestration::SortingStrategy::Descending
+                );
+                self.current_index = self.advance_index(index, descending);
+            }
+            self.record_pick(&path);
+            return Some(path);
+        }
+
         let picked = match self.strategy {
             crate::orchestration::SortingStrategy::Loveit => self.pick_loveit_excluding(excluded),
             crate::orchestration::SortingStrategy::Random => self.pick_random_excluding(excluded),
@@ -40,6 +62,18 @@ impl SmartQueue {
 
     /// Get the next content path without consuming it (for pre-buffering)
     pub fn peek_next(&self) -> Option<(PathBuf, ContentType)> {
+        if let Some((path, content_type)) = self.forward_history.iter().find_map(|path| {
+            self.pool
+                .contains(path)
+                .then(|| {
+                    self.cached_content_type(path)
+                        .map(|kind| (path.clone(), kind))
+                })
+                .flatten()
+        }) {
+            return Some((path, content_type));
+        }
+
         // For sequential strategies, we can peek at the next index
         match self.strategy {
             crate::orchestration::SortingStrategy::Ascending
@@ -135,7 +169,11 @@ impl SmartQueue {
                 );
                 let mut history_previous = None;
                 if !self.history.is_empty() {
-                    self.history.pop_back();
+                    if let Some(current) = self.history.pop_back()
+                        && self.pool.contains(&current)
+                    {
+                        self.push_forward_history(current);
+                    }
                     while let Some(previous) = self.history.back().cloned() {
                         if let Some(previous_index) = self
                             .pool
@@ -159,7 +197,9 @@ impl SmartQueue {
             _ => {
                 // For non-sequential, use history
                 if self.history.len() > 1 {
-                    self.history.pop_back(); // Remove current
+                    if let Some(current) = self.history.pop_back() {
+                        self.push_forward_history(current);
+                    }
                     self.history.back().cloned()
                 } else {
                     None
@@ -180,6 +220,15 @@ impl SmartQueue {
             self.history.push_back(path.clone());
             if self.history.len() > 50 {
                 self.history.pop_front();
+            }
+        }
+    }
+
+    fn push_forward_history(&mut self, path: PathBuf) {
+        if self.forward_history.front() != Some(&path) {
+            self.forward_history.push_front(path);
+            if self.forward_history.len() > 50 {
+                self.forward_history.pop_back();
             }
         }
     }
