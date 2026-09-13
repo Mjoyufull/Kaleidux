@@ -52,6 +52,14 @@ pub(crate) struct SizedLruCache<K, V> {
     max_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SizedCacheSnapshot {
+    pub(crate) entries: usize,
+    pub(crate) bytes: usize,
+    pub(crate) max_entries: usize,
+    pub(crate) max_bytes: usize,
+}
+
 impl<K: Hash + Eq, V: CacheSized> SizedLruCache<K, V> {
     pub(crate) fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
@@ -83,6 +91,15 @@ impl<K: Hash + Eq, V: CacheSized> SizedLruCache<K, V> {
             self.total_bytes = self
                 .total_bytes
                 .saturating_sub(evicted_value.cache_size_bytes());
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> SizedCacheSnapshot {
+        SizedCacheSnapshot {
+            entries: self.lru.len(),
+            bytes: self.total_bytes,
+            max_entries: self.max_entries,
+            max_bytes: self.max_bytes,
         }
     }
 }

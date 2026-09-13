@@ -2,7 +2,7 @@ use crate::background::BackgroundWorkKind;
 use crate::image as image_pipeline;
 use crate::image::types::{
     DecodedImagePayload, DecodedSourceImage, ImageSourceDescriptor, ImageSourceIdentity,
-    PreparedImageEntry, PreparedImageKey, SizedLruCache,
+    PreparedImageEntry, PreparedImageKey, SizedCacheSnapshot, SizedLruCache,
 };
 use parking_lot::Mutex as ParkingMutex;
 use std::path::Path;
@@ -25,10 +25,10 @@ static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
         Arc::new(Semaphore::new(workers))
     });
 
-const PREPARED_IMAGE_MEMORY_CACHE_ENTRIES: usize = 48;
-const PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
-const SOURCE_IMAGE_MEMORY_CACHE_ENTRIES: usize = 12;
-const SOURCE_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const PREPARED_IMAGE_MEMORY_CACHE_ENTRIES: usize = 16;
+const PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SOURCE_IMAGE_MEMORY_CACHE_ENTRIES: usize = 4;
+const SOURCE_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SOURCE_IMAGE_DESCRIPTOR_CACHE_ENTRIES: usize = 256;
 const SOURCE_IMAGE_DESCRIPTOR_CACHE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const SLOW_IMAGE_PREPARE_MS: f64 = 100.0;
@@ -43,6 +43,13 @@ static PREPARED_IMAGE_MEMORY_CACHE: once_cell::sync::Lazy<
         PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES,
     ))
 });
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ImageMemoryCacheSnapshot {
+    pub(crate) prepared: SizedCacheSnapshot,
+    pub(crate) source: SizedCacheSnapshot,
+    pub(crate) descriptors: SizedCacheSnapshot,
+}
 
 static SOURCE_IMAGE_MEMORY_CACHE: once_cell::sync::Lazy<
     ParkingMutex<SizedLruCache<ImageSourceIdentity, Arc<DecodedSourceImage>>>,
@@ -61,6 +68,14 @@ static SOURCE_IMAGE_DESCRIPTOR_CACHE: once_cell::sync::Lazy<
         SOURCE_IMAGE_DESCRIPTOR_CACHE_MAX_BYTES,
     ))
 });
+
+pub(crate) fn image_memory_cache_snapshot() -> ImageMemoryCacheSnapshot {
+    ImageMemoryCacheSnapshot {
+        prepared: PREPARED_IMAGE_MEMORY_CACHE.lock().snapshot(),
+        source: SOURCE_IMAGE_MEMORY_CACHE.lock().snapshot(),
+        descriptors: SOURCE_IMAGE_DESCRIPTOR_CACHE.lock().snapshot(),
+    }
+}
 
 pub(crate) fn select_compatible_prepared_key<'a, I>(
     keys: I,
