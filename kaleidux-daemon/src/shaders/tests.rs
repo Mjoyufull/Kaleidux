@@ -51,3 +51,37 @@ fn overexposure_uses_shader_default_strength() {
         "float strength = 0.6;"
     );
 }
+
+#[test]
+fn custom_shader_cache_key_includes_sorted_parameter_values() {
+    let first = Transition::Custom {
+        shader: "example".to_string(),
+        params: std::collections::HashMap::from([
+            ("strength".to_string(), 0.5),
+            ("speed".to_string(), 1.0),
+        ]),
+    };
+    let reordered = Transition::Custom {
+        shader: "example".to_string(),
+        params: std::collections::HashMap::from([
+            ("speed".to_string(), 1.0),
+            ("strength".to_string(), 0.5),
+        ]),
+    };
+    let changed = Transition::Custom {
+        shader: "example".to_string(),
+        params: std::collections::HashMap::from([
+            ("speed".to_string(), 1.0),
+            ("strength".to_string(), 0.75),
+        ]),
+    };
+
+    assert_eq!(
+        ShaderManager::transition_cache_key(&first),
+        ShaderManager::transition_cache_key(&reordered)
+    );
+    assert_ne!(
+        ShaderManager::transition_cache_key(&first),
+        ShaderManager::transition_cache_key(&changed)
+    );
+}

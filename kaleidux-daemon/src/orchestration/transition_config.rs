@@ -95,7 +95,7 @@ fn canonical_transition_tag(name: &str) -> Option<String> {
 
     let normalized = trimmed.to_ascii_lowercase().replace([' ', '_'], "-");
     if normalized == "fade" {
-        return Some("Fade".to_string());
+        return Some("fade".to_string());
     }
 
     let transition = crate::shaders::Transition::from_name(trimmed);
