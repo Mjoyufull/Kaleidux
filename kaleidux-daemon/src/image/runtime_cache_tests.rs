@@ -6,7 +6,7 @@ mod tests {
     use crate::image::runtime_switch::*;
     use crate::image::types::{
         DecodedImagePayload, DecodedSourceImage, DecodedSourcePixels, ImageLoadProfile,
-        ImageSourceIdentity, PreparedImageKey,
+        ImageSourceIdentity, PreparedImageKey, SizedLruCache,
     };
     use crate::main_loop::PendingContentSwitch;
     use crate::metrics;
@@ -28,6 +28,41 @@ mod tests {
         let image = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]));
         image.save(&path).expect("temp png should save");
         path
+    }
+
+    #[test]
+    fn sized_lru_reports_and_enforces_live_residency() {
+        let mut cache = SizedLruCache::new(2, 6);
+        cache.put(
+            1_u8,
+            Arc::new(DecodedSourceImage {
+                pixels: DecodedSourcePixels::Rgba(vec![1; 4].into()),
+                width: 1,
+                height: 1,
+                format: "test".to_string(),
+                decode: Duration::ZERO,
+                convert: Duration::ZERO,
+            }),
+        );
+        cache.put(
+            2_u8,
+            Arc::new(DecodedSourceImage {
+                pixels: DecodedSourcePixels::Rgba(vec![2; 4].into()),
+                width: 1,
+                height: 1,
+                format: "test".to_string(),
+                decode: Duration::ZERO,
+                convert: Duration::ZERO,
+            }),
+        );
+
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.entries, 1);
+        assert_eq!(snapshot.bytes, 4);
+        assert_eq!(snapshot.max_entries, 2);
+        assert_eq!(snapshot.max_bytes, 6);
+        assert!(cache.get_cloned(&1).is_none());
+        assert!(cache.get_cloned(&2).is_some());
     }
 
     #[test]

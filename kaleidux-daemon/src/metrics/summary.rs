@@ -118,8 +118,9 @@ impl PerformanceMetrics {
     }
 
     fn image_cache_summary(&self) -> String {
+        let resident = crate::image::runtime_cache::image_memory_cache_snapshot();
         format!(
-            "prepared_memory={} compatible={} disk={} miss={} source_memory={} source_decode={} shared_wait={} slow_prepare={}",
+            "prepared_memory={} compatible={} disk={} miss={} source_memory={} source_decode={} shared_wait={} slow_prepare={} resident=prepared:{}/{}b({}/{}) source:{}/{}b({}/{}) descriptors:{}/{}b({}/{})",
             self.image_prepared_memory_hits.load(Ordering::Relaxed),
             self.image_prepared_compatible_hits.load(Ordering::Relaxed),
             self.image_prepared_disk_hits.load(Ordering::Relaxed),
@@ -127,7 +128,19 @@ impl PerformanceMetrics {
             self.image_source_memory_hits.load(Ordering::Relaxed),
             self.image_source_decode_misses.load(Ordering::Relaxed),
             self.image_shared_waits.load(Ordering::Relaxed),
-            self.image_slow_prepares.load(Ordering::Relaxed)
+            self.image_slow_prepares.load(Ordering::Relaxed),
+            resident.prepared.bytes,
+            resident.prepared.max_bytes,
+            resident.prepared.entries,
+            resident.prepared.max_entries,
+            resident.source.bytes,
+            resident.source.max_bytes,
+            resident.source.entries,
+            resident.source.max_entries,
+            resident.descriptors.bytes,
+            resident.descriptors.max_bytes,
+            resident.descriptors.entries,
+            resident.descriptors.max_entries,
         )
     }
 
