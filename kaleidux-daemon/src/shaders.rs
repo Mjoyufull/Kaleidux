@@ -9,6 +9,7 @@ use safe_sources::{CUBE_SAFE_GLSL, DISPLACEMENT_SAFE_GLSL, GLSL_PRELUDE};
 pub struct ShaderManager;
 
 const WGSL_DISK_CACHE_VERSION: u32 = 2;
+const MAX_WGSL_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CachedWgslEntry {
@@ -22,8 +23,9 @@ struct WgslDiskCache {
     entries: std::collections::HashMap<String, CachedWgslEntry>,
 }
 
-// Process-wide cache of compiled WGSL shader strings (P-21)
-// Keyed by transition name — avoids duplicate GLSL→WGSL compilation across renderers
+// Process-wide cache of compiled WGSL shader strings (P-21). Custom shader
+// keys include their parameter values so differently configured instances do
+// not alias each other.
 static WGSL_CACHE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<String, CachedWgslEntry>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -32,6 +34,29 @@ static BROKEN_TRANSITIONS: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 use anyhow::Context;
+
+fn cache_wgsl(key: String, entry: CachedWgslEntry) {
+    let mut cache = WGSL_CACHE.lock();
+    cache_wgsl_bounded(&mut cache, key, entry);
+}
+
+fn cache_wgsl_bounded(
+    cache: &mut std::collections::HashMap<String, CachedWgslEntry>,
+    key: String,
+    entry: CachedWgslEntry,
+) {
+    if !cache.contains_key(&key) && cache.len() >= MAX_WGSL_CACHE_ENTRIES {
+        let evicted = cache
+            .keys()
+            .find(|cached_key| cached_key.starts_with("custom:"))
+            .cloned()
+            .or_else(|| cache.keys().next().cloned());
+        if let Some(evicted) = evicted {
+            cache.remove(&evicted);
+        }
+    }
+    cache.insert(key, entry);
+}
 
 fn stable_shader_fingerprint(parts: &[&str]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -57,11 +82,27 @@ impl ShaderManager {
     }
 
     pub fn is_shader_cached(transition: &Transition) -> bool {
-        let name = transition.name();
+        let key = Self::transition_cache_key(transition);
         WGSL_CACHE
             .lock()
-            .get(&name)
+            .get(&key)
             .is_some_and(|entry| Self::cache_entry_matches_transition(transition, entry))
+    }
+
+    pub(crate) fn transition_cache_key(transition: &Transition) -> String {
+        match transition {
+            Transition::Custom { shader, params } => {
+                let mut params = params.iter().collect::<Vec<_>>();
+                params.sort_unstable_by_key(|(name, _)| *name);
+                let params = params
+                    .into_iter()
+                    .map(|(name, value)| format!("{}={:08x}", name, value.to_bits()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("custom:{}:{}", shader, params)
+            }
+            _ => transition.name(),
+        }
     }
 
     pub fn save_cache() -> anyhow::Result<()> {
@@ -71,7 +112,11 @@ impl ShaderManager {
             let cache = WGSL_CACHE.lock();
             postcard::to_allocvec(&WgslDiskCache {
                 version: WGSL_DISK_CACHE_VERSION,
-                entries: cache.clone(),
+                entries: cache
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with("custom:"))
+                    .map(|(key, entry)| (key.clone(), entry.clone()))
+                    .collect(),
             })?
         };
         let tmp = cache_dir.join("wgsl_cache.bin.tmp");
@@ -107,7 +152,7 @@ impl ShaderManager {
                         return Ok(());
                     }
                 };
-            for (k, v) in loaded {
+            for (k, v) in loaded.into_iter().take(MAX_WGSL_CACHE_ENTRIES) {
                 cache.entry(k).or_insert(v);
             }
             tracing::info!(
@@ -254,16 +299,34 @@ impl ShaderManager {
         Ok(out)
     }
 
-    #[allow(dead_code)]
     pub fn get_shader(transition: &Transition) -> anyhow::Result<String> {
         match transition {
             Transition::Custom { shader, params } => {
                 let glsl = Self::load_external_glsl(shader)?;
-                let mut mapping = String::new();
-                for (name, val) in params {
-                    mapping.push_str(&format!("float {} = {}; ", name, val));
+                let mut sorted_params = params.iter().collect::<Vec<_>>();
+                sorted_params.sort_unstable_by_key(|(name, _)| *name);
+                let mapping = sorted_params
+                    .into_iter()
+                    .map(|(name, value)| format!("float {} = {};", name, value))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let key = Self::transition_cache_key(transition);
+                let fingerprint =
+                    stable_shader_fingerprint(&[shader, GLSL_PRELUDE, &glsl, &mapping]);
+                if let Some(cached) = WGSL_CACHE.lock().get(&key)
+                    && cached.fingerprint == fingerprint
+                {
+                    return Ok(cached.wgsl.clone());
                 }
-                Self::compile_glsl(shader, &glsl, &mapping)
+                let wgsl = Self::compile_glsl(shader, &glsl, &mapping)?;
+                cache_wgsl(
+                    key,
+                    CachedWgslEntry {
+                        fingerprint,
+                        wgsl: wgsl.clone(),
+                    },
+                );
+                Ok(wgsl)
             }
             Transition::Random => {
                 let picked = Self::pick_random_transition();
@@ -327,7 +390,7 @@ impl ShaderManager {
         let wgsl = Self::compile_glsl(&name, glsl, mapping)?;
 
         // Store in process-wide cache (P-21)
-        WGSL_CACHE.lock().insert(
+        cache_wgsl(
             name,
             CachedWgslEntry {
                 fingerprint,
@@ -338,7 +401,20 @@ impl ShaderManager {
     }
 
     fn cache_entry_matches_transition(transition: &Transition, entry: &CachedWgslEntry) -> bool {
-        match Self::builtin_shader_cache_fingerprint_for_transition(transition) {
+        let fingerprint = match transition {
+            Transition::Custom { shader, params } => Self::load_external_glsl(shader).map(|glsl| {
+                let mut sorted_params = params.iter().collect::<Vec<_>>();
+                sorted_params.sort_unstable_by_key(|(name, _)| *name);
+                let mapping = sorted_params
+                    .into_iter()
+                    .map(|(name, value)| format!("float {} = {};", name, value))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                stable_shader_fingerprint(&[shader, GLSL_PRELUDE, &glsl, &mapping])
+            }),
+            _ => Self::builtin_shader_cache_fingerprint_for_transition(transition),
+        };
+        match fingerprint {
             Ok(fingerprint) => entry.fingerprint == fingerprint,
             Err(_) => false,
         }

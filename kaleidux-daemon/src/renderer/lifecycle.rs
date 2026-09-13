@@ -211,12 +211,12 @@ impl super::Renderer {
         let shader_precompile_handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
             // Always precompile Fade (used as fallback on errors)
-            let _ = crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade);
+            let _ = crate::shaders::ShaderManager::get_shader(&Transition::Fade);
             // Precompile the user's configured transition (skip if it IS Fade or Random)
             if matches!(transition, Transition::Random) {
                 let common = random_transition_prewarm_set();
                 for t in &common {
-                    let _ = crate::shaders::ShaderManager::get_builtin_shader(t);
+                    let _ = crate::shaders::ShaderManager::get_shader(t);
                 }
                 let duration = start.elapsed();
                 tracing::info!(
@@ -226,7 +226,7 @@ impl super::Renderer {
                     common.len(),
                 );
             } else if !matches!(transition, Transition::Fade) {
-                let _ = crate::shaders::ShaderManager::get_builtin_shader(&transition);
+                let _ = crate::shaders::ShaderManager::get_shader(&transition);
                 let duration = start.elapsed();
                 tracing::debug!(
                     "[RENDER] {}: Background shader precompilation completed in {:.2}ms ({})",
@@ -279,9 +279,10 @@ impl super::Renderer {
         transition: &Transition,
     ) -> Option<Arc<wgpu::RenderPipeline>> {
         let name = transition.name();
+        let cache_key = crate::shaders::ShaderManager::transition_cache_key(transition);
 
         // Check cache first (using Mutex in ctx)
-        if let Some(pipe) = self.ctx.transition_pipelines.lock().get(&name) {
+        if let Some(pipe) = self.ctx.transition_pipelines.lock().get(&cache_key) {
             return Some(pipe.clone());
         }
 
@@ -303,49 +304,51 @@ impl super::Renderer {
     ) -> Option<Arc<wgpu::RenderPipeline>> {
         let compile_start = std::time::Instant::now();
         let name = transition.name();
+        let cache_key = crate::shaders::ShaderManager::transition_cache_key(transition);
 
         // Get compiled WGSL shader code using ShaderManager (fragment shader only)
-        let fragment_shader_code = if crate::shaders::ShaderManager::is_transition_broken(&name) {
-            error!(
-                "Skipping known-broken shader for {}. Falling back to fade.",
-                name
-            );
-            match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
-                Ok(code) => code,
-                Err(fe) => {
-                    error!("FATAL: Failed to compile fallback fade shader: {}", fe);
-                    if let Some(m) = &self.metrics {
-                        m.record_error("shader_compile_fatal");
+        let fragment_shader_code =
+            if crate::shaders::ShaderManager::is_transition_broken(&cache_key) {
+                error!(
+                    "Skipping known-broken shader for {}. Falling back to fade.",
+                    name
+                );
+                match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
+                    Ok(code) => code,
+                    Err(fe) => {
+                        error!("FATAL: Failed to compile fallback fade shader: {}", fe);
+                        if let Some(m) = &self.metrics {
+                            m.record_error("shader_compile_fatal");
+                        }
+                        return None;
                     }
-                    return None;
                 }
-            }
-        } else {
-            match crate::shaders::ShaderManager::get_builtin_shader(transition) {
-                Ok(code) => code,
-                Err(e) => {
-                    crate::shaders::ShaderManager::mark_transition_broken(&name);
-                    error!(
-                        "Failed to compile shader for {}: {}. Falling back to fade.",
-                        name, e
-                    );
-                    if let Some(m) = &self.metrics {
-                        m.record_error("shader_compile");
-                    }
-                    // Fallback to fade
-                    match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
-                        Ok(code) => code,
-                        Err(fe) => {
-                            error!("FATAL: Failed to compile fallback fade shader: {}", fe);
-                            if let Some(m) = &self.metrics {
-                                m.record_error("shader_compile_fatal");
+            } else {
+                match crate::shaders::ShaderManager::get_shader(transition) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        crate::shaders::ShaderManager::mark_transition_broken(&cache_key);
+                        error!(
+                            "Failed to compile shader for {}: {}. Falling back to fade.",
+                            name, e
+                        );
+                        if let Some(m) = &self.metrics {
+                            m.record_error("shader_compile");
+                        }
+                        // Fallback to fade
+                        match crate::shaders::ShaderManager::get_builtin_shader(&Transition::Fade) {
+                            Ok(code) => code,
+                            Err(fe) => {
+                                error!("FATAL: Failed to compile fallback fade shader: {}", fe);
+                                if let Some(m) = &self.metrics {
+                                    m.record_error("shader_compile_fatal");
+                                }
+                                return None;
                             }
-                            return None;
                         }
                     }
                 }
-            }
-        };
+            };
 
         // Create vertex shader module from the built-in quad.wgsl
         let vertex_shader = self
@@ -412,7 +415,7 @@ impl super::Renderer {
         self.ctx
             .transition_pipelines
             .lock()
-            .insert(name, pipeline_arc.clone());
+            .insert(cache_key, pipeline_arc.clone());
 
         // Record shader compile CPU time
         if let Some(m) = &self.metrics {
