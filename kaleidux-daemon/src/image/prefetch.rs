@@ -84,7 +84,26 @@ pub(crate) fn build_plan(
 
     requests.truncate(MAX_REQUESTS);
     sort_requests(&mut requests);
+    limit_plan_to_memory_budget(&mut requests);
     requests
+}
+
+fn limit_plan_to_memory_budget(requests: &mut Vec<ImagePrefetchRequest>) {
+    // Don't warm enough speculative RGBA images to evict the immediate next
+    // image (notably three 4K images in a 64 MiB cache). Reserve half for
+    // foreground work and other outputs; a single oversized request is left
+    // cold rather than decoded and immediately discarded.
+    let mut remaining = super::runtime_cache::PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES / 2;
+    requests.retain(|request| {
+        let bytes = u64::from(request.target_width)
+            .saturating_mul(u64::from(request.target_height))
+            .saturating_mul(4);
+        if bytes > remaining as u64 {
+            return false;
+        }
+        remaining -= bytes as usize;
+        true
+    });
 }
 
 pub(crate) fn sort_requests(requests: &mut [ImagePrefetchRequest]) {
@@ -163,6 +182,22 @@ fn request_priority(reason: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_k_lookahead_preserves_room_for_foreground_work() {
+        let mut requests: Vec<_> = (0..3)
+            .map(|index| ImagePrefetchRequest {
+                target_output: "DP-1".into(),
+                path: PathBuf::from(format!("{index}.png")),
+                target_width: 3840,
+                target_height: 2160,
+                reason: if index == 0 { "next" } else { "lookahead" },
+            })
+            .collect();
+        limit_plan_to_memory_budget(&mut requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reason, "next");
+    }
 
     #[test]
     fn sorts_immediate_requests_before_lookahead_and_by_size() {

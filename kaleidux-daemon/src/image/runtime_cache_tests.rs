@@ -63,6 +63,20 @@ mod tests {
         assert_eq!(snapshot.max_bytes, 6);
         assert!(cache.get_cloned(&1).is_none());
         assert!(cache.get_cloned(&2).is_some());
+        cache.put(
+            3_u8,
+            Arc::new(DecodedSourceImage {
+                pixels: DecodedSourcePixels::Rgba(vec![3; 8].into()),
+                width: 2,
+                height: 1,
+                format: "test".to_string(),
+                decode: Duration::ZERO,
+                convert: Duration::ZERO,
+            }),
+        );
+        assert_eq!(cache.snapshot(), snapshot);
+        assert!(cache.get_cloned(&2).is_some());
+        assert!(cache.get_cloned(&3).is_none());
     }
 
     #[test]

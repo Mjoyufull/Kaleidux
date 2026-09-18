@@ -26,7 +26,7 @@ static IMAGE_DECODE_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
     });
 
 const PREPARED_IMAGE_MEMORY_CACHE_ENTRIES: usize = 16;
-const PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SOURCE_IMAGE_MEMORY_CACHE_ENTRIES: usize = 4;
 const SOURCE_IMAGE_MEMORY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SOURCE_IMAGE_DESCRIPTOR_CACHE_ENTRIES: usize = 256;
@@ -177,7 +177,7 @@ pub(crate) fn store_prepared_image_cache(
     let Some(key) = prepared_image_cache_lookup_key(path, target_width, target_height) else {
         return;
     };
-    store_prepared_image_cache_by_key(&key, payload);
+    image_pipeline::persistent_cache::store_by_key_for_test(&key, payload);
 }
 
 pub(crate) fn try_load_prepared_image_memory(
