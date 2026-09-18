@@ -41,6 +41,9 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Process-global libva environment sanitization must happen before the
+    // Tokio runtime creates worker threads.
+    kaleidux_daemon::video::sanitize_libva_driver_env_for_gstreamer();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
@@ -177,15 +180,23 @@ fn init_file_logging(
         .with_writer(non_blocking_file)
         .with_ansi(false)
         .with_timer(CustomTimer);
+    let (non_blocking_stdout, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+    let stdout_layer = subscriber_fmt::layer()
+        .with_writer(non_blocking_stdout)
+        .with_timer(CustomTimer);
 
-    Registry::default().with(env_filter).with(file_layer).init();
+    Registry::default()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
 
     info!(
         "Kaleidux Daemon starting... (Level {}, File: {})",
         level,
         config_dir.display()
     );
-    Ok((Some(file_guard), None))
+    Ok((Some(file_guard), Some(stdout_guard)))
 }
 
 fn apply_video_mode(video_mode: Option<&str>) {
@@ -290,13 +301,9 @@ fn apply_video_backend(video_backend: Option<&str>) {
 }
 
 async fn load_config(demo: bool) -> anyhow::Result<kaleidux_daemon::orchestration::Config> {
-    let mut config = match kaleidux_daemon::orchestration::Config::load().await {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("Failed to load configuration: {}. Using defaults.", e);
-            kaleidux_daemon::orchestration::Config::default()
-        }
-    };
+    let mut config = kaleidux_daemon::orchestration::Config::load()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to load configuration: {error:#}"))?;
 
     if demo {
         info!("Demo mode enabled! Overriding configuration to use current directory...");
@@ -321,7 +328,6 @@ fn init_gstreamer() -> anyhow::Result<std::time::Duration> {
     #[cfg(feature = "backend-appsink")]
     {
         let gstreamer_start = Instant::now();
-        kaleidux_daemon::video::sanitize_libva_driver_env_for_gstreamer();
         gstreamer::init()?;
         if kaleidux_daemon::observability::trace_all::trace_all_enabled() {
             gstreamer::log::set_active(true);

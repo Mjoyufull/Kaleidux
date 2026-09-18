@@ -6,9 +6,27 @@ use crate::shaders::Transition;
 
 #[test]
 fn zero_script_tick_interval_is_rejected() {
-    let error = toml::from_str::<super::GlobalConfig>("script-tick-interval = 0")
-        .expect_err("a zero-second script tick would hot-loop");
-    assert!(error.to_string().contains("at least one second"));
+    let error = Config::parse_str(
+        r#"
+            [global]
+            performance = "quality"
+            script-tick-interval = 0
+            "#,
+    )
+    .expect_err("a zero-second script tick must reject the config");
+    assert!(format!("{error:#}").contains("at least one second"));
+}
+
+#[test]
+fn invalid_any_section_is_rejected() {
+    let error = Config::parse_str(
+        r#"
+            [any]
+            video-fps = "definitely-not-a-profile"
+            "#,
+    )
+    .expect_err("an invalid [any] section must reject the config");
+    assert!(format!("{error:#}").contains("Failed to parse [any] config section"));
 }
 
 #[test]
