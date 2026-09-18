@@ -191,11 +191,14 @@ impl MonitorManager {
                         let now = Instant::now();
                         // Reset shared display start time for next cycle
                         self.shared_display_start_time = None;
+                        let next = queue.peek_next();
                         for (name, orch) in &mut self.outputs {
                             orch.current_path = Some(path.clone());
                             orch.display_start_time = None;
                             orch.next_change =
                                 Some(now + content_load_timeout(orch.config.duration));
+                            orch.next_path = next.as_ref().map(|(path, _)| path.clone());
+                            orch.next_content_type = next.as_ref().map(|(_, kind)| *kind);
                             changes.insert(name.clone(), (path.clone(), content_type));
                         }
                     }
@@ -213,10 +216,15 @@ impl MonitorManager {
                                 };
                                 // Reset group display start time for next cycle
                                 self.group_display_start_times.remove(&gid);
+                                let next = queue.peek_next();
                                 for (name, og) in &self.output_groups {
                                     if og == &gid {
                                         if let Some(orch) = self.outputs.get_mut(name) {
                                             orch.current_path = Some(path.clone());
+                                            orch.next_path =
+                                                next.as_ref().map(|(path, _)| path.clone());
+                                            orch.next_content_type =
+                                                next.as_ref().map(|(_, kind)| *kind);
                                             orch.display_start_time = None;
                                             orch.next_change = Some(
                                                 Instant::now()
@@ -247,10 +255,15 @@ impl MonitorManager {
                                     };
                                     // Reset group display start time for next cycle
                                     self.group_display_start_times.remove(gid);
+                                    let next = queue.peek_next();
                                     for (n, og) in &self.output_groups {
                                         if og == gid {
                                             if let Some(orch) = self.outputs.get_mut(n) {
                                                 orch.current_path = Some(path.clone());
+                                                orch.next_path =
+                                                    next.as_ref().map(|(path, _)| path.clone());
+                                                orch.next_content_type =
+                                                    next.as_ref().map(|(_, kind)| *kind);
                                                 orch.display_start_time = None;
                                                 orch.next_change = Some(
                                                     Instant::now()

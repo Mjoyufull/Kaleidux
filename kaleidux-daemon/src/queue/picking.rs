@@ -20,13 +20,23 @@ impl SmartQueue {
             return None;
         }
 
-        while let Some(path) = self.forward_history.pop_front() {
-            if excluded.contains(path.as_path()) {
-                continue;
-            }
-            let Some(index) = self.pool.iter().position(|candidate| candidate == &path) else {
-                continue;
-            };
+        self.forward_history.retain(|path| self.pool.contains(path));
+        // Cross-output exclusions are temporary; don't destroy browser-style
+        // forward history merely because another output is showing an entry.
+        if let Some(position) = self
+            .forward_history
+            .iter()
+            .position(|path| !excluded.contains(path))
+        {
+            let path = self
+                .forward_history
+                .remove(position)
+                .expect("position exists");
+            let index = self
+                .pool
+                .iter()
+                .position(|candidate| candidate == &path)
+                .expect("retained pool entry");
             if matches!(
                 self.strategy,
                 crate::orchestration::SortingStrategy::Ascending
@@ -62,16 +72,14 @@ impl SmartQueue {
 
     /// Get the next content path without consuming it (for pre-buffering)
     pub fn peek_next(&self) -> Option<(PathBuf, ContentType)> {
-        if let Some((path, content_type)) = self.forward_history.iter().find_map(|path| {
-            self.pool
-                .contains(path)
-                .then(|| {
-                    self.cached_content_type(path)
-                        .map(|kind| (path.clone(), kind))
-                })
-                .flatten()
-        }) {
-            return Some((path, content_type));
+        if let Some(path) = self
+            .forward_history
+            .iter()
+            .find(|path| self.pool.contains(path))
+        {
+            return self
+                .cached_content_type(path)
+                .map(|kind| (path.clone(), kind));
         }
 
         // For sequential strategies, we can peek at the next index
@@ -116,7 +124,17 @@ impl SmartQueue {
             return Vec::new();
         }
 
-        match self.strategy {
+        let mut forward: Vec<_> = self
+            .forward_history
+            .iter()
+            .filter(|path| {
+                self.pool.contains(path)
+                    && self.cached_content_type(path) == Some(ContentType::Image)
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        let candidates = match self.strategy {
             crate::orchestration::SortingStrategy::Ascending
             | crate::orchestration::SortingStrategy::Descending => {
                 let descending = matches!(
@@ -150,7 +168,16 @@ impl SmartQueue {
                 .filter(|(_, content_type)| *content_type == ContentType::Image)
                 .map(|(path, _)| vec![path])
                 .unwrap_or_default(),
+        };
+        for path in candidates {
+            if forward.len() >= limit {
+                break;
+            }
+            if !forward.contains(&path) {
+                forward.push(path);
+            }
         }
+        forward
     }
 
     #[inline]
