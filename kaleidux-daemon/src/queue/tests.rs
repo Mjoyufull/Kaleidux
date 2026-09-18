@@ -321,6 +321,10 @@ fn non_sequential_previous_preserves_forward_navigation() {
         assert_eq!(queue.pick_prev(), Some(second.clone()));
         assert_eq!(queue.peek_next(), Some((third.clone(), ContentType::Image)));
         assert_eq!(queue.pick_prev(), Some(first));
+        assert_eq!(
+            queue.peek_upcoming_images(2),
+            vec![second.clone(), third.clone()]
+        );
         assert_eq!(queue.pick_next(), Some(second));
         assert_eq!(queue.pick_next(), Some(third));
     }
@@ -349,6 +353,22 @@ fn forward_navigation_skips_removed_and_excluded_entries() {
     let excluded = HashSet::from([third.clone()]);
 
     assert_eq!(queue.pick_next_excluding(&excluded), Some(first));
+    assert_eq!(queue.pick_next(), Some(third));
+}
+
+#[test]
+fn forward_peek_does_not_skip_an_unknown_first_entry() {
+    let unknown = PathBuf::from("unknown");
+    let image = PathBuf::from("a.jpg");
+    let mut queue = make_test_queue(
+        vec![unknown.clone(), image.clone()],
+        crate::orchestration::SortingStrategy::Random,
+        0,
+        HashMap::from([(image.clone(), ContentType::Image)]),
+    );
+    queue.forward_history = VecDeque::from([unknown.clone(), image]);
+    assert_eq!(queue.peek_next(), None);
+    assert_eq!(queue.pick_next(), Some(unknown));
 }
 
 #[test]

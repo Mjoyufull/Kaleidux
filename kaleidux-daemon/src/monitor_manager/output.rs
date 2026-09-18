@@ -220,28 +220,8 @@ impl OutputOrchestrator {
     }
 
     pub fn pick_prev(&mut self) -> Option<(PathBuf, ContentType)> {
-        if let Some(queue) = &mut self.queue {
-            if let Some(path) = queue.pick_prev() {
-                let content_type = match crate::queue::SmartQueue::get_content_type(&path) {
-                    Some(content_type) => content_type,
-                    None => {
-                        warn!(
-                            "[PICK] {}: Could not determine content type for previous path: {}",
-                            self._name,
-                            path.display()
-                        );
-                        return None;
-                    }
-                };
-                self.current_path = Some(path.clone());
-                // Reset display start time - will be set when content actually starts displaying
-                self.display_start_time = None;
-                self.next_change =
-                    Some(Instant::now() + content_load_timeout(self.cycle_duration()));
-                return Some((path, content_type));
-            }
-        }
-        None
+        let path = self.queue.as_mut()?.pick_prev()?;
+        self.apply_selected_path(path)
     }
 
     pub(super) fn apply_selected_path(&mut self, path: PathBuf) -> Option<(PathBuf, ContentType)> {
