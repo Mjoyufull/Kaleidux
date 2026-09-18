@@ -49,13 +49,8 @@ impl CachePolicy {
             max_bytes: env_mib("KALEIDUX_IMAGE_CACHE_MAX_MIB", DEFAULT_MAX_BYTES),
             max_entries: env_usize("KALEIDUX_IMAGE_CACHE_MAX_ENTRIES", DEFAULT_MAX_ENTRIES),
             max_age: env_days("KALEIDUX_IMAGE_CACHE_MAX_AGE_DAYS", DEFAULT_MAX_AGE),
-            // Unit tests use a tiny isolated cache under the host temp filesystem;
-            // their correctness must not depend on how full that filesystem is.
-            min_free_bytes: if cfg!(test) {
-                0
-            } else {
-                env_mib("KALEIDUX_IMAGE_CACHE_MIN_FREE_MIB", DEFAULT_MIN_FREE_BYTES).unwrap_or(0)
-            },
+            min_free_bytes: env_mib("KALEIDUX_IMAGE_CACHE_MIN_FREE_MIB", DEFAULT_MIN_FREE_BYTES)
+                .unwrap_or(0),
             fsync: env_bool("KALEIDUX_IMAGE_CACHE_FSYNC"),
         }
     }
@@ -288,6 +283,23 @@ fn validate_file_header(file: File) -> std::io::Result<(BufReader<File>, CacheHe
 }
 
 pub(crate) fn store_by_key(key: &PreparedImageKey, payload: &DecodedImagePayload) {
+    store_by_key_with_policy(key, payload, policy());
+}
+
+#[cfg(test)]
+pub(crate) fn store_by_key_for_test(key: &PreparedImageKey, payload: &DecodedImagePayload) {
+    let policy = CachePolicy {
+        min_free_bytes: 0,
+        ..policy()
+    };
+    store_by_key_with_policy(key, payload, policy);
+}
+
+fn store_by_key_with_policy(
+    key: &PreparedImageKey,
+    payload: &DecodedImagePayload,
+    policy: CachePolicy,
+) {
     let Some(cache_path) = path_for_key(key) else {
         return;
     };
@@ -307,7 +319,7 @@ pub(crate) fn store_by_key(key: &PreparedImageKey, payload: &DecodedImagePayload
     let Some(dir) = cache_path.parent() else {
         return;
     };
-    if !ensure_capacity(dir, &cache_path, total_len, policy()) {
+    if !ensure_capacity(dir, &cache_path, total_len, policy) {
         tracing::warn!(
             "[IMAGE] Persistent cache budget/free-space floor rejected {} bytes",
             total_len
@@ -323,7 +335,7 @@ pub(crate) fn store_by_key(key: &PreparedImageKey, payload: &DecodedImagePayload
         payload,
         source_format,
         expected_len,
-        policy().fsync,
+        policy.fsync,
     )
     .and_then(|()| std::fs::rename(&tmp_path, &cache_path));
     if result.is_err() {

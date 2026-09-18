@@ -79,6 +79,10 @@ impl<K: Hash + Eq, V: CacheSized> SizedLruCache<K, V> {
 
     pub(crate) fn put(&mut self, key: K, value: V) {
         let value_size = value.cache_size_bytes();
+        // An uncacheable large source must not evict every useful small entry.
+        if value_size > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
         if let Some(old) = self.lru.put(key, value) {
             self.total_bytes = self.total_bytes.saturating_sub(old.cache_size_bytes());
         }
