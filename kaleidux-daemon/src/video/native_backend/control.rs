@@ -58,6 +58,9 @@ impl NativePlaybackControl {
             self.play_epoch.fetch_add(1, Ordering::Relaxed);
         }
         state.playback = PlaybackState::Playing;
+        // Preroll consumes the initial credit. Starting/resuming must wake the
+        // demand-driven decoder even before a compositor callback arrives.
+        state.frame_demanded = true;
         self.playback
             .store(PlaybackState::Playing.as_u8(), Ordering::Release);
         drop(state);
@@ -223,5 +226,17 @@ mod tests {
         control.consume_frame_demand();
         control.stop();
         assert!(!control.wait_for_frame_demand());
+    }
+
+    #[test]
+    fn start_and_resume_replenish_consumed_preroll_demand() {
+        let control = NativePlaybackControl::new();
+        control.consume_frame_demand();
+        control.play();
+        assert!(control.wait_for_frame_demand());
+        control.consume_frame_demand();
+        control.pause();
+        control.play();
+        assert!(control.wait_for_frame_demand());
     }
 }
