@@ -1,5 +1,5 @@
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tracing::{debug, info, warn};
 
@@ -8,6 +8,12 @@ pub struct SystemMonitor {
     nvml: Option<nvml_wrapper::Nvml>,
     amd_gpu_path: Option<String>,
     metrics: Option<std::sync::Arc<crate::metrics::PerformanceMetrics>>,
+}
+
+impl Default for SystemMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SystemMonitor {
@@ -115,8 +121,13 @@ impl SystemMonitor {
         loop {
             interval.tick().await;
 
+            let refresh_cpu_start = Instant::now();
             self.sys.refresh_cpu_all();
+            let refresh_cpu = refresh_cpu_start.elapsed();
+
+            let refresh_memory_start = Instant::now();
             self.sys.refresh_memory();
+            let refresh_memory = refresh_memory_start.elapsed();
 
             let load = self.sys.global_cpu_usage();
             let total_mem = self.sys.total_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
@@ -127,6 +138,7 @@ impl SystemMonitor {
             let mut proc_cpu = 0.0;
             let mut proc_mem = 0.0;
 
+            let process_refresh_start = Instant::now();
             if let Some(p) = pid {
                 self.sys.refresh_processes_specifics(
                     ProcessesToUpdate::Some(&[p]),
@@ -135,15 +147,17 @@ impl SystemMonitor {
                 );
                 if let Some(process) = self.sys.process(p) {
                     proc_cpu = process.cpu_usage();
-                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0; // Bytes to MB (assuming sysinfo returns bytes for process memory)
-                    // Record memory usage in metrics
+                    proc_mem = process.memory() as f32 / 1024.0 / 1024.0;
                     if let Some(m) = &self.metrics {
                         m.record_memory_usage(proc_mem as f64);
                     }
                 }
             }
+            let process_refresh = process_refresh_start.elapsed();
 
+            let gpu_query_start = Instant::now();
             let (gpu_load, vram_used, vram_total) = self.get_gpu_stats();
+            let gpu_query = gpu_query_start.elapsed();
 
             // Record GPU utilization in metrics
             if let Some(gl) = gpu_load {
@@ -164,14 +178,25 @@ impl SystemMonitor {
                 log_msg.push_str(&format!(" | VRAM: {:.2}GB / {:.2}GB", vu, vt));
             }
 
+            let logging_start = Instant::now();
             info!("{}", log_msg);
 
-            // Log individual core spikes if high
             for (i, cpu) in self.sys.cpus().iter().enumerate() {
                 let usage = cpu.cpu_usage();
                 if usage > 90.0 {
                     debug!("[MONITOR] CORE spiking: Core {} at {:.1}%", i, usage);
                 }
+            }
+            let logging = logging_start.elapsed();
+
+            if let Some(m) = &self.metrics {
+                m.record_monitor_stage_timings(crate::metrics::MonitorStageTimings {
+                    refresh_cpu,
+                    refresh_memory,
+                    process_refresh,
+                    gpu_query,
+                    logging,
+                });
             }
         }
     }

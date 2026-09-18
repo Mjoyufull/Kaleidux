@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +24,27 @@ pub enum SortingStrategy {
     Descending,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerformanceProfile {
+    Quality,
+    #[default]
+    Balanced,
+    LowPower,
+    Debug,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VideoFpsProfile {
+    Low,
+    Medium,
+    High,
+    #[default]
+    Unlimited,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutputConfig {
     pub path: Option<PathBuf>,
@@ -42,6 +62,15 @@ pub struct OutputConfig {
     #[serde(default = "default_layer")]
     pub layer: Layer,
     pub default_playlist: Option<String>,
+    #[serde(default)]
+    pub performance: PerformanceProfile,
+    pub video_fps: VideoFpsProfile,
+    #[serde(default)]
+    pub frame_latency: Option<u32>,
+    /// On Wayland, pace steady video through compositor frame callbacks so an
+    /// occluded background naturally holds its current frame.
+    #[serde(default)]
+    pub pause_on_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -103,9 +132,10 @@ struct RegexOutputOverride {
     config: PartialOutputConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalConfig {
+    #[serde(default)]
     pub monitor_behavior: MonitorBehavior,
     #[serde(default)]
     pub _custom_transitions: bool,
@@ -115,123 +145,52 @@ pub struct GlobalConfig {
     pub script_path: Option<PathBuf>,
     pub sorting: Option<SortingStrategy>,
     /// How often to tick Rhai scripts (in seconds), default 1
-    #[serde(default = "default_script_tick_interval")]
+    #[serde(
+        default = "default_script_tick_interval",
+        deserialize_with = "deserialize_script_tick_interval"
+    )]
     pub script_tick_interval: u64,
     pub default_playlist: Option<String>,
+    pub performance: Option<PerformanceProfile>,
+    pub video_fps: Option<VideoFpsProfile>,
+    pub frame_latency: Option<u32>,
+    pub pause_on_fullscreen: Option<bool>,
 }
 
 fn default_script_tick_interval() -> u64 {
     1
 }
 
-fn deserialize_optional_transition<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<crate::shaders::Transition>, D::Error>
+fn deserialize_script_tick_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
-    D: Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
-    let value = Option::<toml::Value>::deserialize(deserializer)?;
-    value
-        .map(parse_transition_value)
-        .transpose()
-        .map_err(serde::de::Error::custom)
+    let interval = u64::deserialize(deserializer)?;
+    if interval == 0 {
+        return Err(serde::de::Error::custom(
+            "script-tick-interval must be at least one second",
+        ));
+    }
+    Ok(interval)
 }
 
-fn parse_transition_value(value: toml::Value) -> Result<crate::shaders::Transition> {
-    if let Ok(transition) = value.clone().try_into::<crate::shaders::Transition>() {
-        return Ok(transition);
-    }
-
-    match value {
-        toml::Value::String(name) => {
-            let canonical = canonical_transition_tag(&name)
-                .ok_or_else(|| anyhow::anyhow!("unknown transition type `{}`", name))?;
-            let mut table = toml::map::Map::new();
-            table.insert("type".to_string(), toml::Value::String(canonical));
-            toml::Value::Table(table)
-                .try_into()
-                .map_err(|e| anyhow::anyhow!("failed to parse transition `{}`: {}", name, e))
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            monitor_behavior: MonitorBehavior::default(),
+            _custom_transitions: false,
+            video_ratio: None,
+            transition_time: None,
+            volume: None,
+            script_path: None,
+            sorting: None,
+            script_tick_interval: default_script_tick_interval(),
+            default_playlist: None,
+            performance: None,
+            video_fps: None,
+            frame_latency: None,
+            pause_on_fullscreen: None,
         }
-        toml::Value::Table(mut table) => {
-            if let Some(raw_type) = table.remove("type") {
-                let type_name = raw_type.as_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "transition.type must be a string, got {}",
-                        raw_type.type_str()
-                    )
-                })?;
-                let canonical = canonical_transition_tag(type_name)
-                    .ok_or_else(|| anyhow::anyhow!("unknown transition type `{}`", type_name))?;
-                table.insert("type".to_string(), toml::Value::String(canonical));
-                toml::Value::Table(table).try_into().map_err(|e| {
-                    anyhow::anyhow!("failed to parse transition `{}`: {}", type_name, e)
-                })
-            } else if table.len() == 1 {
-                let (legacy_name, legacy_value) = table.into_iter().next().unwrap();
-                let canonical = canonical_transition_tag(&legacy_name)
-                    .ok_or_else(|| anyhow::anyhow!("unknown transition type `{}`", legacy_name))?;
-                let mut canonical_table = match legacy_value {
-                    toml::Value::Table(inner) => inner,
-                    other => {
-                        return Err(anyhow::anyhow!(
-                            "legacy transition `{}` must contain a table of params, got {}",
-                            legacy_name,
-                            other.type_str()
-                        ));
-                    }
-                };
-                canonical_table.insert("type".to_string(), toml::Value::String(canonical));
-                toml::Value::Table(canonical_table).try_into().map_err(|e| {
-                    anyhow::anyhow!("failed to parse legacy transition `{}`: {}", legacy_name, e)
-                })
-            } else {
-                Err(anyhow::anyhow!(
-                    "transition table must use `type = ...` or legacy `{{ name = {{ ... }} }}` syntax"
-                ))
-            }
-        }
-        other => Err(anyhow::anyhow!(
-            "transition must be a string or table, got {}",
-            other.type_str()
-        )),
-    }
-}
-
-fn canonical_transition_tag(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.eq_ignore_ascii_case("custom") {
-        return Some("custom".to_string());
-    }
-
-    let mut direct = toml::map::Map::new();
-    direct.insert("type".to_string(), toml::Value::String(trimmed.to_string()));
-    if toml::Value::Table(direct)
-        .try_into::<crate::shaders::Transition>()
-        .is_ok()
-    {
-        return Some(trimmed.to_string());
-    }
-
-    let normalized = trimmed.to_ascii_lowercase().replace([' ', '_'], "-");
-    if normalized == "fade" {
-        return Some("Fade".to_string());
-    }
-
-    let transition = crate::shaders::Transition::from_name(trimmed);
-    let canonical = serde_json::to_value(&transition)
-        .ok()?
-        .get("type")?
-        .as_str()?
-        .to_string();
-
-    if canonical == "Fade" && normalized != "fade" {
-        None
-    } else {
-        Some(canonical)
     }
 }
 
@@ -242,13 +201,20 @@ pub struct PartialOutputConfig {
     #[serde(with = "humantime_serde", default)]
     pub duration: Option<Duration>,
     pub video_ratio: Option<u8>,
-    #[serde(default, deserialize_with = "deserialize_optional_transition")]
+    #[serde(
+        default,
+        deserialize_with = "transition_config::deserialize_optional_transition"
+    )]
     pub transition: Option<crate::shaders::Transition>,
     pub transition_time: Option<u32>,
     pub volume: Option<u8>,
     pub sorting: Option<SortingStrategy>,
     pub layer: Option<Layer>,
     pub default_playlist: Option<String>,
+    pub performance: Option<PerformanceProfile>,
+    pub video_fps: Option<VideoFpsProfile>,
+    pub frame_latency: Option<u32>,
+    pub pause_on_fullscreen: Option<bool>,
 }
 
 impl Config {
@@ -318,19 +284,17 @@ impl Config {
             toml::from_str(content).with_context(|| "Failed to parse config TOML")?;
 
         let global: GlobalConfig = if let Some(v) = table.get("global") {
-            v.clone().try_into().unwrap_or_else(|e| {
-                tracing::error!("Failed to parse [global] config section: {}", e);
-                GlobalConfig::default()
-            })
+            v.clone()
+                .try_into()
+                .with_context(|| "Failed to parse [global] config section")?
         } else {
             GlobalConfig::default()
         };
 
         let any: PartialOutputConfig = if let Some(v) = table.get("any") {
-            v.clone().try_into().unwrap_or_else(|e| {
-                tracing::error!("Failed to parse [any] config section: {}", e);
-                PartialOutputConfig::default()
-            })
+            v.clone()
+                .try_into()
+                .with_context(|| "Failed to parse [any] config section")?
         } else {
             PartialOutputConfig::default()
         };
@@ -394,6 +358,10 @@ impl Config {
             sorting: self.global.sorting,
             layer: None,
             default_playlist: self.global.default_playlist.clone(),
+            performance: self.global.performance,
+            video_fps: self.global.video_fps,
+            frame_latency: self.global.frame_latency,
+            pause_on_fullscreen: self.global.pause_on_fullscreen,
         };
 
         // 2. Merge [any] fallback
@@ -443,9 +411,22 @@ impl PartialOutputConfig {
         if other.default_playlist.is_some() {
             self.default_playlist = other.default_playlist.clone();
         }
+        if other.performance.is_some() {
+            self.performance = other.performance;
+        }
+        if other.video_fps.is_some() {
+            self.video_fps = other.video_fps;
+        }
+        if other.frame_latency.is_some() {
+            self.frame_latency = other.frame_latency;
+        }
+        if other.pause_on_fullscreen.is_some() {
+            self.pause_on_fullscreen = other.pause_on_fullscreen;
+        }
     }
 
     fn into_output_config(self) -> OutputConfig {
+        let performance = self.performance.unwrap_or_default();
         OutputConfig {
             path: self.path,
             duration: self.duration.unwrap_or_else(default_duration),
@@ -456,162 +437,24 @@ impl PartialOutputConfig {
             sorting: self.sorting.unwrap_or_default(),
             layer: self.layer.unwrap_or_default(),
             default_playlist: self.default_playlist,
+            performance,
+            video_fps: self.video_fps.unwrap_or(match performance {
+                PerformanceProfile::LowPower => VideoFpsProfile::Low,
+                PerformanceProfile::Quality
+                | PerformanceProfile::Balanced
+                | PerformanceProfile::Debug => VideoFpsProfile::Unlimited,
+            }),
+            frame_latency: self.frame_latency.or(match performance {
+                PerformanceProfile::LowPower => Some(1),
+                PerformanceProfile::Quality => Some(2),
+                PerformanceProfile::Balanced | PerformanceProfile::Debug => None,
+            }),
+            pause_on_fullscreen: self.pause_on_fullscreen.unwrap_or(false),
         }
     }
 }
 
+mod transition_config;
+
 #[cfg(test)]
-mod tests {
-    use super::{Config, MonitorBehavior, PartialOutputConfig, SortingStrategy};
-    use crate::shaders::Transition;
-
-    #[test]
-    fn parses_legacy_nested_transition_tables() {
-        let cfg: PartialOutputConfig = toml::from_str(
-            r#"
-            transition = { hexagonalize = { steps = 50, horizontal_hexagons = 20.0 } }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            cfg.transition,
-            Some(Transition::Hexagonalize {
-                steps: 50,
-                horizontal_hexagons: 20.0,
-            })
-        );
-    }
-
-    #[test]
-    fn parses_simple_transition_strings() {
-        let cfg: PartialOutputConfig = toml::from_str(
-            r#"
-            transition = "crosszoom"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            cfg.transition,
-            Some(Transition::CrossZoom { strength: 0.4 })
-        );
-    }
-
-    #[test]
-    fn parses_tagged_transition_aliases() {
-        let cfg: PartialOutputConfig = toml::from_str(
-            r#"
-            transition = { type = "randomsquares", size = [8, 8], smoothness = 0.25 }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            cfg.transition,
-            Some(Transition::RandomSquares {
-                size: [8, 8],
-                smoothness: 0.25,
-            })
-        );
-    }
-
-    #[test]
-    fn parses_grouped_monitor_behavior_from_global() {
-        let cfg = Config::parse_str(
-            r#"
-            [global]
-            monitor-behavior = { grouped = [["DP-2", "DP-3"], ["HDMI-A-1"]] }
-
-            [any]
-            path = "/tmp/walls"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            cfg.global.monitor_behavior,
-            MonitorBehavior::Grouped(vec![
-                vec!["DP-2".to_string(), "DP-3".to_string()],
-                vec!["HDMI-A-1".to_string()],
-            ])
-        );
-    }
-
-    #[test]
-    fn merges_global_any_regex_and_specific_output_configs() {
-        let cfg = Config::parse_str(
-            r#"
-            [global]
-            monitor-behavior = "independent"
-            volume = 10
-            transition-time = 400
-            sorting = "ascending"
-
-            [any]
-            path = "/tmp/any"
-            duration = "45s"
-            transition = "fade"
-
-            ["re:Primary.*"]
-            path = "/tmp/regex"
-            volume = 20
-            transition = "circleopen"
-
-            [DP-2]
-            path = "/tmp/specific"
-            volume = 30
-            transition = "crosszoom"
-            sorting = "descending"
-            "#,
-        )
-        .unwrap();
-
-        let specific = cfg.get_config_for_output("DP-2", "Primary Display");
-        assert_eq!(
-            specific.path.unwrap(),
-            std::path::PathBuf::from("/tmp/specific")
-        );
-        assert_eq!(specific.volume, 30);
-        assert_eq!(specific.transition, Transition::CrossZoom { strength: 0.4 });
-        assert_eq!(specific.transition_time, 400);
-        assert_eq!(specific.sorting, SortingStrategy::Descending);
-
-        let regex = cfg.get_config_for_output("HDMI-A-1", "Primary Display");
-        assert_eq!(regex.path.unwrap(), std::path::PathBuf::from("/tmp/regex"));
-        assert_eq!(regex.volume, 20);
-        assert_eq!(
-            regex.transition,
-            Transition::CircleOpen {
-                smoothness: 0.3,
-                opening: true,
-            }
-        );
-        assert_eq!(regex.transition_time, 400);
-        assert_eq!(regex.sorting, SortingStrategy::Ascending);
-
-        let fallback = cfg.get_config_for_output("DP-3", "Side Display");
-        assert_eq!(fallback.path.unwrap(), std::path::PathBuf::from("/tmp/any"));
-        assert_eq!(fallback.volume, 10);
-        assert_eq!(fallback.transition, Transition::Fade);
-        assert_eq!(fallback.transition_time, 400);
-        assert_eq!(fallback.sorting, SortingStrategy::Ascending);
-    }
-
-    #[test]
-    fn regex_output_matching_is_lexicographically_deterministic() {
-        let cfg = Config::parse_str(
-            r#"
-            ["re:Primary.*"]
-            volume = 40
-
-            ["re:P.*"]
-            volume = 25
-            "#,
-        )
-        .unwrap();
-
-        let matched = cfg.get_config_for_output("HDMI-A-1", "Primary Display");
-        assert_eq!(matched.volume, 25);
-    }
-}
+mod tests;
