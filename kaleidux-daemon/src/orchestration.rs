@@ -284,19 +284,17 @@ impl Config {
             toml::from_str(content).with_context(|| "Failed to parse config TOML")?;
 
         let global: GlobalConfig = if let Some(v) = table.get("global") {
-            v.clone().try_into().unwrap_or_else(|e| {
-                tracing::error!("Failed to parse [global] config section: {}", e);
-                GlobalConfig::default()
-            })
+            v.clone()
+                .try_into()
+                .with_context(|| "Failed to parse [global] config section")?
         } else {
             GlobalConfig::default()
         };
 
         let any: PartialOutputConfig = if let Some(v) = table.get("any") {
-            v.clone().try_into().unwrap_or_else(|e| {
-                tracing::error!("Failed to parse [any] config section: {}", e);
-                PartialOutputConfig::default()
-            })
+            v.clone()
+                .try_into()
+                .with_context(|| "Failed to parse [any] config section")?
         } else {
             PartialOutputConfig::default()
         };
