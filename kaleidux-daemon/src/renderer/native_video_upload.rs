@@ -339,30 +339,55 @@ impl super::Renderer {
     }
 
     pub(super) fn snapshot_yuv_for_transition(&mut self) {
-        let native_direct = self.active_yuv_source.is_some_and(|source| {
-            source.format == super::YuvFormat::Nv12
-                && source.origin == super::YuvOrigin::NativeDmaBuf
-        });
-        if !native_direct
-            && let Some(frame) = self.native_wayland_snapshot_frame.take()
+        // Steady native presentation bypasses WGPU, so its staging planes may
+        // contain an old transition frame and its RGBA texture may be absent.
+        // Import the retained, last-presented frame before tearing down video.
+        if let Some(frame) = self.native_wayland_snapshot_frame.take()
             && let crate::video::VideoFrameFormat::NativeDmaBufNv12 { frame: descriptor } =
                 &frame.format
-            && let Some(output) = self.current_texture.take()
         {
-            let _ = self.upload_frame_native_dmabuf_nv12(
+            let (width, height) = super::compute_cover_target_dimensions(
+                frame.width,
+                frame.height,
+                self.config.width.max(1),
+                self.config.height.max(1),
+            );
+            let output = self.ctx.get_texture_from_pool(
+                width,
+                height,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                self.metrics.as_deref(),
+            );
+            self.write_yuv_uniforms(frame.color, frame.geometry);
+            if self.upload_frame_native_dmabuf_nv12(
                 &frame,
                 &output,
                 frame.width,
                 frame.height,
                 descriptor,
                 super::YuvOrigin::NativeDmaBuf,
-            );
-            self.current_texture = Some(output);
-        }
-        if !native_direct {
-            if self.active_yuv_source.is_none() {
+            ) {
+                self.render_nv12_to_rgba(&output, "Native Last-Presented Snapshot");
+                if let Some(old) = self.current_texture.take() {
+                    let (old_width, old_height) = (old.width(), old.height());
+                    self.ctx.return_texture_to_pool(old, old_width, old_height);
+                }
+                self.current_texture_view =
+                    Some(output.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Native Outgoing Snapshot View"),
+                        format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                        ..Default::default()
+                    }));
+                self.current_texture = Some(output);
+                self.current_texture_size = Some((width, height));
+                self.current_aspect = width as f32 / height as f32;
+                self.active_yuv_source = None;
                 return;
             }
+            // Import failure must never promote an uninitialized pool texture.
+            self.ctx.return_texture_to_pool(output, width, height);
         }
         let Some(source) = self.active_yuv_source else {
             return;
@@ -389,7 +414,10 @@ impl super::Renderer {
             format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
             ..Default::default()
         }));
-        self.current_texture = Some(texture);
+        if let Some(old) = self.current_texture.replace(texture) {
+            let (old_width, old_height) = (old.width(), old.height());
+            self.ctx.return_texture_to_pool(old, old_width, old_height);
+        }
         self.current_texture_size = Some((width, height));
         self.current_aspect = width as f32 / height as f32;
         self.active_yuv_source = None;
