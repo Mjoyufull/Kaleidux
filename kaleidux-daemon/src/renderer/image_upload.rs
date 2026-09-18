@@ -88,7 +88,7 @@ impl super::Renderer {
         self.blit_source_is_composition = false;
         self.blit_source_is_prev = false;
 
-        if self.prev_texture.is_some() {
+        if self.has_previous_texture() {
             self.transition_start_time = None;
             self.transition_progress = 0.0;
             self.transition_active = true;

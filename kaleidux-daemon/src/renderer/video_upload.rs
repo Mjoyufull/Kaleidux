@@ -487,7 +487,7 @@ impl super::Renderer {
         // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
     }
 
-    fn has_previous_texture(&self) -> bool {
+    pub(super) fn has_previous_texture(&self) -> bool {
         self.prev_texture.is_some() || self.has_prev_external_texture_for_video()
     }
 
