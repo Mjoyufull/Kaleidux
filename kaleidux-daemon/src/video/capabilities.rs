@@ -128,6 +128,9 @@ pub fn get_video_backend_request() -> VideoBackendRequest {
 pub fn resolve_video_backend_request(request: VideoBackendRequest) -> VideoBackendRequest {
     match request {
         VideoBackendRequest::Auto => match get_video_backend_request() {
+            VideoBackendRequest::Auto if get_video_mode() != VideoMode::Auto => {
+                VideoBackendRequest::ForceAppsink
+            }
             VideoBackendRequest::Auto => default_video_backend_request(),
             selected => selected,
         },
@@ -145,6 +148,19 @@ pub fn default_video_backend_request() -> VideoBackendRequest {
     } else {
         VideoBackendRequest::Auto
     }
+}
+
+pub fn validate_video_mode_backend(
+    mode: VideoMode,
+    backend: VideoBackendRequest,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        mode == VideoMode::Auto
+            || (backend == VideoBackendRequest::ForceAppsink && video_backend_is_enabled(backend)),
+        "--video-mode {} requires --video-backend appsink (Cargo feature backend-appsink); use --video-mode auto with FFmpeg or mpv",
+        mode.cli_label()
+    );
+    Ok(())
 }
 
 pub fn video_backend_is_enabled(request: VideoBackendRequest) -> bool {
@@ -472,7 +488,7 @@ pub fn configure_hw_decoders() {
 mod tests {
     use super::{
         VideoBackendRequest, VideoCapabilities, VideoMode, build_video_sink_caps,
-        default_video_backend_request,
+        default_video_backend_request, validate_video_mode_backend,
     };
     use gstreamer as gst;
     use gstreamer_allocators as gst_alloc;
@@ -489,6 +505,27 @@ mod tests {
             VideoBackendRequest::Auto
         };
         assert_eq!(default_video_backend_request(), expected);
+    }
+
+    #[test]
+    fn explicit_decode_modes_are_not_silently_ignored() {
+        for mode in [
+            VideoMode::ForceCpu,
+            VideoMode::StrictCuda,
+            VideoMode::ForceDmaBuf,
+            VideoMode::ForceNv12,
+            VideoMode::ForceRgba,
+        ] {
+            assert!(validate_video_mode_backend(mode, VideoBackendRequest::ForceFfmpeg).is_err());
+            assert!(validate_video_mode_backend(mode, VideoBackendRequest::ForceMpv).is_err());
+            assert_eq!(
+                validate_video_mode_backend(mode, VideoBackendRequest::ForceAppsink).is_ok(),
+                cfg!(feature = "backend-appsink")
+            );
+        }
+        assert!(
+            validate_video_mode_backend(VideoMode::Auto, VideoBackendRequest::ForceFfmpeg).is_ok()
+        );
     }
 
     #[test]

@@ -16,7 +16,8 @@ pub use capabilities::{
     enabled_video_backend_labels, get_video_backend_request, get_video_mode,
     mpv_backend_is_explicitly_forced, p010_sampling_supported, refresh_video_capabilities,
     resolve_video_backend_request, set_p010_sampling_supported, set_video_backend_request,
-    set_video_mode, validate_selected_video_mode, video_backend_feature, video_backend_is_enabled,
+    set_video_mode, validate_selected_video_mode, validate_video_mode_backend,
+    video_backend_feature, video_backend_is_enabled,
 };
 use capabilities::{build_video_sink_caps, is_nvcodec_decoder_factory};
 
@@ -262,6 +263,7 @@ impl VideoPlayer {
     ) -> anyhow::Result<Self> {
         let creation_start = std::time::Instant::now();
         let mut resolved_backend_request = resolve_video_backend_request(backend_request);
+        capabilities::validate_video_mode_backend(get_video_mode(), resolved_backend_request)?;
         let backend_is_explicitly_forced = backend_request != VideoBackendRequest::Auto
             || get_video_backend_request() != VideoBackendRequest::Auto;
         if !video_backend_is_enabled(resolved_backend_request) {
