@@ -1,0 +1,398 @@
+use crate::image::types::{
+    DecodedImagePayload, DecodedSourceImage, DecodedSourcePixels, ImageLoadProfile,
+};
+use std::io::Read;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+
+const MAX_DECODED_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn read_encoded_source(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_DECODED_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_DECODED_SOURCE_BYTES,
+        "encoded image exceeds 512 MiB safety limit: {}",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+fn validate_source_dimensions(path: &Path, width: u32, height: u32) -> anyhow::Result<()> {
+    let decoded_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("image dimensions overflow for {}", path.display()))?;
+    if width == 0 || height == 0 {
+        anyhow::bail!("image has zero dimensions: {}", path.display());
+    }
+    if decoded_bytes > MAX_DECODED_SOURCE_BYTES {
+        anyhow::bail!(
+            "image decoded size exceeds {} MiB safety limit: {}x{} ({})",
+            MAX_DECODED_SOURCE_BYTES / (1024 * 1024),
+            width,
+            height,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> String {
+    let label = match format {
+        Some(image::ImageFormat::Avif) => "avif",
+        Some(image::ImageFormat::Bmp) => "bmp",
+        Some(image::ImageFormat::Gif) => "gif",
+        Some(image::ImageFormat::Hdr) => "hdr",
+        Some(image::ImageFormat::Ico) => "ico",
+        Some(image::ImageFormat::Jpeg) => "jpeg",
+        Some(image::ImageFormat::OpenExr) => "openexr",
+        Some(image::ImageFormat::Png) => "png",
+        Some(image::ImageFormat::Pnm) => "pnm",
+        Some(image::ImageFormat::Qoi) => "qoi",
+        Some(image::ImageFormat::Tga) => "tga",
+        Some(image::ImageFormat::Tiff) => "tiff",
+        Some(image::ImageFormat::WebP) => "webp",
+        Some(image::ImageFormat::Dds) => "dds",
+        Some(image::ImageFormat::Farbfeld) => "farbfeld",
+        _ => "unknown",
+    };
+
+    if fast_path {
+        format!("{}-fast", label)
+    } else {
+        label.to_string()
+    }
+}
+
+fn decode_jpeg_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
+    let decode_start = Instant::now();
+    let encoded = read_encoded_source(path)?;
+    let options = DecoderOptions::new_fast()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(encoded.as_slice()), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("jpeg header decode failed: {}", e))?;
+    let (source_width, source_height) = decoder
+        .dimensions()
+        .ok_or_else(|| anyhow::anyhow!("jpeg dimensions missing after header decode"))?;
+    let source_width =
+        u32::try_from(source_width).map_err(|_| anyhow::anyhow!("jpeg width is too large"))?;
+    let source_height =
+        u32::try_from(source_height).map_err(|_| anyhow::anyhow!("jpeg height is too large"))?;
+    validate_source_dimensions(path, source_width, source_height)?;
+    log_decode_time_downscale_status(path, source_width, source_height);
+    let decoded = decoder
+        .decode()
+        .map_err(|e| anyhow::anyhow!("jpeg decode failed: {}", e))?;
+    Ok(DecodedSourceImage {
+        pixels: DecodedSourcePixels::Rgb(decoded.into()),
+        width: source_width,
+        height: source_height,
+        format: "jpeg-fast".to_string(),
+        decode: decode_start.elapsed(),
+        convert: Duration::ZERO,
+    })
+}
+
+fn log_decode_time_downscale_status(path: &Path, source_width: u32, source_height: u32) {
+    let max_dimension = crate::image::prepare::MAX_IMAGE_UPLOAD_DIMENSION;
+    if source_width <= max_dimension && source_height <= max_dimension {
+        return;
+    }
+
+    debug!(
+        "[IMAGE-CACHE] decode_downscale_unavailable path={} source={}x{} max_upload_dimension={} decoder=zune-jpeg reason=no_scaled_decode_api_in_current_dependency",
+        path.display(),
+        source_width,
+        source_height,
+        max_dimension
+    );
+}
+
+fn decode_png_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
+    let decode_start = Instant::now();
+    let encoded = read_encoded_source(path)?;
+    let options = DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .png_set_strip_to_8bit(true);
+    let mut decoder =
+        zune_png::PngDecoder::new_with_options(ZCursor::new(encoded.as_slice()), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow::anyhow!("png header decode failed: {}", e))?;
+    let (source_width, source_height) = decoder
+        .dimensions()
+        .ok_or_else(|| anyhow::anyhow!("png dimensions missing after header decode"))?;
+    let source_width =
+        u32::try_from(source_width).map_err(|_| anyhow::anyhow!("png width is too large"))?;
+    let source_height =
+        u32::try_from(source_height).map_err(|_| anyhow::anyhow!("png height is too large"))?;
+    validate_source_dimensions(path, source_width, source_height)?;
+    let colorspace = decoder
+        .colorspace()
+        .ok_or_else(|| anyhow::anyhow!("png colorspace missing after header decode"))?;
+    let decoded = decoder
+        .decode_raw()
+        .map_err(|e| anyhow::anyhow!("png decode failed: {}", e))?;
+
+    let pixels = match colorspace {
+        ColorSpace::RGB => DecodedSourcePixels::Rgb(decoded.into()),
+        ColorSpace::RGBA => DecodedSourcePixels::Rgba(decoded.into()),
+        ColorSpace::Luma => DecodedSourcePixels::Luma(decoded.into()),
+        ColorSpace::LumaA => DecodedSourcePixels::LumaA(decoded.into()),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported fast png colorspace {:?} for {}",
+                other,
+                path.display()
+            ));
+        }
+    };
+
+    Ok(DecodedSourceImage {
+        pixels,
+        width: source_width,
+        height: source_height,
+        format: "png-fast".to_string(),
+        decode: decode_start.elapsed(),
+        convert: Duration::ZERO,
+    })
+}
+
+fn decode_source_generic(
+    path: &Path,
+    format: Option<image::ImageFormat>,
+) -> anyhow::Result<DecodedSourceImage> {
+    let decode_start = Instant::now();
+    let (header_width, header_height) = image::image_dimensions(path)?;
+    validate_source_dimensions(path, header_width, header_height)?;
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_SOURCE_BYTES);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    let decode_duration = decode_start.elapsed();
+    let source_width = image.width();
+    let source_height = image.height();
+
+    if image.has_alpha() {
+        let convert_start = Instant::now();
+        let rgba = image.into_rgba8().into_raw();
+        return Ok(DecodedSourceImage {
+            pixels: DecodedSourcePixels::Rgba(rgba.into()),
+            width: source_width,
+            height: source_height,
+            format: image_format_label(format, false),
+            decode: decode_duration,
+            convert: convert_start.elapsed(),
+        });
+    }
+
+    let convert_start = Instant::now();
+    let rgb = image.into_rgb8().into_raw();
+    Ok(DecodedSourceImage {
+        pixels: DecodedSourcePixels::Rgb(rgb.into()),
+        width: source_width,
+        height: source_height,
+        format: image_format_label(format, false),
+        decode: decode_duration,
+        convert: convert_start.elapsed(),
+    })
+}
+
+pub(crate) fn decode_source_image(path: &Path) -> anyhow::Result<DecodedSourceImage> {
+    let format = image::ImageFormat::from_path(path).ok();
+    match format {
+        Some(image::ImageFormat::Jpeg) => match decode_jpeg_source_fast(path) {
+            Ok(source) => Ok(source),
+            Err(e) => {
+                warn!(
+                    "[ASSET] {}: Fast JPEG decode failed, falling back to generic image path: {}",
+                    path.display(),
+                    e
+                );
+                decode_source_generic(path, format)
+            }
+        },
+        Some(image::ImageFormat::Png) => match decode_png_source_fast(path) {
+            Ok(source) => Ok(source),
+            Err(e) => {
+                warn!(
+                    "[ASSET] {}: Fast PNG decode failed, falling back to generic image path: {}",
+                    path.display(),
+                    e
+                );
+                decode_source_generic(path, format)
+            }
+        },
+        _ => decode_source_generic(path, format),
+    }
+}
+
+pub(crate) fn prepare_source_image_for_output(
+    source: &DecodedSourceImage,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<DecodedImagePayload> {
+    let (data, width, height, resize_duration, expand_duration, resize_filter): (
+        std::sync::Arc<[u8]>,
+        u32,
+        u32,
+        Duration,
+        Duration,
+        Option<String>,
+    ) = match &source.pixels {
+        DecodedSourcePixels::Rgb(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_rgb_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+        DecodedSourcePixels::Rgba(pixels) => {
+            if crate::image::prepare::compute_upload_downscale_dimensions(
+                source.width,
+                source.height,
+                target_width,
+                target_height,
+            )
+            .is_none()
+            {
+                // The decoded source is already upload-ready RGBA. Keep the
+                // same allocation through prepared-cache publication and
+                // the image channel instead of cloning every pixel.
+                return Ok(DecodedImagePayload {
+                    data: pixels.clone(),
+                    width: source.width,
+                    height: source.height,
+                    profile: ImageLoadProfile {
+                        format: source.format.clone(),
+                        source_width: source.width,
+                        source_height: source.height,
+                        permit_wait: Duration::ZERO,
+                        decode: source.decode,
+                        convert: source.convert,
+                        resize: Duration::ZERO,
+                        expand: Duration::ZERO,
+                        resize_filter: None,
+                    },
+                });
+            }
+            let (prepared, width, height, resize_duration, resize_filter) =
+                crate::image::prepare::prepare_rgba_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (
+                prepared.into(),
+                width,
+                height,
+                resize_duration,
+                Duration::ZERO,
+                resize_filter,
+            )
+        }
+        DecodedSourcePixels::Luma(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_luma_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+        DecodedSourcePixels::LumaA(pixels) => {
+            let (data, width, height, resize, expand, filter) =
+                crate::image::prepare::prepare_lumaa_image(
+                    pixels,
+                    source.width,
+                    source.height,
+                    target_width,
+                    target_height,
+                )?;
+            (data.into(), width, height, resize, expand, filter)
+        }
+    };
+
+    Ok(DecodedImagePayload {
+        data,
+        width,
+        height,
+        profile: ImageLoadProfile {
+            format: source.format.clone(),
+            source_width: source.width,
+            source_height: source.height,
+            permit_wait: Duration::ZERO,
+            decode: source.decode,
+            convert: source.convert,
+            resize: resize_duration,
+            expand: expand_duration,
+            resize_filter,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_rgba_prepare_reuses_source_allocation() {
+        let pixels: std::sync::Arc<[u8]> = vec![1_u8; 4 * 4 * 4].into();
+        let source = DecodedSourceImage {
+            pixels: DecodedSourcePixels::Rgba(pixels.clone()),
+            width: 4,
+            height: 4,
+            format: "test-rgba".to_string(),
+            decode: Duration::ZERO,
+            convert: Duration::ZERO,
+        };
+
+        let prepared = prepare_source_image_for_output(&source, 8, 8)
+            .expect("unchanged RGBA preparation should succeed");
+
+        assert!(std::sync::Arc::ptr_eq(&pixels, &prepared.data));
+    }
+
+    #[test]
+    fn decoded_source_size_is_bounded_before_allocation() {
+        let path = Path::new("oversized.png");
+        assert!(validate_source_dimensions(path, 8_192, 8_192).is_ok());
+        let error = validate_source_dimensions(path, 65_535, 65_535)
+            .expect_err("decompression-bomb dimensions must be rejected");
+        assert!(error.to_string().contains("safety limit"));
+        assert!(validate_source_dimensions(path, 0, 1).is_err());
+    }
+}
+
+pub(crate) fn prepare_image_for_output_uncached(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<DecodedImagePayload> {
+    let source = decode_source_image(path)?;
+    prepare_source_image_for_output(&source, target_width, target_height)
+}

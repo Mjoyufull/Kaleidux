@@ -138,6 +138,10 @@ enum Commands {
         command: BlacklistSubcommand,
     },
 
+    /// Dump current performance counters from the daemon
+    #[command(name = "perf-snapshot")]
+    PerfSnapshot,
+
     /// Show recently played wallpapers
     History {
         /// Target output (omit for default/all)
@@ -242,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             BlacklistSubcommand::List => kaleidux_common::BlacklistCommand::List,
         }),
         Commands::History { output } => Request::History { output },
+        Commands::PerfSnapshot => Request::PerfSnapshot,
     };
 
     // Determine socket path (use provided or default)
@@ -315,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
                                 println!(" {:>2}. {}", i + 1, path);
                             }
                         }
+                        Response::PerfSnapshot(snapshot) => println!("{}", snapshot),
                     }
                 } else {
                     println!("{}", response);

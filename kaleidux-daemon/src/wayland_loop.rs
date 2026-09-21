@@ -3,16 +3,15 @@
 //! Contains surface creation, Wayland event polling, frame callback rendering,
 //! and connection error recovery. All shared logic lives in `main_loop::MainLoopContext`.
 
-use crate::background::{self, BackgroundWorkKind};
-use crate::main_loop::{MainLoopContext, stop_video_player_in_background};
+use crate::main_loop::MainLoopContext;
+use crate::observability::wake::{DeadlineReason, WakeReason};
 use crate::orchestration;
 use crate::renderer;
+use crate::wayland::{frame_callbacks, startup};
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tracing::{error, info, warn};
 use wayland_client::{Connection, globals::registry_queue_init};
 
 pub async fn run(
@@ -28,308 +27,22 @@ pub async fn run(
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
     let mut backend = crate::wayland::WaylandBackend::new(&globals, &qh)?;
+    let mut pending_renderer_adds = HashMap::new();
+    let mut renderer_retries = crate::renderer_retry::RendererRetryBackoff::default();
 
     event_queue.roundtrip(&mut backend)?;
 
-    let mut initial_surface: Option<wgpu::Surface<'static>> = None;
-
-    let display_ptr = {
-        let backend_ref = conn.backend();
-        backend_ref.display_ptr() as *mut std::ffi::c_void
-    };
-
-    // Phase 1: Collect all output info (fast, no IO)
-    let mut output_infos: Vec<(
-        String,
-        String,
-        wayland_client::protocol::wl_output::WlOutput,
-    )> = Vec::new();
-    let outputs: Vec<_> = backend.output_state.outputs().collect();
-    for output in outputs {
-        let info = match backend.output_state.info(&output) {
-            Some(i) => i,
-            None => continue,
-        };
-        let name = info.name.as_deref().unwrap_or("unknown").to_string();
-        let description = info.description.as_deref().unwrap_or("unknown").to_string();
-        info!("Found output: {} ({})", name, description);
-        output_infos.push((name, description, output));
-    }
-
-    // Phase 2: Initialize all outputs (monitor_manager reuses cached file lists)
-    for (name, description, _) in &output_infos {
-        ctx.monitor_manager.add_output(name, description).await;
-    }
-
-    // Phase 3: Create Wayland surfaces (fast, no IO)
-    let mut surface_infos = Vec::new();
-    for (name, _description, output) in &output_infos {
-        let output_config = match ctx.monitor_manager.get_output_config(name) {
-            Some(cfg) => cfg,
-            None => continue,
-        };
-
-        let layer_surface = backend.create_wallpaper_surface(
-            output,
-            &qh,
-            name.clone(),
-            output_config.layer.clone().into(),
-        )?;
-
-        let raw_handle_surface = crate::wayland::RawHandleSurface {
-            layer_surface,
-            display_ptr,
-        };
-        let surface_arc = Arc::new(raw_handle_surface);
-        surface_infos.push((name.clone(), surface_arc));
-    }
-
-    // Phase 4: Initialize WGPU + renderers
-    if let Some((_, first_surface_arc)) = surface_infos.first() {
-        info!("Initializing WGPU context with first surface as compatible...");
-        let wgpu_start = Instant::now();
-        let mut last_error = None;
-        let mut init_result = None;
-        for attempt in 1..=3 {
-            match renderer::WgpuContext::with_surface(first_surface_arc.clone()).await {
-                Ok(result) => {
-                    init_result = Some(result);
-                    break;
-                }
-                Err(e) => {
-                    let error_text = e.to_string();
-                    warn!(
-                        "[STARTUP] WGPU initialization attempt {attempt}/3 failed: {}",
-                        error_text
-                    );
-                    last_error = Some(e);
-                    if !error_text.to_ascii_lowercase().contains("device is lost") || attempt == 3 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-        }
-        let (wgpu_ctx, surface) = match init_result {
-            Some(result) => result,
-            None => return Err(last_error.expect("wgpu init retry loop must capture an error")),
-        };
-        let wgpu_duration = wgpu_start.elapsed();
-        ctx.metrics.record_wgpu_init(wgpu_duration);
-        let adapter_name = wgpu_ctx.adapter.get_info().name.clone();
-        ctx.wgpu_ctx = Some(wgpu_ctx);
-        initial_surface = Some(surface);
-        info!("WGPU initialized on GPU: {:?}", adapter_name);
-    }
-
-    match ctx.wgpu_ctx.clone() {
-        Some(wgpu_ctx) => {
-            let first_name = surface_infos.first().map(|(n, _)| n.clone());
-
-            for (name, surface_arc) in surface_infos {
-                let ctx_clone = wgpu_ctx.clone();
-                let is_first = Some(&name) == first_name.as_ref();
-                let init_surf = if is_first {
-                    initial_surface.take()
-                } else {
-                    None
-                };
-
-                let metrics_clone = ctx.metrics.clone();
-
-                info!("[STARTUP] Initializing renderer for {}", name);
-
-                let name_for_bg = name.clone();
-                let Some(spawn_handler) = background::spawn_blocking_tracked(
-                    BackgroundWorkKind::RendererInit,
-                    move || {
-                        renderer::Renderer::new(
-                            name_for_bg,
-                            ctx_clone,
-                            surface_arc,
-                            init_surf,
-                            Some(metrics_clone),
-                        )
-                    },
-                ) else {
-                    error!(
-                        "[STARTUP] Renderer initialization skipped for {}: shutdown in progress",
-                        name
-                    );
-                    continue;
-                };
-
-                match tokio::time::timeout(std::time::Duration::from_secs(5), spawn_handler).await {
-                    Ok(join_res) => match join_res {
-                        Ok(render_res) => match render_res {
-                            Ok(mut r) => {
-                                if let Some(output_config) =
-                                    ctx.monitor_manager.get_output_config(&name)
-                                {
-                                    r.apply_config(output_config);
-                                }
-                                ctx.renderers.insert(name.clone(), r);
-                                info!("[STARTUP] Renderer initialized successfully for {}", name);
-                            }
-                            Err(e) => {
-                                error!("Failed to create renderer for output {}: {}", name, e);
-                                ctx.metrics.record_error("renderer_creation");
-                            }
-                        },
-                        Err(e) => {
-                            error!("Thread join error for output {}: {}", name, e);
-                            ctx.metrics.record_error("renderer_thread_error");
-                        }
-                    },
-                    Err(_) => {
-                        error!(
-                            "TIMEOUT: Renderer initialization for {} took longer than 5s. Skipping.",
-                            name
-                        );
-                        ctx.metrics.record_error("renderer_creation_timeout");
-                    }
-                }
-                wgpu_ctx.device.poll(wgpu::Maintain::Poll);
-            }
-
-            let should_warmup_cuda = std::fs::metadata("/proc/driver/nvidia/gpus").is_ok()
-                && ctx
-                    .monitor_manager
-                    .outputs
-                    .values()
-                    .any(|orch| orch.config.video_ratio > 0);
-            if should_warmup_cuda {
-                let warmup_ctx = wgpu_ctx.clone();
-                if let Some(handle) =
-                    background::spawn_blocking_tracked(BackgroundWorkKind::CudaWarmup, move || {
-                        warmup_ctx.warmup_cuda_interop()
-                    })
-                {
-                    drop(handle);
-                }
-            }
-
-            ctx.metrics.record_full_init();
-            if log_level.map(|l| l >= 3).unwrap_or(false) {
-                ctx.metrics.log_startup_summary();
-            }
-            info!(
-                "[STARTUP] All renderers created, count: {}",
-                ctx.renderers.len()
-            );
-        }
-        _ => {
-            warn!("[STARTUP] No WGPU context available, cannot create renderers!");
-        }
-    }
-
-    // ─── Wait for Wayland configure events ──────────────────────────────
-
-    info!("[STARTUP] Waiting for all renderers to be configured...");
-    let total_renderers = ctx.renderers.len();
-    let wait_start = Instant::now();
-    let mut configured_count = 0;
-    const MAX_WAIT_TIME: std::time::Duration = std::time::Duration::from_secs(5);
-
-    while configured_count < total_renderers && wait_start.elapsed() < MAX_WAIT_TIME {
-        match conn.prepare_read() {
-            Some(guard) => {
-                use std::os::unix::io::{AsFd, AsRawFd};
-                let fd = conn.as_fd().as_raw_fd();
-                let mut poll_fd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let timeout_ms = 10;
-                let ret = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-                if ret > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
-                    if let Err(e) = guard.read() {
-                        error!("Failed to read Wayland events: {}", e);
-                    }
-                    if let Err(e) = event_queue.dispatch_pending(&mut backend) {
-                        error!("Failed to dispatch Wayland events: {}", e);
-                    }
-                    let _ = conn.flush();
-                }
-            }
-            _ => {
-                if let Err(e) = event_queue.dispatch_pending(&mut backend) {
-                    error!("Failed to dispatch Wayland events: {}", e);
-                }
-                let _ = conn.flush();
-            }
-        }
-
-        // Process pending_resizes to configure renderers
-        let resizes: Vec<_> = backend.pending_resizes.drain(..).collect();
-        for (name, w, h, _) in resizes {
-            if let Some(r) = ctx.renderers.get_mut(&name) {
-                let width = if w == 0 { r.config.width } else { w };
-                let height = if h == 0 { r.config.height } else { h };
-                let _ = r.resize_checked(width, height);
-            }
-        }
-
-        configured_count = ctx.renderers.values().filter(|r| r.configured).count();
-        if configured_count < total_renderers {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }
-
-    if configured_count < total_renderers {
-        warn!(
-            "[STARTUP] Only {}/{} renderers configured after {}ms timeout. Some wallpapers may not load initially.",
-            configured_count,
-            total_renderers,
-            wait_start.elapsed().as_millis()
-        );
-        for (name, r) in ctx.renderers.iter() {
-            if !r.configured {
-                warn!("[STARTUP] Renderer {} is not configured", name);
-            }
-        }
-    } else {
-        info!(
-            "[STARTUP] All {} renderers configured in {:.2}ms",
-            configured_count,
-            wait_start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    // Force initial renders for unconfigured renderers
-    let mut initial_callback_flush_needed = false;
-    for (name, r) in ctx.renderers.iter_mut() {
-        if !r.configured && r.config.width > 0 && r.config.height > 0 {
-            if let Some(layer_surface) = backend.surfaces.get(name) {
-                let _ = r.resize_checked(r.config.width, r.config.height);
-                if r.configured {
-                    let _ = r.render(
-                        renderer::BackendContext::Wayland {
-                            surface: layer_surface,
-                            qh: &qh,
-                        },
-                        Instant::now(),
-                    );
-                    initial_callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
-                }
-            }
-        }
-    }
-    if initial_callback_flush_needed {
-        let _ = conn.flush();
-    }
-
-    // ─── Initial load ───────────────────────────────────────────────────
+    startup::initialize_outputs_and_renderers(
+        &mut ctx,
+        &conn,
+        &mut backend,
+        &qh,
+        &mut event_queue,
+        log_level,
+    )
+    .await?;
 
     ctx.initial_load();
-
-    // ─── Wayland connection state ───────────────────────────────────────
-
-    let mut connection_error_count = 0u32;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 3;
-    let mut connection_dead = false;
-    let mut last_error_time = Instant::now();
 
     // ─── Main Loop ──────────────────────────────────────────────────────
 
@@ -338,121 +51,243 @@ pub async fn run(
         tokio::io::unix::AsyncFd::new(conn.as_fd().as_raw_fd())
             .expect("Failed to create AsyncFd for Wayland connection")
     };
+    let mut last_presentation_log = Instant::now();
+    let mut power_monitor =
+        crate::hyprland_power::HyprlandPowerMonitor::from_environment(Instant::now());
+    let mut deferred_power_resizes: HashMap<String, (u32, u32)> = HashMap::new();
 
     loop {
         let loop_start = Instant::now();
+        if renderer_retries
+            .next_deadline()
+            .is_some_and(|deadline| loop_start >= deadline)
+        {
+            backend.outputs_changed = true;
+        }
         if ctx.shutdown_flag.load(Ordering::SeqCst) {
             ctx.shutdown().await;
             break;
         }
         let mut callback_flush_needed = false;
 
-        if connection_dead {
-            if last_error_time.elapsed().as_secs() > 5 {
-                connection_dead = false;
-                connection_error_count = 0;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
+        let power_result_ready = power_monitor.needs_output_snapshot();
+        let output_names: Vec<String> = if power_result_ready {
+            ctx.renderers.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        if power_result_ready
+            && let Some(update) = power_monitor.retain_outputs(&output_names, loop_start)
+        {
+            crate::hyprland_power::apply_update(&mut ctx, update);
+        }
+        let has_active_video = ctx
+            .renderers
+            .values()
+            .any(|renderer| renderer.valid_content_type == crate::queue::ContentType::Video)
+            || !ctx.video_players.is_empty();
+        if let Some(update) = power_monitor
+            .poll_if_due(&output_names, has_active_video, loop_start)
+            .await
+        {
+            crate::hyprland_power::apply_update(&mut ctx, update);
         }
 
-        let hot_loop_active = ctx.wayland_hot_loop_active();
+        let renderer_activity =
+            ctx.renderer_activity_snapshot_for(|name| power_monitor.is_powered(name));
+        let hot_loop_active = renderer_activity.wayland_hot;
+        if crate::observability::trace_all::trace_all_enabled() {
+            tracing::trace!(
+                "[TRACE5][LOOP] hot={} any_active={} renderers={} players={} pending_frames={}",
+                hot_loop_active,
+                renderer_activity.any_active,
+                ctx.renderers.len(),
+                ctx.video_players.len(),
+                ctx.latest_video_frames.occupancy()
+            );
+        }
         if hot_loop_active {
             ctx.metrics.record_wayland_hot_loop();
+            ctx.metrics.record_wake_reason(WakeReason::Immediate);
         } else {
             ctx.metrics.record_wayland_idle_loop();
         }
 
         // Idle — block until any event source is ready
-        let (mut cmd_buf, mut frame_buf, mut image_buf, mut player_buf, mut player_event_buf) =
-            (None, None, None, None, None);
+        let (
+            mut cmd_buf,
+            mut frame_ready,
+            mut wayland_fd_ready,
+            mut image_buf,
+            mut player_buf,
+            mut player_event_buf,
+        ) = (None, false, false, None, None, None);
         let mut entered_idle_wait = false;
-        if !hot_loop_active && !connection_dead {
-            let idle_deadline = ctx.next_wayland_idle_deadline(loop_start);
+        if !hot_loop_active {
+            let mut idle_deadline =
+                ctx.next_wayland_idle_deadline_from_snapshot(loop_start, renderer_activity);
+            if let Some(hotplug_deadline) = backend.hotplug_wsi_drain_deadline
+                && idle_deadline.is_none_or(|(deadline, _)| hotplug_deadline < deadline)
+            {
+                idle_deadline = Some((hotplug_deadline, DeadlineReason::WaylandRetry));
+            }
+            if let Some(renderer_deadline) = crate::wayland::hotplug::pending_renderer_deadline(
+                &pending_renderer_adds,
+                loop_start,
+            ) && idle_deadline.is_none_or(|(deadline, _)| renderer_deadline < deadline)
+            {
+                idle_deadline = Some((renderer_deadline, DeadlineReason::WaylandRetry));
+            }
+            if let Some(retry_deadline) = renderer_retries.next_deadline()
+                && idle_deadline.is_none_or(|(deadline, _)| retry_deadline < deadline)
+            {
+                idle_deadline = Some((retry_deadline, DeadlineReason::WaylandRetry));
+            }
+            if backend.outputs_changed {
+                // Renderer completion can re-arm topology reconciliation after
+                // the Wayland fd was already drained. Do not defer the retry
+                // to the generic housekeeping deadline.
+                idle_deadline = Some((loop_start, DeadlineReason::WaylandRetry));
+            }
+            idle_deadline = crate::runtime::timing::min_deadline_with_reason(
+                idle_deadline,
+                power_monitor.next_deadline(!ctx.renderers.is_empty()),
+            );
             let result = ctx.idle_wait(&wayland_fd, idle_deadline).await;
-            cmd_buf = result.0;
-            frame_buf = result.1;
-            image_buf = result.2;
-            player_buf = result.3;
-            player_event_buf = result.4;
+            cmd_buf = result.cmd;
+            frame_ready = result.frame_ready;
+            wayland_fd_ready = result.fd_ready;
+            image_buf = result.image;
+            player_buf = result.player;
+            player_event_buf = result.player_event;
             entered_idle_wait = true;
         }
 
-        // ─── Wayland event polling ──────────────────────────────────────
-
-        if let Some(guard) = conn.prepare_read() {
-            use std::os::unix::io::{AsFd, AsRawFd};
-            let fd = conn.as_fd().as_raw_fd();
-            let mut poll_fd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ret = unsafe { libc::poll(&mut poll_fd, 1, 0) };
-            if ret > 0 && (poll_fd.revents & libc::POLLIN != 0) {
-                let _ = guard.read();
-            }
-        }
-
-        match event_queue.dispatch_pending(&mut backend) {
-            Ok(_) => {
-                connection_error_count = 0;
-            }
-            Err(e) => {
-                let error_str = e.to_string();
-                error!("Failed to dispatch Wayland events in main loop: {}", e);
-                connection_error_count += 1;
-                last_error_time = Instant::now();
-                if connection_error_count >= MAX_CONSECUTIVE_ERRORS {
-                    connection_dead = true;
-                }
-                if !error_str.contains("Broken pipe") {
-                    tracing::debug!(
-                        "[WAYLAND] Non-broken-pipe dispatch error (count={})",
-                        connection_error_count
-                    );
+        // Video-frame wakes can race with Wayland frame callback readiness. Poll the
+        // Wayland fd opportunistically for composed rendering, but direct native
+        // surfaces do not use renderer frame callbacks. Their buffer-release event
+        // is dispatched by its own fd wake, so polling here would duplicate the
+        // Wayland read/dispatch work once per decoded frame.
+        let direct_native_video_wake = frame_ready && {
+            let mut active_video = ctx.renderers.iter().filter(|(_, renderer)| {
+                renderer.valid_content_type == crate::queue::ContentType::Video
+            });
+            active_video.clone().next().is_some()
+                && active_video.all(|(name, renderer)| {
+                    power_monitor.is_powered(name)
+                        && renderer.can_present_native_wayland_surface()
+                        && backend.native_dmabuf_surface_active(name)
+                })
+        };
+        if hot_loop_active || wayland_fd_ready || (frame_ready && !direct_native_video_wake) {
+            // Follow wayland-client's external-event-loop contract exactly:
+            // drain events already queued in userspace before prepare_read().
+            // Otherwise prepare_read() can repeatedly return None while the
+            // socket remains epoll-readable, creating a high-CPU readiness
+            // loop and delaying async linux-dmabuf created/failed events.
+            match event_queue.dispatch_pending(&mut backend) {
+                Ok(_) => {}
+                Err(error) => {
+                    ctx.shutdown().await;
+                    drop(ctx);
+                    return Err(anyhow::anyhow!(
+                        "fatal Wayland dispatch error (connection cannot be reused): {error}"
+                    ));
                 }
             }
-        }
+            if let Some(guard) = conn.prepare_read() {
+                use std::os::unix::io::{AsFd, AsRawFd};
+                let fd = conn.as_fd().as_raw_fd();
+                let mut poll_fd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: `poll_fd` points to one initialized `libc::pollfd`, the count is 1,
+                // and the file descriptor is borrowed from a live Wayland connection.
+                let ret = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+                if ret > 0 && (poll_fd.revents & libc::POLLIN != 0) {
+                    if let Err(error) = guard.read() {
+                        ctx.shutdown().await;
+                        drop(ctx);
+                        return Err(anyhow::anyhow!(
+                            "fatal Wayland socket read error (connection cannot be reused): {error}"
+                        ));
+                    }
+                }
+            }
 
-        if !connection_dead {
-            let needs_flush = ctx
-                .renderers
-                .values()
-                .any(|r| r.needs_redraw || r.transition_active);
-            if needs_flush {
-                let _ = conn.flush();
+            match event_queue.dispatch_pending(&mut backend) {
+                Ok(_) => {}
+                Err(e) => {
+                    ctx.shutdown().await;
+                    drop(ctx);
+                    return Err(anyhow::anyhow!(
+                        "fatal Wayland dispatch error (connection cannot be reused): {e}"
+                    ));
+                }
             }
         }
 
         // ─── Wayland-specific: orphan cleanup + resize ──────────────────
 
-        {
-            let active_output_names: std::collections::HashSet<String> = backend
-                .output_state
-                .outputs()
-                .filter_map(|o| backend.output_state.info(&o).and_then(|i| i.name.clone()))
-                .collect();
-            ctx.renderers.retain(|name, _| {
-                if !active_output_names.contains(name) {
-                    if let Some(vp) = ctx.video_players.remove(name) {
-                        stop_video_player_in_background(name.clone(), vp);
-                    }
-                    ctx.pending_video_switches.remove(name);
-                    crate::main_loop::set_pending_video_session(
-                        &ctx.pending_video_sessions,
-                        name,
-                        None,
-                    );
-                    false
-                } else {
-                    true
-                }
-            });
+        if backend.outputs_changed {
+            backend.outputs_changed = false;
+            callback_flush_needed |= crate::wayland::hotplug::reconcile_outputs(
+                &mut ctx,
+                &conn,
+                &mut backend,
+                &mut pending_renderer_adds,
+                &mut renderer_retries,
+                &qh,
+                loop_start,
+            )
+            .await;
+        }
+        crate::wayland::hotplug::drain_pending_renderer_adds(
+            &mut ctx,
+            &mut backend,
+            &mut pending_renderer_adds,
+            &mut renderer_retries,
+            loop_start,
+        )
+        .await;
+        // A failed first-device attempt may have serialized other connected
+        // outputs. Give those outputs one immediate reconciliation pass; the
+        // failed output itself remains behind its per-output backoff.
+        if backend.outputs_changed {
+            backend.outputs_changed = false;
+            callback_flush_needed |= crate::wayland::hotplug::reconcile_outputs(
+                &mut ctx,
+                &conn,
+                &mut backend,
+                &mut pending_renderer_adds,
+                &mut renderer_retries,
+                &qh,
+                loop_start,
+            )
+            .await;
+        }
+        callback_flush_needed |= crate::wayland::hotplug::drain_delayed_wsi_feedback(
+            &mut ctx,
+            &mut backend,
+            &qh,
+            loop_start,
+        );
 
-            let resizes: Vec<_> = backend.pending_resizes.drain(..).collect();
-            for (name, w, h, _) in resizes {
+        {
+            // Keep the newest configure while an output is powered off. A
+            // configure is one-shot protocol state; dropping it here would
+            // leave the renderer at the pre-DPMS mode/scale indefinitely.
+            let mut latest_resizes = std::mem::take(&mut deferred_power_resizes);
+            for (name, w, h, _) in backend.pending_resizes.drain(..) {
+                latest_resizes.insert(name, (w, h));
+            }
+            for (name, (w, h)) in latest_resizes {
+                if !power_monitor.is_powered(&name) {
+                    deferred_power_resizes.insert(name, (w, h));
+                    continue;
+                }
                 if let Some(r) = ctx.renderers.get_mut(&name) {
                     let width = if w == 0 { r.config.width } else { w };
                     let height = if h == 0 { r.config.height } else { h };
@@ -463,163 +298,148 @@ pub async fn run(
                                 renderer::BackendContext::Wayland {
                                     surface: layer_surface,
                                     qh: &qh,
+                                    presentation: backend.presentation_proxy(),
                                 },
                                 loop_start,
                             );
                             callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                         }
                     }
+                } else {
+                    // Hotplug renderer creation is asynchronous. Preserve the
+                    // compositor's fractionally-scaled buffer extent until the
+                    // renderer is ready instead of falling back to logical
+                    // output dimensions.
+                    crate::wayland::hotplug::record_pending_resize(
+                        &mut pending_renderer_adds,
+                        &name,
+                        (w, h),
+                    );
                 }
             }
         }
 
-        // ─── Shared logic ───────────────────────────────────────────────
-
         ctx.process_scheduled(loop_start);
         ctx.process_script_tick();
-        ctx.drain_commands(cmd_buf, loop_start).await;
-        ctx.drain_player_events(player_event_buf, loop_start);
+        if hot_loop_active || cmd_buf.is_some() {
+            ctx.drain_commands(cmd_buf, loop_start).await;
+        }
+        if hot_loop_active || player_event_buf.is_some() {
+            ctx.drain_player_events(player_event_buf, loop_start);
+        }
 
-        // ─── Frame handling (Wayland-specific upload + render) ───────────
+        {
+            for (name, renderer) in &ctx.renderers {
+                if !renderer.can_present_native_wayland_surface() {
+                    callback_flush_needed |= backend.hide_native_dmabuf(name);
+                }
+            }
+        }
 
-        let (latest_frames, _frames_received, _frames_discarded) = ctx.drain_frames(frame_buf);
+        let (latest_frames, _frames_received, _frames_discarded) =
+            ctx.drain_frames(hot_loop_active || frame_ready, !direct_native_video_wake);
         for (source_id, frame) in latest_frames {
-            let barrier_blocks = ctx.startup_barrier_blocks_output(source_id.as_str(), loop_start);
+            if !power_monitor.is_powered(source_id.as_ref()) {
+                drop(frame);
+                continue;
+            }
+            backend.set_surface_content_type(source_id.as_ref(), crate::queue::ContentType::Video);
+            let mut frame = Some(frame);
+            let barrier_blocks = ctx.startup_barrier_blocks_output(source_id.as_ref(), loop_start);
             let mut mark_presented = false;
             let mut mark_ready = false;
-            if let Some(r) = ctx.renderers.get_mut(source_id.as_str()) {
+            if let Some(r) = ctx.renderers.get_mut(source_id.as_ref()) {
+                if crate::observability::trace_all::trace_all_enabled() {
+                    let traced_frame = frame.as_ref().expect("frame is live");
+                    tracing::trace!(
+                        "[TRACE5][VIDEO-DRAIN-FRAME] output={} session={} frame_hash={:016x} size={}x{} pts_ns={:?} duration_ns={:?} pending_age_ms={:?} callback_pending={} transition={}",
+                        source_id,
+                        traced_frame.session_id,
+                        traced_frame.trace_fingerprint(),
+                        traced_frame.width,
+                        traced_frame.height,
+                        traced_frame.pts_ns,
+                        traced_frame.duration_ns,
+                        ctx.latest_video_frames
+                            .pending_frame_age(source_id.as_ref())
+                            .map(|age| age.as_secs_f64() * 1000.0),
+                        r.frame_callback_pending,
+                        r.transition_active
+                    );
+                }
+                let had_current_texture = r.has_current_texture();
+                let native_output_size = backend
+                    .logical_surface_size(source_id.as_ref(), (r.config.width, r.config.height));
+                let native_surface_presented =
+                    crate::wayland::native_dmabuf_surface::present_native_frame(
+                        &mut backend,
+                        r,
+                        &qh,
+                        &conn,
+                        source_id.as_ref(),
+                        frame.as_ref().expect("frame is live"),
+                        native_output_size,
+                    );
+                if native_surface_presented {
+                    frame.take();
+                    mark_ready = true;
+                    mark_presented = true;
+                    callback_flush_needed = true;
+                    if let Some(player) = ctx.video_players.get(source_id.as_ref()) {
+                        player.request_video_frame();
+                    }
+                }
                 let should_upload = if r.valid_content_type == crate::queue::ContentType::Video {
-                    !r.has_current_texture() || !r.frame_callback_pending_too_long(1000)
+                    !r.steady_video_uses_frame_callbacks()
+                        || !had_current_texture
+                        || !r.frame_callback_pending
+                        || r.frame_callback_pending_too_long(1000)
                 } else {
                     !r.frame_callback_pending || !r.has_current_texture()
                 };
 
-                if should_upload {
+                if !native_surface_presented && should_upload {
+                    callback_flush_needed |= backend.hide_native_dmabuf(source_id.as_ref());
                     let video_start = std::time::Instant::now();
-                    r.upload_frame(&frame);
+                    r.upload_frame(frame.as_ref().expect("frame is live"));
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
+                    ctx.metrics.record_video_frame_uploaded();
                     mark_ready = true;
-                    drop(frame);
-                } else {
-                    drop(frame);
+                    frame.take();
+                } else if !native_surface_presented {
+                    frame.take();
                 }
 
-                if r.valid_content_type == crate::queue::ContentType::Video {
-                    if let Some(layer_surface) = backend.surfaces.get(source_id.as_str()) {
-                        if !barrier_blocks {
-                            if r.frame_callback_pending_too_long(1000) {
-                                let _ = r.render(
-                                    renderer::BackendContext::Wayland {
-                                        surface: layer_surface,
-                                        qh: &qh,
-                                    },
-                                    loop_start,
-                                );
-                                if !ctx.first_frame_recorded {
-                                    ctx.metrics.record_first_frame();
-                                    ctx.first_frame_recorded = true;
-                                }
-                                mark_presented = true;
-                                callback_flush_needed |=
-                                    r.request_frame_callback(layer_surface, &qh);
-                            } else if !r.frame_callback_pending {
-                                callback_flush_needed |=
-                                    r.request_frame_callback(layer_surface, &qh);
-                            }
-                        }
-                    }
-                }
-            } else {
-                drop(frame);
-            }
-            if mark_ready {
-                ctx.mark_startup_output_ready(source_id.as_str(), loop_start);
-            }
-            if mark_presented {
-                ctx.mark_output_presented_if_ready(source_id.as_str());
-            }
-        }
-
-        // ─── Image handling (Wayland render via closure) ─────────────────
-
-        // We need to capture backend reference for the render closure
-        let surfaces = &backend.surfaces;
-        ctx.drain_images(image_buf, loop_start, |r, name, ls| {
-            if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
-                    let _ = r.render(
-                        renderer::BackendContext::Wayland {
-                            surface: layer_surface,
-                            qh: &qh,
-                        },
-                        ls,
-                    );
-                }
-            }
-        });
-
-        // ─── Player results ─────────────────────────────────────────────
-
-        ctx.drain_players(player_buf, loop_start, |r, name, ls| {
-            if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
-                    let _ = r.render(
-                        renderer::BackendContext::Wayland {
-                            surface: layer_surface,
-                            qh: &qh,
-                        },
-                        ls,
-                    );
-                }
-            }
-        });
-
-        ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
-            if r.configured {
-                if let Some(layer_surface) = surfaces.get(name) {
-                    let _ = r.render(
-                        renderer::BackendContext::Wayland {
-                            surface: layer_surface,
-                            qh: &qh,
-                        },
-                        ls,
-                    );
-                }
-            }
-        });
-
-        // ─── Wayland frame callback rendering ───────────────────────────
-
-        let frame_ready_names: Vec<String> = backend.frame_callback_ready.drain().collect();
-        for name in frame_ready_names {
-            ctx.metrics.record_wayland_callback_wake();
-            let barrier_blocks = ctx.startup_barrier_blocks_output(&name, loop_start);
-            let mut mark_presented = false;
-            if let Some(r) = ctx.renderers.get_mut(&name) {
-                if let Some(wait_duration) = r.frame_callback_pending_duration() {
-                    if wait_duration > std::time::Duration::from_millis(250) {
-                        tracing::warn!(
-                            "[FRAME] {}: Wayland frame callback stalled for {:.1}ms",
-                            name,
-                            wait_duration.as_secs_f64() * 1000.0
-                        );
-                    } else if wait_duration > std::time::Duration::from_millis(16) {
+                if !native_surface_presented
+                    && r.valid_content_type == crate::queue::ContentType::Video
+                    && let Some(layer_surface) = backend.surfaces.get(source_id.as_ref())
+                    && !barrier_blocks
+                {
+                    let immediate_video = !r.steady_video_uses_frame_callbacks()
+                        || crate::wayland::video_immediate_present_enabled();
+                    let should_render_now = (mark_ready
+                        && (immediate_video || !had_current_texture))
+                        || r.frame_callback_pending_too_long(1000);
+                    if crate::observability::trace_all::trace_all_enabled() {
                         tracing::trace!(
-                            "[FRAME] {}: Wayland frame callback waited {:.1}ms",
-                            name,
-                            wait_duration.as_secs_f64() * 1000.0
+                            "[TRACE5][VIDEO-PRESENT-DECISION] output={} mark_ready={} immediate={} had_current={} callback_pending={} should_render_now={} callback_too_long={} transition_just_completed={}",
+                            source_id,
+                            mark_ready,
+                            immediate_video,
+                            had_current_texture,
+                            r.frame_callback_pending,
+                            should_render_now,
+                            r.frame_callback_pending_too_long(1000),
+                            r.transition_just_completed()
                         );
                     }
-                }
-                r.frame_callback_pending = false;
-                r.last_frame_request = None;
-                if !barrier_blocks {
-                    if let Some(layer_surface) = backend.surfaces.get(&name) {
+                    if should_render_now {
                         let _ = r.render(
                             renderer::BackendContext::Wayland {
                                 surface: layer_surface,
                                 qh: &qh,
+                                presentation: backend.presentation_proxy(),
                             },
                             loop_start,
                         );
@@ -628,51 +448,156 @@ pub async fn run(
                             ctx.first_frame_recorded = true;
                         }
                         mark_presented = true;
+                        let _ = r.transition_just_completed();
+                        if !immediate_video {
+                            callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
+                        } else if let Some(player) = ctx.video_players.get(source_id.as_ref()) {
+                            // The native FFmpeg worker decodes one useful frame per
+                            // demand. Callback-paced playback receives that demand
+                            // from the callback handler; source-driven composition
+                            // must continue the chain after each completed present.
+                            player.request_video_frame();
+                        }
+                    } else if !r.frame_callback_pending {
+                        callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                     }
                 }
+            } else {
+                frame.take();
+            }
+            if mark_ready {
+                ctx.mark_startup_output_ready(source_id.as_ref(), loop_start);
             }
             if mark_presented {
-                ctx.mark_output_presented_if_ready(&name);
+                ctx.mark_output_presented_if_ready(source_id.as_ref());
             }
         }
 
-        // Request missing frames
-        let blocked_outputs: HashSet<String> = ctx
-            .startup_present_barrier
-            .as_ref()
-            .map(|barrier| {
-                barrier
-                    .outputs
-                    .iter()
-                    .filter_map(|(name, state)| {
-                        if state.can_block && barrier.release_reason.is_none() {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (name, r) in ctx.renderers.iter_mut() {
-            let barrier_blocks = blocked_outputs.contains(name);
-            let should_request =
-                r.has_any_content() && (r.needs_redraw || r.transition_active) && !barrier_blocks;
-            if should_request {
-                if let Some(layer_surface) = backend.surfaces.get(name) {
-                    callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
+        if hot_loop_active || image_buf.is_some() {
+            ctx.drain_images(image_buf, loop_start, |r, name, ls| {
+                if !power_monitor.is_powered(name) {
+                    return;
+                }
+                backend.set_surface_content_type(name, crate::queue::ContentType::Image);
+                if r.configured {
+                    if let Some(layer_surface) = backend.surfaces.get(name) {
+                        let _ = r.render(
+                            renderer::BackendContext::Wayland {
+                                surface: layer_surface,
+                                qh: &qh,
+                                presentation: backend.presentation_proxy(),
+                            },
+                            ls,
+                        );
+                    }
+                }
+            });
+        }
+
+        if hot_loop_active || player_buf.is_some() {
+            ctx.drain_players(player_buf, loop_start, |r, name, ls| {
+                if !power_monitor.is_powered(name) {
+                    return;
+                }
+                backend.set_surface_content_type(name, r.valid_content_type);
+                if r.configured {
+                    if let Some(layer_surface) = backend.surfaces.get(name) {
+                        let _ = r.render(
+                            renderer::BackendContext::Wayland {
+                                surface: layer_surface,
+                                qh: &qh,
+                                presentation: backend.presentation_proxy(),
+                            },
+                            ls,
+                        );
+                    }
+                }
+            });
+            if power_monitor.is_suspended() {
+                for player in ctx.video_players.values() {
+                    let _ = player.pause();
                 }
             }
         }
-        if callback_flush_needed && !connection_dead {
+
+        ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
+            if !power_monitor.is_powered(name) {
+                return;
+            }
+            if r.configured {
+                if let Some(layer_surface) = backend.surfaces.get(name) {
+                    let _ = r.render(
+                        renderer::BackendContext::Wayland {
+                            surface: layer_surface,
+                            qh: &qh,
+                            presentation: backend.presentation_proxy(),
+                        },
+                        ls,
+                    );
+                }
+            }
+        });
+
+        let direct_native_steady = {
+            let mut active_video = ctx.renderers.iter().filter(|(_, renderer)| {
+                renderer.valid_content_type == crate::queue::ContentType::Video
+            });
+            active_video.clone().next().is_some()
+                && active_video.all(|(name, renderer)| {
+                    power_monitor.is_powered(name)
+                        && renderer.can_present_native_wayland_surface()
+                        && backend.native_dmabuf_surface_active(name)
+                        && !renderer.transition_active
+                        && !renderer.needs_redraw
+                })
+        };
+        if !direct_native_steady || !backend.frame_callback_ready.is_empty() {
+            frame_callbacks::process_frame_callbacks(
+                &mut ctx,
+                &mut backend,
+                &qh,
+                &conn,
+                &power_monitor,
+                &mut callback_flush_needed,
+                loop_start,
+            );
+        }
+        if callback_flush_needed {
             let _ = conn.flush();
         }
 
-        // ─── Housekeeping ───────────────────────────────────────────────
-
         ctx.housekeeping(loop_start, entered_idle_wait).await;
-        ctx.timing_and_poll(hot_loop_active, loop_start).await;
+        if last_presentation_log.elapsed() >= std::time::Duration::from_secs(10) {
+            last_presentation_log = Instant::now();
+            backend.reap_native_release_fences();
+            let native = backend.native_dmabuf_resource_counts();
+            tracing::info!(
+                "[WAYLAND-RESOURCES] native_surfaces={} native_buffers={} native_busy={} native_owners={} native_pending={} native_retired={} native_explicit_releases={} native_feedbacks={}",
+                native.surfaces,
+                native.buffers,
+                native.busy,
+                native.owners,
+                native.pending,
+                native.retired,
+                native.explicit_releases,
+                native.feedbacks,
+            );
+            if backend.presentation_proxy().is_some() {
+                tracing::info!(
+                    "[WAYLAND-PRESENT] {}",
+                    backend.presentation_telemetry.summary()
+                );
+            }
+        }
+        ctx.timing_and_poll(renderer_activity.any_active, loop_start)
+            .await;
     }
+
+    // `ctx` owns WGPU surfaces and its backend instances. Destroy them while
+    // the Wayland connection is still alive: Mesa's EGL teardown may marshal
+    // Wayland requests, and Rust's default reverse-local drop order would
+    // otherwise destroy `conn` before `ctx`.
+    drop(ctx);
 
     Ok(())
 }
