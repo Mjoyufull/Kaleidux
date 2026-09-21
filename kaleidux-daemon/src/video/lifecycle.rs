@@ -259,6 +259,9 @@ impl VideoPlayer {
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
+        if self.is_running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         info!(
             "[VIDEO] {}: Starting playback for {}",
             self.source_id,

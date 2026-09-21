@@ -234,9 +234,13 @@ fn receive_frames(
 ) -> anyhow::Result<bool> {
     let mut decoded = state.surface_exporter.acquire_decode_frame();
     loop {
-        if decoder.decoder.receive_frame(&mut decoded).is_err() {
+        if let Err(error) = decoder.decoder.receive_frame(&mut decoded) {
             state.surface_exporter.recycle_decode_frame(decoded);
-            return Ok(false);
+            return match error {
+                ffmpeg::Error::Eof => Ok(false),
+                ffmpeg::Error::Other { errno } if errno == ffmpeg::error::EAGAIN => Ok(false),
+                error => Err(error.into()),
+            };
         }
         let pts_ns = decoded
             .timestamp()
@@ -413,8 +417,8 @@ fn publish_frame(config: &NativeDecodeConfig, state: &mut DecodeState, frame: Vi
     ) {
         return false;
     }
-    config.fanout.publish_frame(frame);
     config.control.consume_frame_demand();
+    config.fanout.publish_frame(frame);
     true
 }
 

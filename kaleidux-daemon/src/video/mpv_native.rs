@@ -63,6 +63,7 @@ impl MpvRenderApiRequest {
 pub struct MpvNativeVideoTarget {
     display_ptr: usize,
     surface_id: ObjectId,
+    _surface: smithay_client_toolkit::shell::wlr_layer::LayerSurface,
     width: u32,
     height: u32,
 }
@@ -179,7 +180,7 @@ unsafe impl Sync for MpvNativeVideoTarget {}
 impl MpvNativeVideoTarget {
     pub(crate) fn new(
         display_ptr: *mut c_void,
-        surface_id: ObjectId,
+        surface: smithay_client_toolkit::shell::wlr_layer::LayerSurface,
         width: u32,
         height: u32,
     ) -> Option<Self> {
@@ -188,7 +189,12 @@ impl MpvNativeVideoTarget {
         }
         Some(Self {
             display_ptr: display_ptr as usize,
-            surface_id,
+            surface_id: {
+                use smithay_client_toolkit::shell::WaylandSurface;
+                use wayland_client::Proxy;
+                surface.wl_surface().id()
+            },
+            _surface: surface,
             width: width.max(1),
             height: height.max(1),
         })
@@ -339,6 +345,13 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
                 config
                     .metrics
                     .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
+                let _ = config.player_event_tx.blocking_send(PlayerEvent {
+                    source_id: config.source_id.to_string(),
+                    session_id: config.session_id,
+                    backend_kind: VideoBackendKind::Mpv,
+                    kind: PlayerEventKind::Error,
+                    reason: format!("composed libmpv GL render failed: {error}"),
+                });
                 break;
             }
         }
@@ -436,6 +449,13 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
                         source_id,
                         start_time.elapsed().as_secs_f64() * 1000.0
                     );
+                    let _ = player_event_tx.blocking_send(PlayerEvent {
+                        source_id: source_id.to_string(),
+                        session_id,
+                        backend_kind: VideoBackendKind::Mpv,
+                        kind: PlayerEventKind::FirstPresent,
+                        reason: "native surface presented its first frame".to_string(),
+                    });
                 }
                 metrics.record_video_backend_metric(VideoBackendMetricKind::MpvFramePublished);
             }

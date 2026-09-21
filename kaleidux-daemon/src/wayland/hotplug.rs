@@ -4,13 +4,12 @@ use crate::content::sessions::{set_pending_video_session, stop_video_player_in_b
 use crate::main_loop::MainLoopContext;
 use crate::renderer;
 use crate::renderer_retry::RendererRetryBackoff;
-use smithay_client_toolkit::shell::WaylandSurface;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 use wayland_client::protocol::wl_output;
-use wayland_client::{Connection, Proxy, QueueHandle};
+use wayland_client::{Connection, QueueHandle};
 
 struct LiveOutput {
     description: String,
@@ -213,7 +212,7 @@ async fn add_output(
             Ok(surface) => {
                 if let Some(target) = crate::video::MpvNativeVideoTarget::new(
                     display_ptr,
-                    surface.wl_surface().id(),
+                    surface.clone(),
                     output.size.0,
                     output.size.1,
                 ) {

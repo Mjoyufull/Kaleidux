@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
-use wayland_client::Proxy;
 use wayland_client::{Connection, QueueHandle};
 
 pub(crate) fn should_create_mpv_native_surfaces() -> bool {
@@ -100,8 +99,6 @@ pub(crate) async fn initialize_outputs_and_renderers(
         )?;
 
         if should_create_mpv_native_surfaces() {
-            use smithay_client_toolkit::shell::WaylandSurface;
-
             let mpv_surface = backend.create_mpv_video_surface(
                 output,
                 qh,
@@ -110,7 +107,7 @@ pub(crate) async fn initialize_outputs_and_renderers(
             )?;
             if let Some(target) = crate::video::MpvNativeVideoTarget::new(
                 display_ptr,
-                mpv_surface.wl_surface().id(),
+                mpv_surface.clone(),
                 _output_size.0,
                 _output_size.1,
             ) {
