@@ -19,7 +19,6 @@ struct LiveOutput {
 
 pub(crate) struct PendingRendererAdd {
     handle: tokio::task::JoinHandle<anyhow::Result<RendererInitResult>>,
-    output_config: crate::orchestration::OutputConfig,
     display_ptr: usize,
     size: (u32, u32),
     started_at: Instant,
@@ -274,7 +273,6 @@ async fn add_output(
         name.to_string(),
         PendingRendererAdd {
             handle,
-            output_config,
             display_ptr: display_ptr as usize,
             size: output.size,
             started_at: Instant::now(),
@@ -361,7 +359,9 @@ pub(crate) async fn drain_pending_renderer_adds(
             ctx.wgpu_ctx = Some(wgpu_ctx.clone());
             backend.outputs_changed = true;
         }
-        renderer.apply_config(&add.output_config);
+        if let Some(config) = ctx.monitor_manager.get_output_config(&name) {
+            renderer.apply_config(config);
+        }
         let _ = renderer.resize_checked(add.size.0, add.size.1);
         ctx.renderers.insert(name.clone(), renderer);
         if startup::should_create_mpv_composed_targets()

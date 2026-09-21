@@ -41,6 +41,9 @@ pub struct MonitorManager {
 impl MonitorManager {
     pub fn remove_output(&mut self, name: &str) {
         self.outputs.remove(name);
+        if self.outputs.is_empty() {
+            self.shared_display_start_time = None;
+        }
         let Some(group_id) = self.output_groups.remove(name) else {
             return;
         };
