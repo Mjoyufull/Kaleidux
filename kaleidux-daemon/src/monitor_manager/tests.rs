@@ -304,6 +304,9 @@ fn synchronized_hotplug_joins_current_content_before_the_deadline() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes["DP-2"].0, image);
     assert!(!changes.contains_key("DP-1"));
+    manager.remove_output("DP-1");
+    manager.remove_output("DP-2");
+    assert!(manager.shared_display_start_time.is_none());
 }
 
 #[test]
