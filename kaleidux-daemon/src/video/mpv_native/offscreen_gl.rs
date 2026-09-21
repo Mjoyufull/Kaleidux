@@ -109,6 +109,11 @@ impl ComposedGlRenderContext {
         let proc_loader = Box::new(EglProcLoader::new(egl.as_ref()));
         let adapter_vendor = target.wgpu_ctx.adapter.get_info().vendor;
         let drm_render_fd = select_hwdec_display_resource(Some(adapter_vendor));
+        let update_wake = RenderWake::new().context("creating composed mpv render wake fd")?;
+        let mut slots = Vec::with_capacity(3);
+        for _ in 0..3 {
+            slots.push(SharedGlSlot::new(&gl, &target.wgpu_ctx, width, height)?);
+        }
         let mpv_context = create_mpv_gl_context(
             mpv,
             target.mpv_native_display_param(),
@@ -116,7 +121,6 @@ impl ComposedGlRenderContext {
             Some(adapter_vendor),
             proc_loader.as_ref(),
         )?;
-        let update_wake = RenderWake::new().context("creating composed mpv render wake fd")?;
         // SAFETY: update_wake owns a boxed fd that outlives the callback.
         unsafe {
             sys::mpv_render_context_set_update_callback(
@@ -124,10 +128,6 @@ impl ComposedGlRenderContext {
                 Some(render_update_callback),
                 update_wake.callback_context(),
             );
-        }
-        let mut slots = Vec::with_capacity(3);
-        for _ in 0..3 {
-            slots.push(SharedGlSlot::new(&gl, &target.wgpu_ctx, width, height)?);
         }
         Ok(Self {
             egl,

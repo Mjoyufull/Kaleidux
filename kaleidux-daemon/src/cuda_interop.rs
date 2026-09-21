@@ -247,16 +247,37 @@ macro_rules! load_fn {
 }
 
 impl CudaInterop {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(wgpu_device: &wgpu::Device) -> Result<Self, String> {
         // SAFETY: CUDA symbols are loaded from the process CUDA driver library and stored
         // with the owning `Library` in `CudaInterop`, so function pointers never outlive it.
         unsafe {
+            let vulkan_uuid = wgpu_device
+                .as_hal::<wgpu_hal::vulkan::Api, _, _>(|device| {
+                    let device =
+                        device.ok_or_else(|| "CUDA interop requires Vulkan".to_string())?;
+                    let mut identity = ash::vk::PhysicalDeviceIDProperties::default();
+                    let mut properties =
+                        ash::vk::PhysicalDeviceProperties2::default().push_next(&mut identity);
+                    device
+                        .shared_instance()
+                        .raw_instance()
+                        .get_physical_device_properties2(
+                            device.raw_physical_device(),
+                            &mut properties,
+                        );
+                    Ok::<_, String>(identity.device_uuid)
+                })
+                .ok_or_else(|| "Vulkan device unavailable".to_string())??;
             let lib = libloading::Library::new("libcuda.so.1")
                 .or_else(|_| libloading::Library::new("libcuda.so"))
                 .map_err(|e| format!("[CUDA] Failed to load libcuda.so: {e}"))?;
 
             let cu_init: FnCuInit = load_fn!(lib, b"cuInit\0");
             let cu_device_get: FnCuDeviceGet = load_fn!(lib, b"cuDeviceGet\0");
+            let cu_device_get_count: unsafe extern "C" fn(*mut i32) -> CUresult =
+                load_fn!(lib, b"cuDeviceGetCount\0");
+            let cu_device_get_uuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult =
+                load_fn!(lib, b"cuDeviceGetUuid\0");
             let cu_ctx_create: FnCuCtxCreate = load_fn!(lib, b"cuCtxCreate_v2\0");
             let cu_ctx_set_current: FnCuCtxSetCurrent = load_fn!(lib, b"cuCtxSetCurrent\0");
             let cu_ctx_destroy: FnCuCtxDestroy = load_fn!(lib, b"cuCtxDestroy_v2\0");
@@ -303,11 +324,25 @@ impl CudaInterop {
                 return Err(cuda_err("cuInit", res));
             }
 
-            let mut device: CUdevice = 0;
-            let res = cu_device_get(&mut device, 0);
+            let mut count = 0;
+            let res = cu_device_get_count(&mut count);
             if res != CUDA_SUCCESS {
-                return Err(cuda_err("cuDeviceGet", res));
+                return Err(cuda_err("cuDeviceGetCount", res));
             }
+            let mut matched = None;
+            for ordinal in 0..count {
+                let mut candidate = 0;
+                let mut uuid = [0u8; 16];
+                if cu_device_get(&mut candidate, ordinal) == CUDA_SUCCESS
+                    && cu_device_get_uuid(&mut uuid, candidate) == CUDA_SUCCESS
+                    && uuid == vulkan_uuid
+                {
+                    matched = Some(candidate);
+                    break;
+                }
+            }
+            let device = matched
+                .ok_or_else(|| "No CUDA device matches the Vulkan adapter UUID".to_string())?;
 
             let mut ctx: CUcontext = std::ptr::null_mut();
             let res = cu_ctx_create(&mut ctx, 0, device);

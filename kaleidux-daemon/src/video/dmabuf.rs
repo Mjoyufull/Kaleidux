@@ -231,13 +231,22 @@ fn validate_layout(
         "DMA-BUF pitch is smaller than the NV12 plane width"
     );
     anyhow::ensure!(buffer.n_memory() > 0, "DMA-BUF frame has no memory");
-    if buffer.n_memory() == 1 && modifier == DRM_FORMAT_MOD_LINEAR {
+    if modifier == DRM_FORMAT_MOD_LINEAR {
         let y_end = offsets[0].saturating_add(strides[0] as usize * height as usize);
         let uv_end = offsets[1].saturating_add(strides[1] as usize * height.div_ceil(2) as usize);
         anyhow::ensure!(
             y_end <= buffer.size() && uv_end <= buffer.size(),
             "linear DMA-BUF plane exceeds buffer bounds"
         );
+        for (start, end) in [(offsets[0], y_end), (offsets[1], uv_end)] {
+            let (memories, _) = buffer
+                .find_memory(start..end)
+                .context("linear DMA-BUF plane is outside its memory")?;
+            anyhow::ensure!(
+                memories.len() == 1,
+                "linear DMA-BUF plane spans multiple memory objects"
+            );
+        }
     }
     Ok(())
 }
@@ -295,14 +304,14 @@ fn build_descriptor(
         });
     }
 
-    let plane_objects = plane_object_indices(buffer, offsets)?;
+    let plane_locations = plane_locations(buffer, offsets)?;
     let planes = std::array::from_fn(|plane_index| NativeDmaBufPlane {
         layer_index: 0,
-        object_index: plane_objects[plane_index],
+        object_index: plane_locations[plane_index].0,
         offset: buffer
-            .peek_memory(plane_objects[plane_index])
+            .peek_memory(plane_locations[plane_index].0)
             .offset()
-            .saturating_add(offsets[plane_index]) as u64,
+            .saturating_add(plane_locations[plane_index].1) as u64,
         pitch: strides[plane_index] as u64,
         drm_fourcc: key.fourcc,
     });
@@ -318,22 +327,17 @@ fn build_descriptor(
     })
 }
 
-fn plane_object_indices(
+fn plane_locations(
     buffer: &gst::BufferRef,
     offsets: [usize; 4],
-) -> anyhow::Result<[usize; 2]> {
-    if buffer.n_memory() >= 2 {
-        // Hardware exporters conventionally expose one GstMemory per NV12
-        // plane and VideoMeta offsets relative to each memory object.
-        return Ok([0, 1]);
-    }
+) -> anyhow::Result<[(usize, usize); 2]> {
     let y = buffer
         .find_memory(offsets[0]..offsets[0].saturating_add(1))
-        .map(|(range, _)| range.start)
+        .map(|(range, skip)| (range.start, skip))
         .ok_or_else(|| anyhow::anyhow!("luma offset is outside the DMA-BUF"))?;
     let uv = buffer
         .find_memory(offsets[1]..offsets[1].saturating_add(1))
-        .map(|(range, _)| range.start)
+        .map(|(range, skip)| (range.start, skip))
         .ok_or_else(|| anyhow::anyhow!("chroma offset is outside the DMA-BUF"))?;
     Ok([y, uv])
 }
@@ -407,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn linear_planes_cannot_span_memory_objects() {
+        let buffer = dmabuf_buffer(&[4096, 4096, 4096]);
+        let error = DmaBufDescriptorCache::default()
+            .frame_format(
+                &buffer,
+                64,
+                64,
+                DRM_FORMAT_NV12,
+                DRM_FORMAT_MOD_LINEAR,
+                [128, 128, 0, 0],
+                [0, 8192, 0, 0],
+            )
+            .expect_err("a fragmented luma plane cannot be imported as one fd");
+        assert!(error.to_string().contains("spans multiple"));
+    }
+
+    #[test]
     fn tiled_multi_object_layout_preserves_modifier_and_object_mapping() {
         const INTEL_X_TILED: u64 = 0x0100_0000_0000_0001;
         let buffer = dmabuf_buffer(&[8192, 4096]);
@@ -419,7 +440,7 @@ mod tests {
                 DRM_FORMAT_NV12,
                 INTEL_X_TILED,
                 [128, 128, 0, 0],
-                [0, 0, 0, 0],
+                [0, 8192, 0, 0],
             )
             .expect("tiled multi-object layout should be preserved");
         let VideoFrameFormat::DmaBufNv12 { frame } = format else {
