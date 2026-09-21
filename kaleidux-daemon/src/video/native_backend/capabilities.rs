@@ -68,9 +68,9 @@ impl NativeDecoderApi {
             Self::Vaapi => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
             Self::Nvdec => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
             Self::Qsv => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
-            Self::Amf => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_AMF,
+            Self::Amf => unsafe { ffi::av_hwdevice_find_type_by_name(c"amf".as_ptr()) },
             Self::VideoToolbox => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-            Self::D3d12 => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA,
+            Self::D3d12 => unsafe { ffi::av_hwdevice_find_type_by_name(c"d3d12va".as_ptr()) },
             Self::D3d11 => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
             Self::MediaCodec => ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC,
         }
@@ -82,11 +82,21 @@ impl NativeDecoderApi {
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI => Some(Self::Vaapi),
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => Some(Self::Nvdec),
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV => Some(Self::Qsv),
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_AMF => Some(Self::Amf),
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX => Some(Self::VideoToolbox),
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D12VA => Some(Self::D3d12),
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA => Some(Self::D3d11),
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC => Some(Self::MediaCodec),
+            other
+                if other != ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
+                    && other == Self::Amf.device_type() =>
+            {
+                Some(Self::Amf)
+            }
+            other
+                if other != ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
+                    && other == Self::D3d12.device_type() =>
+            {
+                Some(Self::D3d12)
+            }
             _ => None,
         }
     }
