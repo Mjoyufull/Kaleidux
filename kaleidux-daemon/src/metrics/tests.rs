@@ -22,11 +22,15 @@ fn image_stage_timings_are_averaged() {
         Duration::from_millis(60),
     );
 
-    assert_eq!(metrics.get_recent_avg_image_wait_ms(), 10.0);
-    assert_eq!(metrics.get_recent_avg_image_decode_ms(), 20.0);
-    assert_eq!(metrics.get_recent_avg_image_convert_ms(), 30.0);
-    assert_eq!(metrics.get_recent_avg_image_resize_ms(), 40.0);
-    assert_eq!(metrics.get_recent_avg_image_expand_ms(), 50.0);
-    assert_eq!(metrics.get_recent_avg_image_upload_ms(), 60.0);
-    assert_eq!(metrics.get_recent_avg_image_total_ms(), 210.0);
+    for (actual, expected) in [
+        (metrics.get_recent_avg_image_wait_ms(), 10.0),
+        (metrics.get_recent_avg_image_decode_ms(), 20.0),
+        (metrics.get_recent_avg_image_convert_ms(), 30.0),
+        (metrics.get_recent_avg_image_resize_ms(), 40.0),
+        (metrics.get_recent_avg_image_expand_ms(), 50.0),
+        (metrics.get_recent_avg_image_upload_ms(), 60.0),
+        (metrics.get_recent_avg_image_total_ms(), 210.0),
+    ] {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
 }
