@@ -159,6 +159,18 @@
             done
 
             wrapProgram $out/bin/kaleidux-daemon \
+              --run '
+                kld_driver_paths=""
+                IFS=: read -r -a kld_library_dirs <<< "''${LD_LIBRARY_PATH-}"
+                for kld_library_dir in "''${kld_library_dirs[@]}"; do
+                  case "$kld_library_dir" in
+                    /nix/store/*|/run/opengl-driver/lib|/run/opengl-driver-32/lib)
+                      kld_driver_paths="''${kld_driver_paths:+$kld_driver_paths:}$kld_library_dir"
+                      ;;
+                  esac
+                done
+                export LD_LIBRARY_PATH="$kld_driver_paths"
+              ' \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath packageRuntimeDeps}:/run/opengl-driver/lib" \
               ${packageVaWrapperArgs} \
               ${packageGstWrapperArgs} \
