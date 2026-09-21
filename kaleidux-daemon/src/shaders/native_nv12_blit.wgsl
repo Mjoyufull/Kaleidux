@@ -114,8 +114,8 @@ fn tonemap_hdr_to_sdr(rgb: vec3<f32>, transfer: f32, mastering_peak: f32, sdr_wh
     let luminance = max(dot(nits_rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.000001);
     let x = luminance / max(sdr_white, 1.0);
     let white = max(mastering_peak / max(sdr_white, 1.0), 1.0);
-    // Extended Reinhard: reference diffuse white stays stable while mastering
-    // peak maps to display white with a smooth highlight shoulder.
+    // Extended Reinhard maps the mastering peak to display white. Diffuse
+    // white is compressed to leave room for highlights on an SDR display.
     let mapped = x * (1.0 + x / (white * white)) / (1.0 + x);
     return nits_rgb * (mapped / luminance);
 }

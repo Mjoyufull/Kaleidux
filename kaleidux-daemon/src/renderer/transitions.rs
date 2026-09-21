@@ -226,6 +226,9 @@ impl super::Renderer {
         }
 
         self.release_prev_texture("flatten active transition");
+        self.current_external_view = None;
+        let external = self.current_external_frame.take();
+        self.drop_external_frame(external);
         self.current_texture = Some(composition_texture);
         self.current_texture_view = Some(composition_view);
         self.current_texture_size = Some((self.config.width.max(1), self.config.height.max(1)));

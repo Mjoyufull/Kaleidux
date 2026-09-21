@@ -117,6 +117,7 @@ impl Transition {
             }
             Transition::DirectionalWarp { direction } => {
                 p[0..2].copy_from_slice(direction);
+                p[2] = 0.1;
             }
             Transition::DirectionalWipe {
                 direction,
@@ -177,6 +178,9 @@ impl Transition {
             }
             Transition::FadeGrayscale { intensity } => {
                 p[0] = *intensity;
+            }
+            Transition::FilmBurn { seed } => {
+                p[0] = *seed;
             }
             Transition::FlyEye {
                 size,
@@ -406,7 +410,6 @@ impl Transition {
             | Transition::ZoomRightWipe { zoom_quickness } => {
                 p[0] = *zoom_quickness;
             }
-            _ => {}
         }
         p
     }
