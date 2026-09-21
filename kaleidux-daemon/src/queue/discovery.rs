@@ -170,7 +170,8 @@ impl SmartQueue {
                     let bg_cache = cache.clone();
                     let bg_metrics = metrics.clone();
 
-                    if background::spawn_blocking_tracked(
+                    tokio::spawn(async move {
+                        let handle = background::spawn_blocking_tracked_wait(
                         BackgroundWorkKind::QueueDiscovery,
                         move || match Self::discover_content(
                             &bg_path,
@@ -189,14 +190,13 @@ impl SmartQueue {
                                 tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
                             }
                         },
-                    )
-                    .is_none()
-                    {
-                        tracing::debug!(
-                            "[QUEUE] Skipping background pool refresh for {:?}: shutdown in progress",
-                            path
-                        );
-                    }
+                    ).await;
+                        if handle.is_none() {
+                            tracing::debug!(
+                                "[QUEUE] Skipping background pool refresh: shutdown in progress"
+                            );
+                        }
+                    });
 
                     ct_cache_init = Some(Self::populate_content_type_cache_from_pool(
                         &cache,

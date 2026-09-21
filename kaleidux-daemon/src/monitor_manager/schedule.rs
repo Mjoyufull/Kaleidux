@@ -13,6 +13,45 @@ impl MonitorManager {
         }
         let now = Instant::now();
 
+        // A newly connected peer joins the content already on its group;
+        // it must neither wait for the cycle deadline nor consume queue Next.
+        let joins: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|(_, orch)| orch.current_path.is_none())
+            .filter_map(|(name, _)| {
+                let peer = self.outputs.iter().find(|(peer_name, peer)| {
+                    peer.current_path.is_some()
+                        && match &self.config.global.monitor_behavior {
+                            MonitorBehavior::Synchronized => true,
+                            MonitorBehavior::Grouped(_) => {
+                                self.output_groups.contains_key(name)
+                                    && self.output_groups.get(name)
+                                        == self.output_groups.get(*peer_name)
+                            }
+                            MonitorBehavior::Independent => false,
+                        }
+                })?;
+                Some((
+                    name.clone(),
+                    peer.1.current_path.clone()?,
+                    peer.1.next_path.clone(),
+                    peer.1.next_content_type,
+                ))
+            })
+            .collect();
+        for (name, path, next_path, next_content_type) in joins {
+            if let Some(kind) = Self::resolve_content_type(&path, "hotplug join") {
+                let orch = self.outputs.get_mut(&name).expect("collected output");
+                orch.current_path = Some(path.clone());
+                orch.display_start_time = None;
+                orch.next_change = Some(now + content_load_timeout(orch.config.duration));
+                orch.next_path = next_path;
+                orch.next_content_type = next_content_type;
+                changes.insert(name, (path, kind));
+            }
+        }
+
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for (name, orch) in &mut self.outputs {

@@ -15,16 +15,21 @@ impl SmartQueue {
     }
 
     pub(super) fn sync_root_index_if_needed(&mut self) {
-        if self.active_playlist.is_some() {
-            return;
-        }
         let snapshot = self.root_index.snapshot();
         if snapshot.generation == self.root_generation {
             return;
         }
+        let playlist = self
+            .active_playlist
+            .as_ref()
+            .and_then(|name| self.stats.playlists.get(name));
         self.pool = snapshot
             .entries
             .iter()
+            .filter(|entry| {
+                !self.stats.blacklist.contains(&entry.path)
+                    && playlist.is_none_or(|playlist| playlist.paths.contains(&entry.path))
+            })
             .map(|entry| entry.path.clone())
             .collect();
         self.content_type_cache = snapshot

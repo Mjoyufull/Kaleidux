@@ -115,6 +115,14 @@ impl MonitorManager {
             return false;
         }
 
+        if self
+            .outputs
+            .values()
+            .any(|orch| orch.current_path.is_none())
+        {
+            return true;
+        }
+
         match self.next_switch_deadline() {
             Some(deadline) => deadline <= now,
             None => self

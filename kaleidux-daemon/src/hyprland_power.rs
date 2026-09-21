@@ -181,9 +181,9 @@ impl HyprlandPowerMonitor {
     }
 
     pub(crate) fn needs_output_snapshot(&self) -> bool {
-        self.in_flight
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+        // Completion can race with the subsequent poll. Take the output
+        // snapshot for every in-flight query, including one still running.
+        self.in_flight.is_some()
     }
 
     /// Drop state for outputs no longer owned by the display backend.
