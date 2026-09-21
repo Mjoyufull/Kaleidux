@@ -5,6 +5,12 @@ use super::{
 use crate::shaders::Transition;
 
 #[test]
+fn shipped_example_configuration_parses() {
+    let config = Config::parse_str(include_str!("../../../config.example.toml"));
+    assert!(config.is_ok(), "example config must parse: {config:?}");
+}
+
+#[test]
 fn zero_script_tick_interval_is_rejected() {
     let error = Config::parse_str(
         r#"
