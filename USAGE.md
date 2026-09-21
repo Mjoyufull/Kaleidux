@@ -77,6 +77,12 @@ disable this tuning. Builds using the optional `jemalloc` feature do not apply i
 
 ## Diagnostics
 
+On non-NixOS NVIDIA systems, launch the Nix package through nixGL. The wrapper
+preserves inherited `/nix/store/` and `/run/opengl-driver` library paths, but
+filters host library directories before starting the daemon. An inherited
+`/usr/lib` can break the Nix shell interpreter before the wrapper runs; clear
+`LD_LIBRARY_PATH` before invoking nixGL if that happens.
+
 Console logging defaults to `WARN`. `--log 1` enables warnings and file logging;
 levels 2, 3, and 4 add info, debug, and trace output. Logs are written under
 `~/.config/kaleidux/logs/`.
