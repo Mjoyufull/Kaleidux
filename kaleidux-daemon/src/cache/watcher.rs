@@ -107,6 +107,7 @@ impl DirectoryWatcher {
         match (rename_mode, paths.as_slice()) {
             (RenameMode::Both, [from, to]) => {
                 if to.is_dir() {
+                    self.emit_root_rescans(from, pool_events);
                     self.emit_root_rescans(to, pool_events);
                     return;
                 }

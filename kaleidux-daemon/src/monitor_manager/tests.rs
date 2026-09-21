@@ -271,6 +271,42 @@ fn applying_updated_config_recomputes_phase_offset() {
 mod update_config;
 
 #[test]
+fn synchronized_hotplug_joins_current_content_before_the_deadline() {
+    let temp = unique_test_dir("sync-hotplug");
+    let cache = Arc::new(FileCache::new_test(&temp.join("cache.redb")).unwrap());
+    let image = write_test_image(&temp, "current.png");
+    let config = test_output_config(Duration::from_secs(600));
+    let now = Instant::now();
+    let make_output = |name: &str, current_path| OutputOrchestrator {
+        _name: name.to_string(),
+        description: name.to_string(),
+        phase_offset: Duration::ZERO,
+        config: config.clone(),
+        queue: None,
+        current_path,
+        next_path: None,
+        next_content_type: None,
+        next_change: Some(now + config.duration),
+        display_start_time: Some(now),
+    };
+    let mut manager = make_test_manager(
+        "DP-1",
+        cache,
+        make_output("DP-1", Some(image.clone())),
+        config_for_output_with_behavior("DP-1", &config, MonitorBehavior::Synchronized),
+    );
+    manager.shared_display_start_time = Some(now);
+    manager
+        .outputs
+        .insert("DP-2".to_string(), make_output("DP-2", None));
+    assert!(manager.tick_due(now));
+    let changes = manager.tick();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes["DP-2"].0, image);
+    assert!(!changes.contains_key("DP-1"));
+}
+
+#[test]
 fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
     let temp = unique_test_dir("sync-unknown-tick");
     let cache = Arc::new(
