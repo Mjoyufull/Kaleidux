@@ -25,6 +25,13 @@ struct RootMediaState {
 #[derive(Debug)]
 pub(crate) struct RootMediaIndex {
     state: RwLock<RootMediaState>,
+    rescan: Mutex<RescanState>,
+}
+
+#[derive(Debug, Default)]
+struct RescanState {
+    running: bool,
+    generation: u64,
 }
 
 static ROOT_INDEXES: LazyLock<Mutex<HashMap<PathBuf, Weak<RootMediaIndex>>>> =
@@ -45,12 +52,40 @@ pub(crate) fn shared_root_index(root: &Path) -> Arc<RootMediaIndex> {
     }
     let index = Arc::new(RootMediaIndex {
         state: RwLock::new(RootMediaState::default()),
+        rescan: Mutex::new(RescanState::default()),
     });
     indexes.insert(root, Arc::downgrade(&index));
     index
 }
 
 impl RootMediaIndex {
+    pub(crate) fn request_rescan(&self) -> Option<u64> {
+        let mut state = self
+            .rescan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        if state.running {
+            None
+        } else {
+            state.running = true;
+            Some(state.generation)
+        }
+    }
+
+    pub(crate) fn finish_rescan(&self, generation: u64) -> Option<u64> {
+        let mut state = self
+            .rescan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.generation != generation {
+            Some(state.generation)
+        } else {
+            state.running = false;
+            None
+        }
+    }
+
     pub(crate) fn install_if_empty(
         &self,
         pool: &[PathBuf],
@@ -91,6 +126,15 @@ impl RootMediaIndex {
         &self,
         changes: &[(PathBuf, Option<ContentType>)],
     ) -> RootMediaSnapshot {
+        if !changes.is_empty() {
+            let mut rescan = self
+                .rescan
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if rescan.running {
+                rescan.generation = rescan.generation.wrapping_add(1);
+            }
+        }
         let mut state = self
             .state
             .write()
@@ -173,6 +217,19 @@ fn snapshot_locked(state: &RootMediaState) -> RootMediaSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_requests_coalesce_without_losing_changes_during_a_scan() {
+        let index = shared_root_index(&PathBuf::from(format!("rescan-{}", rand::random::<u64>())));
+        let first = index.request_rescan().unwrap();
+        assert!(index.request_rescan().is_none());
+        index.apply_changes(&[(PathBuf::from("new.png"), Some(ContentType::Image))]);
+        let next = index
+            .finish_rescan(first)
+            .expect("requests during scan require a rerun");
+        assert!(index.finish_rescan(next).is_none());
+        assert!(index.request_rescan().is_some());
+    }
 
     #[test]
     fn root_snapshot_storage_is_shared_and_generation_tagged() {
