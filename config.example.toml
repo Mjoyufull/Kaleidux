@@ -45,8 +45,8 @@ sorting = "loveit"
 
 # Default transition duration in milliseconds
 transition-time = 1000
-# Default volume (0.0 to 10.0), default 1.0
-volume = 1.0
+# Default volume as an integer percentage (0-100), default 100
+volume = 100
 
 # Optional: Path to Rhai script for custom logic
 # script-path = "~/.config/kaleidux/automation.rhai"
@@ -83,7 +83,7 @@ transition = { type = "fade" }
 # video-ratio = 80
 # transition = { type = "cube", persp = 0.4, unzoom = 0.8, reflection = 0.4, floating = 3.0 }
 # transition-time = 2000
-# volume = 0.8
+# volume = 80
 
 # Example: Secondary monitor with static images
 # [DP-2]
