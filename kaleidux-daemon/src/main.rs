@@ -41,6 +41,7 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    configure_image_allocator();
     // Process-global libva environment sanitization must happen before the
     // Tokio runtime creates worker threads.
     kaleidux_daemon::video::sanitize_libva_driver_env_for_gstreamer();
@@ -53,6 +54,26 @@ fn main() -> anyhow::Result<()> {
     let result = runtime.block_on(async_main());
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     result
+}
+
+fn configure_image_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+    {
+        // Keep large, short-lived decode buffers mmap-backed. glibc's adaptive
+        // threshold otherwise retains hundreds of MiB after image switching.
+        // Respect explicit allocator tuning supplied by the launcher.
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
+            && std::env::var_os("MALLOC_TRIM_THRESHOLD_").is_none()
+            && std::env::var_os("GLIBC_TUNABLES").is_none()
+        {
+            // SAFETY: called before worker creation; mallopt accepts integer
+            // allocator settings and does not borrow application memory.
+            unsafe {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+                libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+            }
+        }
+    }
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -73,6 +94,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     apply_video_mode(args.video_mode.as_deref());
     apply_video_backend(args.video_backend.as_deref());
+    kaleidux_daemon::video::validate_video_mode_backend(
+        kaleidux_daemon::video::get_video_mode(),
+        kaleidux_daemon::video::resolve_video_backend_request(
+            kaleidux_daemon::video::get_video_backend_request(),
+        ),
+    )?;
     let config = load_config(args.demo).await?;
     let gstreamer_duration = init_gstreamer()?;
 
