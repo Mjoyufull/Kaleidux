@@ -196,8 +196,16 @@ impl SoftwareRenderContext {
         height: u32,
         force_redraw: bool,
     ) -> anyhow::Result<Option<SoftwareRenderedFrame>> {
-        let stride = width.saturating_mul(4);
-        let mut data = vec![0u8; stride as usize * height as usize];
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("mpv software frame size overflow"))?;
+        anyhow::ensure!(
+            width > 0 && height > 0 && bytes <= 256 * 1024 * 1024,
+            "mpv software frame exceeds the 256 MiB allocation limit: {width}x{height}"
+        );
+        let stride = width * 4;
+        let mut data = vec![0u8; bytes as usize];
         let size = [width as i32, height as i32];
         let mut stride_param = stride as usize;
         let mut block_for_target_time = RENDER_WITHOUT_TARGET_BLOCK;

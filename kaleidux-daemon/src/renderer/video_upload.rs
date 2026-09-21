@@ -199,7 +199,6 @@ impl super::Renderer {
                 self.release_i420_staging("GStreamer dmabuf frame path");
                 self.release_p010_staging("GStreamer dmabuf frame path");
                 self.release_cuda_cache();
-                self.release_dmabuf_cache();
             }
             crate::video::VideoFrameFormat::NativeDmaBufNv12 { .. } => {
                 self.release_i420_staging("native dmabuf frame path");
@@ -358,9 +357,10 @@ impl super::Renderer {
                         *y_stride,
                         *uv_offset,
                         *uv_stride,
-                    );
+                    )
+                } else {
+                    true
                 }
-                true
             }
         };
 

@@ -44,14 +44,14 @@ impl GlExternalFrame {
             return Ok(());
         }
         let Some(previous) = previous else {
-            return self.inner.sync.wait_for_gl_render(&self.inner.wgpu_ctx);
+            return self.wait_for_gl_render();
         };
         if previous
             .inner
             .release_scheduled
             .swap(true, Ordering::AcqRel)
         {
-            return self.inner.sync.wait_for_gl_render(&self.inner.wgpu_ctx);
+            return self.wait_for_gl_render();
         }
         match self
             .inner
@@ -71,6 +71,14 @@ impl GlExternalFrame {
                 Err(error)
             }
         }
+    }
+
+    fn wait_for_gl_render(&self) -> anyhow::Result<()> {
+        let result = self.inner.sync.wait_for_gl_render(&self.inner.wgpu_ctx);
+        if result.is_err() {
+            self.inner.acquired_for_wgpu.store(false, Ordering::Release);
+        }
+        result
     }
 
     pub(crate) fn release_after_submit(&self) {

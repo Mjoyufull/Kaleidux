@@ -51,7 +51,7 @@ impl super::Renderer {
         {
             let mut ci_lock = self.ctx.cuda_interop.lock();
             if ci_lock.is_none() {
-                match crate::cuda_interop::CudaInterop::new() {
+                match crate::cuda_interop::CudaInterop::new(&self.ctx.device) {
                     Ok(ci) => *ci_lock = Some(ci),
                     Err(e) => {
                         error!("[VIDEO] {}: {e}", self.name);
@@ -99,6 +99,7 @@ impl super::Renderer {
             .is_none_or(|c| c.width != width || c.height != height);
         if need_new {
             self.cuda_nv12_bind_group = None;
+            self.final_nv12_bind_group = None;
             let ci_guard = self.ctx.cuda_interop.lock();
             let ci = ci_guard.as_ref().unwrap();
 
@@ -153,6 +154,7 @@ impl super::Renderer {
                         "[VIDEO] {}: Failed to create CUDA-backed UV texture",
                         self.name
                     );
+                    drop(y_tex);
                     ci.free_exportable(y_cuda_alloc);
                     self.ctx
                         .cuda_interop_failed

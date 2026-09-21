@@ -464,7 +464,7 @@ impl WgpuContext {
         {
             let mut ci_lock = self.cuda_interop.lock();
             if ci_lock.is_none() {
-                match crate::cuda_interop::CudaInterop::new() {
+                match crate::cuda_interop::CudaInterop::new(&self.device) {
                     Ok(interop) => {
                         *ci_lock = Some(interop);
                         created_context = true;
