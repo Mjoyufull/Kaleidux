@@ -159,7 +159,7 @@
             done
 
             wrapProgram $out/bin/kaleidux-daemon \
-              --set LD_LIBRARY_PATH "${pkgs.lib.makeLibraryPath packageRuntimeDeps}:/run/opengl-driver/lib" \
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath packageRuntimeDeps}:/run/opengl-driver/lib" \
               ${packageVaWrapperArgs} \
               ${packageGstWrapperArgs} \
               --suffix XDG_DATA_DIRS : "/usr/share"
