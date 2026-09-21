@@ -118,7 +118,7 @@ pub(crate) fn create_and_start_video_player(
                             return Ok(None);
                         }
                         let prebuffer_start = Instant::now();
-                        let prebuffer = match vp.prebuffer(should_abort) {
+                        let mut prebuffer = match vp.prebuffer(should_abort) {
                             Ok(result) => result,
                             Err(e) => {
                                 if should_abort() {
@@ -140,6 +140,7 @@ pub(crate) fn create_and_start_video_player(
                         let prebuffer_duration = prebuffer_start.elapsed();
                         if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0) {
                             vp.set_start_position_ns(position_ns);
+                            prebuffer.frame = None;
                         }
                         debug!(
                             "[VIDEO] {}: Player prepared in {:.1}ms (create {:.1}ms + prebuffer {:.1}ms, set_state {:.1}ms/{} + wait_state {:.1}ms settled={} current={:?} pending={:?} + pull_preroll {:.1}ms, preroll_frame={})",
@@ -204,6 +205,9 @@ pub(crate) fn create_and_start_video_player(
                 Ok(Err(_)) | Err(_) => {
                     if shutdown_flag.load(Ordering::SeqCst) {
                         return;
+                    }
+                    if let Ok(Err(error)) = &result {
+                        error!("[VIDEO] {}: Player preparation/start failed: {error:#}", name_for_panic);
                     }
                     if result.is_err() {
                         error!("[VIDEO] {}: Video player task panicked!", name_for_panic);
