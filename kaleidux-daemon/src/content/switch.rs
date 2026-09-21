@@ -277,11 +277,29 @@ pub(crate) fn switch_wallpaper_content(
                 }
 
                 let request_start = Instant::now();
+                // Reserve before preparing pixels; waiting senders must not
+                // hold uncharged decoded buffers outside the channel budget.
+                let reserved_bytes =
+                    crate::image::runtime_cache::load_image_source_descriptor(&path_clone)
+                        .map(|descriptor| {
+                            crate::image::runtime_cache::prepared_target_dimensions_from_descriptor(
+                                &descriptor,
+                                target_width,
+                                target_height,
+                            )
+                        })
+                        .map(|(width, height)| width as usize * height as usize * 4)
+                        .unwrap_or(256 * 1024 * 1024);
+                let byte_permit = crate::image::channel_budget::acquire(reserved_bytes).await;
+                if byte_permit.is_none() {
+                    return;
+                }
                 let decode_result = request_prepared_image_payload(
                     &path_clone,
                     target_width,
                     target_height,
                     BackgroundWorkKind::ImageDecode,
+                    reserved_bytes,
                     &metrics,
                 )
                 .await;
@@ -300,12 +318,6 @@ pub(crate) fn switch_wallpaper_content(
                         let observed_total = request_start.elapsed();
                         payload.profile.permit_wait =
                             observed_total.saturating_sub(payload.profile.cpu_duration());
-                        let byte_permit =
-                            crate::image::channel_budget::acquire(payload.data.len()).await;
-                        if byte_permit.is_none() {
-                            debug!("[ASSET] {}: Image channel budget closed", name_clone);
-                            return;
-                        }
                         if let Err(e) = tx
                             .send(LoadedImage {
                                 name: name_clone.clone(),

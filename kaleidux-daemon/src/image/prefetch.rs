@@ -95,8 +95,17 @@ fn limit_plan_to_memory_budget(requests: &mut Vec<ImagePrefetchRequest>) {
     // cold rather than decoded and immediately discarded.
     let mut remaining = super::runtime_cache::PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES / 2;
     requests.retain(|request| {
-        let bytes = u64::from(request.target_width)
-            .saturating_mul(u64::from(request.target_height))
+        let (width, height) = super::runtime_cache::load_image_source_descriptor(&request.path)
+            .map(|source| {
+                super::runtime_cache::prepared_target_dimensions_from_descriptor(
+                    &source,
+                    request.target_width,
+                    request.target_height,
+                )
+            })
+            .unwrap_or((request.target_width, request.target_height));
+        let bytes = u64::from(width)
+            .saturating_mul(u64::from(height))
             .saturating_mul(4);
         if bytes > remaining as u64 {
             return false;

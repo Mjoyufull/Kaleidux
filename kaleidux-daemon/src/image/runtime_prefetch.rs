@@ -63,6 +63,7 @@ pub(crate) fn schedule_image_prefetch_plan(
                 request.target_width,
                 request.target_height,
                 BackgroundWorkKind::ImagePrefetch,
+                usize::MAX,
                 &metrics,
             )
             .await

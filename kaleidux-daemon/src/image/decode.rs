@@ -1,6 +1,7 @@
 use crate::image::types::{
     DecodedImagePayload, DecodedSourceImage, DecodedSourcePixels, ImageLoadProfile,
 };
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -9,6 +10,19 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 
 const MAX_DECODED_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn read_encoded_source(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_DECODED_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_DECODED_SOURCE_BYTES,
+        "encoded image exceeds 512 MiB safety limit: {}",
+        path.display()
+    );
+    Ok(bytes)
+}
 
 fn validate_source_dimensions(path: &Path, width: u32, height: u32) -> anyhow::Result<()> {
     let decoded_bytes = u64::from(width)
@@ -59,7 +73,7 @@ fn image_format_label(format: Option<image::ImageFormat>, fast_path: bool) -> St
 
 fn decode_jpeg_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
     let decode_start = Instant::now();
-    let encoded = std::fs::read(path)?;
+    let encoded = read_encoded_source(path)?;
     let options = DecoderOptions::new_fast()
         .set_strict_mode(false)
         .set_max_width(usize::MAX)
@@ -109,7 +123,7 @@ fn log_decode_time_downscale_status(path: &Path, source_width: u32, source_heigh
 
 fn decode_png_source_fast(path: &Path) -> anyhow::Result<DecodedSourceImage> {
     let decode_start = Instant::now();
-    let encoded = std::fs::read(path)?;
+    let encoded = read_encoded_source(path)?;
     let options = DecoderOptions::default()
         .set_strict_mode(false)
         .set_max_width(usize::MAX)
@@ -166,7 +180,11 @@ fn decode_source_generic(
     let decode_start = Instant::now();
     let (header_width, header_height) = image::image_dimensions(path)?;
     validate_source_dimensions(path, header_width, header_height)?;
-    let image = image::open(path)?;
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_SOURCE_BYTES);
+    reader.limits(limits);
+    let image = reader.decode()?;
     let decode_duration = decode_start.elapsed();
     let source_width = image.width();
     let source_height = image.height();
