@@ -23,6 +23,14 @@ use std::sync::Arc;
 
 const MAX_SPECULATIVE_FAILURE_RETRIES: u8 = 3;
 
+fn rejected_image_work(work_kind: BackgroundWorkKind) -> String {
+    if work_kind == BackgroundWorkKind::ImagePrefetch && background::is_accepting_new_work() {
+        format!("{IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX} background registry is full")
+    } else {
+        "image work skipped because shutdown is in progress".to_string()
+    }
+}
+
 async fn spawn_image_blocking<T, F>(
     work_kind: BackgroundWorkKind,
     work: F,
@@ -144,10 +152,16 @@ pub(crate) fn find_compatible_prepared_in_flight_state(
     identity: &ImageSourceIdentity,
     target_width: u32,
     target_height: u32,
+    max_bytes: usize,
 ) -> Option<Arc<InFlightSharedResult<PreparedImageEntry>>> {
     let in_flight = PREPARED_IMAGE_IN_FLIGHT.lock();
     let candidate_key =
         select_compatible_prepared_key(in_flight.keys(), identity, target_width, target_height)?;
+    if u64::from(candidate_key.target_width) * u64::from(candidate_key.target_height) * 4
+        > max_bytes as u64
+    {
+        return None;
+    }
     in_flight.get(&candidate_key).cloned()
 }
 
@@ -214,7 +228,7 @@ pub(crate) async fn request_decoded_source_image(
     let Some(handle) =
         spawn_image_blocking(work_kind, move || decode_source_image(&decode_path)).await
     else {
-        let msg = "image source decode skipped because shutdown is in progress".to_string();
+        let msg = rejected_image_work(work_kind);
         flight.publish(Err(msg.clone()));
         return Err(anyhow::anyhow!(msg));
     };
@@ -244,6 +258,7 @@ pub(crate) async fn request_prepared_image_payload(
     target_width: u32,
     target_height: u32,
     work_kind: BackgroundWorkKind,
+    max_compatible_bytes: usize,
     metrics: &Arc<metrics::PerformanceMetrics>,
 ) -> anyhow::Result<DecodedImagePayload> {
     let Some(descriptor) = load_image_source_descriptor(path) else {
@@ -253,9 +268,7 @@ pub(crate) async fn request_prepared_image_payload(
         })
         .await
         else {
-            return Err(anyhow::anyhow!(
-                "image prepare skipped because shutdown is in progress"
-            ));
+            return Err(anyhow::anyhow!(rejected_image_work(work_kind)));
         };
         metrics.record_image_prepared_miss();
         return handle
@@ -279,7 +292,9 @@ pub(crate) async fn request_prepared_image_payload(
         &descriptor.identity,
         prepared_width,
         prepared_height,
-    ) {
+    )
+    .filter(|payload| payload.data.len() <= max_compatible_bytes)
+    {
         metrics.record_image_prepared_compatible_hit();
         return Ok(payload);
     }
@@ -288,6 +303,7 @@ pub(crate) async fn request_prepared_image_payload(
         &descriptor.identity,
         prepared_width,
         prepared_height,
+        max_compatible_bytes,
     ) {
         metrics.record_image_shared_wait();
         match wait_for_shared_result(state).await {
@@ -378,7 +394,7 @@ pub(crate) async fn request_prepared_image_payload(
     })
     .await
     else {
-        let msg = "image prepare skipped because shutdown is in progress".to_string();
+        let msg = rejected_image_work(work_kind);
         flight.publish(Err(msg.clone()));
         return Err(anyhow::anyhow!(msg));
     };

@@ -177,6 +177,7 @@ mod tests {
                 1920,
                 1080,
                 BackgroundWorkKind::ImageDecode,
+                usize::MAX,
                 &Arc::new(metrics::PerformanceMetrics::new()),
             ))
             .expect("first prepared image should load");
@@ -186,6 +187,7 @@ mod tests {
                 2560,
                 1440,
                 BackgroundWorkKind::ImageDecode,
+                usize::MAX,
                 &Arc::new(metrics::PerformanceMetrics::new()),
             ))
             .expect("second prepared image should reuse cache");
