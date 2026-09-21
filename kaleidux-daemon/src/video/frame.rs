@@ -515,6 +515,7 @@ impl VideoFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerEventKind {
+    FirstPresent,
     Error,
     Eos,
     FatalLifecycle,

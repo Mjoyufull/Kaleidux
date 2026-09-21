@@ -1,6 +1,5 @@
 use std::ffi::c_void;
 use std::sync::Arc;
-use wayland_client::backend::ObjectId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MpvRenderApiRequest {
@@ -44,7 +43,7 @@ pub struct MpvNativeVideoTarget;
 impl MpvNativeVideoTarget {
     pub(crate) fn new(
         _display_ptr: *mut c_void,
-        _surface_id: ObjectId,
+        _surface: smithay_client_toolkit::shell::wlr_layer::LayerSurface,
         _width: u32,
         _height: u32,
     ) -> Option<Self> {

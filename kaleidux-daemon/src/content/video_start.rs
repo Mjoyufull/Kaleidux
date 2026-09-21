@@ -5,11 +5,10 @@ use crate::content::sessions::{
 use crate::metrics;
 use crate::runtime::timing::duration_ms;
 use crate::video;
-use gstreamer as gst;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, error};
 
 pub(crate) struct VideoPlayerStartRequest {
@@ -68,7 +67,8 @@ pub(crate) fn create_and_start_video_player(
     let frame_mailbox_clone = frame_mailbox.clone();
     let player_tx_clone = player_tx.clone();
     let player_event_tx_clone = player_event_tx.clone();
-    let Some(handle) = background::spawn_blocking_tracked(
+    tokio::spawn(async move {
+        let Some(handle) = background::spawn_blocking_tracked_wait(
         BackgroundWorkKind::VideoPrepare,
         move || {
             let name_for_panic = name_str.clone();
@@ -129,22 +129,12 @@ pub(crate) fn create_and_start_video_player(
                                     let _ = vp.stop();
                                     return Ok(None);
                                 }
-                                debug!(
-                                    "[VIDEO] {}: Pre-buffering failed (non-fatal): {}",
+                                error!(
+                                    "[VIDEO] {}: Pre-buffering failed: {}",
                                     name_str, e
                                 );
-                                video::VideoPrebufferResult {
-                                    frame: None,
-                                    profile: video::VideoPrebufferProfile {
-                                        set_state: Duration::ZERO,
-                                        state_wait: Duration::ZERO,
-                                        pull_preroll: Duration::ZERO,
-                                        set_state_result: "error",
-                                        state_wait_settled: false,
-                                        current_state: gst::State::Null,
-                                        pending_state: gst::State::VoidPending,
-                                    },
-                                }
+                                let _ = vp.stop();
+                                return Err(e);
                             }
                         };
                         let prebuffer_duration = prebuffer_start.elapsed();
@@ -170,6 +160,9 @@ pub(crate) fn create_and_start_video_player(
                             let _ = vp.stop();
                             Ok(None)
                         } else {
+                            // Render-context startup can wait on a worker;
+                            // keep that wait off the compositor event loop.
+                            vp.start()?;
                             Ok(Some((vp, prebuffer.frame)))
                         }
                     }
@@ -222,12 +215,13 @@ pub(crate) fn create_and_start_video_player(
                 }
             }
         },
-    ) else {
+    ).await else {
         debug!(
             "[VIDEO] {}: Skipping video prepare task because shutdown is in progress",
             skipped_name
         );
         return;
     };
-    drop(handle);
+        drop(handle);
+    });
 }

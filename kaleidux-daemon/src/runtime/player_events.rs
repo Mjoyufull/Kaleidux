@@ -39,6 +39,11 @@ impl MainLoopContext {
             }
 
             match event.kind {
+                PlayerEventKind::FirstPresent => {
+                    self.mark_startup_output_ready(&event.source_id, loop_start);
+                    self.mark_startup_output_presented(&event.source_id, loop_start);
+                    self.maybe_clear_startup_present_barrier();
+                }
                 PlayerEventKind::Eos => {
                     debug!(
                         "[VIDEO] {} session={} reported EOS ({})",

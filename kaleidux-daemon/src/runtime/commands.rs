@@ -157,7 +157,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         }
         Request::Pause => {
             info!("[CMD] Pausing all video players and wallpaper cycling");
-            for (name, player) in video_players.iter() {
+            for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
                 if let Err(e) = player.pause() {
                     error!("[CMD] Failed to pause video for {}: {}", name, e);
                 }
@@ -171,7 +171,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
             if display_power_suspended {
                 info!("[CMD] Video resume deferred until compositor outputs are powered on");
             } else {
-                for (name, player) in video_players.iter() {
+                for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
                     if let Err(e) = player.resume() {
                         error!("[CMD] Failed to resume video for {}: {}", name, e);
                     } else {
@@ -187,6 +187,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
             let names: HashSet<String> = video_players
                 .keys()
                 .chain(pending_video_switches.keys())
+                .chain(pending_image_video_stops.keys())
                 .cloned()
                 .collect();
             for name in names {
@@ -194,6 +195,9 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                 pending_video_switches.remove(&name);
                 frame_mailbox.clear_source(&name);
                 if let Some(player) = video_players.remove(&name) {
+                    stop_video_player_in_background(name.clone(), player);
+                }
+                if let Some(player) = pending_image_video_stops.remove(&name) {
                     stop_video_player_in_background(name, player);
                 }
             }
@@ -216,6 +220,9 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                 pending_video_switches.remove(&name);
                 frame_mailbox.clear_source(&name);
                 if let Some(vp) = video_players.remove(&name) {
+                    stop_video_player_in_background(name.clone(), vp);
+                }
+                if let Some(vp) = pending_image_video_stops.remove(&name) {
                     stop_video_player_in_background(name.clone(), vp);
                 }
                 if let Some(r) = renderers.get_mut(&name) {
