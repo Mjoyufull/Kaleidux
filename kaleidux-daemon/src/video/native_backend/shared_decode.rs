@@ -35,6 +35,7 @@ pub(super) struct NativeSubscriber {
     first_frame_tx: SyncSender<VideoFrame>,
     first_frame_sent: AtomicBool,
     active: AtomicBool,
+    paused: AtomicBool,
     creation_start: Instant,
 }
 
@@ -87,6 +88,7 @@ impl SharedDecodeSession {
             first_frame_tx,
             first_frame_sent: AtomicBool::new(false),
             active: AtomicBool::new(true),
+            paused: AtomicBool::new(false),
             creation_start: request.creation_start,
         });
         let key = SharedDecodeKey {
@@ -148,9 +150,30 @@ impl SharedDecodeSession {
         Ok((session, first_frame_rx))
     }
 
+    pub(super) fn set_paused(&self, session_id: u64, paused: bool) {
+        let state = self.fanout.state.lock();
+        if let Some(subscriber) = state.subscribers.get(&session_id) {
+            subscriber.paused.store(paused, Ordering::Release);
+        }
+        self.update_playback(&state);
+    }
+
+    fn update_playback(&self, state: &FanoutState) {
+        if state
+            .subscribers
+            .values()
+            .all(|subscriber| subscriber.paused.load(Ordering::Acquire))
+        {
+            self.control.pause();
+        } else {
+            self.control.play();
+        }
+    }
+
     pub(super) fn release(self: &Arc<Self>, session_id: u64) -> anyhow::Result<()> {
         let mut registry = SHARED_DECODERS.lock();
         if !self.fanout.remove_subscriber(session_id) || self.fanout.subscriber_count() != 0 {
+            self.update_playback(&self.fanout.state.lock());
             return Ok(());
         }
         if self.stopping.swap(true, Ordering::AcqRel) {
@@ -251,7 +274,12 @@ impl NativeDecodeFanout {
             } else {
                 (
                     None,
-                    state.subscribers.values().cloned().collect::<Vec<_>>(),
+                    state
+                        .subscribers
+                        .values()
+                        .filter(|subscriber| !subscriber.paused.load(Ordering::Acquire))
+                        .cloned()
+                        .collect::<Vec<_>>(),
                 )
             }
         };
@@ -323,6 +351,9 @@ impl NativeDecodeFanout {
 
 impl NativeSubscriber {
     fn deliver(&self, frame: VideoFrame) {
+        if self.paused.load(Ordering::Acquire) || !self.active.load(Ordering::Acquire) {
+            return;
+        }
         let (source_id, frame) = self.prepare_delivery(frame);
         self.mailbox.publish_frame_key(source_id, frame);
     }
@@ -353,4 +384,53 @@ fn clone_for_session(frame: &VideoFrame, session_id: u64) -> Option<VideoFrame> 
     let mut cloned = frame.try_clone()?;
     cloned.session_id = session_id;
     Some(cloned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subscriber(id: u64) -> Arc<NativeSubscriber> {
+        let (first_frame_tx, _) = std::sync::mpsc::sync_channel(1);
+        Arc::new(NativeSubscriber {
+            source_id: Arc::new(format!("output-{id}")),
+            source_key: Arc::from(format!("output-{id}")),
+            session_id: id,
+            mailbox: LatestFrameMailbox::new(),
+            event_tx: tokio::sync::mpsc::channel(1).0,
+            metrics: Arc::new(PerformanceMetrics::new()),
+            first_frame_tx,
+            first_frame_sent: AtomicBool::new(false),
+            active: AtomicBool::new(true),
+            paused: AtomicBool::new(false),
+            creation_start: Instant::now(),
+        })
+    }
+
+    #[test]
+    fn one_suspended_subscriber_does_not_pause_a_powered_peer() {
+        let fanout = Arc::new(NativeDecodeFanout::new(subscriber(1)));
+        fanout.add_subscriber(subscriber(2));
+        let session = Arc::new(SharedDecodeSession {
+            key: SharedDecodeKey {
+                uri: "test".to_string(),
+                group_id: 1,
+                max_publish_fps: None,
+            },
+            control: Arc::new(NativePlaybackControl::new()),
+            fanout,
+            worker: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+        session.set_paused(1, false);
+        session.set_paused(1, true);
+        assert!(session.control.is_playing());
+        session.set_paused(2, true);
+        assert!(!session.control.is_playing());
+        session.set_paused(1, false);
+        assert!(session.control.is_playing());
+        session.release(1).unwrap();
+        assert!(!session.control.is_playing());
+    }
 }
