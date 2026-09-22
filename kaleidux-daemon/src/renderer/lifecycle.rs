@@ -174,8 +174,8 @@ impl super::Renderer {
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
         self.pause_on_fullscreen = config.pause_on_fullscreen;
-        if let Some(frame_latency) = config.frame_latency {
-            let clamped = frame_latency.clamp(1, 3);
+        {
+            let clamped = resolved_frame_latency(config.frame_latency, self.default_frame_latency);
             if self.config.desired_maximum_frame_latency != clamped {
                 debug!(
                     "[RENDER] {}: Updating desired frame latency {} -> {}",
@@ -432,6 +432,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removing_frame_latency_override_restores_platform_default() {
+        assert_eq!(resolved_frame_latency(Some(3), 1), 3);
+        assert_eq!(resolved_frame_latency(None, 1), 1);
+        assert_eq!(resolved_frame_latency(None, 2), 2);
+        assert_eq!(resolved_frame_latency(Some(0), 1), 1);
+        assert_eq!(resolved_frame_latency(Some(4), 2), 3);
+    }
+
+    #[test]
     fn composition_texture_can_be_promoted_to_an_image_upload_target() {
         let usage = composition_texture_usage();
         assert!(usage.contains(wgpu::TextureUsages::COPY_SRC));
@@ -439,4 +448,8 @@ mod tests {
         assert!(usage.contains(wgpu::TextureUsages::TEXTURE_BINDING));
         assert!(usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
     }
+}
+
+fn resolved_frame_latency(configured: Option<u32>, platform_default: u32) -> u32 {
+    configured.unwrap_or(platform_default).clamp(1, 3)
 }
