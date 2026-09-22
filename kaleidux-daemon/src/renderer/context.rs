@@ -50,13 +50,10 @@ impl WgpuContext {
     pub async fn with_surface(
         window: Arc<impl HasWindowHandle + HasDisplayHandle + Sync + Send + 'static>,
     ) -> anyhow::Result<(Arc<Self>, Surface<'static>)> {
-        let requested_backends = if super::context_vulkan::external_video_interop_requested() {
-            wgpu::Backends::VULKAN
-        } else {
-            wgpu::Backends::all()
-        };
         let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends: requested_backends,
+            // WGPU prefers primary backends, including Vulkan, but must still
+            // discover GLES when the machine has no usable Vulkan adapter.
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
         let compatible_surface = instance.create_surface(window)?;
@@ -112,8 +109,10 @@ impl WgpuContext {
             ) {
                 Ok(device) => device,
                 Err(error)
-                    if !super::context_vulkan::native_dmabuf_interop_requested()
-                        && !crate::video::mpv_backend_is_explicitly_forced() =>
+                    if crate::video::get_video_backend_request()
+                        == crate::video::VideoBackendRequest::Auto
+                        || (!super::context_vulkan::native_dmabuf_interop_requested()
+                            && !crate::video::mpv_backend_is_explicitly_forced()) =>
                 {
                     warn!(
                         "[VIDEO] Default external-video device unavailable ({error:#}); falling back to appsink with the standard WGPU device"
