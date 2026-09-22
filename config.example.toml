@@ -25,7 +25,7 @@ video-ratio = 50
 #   medium    = 24 FPS, better motion for 24 FPS source videos
 #   high      = 48 FPS, smoother motion with more CPU work
 #   unlimited = publish every decoded frame
-# Low-power defaults to low, quality defaults to high, balanced/debug default to unlimited.
+# Low-power defaults to low; quality, balanced and debug default to unlimited.
 # Steady video frame callbacks use minimal damage by default; use
 # KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full only for compositor damage debugging.
 video-fps = "unlimited"
@@ -60,7 +60,7 @@ script-tick-interval = 1
 
 [any]
 # Directory containing wallpapers (supports images and videos)
-path = "~/Pictures/Wallpapers"
+path = "/home/your-user/Pictures/Wallpapers" # Replace with your absolute wallpaper path.
 
 # How long to display each wallpaper (humantime format: 5m, 1h, 30s, 2h30m)
 duration = "5m"
@@ -87,7 +87,7 @@ transition = { type = "fade" }
 
 # Example: Secondary monitor with static images
 # [DP-2]
-# path = "~/Pictures/Wallpapers/Minimal"
+# path = "/home/your-user/Pictures/Wallpapers/Minimal"
 # duration = "30m"
 # video-ratio = 0
 # transition = { type = "fade" }
