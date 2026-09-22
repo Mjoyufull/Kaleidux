@@ -386,6 +386,7 @@ pub struct Renderer {
     native_dmabuf_interop: Option<native_dmabuf_interop::NativeDmaBufInterop>,
     native_gl_surface: Option<native_gl_surface::NativeGlSurfaceRenderer>,
     native_gl_surface_failed: bool,
+    default_frame_latency: u32,
     native_nv12_bind_group: Option<wgpu::BindGroup>,
     final_nv12_bind_group: Option<Arc<wgpu::BindGroup>>,
     final_p010_bind_group: Option<Arc<wgpu::BindGroup>>,
@@ -465,6 +466,7 @@ impl Renderer {
 
         let r = Self {
             name,
+            default_frame_latency: desired_maximum_frame_latency,
             ctx: ctx.clone(),
             surface,
             config,
