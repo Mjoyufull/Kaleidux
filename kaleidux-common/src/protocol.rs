@@ -26,6 +26,12 @@ pub enum Request {
     Pause,
     #[serde(rename = "resume")]
     Resume,
+    #[serde(rename = "inhibit")]
+    Inhibit { reason: String },
+    #[serde(rename = "uninhibit")]
+    Uninhibit { reason: String },
+    #[serde(rename = "inhibitors", alias = "inhibitors_list")]
+    Inhibitors,
     #[serde(rename = "stop")]
     Stop,
     #[serde(rename = "reload")]
@@ -42,6 +48,25 @@ pub enum Request {
     History { output: Option<String> },
     #[serde(rename = "perf_snapshot")]
     PerfSnapshot,
+}
+
+pub const MAX_INHIBITOR_REASON_LEN: usize = 64;
+pub const MAX_INHIBITORS: usize = 64;
+
+pub fn validate_inhibit_reason(reason: &str) -> Result<(), &'static str> {
+    if reason.is_empty() {
+        return Err("inhibit reason cannot be empty");
+    }
+    if reason.trim().is_empty() {
+        return Err("inhibit reason cannot be blank");
+    }
+    if reason.len() > MAX_INHIBITOR_REASON_LEN {
+        return Err("inhibit reason exceeds maximum length");
+    }
+    if reason.chars().any(|c| c.is_control()) {
+        return Err("inhibit reason cannot contain control characters");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +107,7 @@ pub enum Response {
     Blacklist(Vec<String>),
     History(Vec<String>),
     PerfSnapshot(String),
+    Inhibitors(Vec<String>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

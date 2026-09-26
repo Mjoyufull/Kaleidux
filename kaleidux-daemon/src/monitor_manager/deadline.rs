@@ -1,5 +1,6 @@
 use super::MonitorManager;
 use crate::orchestration::{MonitorBehavior, PerformanceProfile};
+use kaleidux_common::{MAX_INHIBITORS, validate_inhibit_reason};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -17,19 +18,64 @@ impl MonitorManager {
         }
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
-        if paused {
-            info!("[MONITOR_MANAGER] Wallpaper cycling paused");
-        } else {
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        let was_effective_paused = self.is_paused();
+        self.manual_paused = paused;
+        let is_effective_paused = self.is_paused();
+        if !was_effective_paused && is_effective_paused {
+            info!("[MONITOR_MANAGER] Wallpaper cycling paused (manual)");
+            true
+        } else if was_effective_paused && !is_effective_paused {
             // When resuming, reset timers so content doesn't immediately switch
             self.reset_display_timers();
-            info!("[MONITOR_MANAGER] Wallpaper cycling resumed (timers reset)");
+            info!("[MONITOR_MANAGER] Wallpaper cycling resumed (manual, timers reset)");
+            true
+        } else {
+            false
         }
     }
 
     pub(crate) fn is_paused(&self) -> bool {
-        self.paused
+        self.manual_paused || !self.pause_reasons.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_manual_paused(&self) -> bool {
+        self.manual_paused
+    }
+
+    pub fn inhibit(&mut self, reason: String) -> Result<bool, &'static str> {
+        validate_inhibit_reason(&reason)?;
+        if !self.pause_reasons.contains(&reason) && self.pause_reasons.len() >= MAX_INHIBITORS {
+            return Err("maximum inhibitor capacity reached");
+        }
+        let was_effective_paused = self.is_paused();
+        self.pause_reasons.insert(reason);
+        let is_effective_paused = self.is_paused();
+        if !was_effective_paused && is_effective_paused {
+            info!("[MONITOR_MANAGER] Wallpaper cycling paused (inhibited)");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn uninhibit(&mut self, reason: &str) -> Result<bool, &'static str> {
+        validate_inhibit_reason(reason)?;
+        let was_effective_paused = self.is_paused();
+        self.pause_reasons.remove(reason);
+        let is_effective_paused = self.is_paused();
+        if was_effective_paused && !is_effective_paused {
+            self.reset_display_timers();
+            info!("[MONITOR_MANAGER] Wallpaper cycling resumed (inhibitor cleared, timers reset)");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn inhibitors(&self) -> Vec<String> {
+        self.pause_reasons.iter().cloned().collect()
     }
 
     pub(crate) fn set_power_suspended(&mut self, suspended: bool) {
@@ -46,7 +92,7 @@ impl MonitorManager {
     }
 
     pub fn next_switch_deadline(&self) -> Option<Instant> {
-        if self.paused || self.power_suspended {
+        if self.is_paused() || self.power_suspended {
             return None;
         }
 
@@ -111,7 +157,7 @@ impl MonitorManager {
     }
 
     pub fn tick_due(&self, now: Instant) -> bool {
-        if self.paused || self.power_suspended {
+        if self.is_paused() || self.power_suspended {
             return false;
         }
 
@@ -133,7 +179,7 @@ impl MonitorManager {
     }
 
     pub fn due_low_power_outputs(&self, now: Instant) -> Vec<String> {
-        if self.paused || self.power_suspended {
+        if self.is_paused() || self.power_suspended {
             return Vec::new();
         }
 
