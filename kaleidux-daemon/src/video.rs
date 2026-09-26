@@ -264,8 +264,7 @@ impl VideoPlayer {
         let creation_start = std::time::Instant::now();
         let mut resolved_backend_request = resolve_video_backend_request(backend_request);
         capabilities::validate_video_mode_backend(get_video_mode(), resolved_backend_request)?;
-        let backend_is_explicitly_forced = backend_request != VideoBackendRequest::Auto
-            || get_video_backend_request() != VideoBackendRequest::Auto;
+        let backend_is_explicitly_forced = backend_is_explicitly_forced(backend_request);
         if !video_backend_is_enabled(resolved_backend_request) {
             anyhow::bail!(
                 "video backend '{}' is disabled in this build (required Cargo feature: {}; enabled backends: {:?})",
@@ -293,6 +292,8 @@ impl VideoPlayer {
                 creation_start,
             );
             match native_result {
+                // Asynchronous initialization is checked by prebuffer before
+                // content/video_start commits an automatic backend choice.
                 Ok(player) => return Ok(player),
                 Err(error) if !backend_is_explicitly_forced => {
                     if video_backend_is_enabled(VideoBackendRequest::ForceMpv) {
@@ -605,4 +606,50 @@ impl VideoPlayer {
     pub fn set_start_position_ns(&mut self, position_ns: u64) {
         self.pending_start_position_ns = (position_ns > 0).then_some(position_ns);
     }
+
+    pub fn has_active_peer_subscribers(&self) -> bool {
+        #[cfg(feature = "backend-ffmpeg")]
+        if let Some(native) = self.native.as_ref() {
+            return native.has_active_peer_subscribers();
+        }
+        false
+    }
+
+    pub fn is_paused(&self) -> bool {
+        #[cfg(feature = "backend-ffmpeg")]
+        if let Some(native) = self.native.as_ref() {
+            return native.is_paused();
+        }
+        false
+    }
+}
+
+pub fn backend_is_explicitly_forced(request: VideoBackendRequest) -> bool {
+    request != VideoBackendRequest::Auto
+        || get_video_backend_request() != VideoBackendRequest::Auto
+        || get_video_mode() != VideoMode::Auto
+}
+
+pub fn candidate_video_backends(backend_request: VideoBackendRequest) -> Vec<VideoBackendRequest> {
+    let resolved = resolve_video_backend_request(backend_request);
+    let explicitly_forced = backend_is_explicitly_forced(backend_request);
+
+    if explicitly_forced {
+        return vec![resolved];
+    }
+
+    let mut candidates = Vec::new();
+    if video_backend_is_enabled(VideoBackendRequest::ForceFfmpeg) {
+        candidates.push(VideoBackendRequest::ForceFfmpeg);
+    }
+    if video_backend_is_enabled(VideoBackendRequest::ForceMpv) {
+        candidates.push(VideoBackendRequest::ForceMpv);
+    }
+    if video_backend_is_enabled(VideoBackendRequest::ForceAppsink) {
+        candidates.push(VideoBackendRequest::ForceAppsink);
+    }
+    if candidates.is_empty() {
+        candidates.push(resolved);
+    }
+    candidates
 }

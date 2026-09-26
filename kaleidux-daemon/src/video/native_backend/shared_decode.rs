@@ -49,6 +49,7 @@ pub(super) struct NativeDecodeFanout {
     primary: Arc<NativeSubscriber>,
     subscriber_count: AtomicUsize,
     latest_initialized: AtomicBool,
+    fatal_error: Mutex<Option<String>>,
 }
 
 pub(super) struct SharedDecodeSession {
@@ -102,6 +103,7 @@ impl SharedDecodeSession {
         if let Some(session) = registry.get(&key).and_then(Weak::upgrade)
             && !session.stopping.load(Ordering::Acquire)
             && !session.finished.load(Ordering::Acquire)
+            && session.fatal_error().is_none()
         {
             session.fanout.add_subscriber(subscriber);
             info!(
@@ -195,6 +197,29 @@ impl SharedDecodeSession {
         }
         Ok(())
     }
+
+    pub(super) fn fatal_error(&self) -> Option<String> {
+        self.fanout.fatal_error()
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    pub(super) fn has_active_peer_subscribers(&self, session_id: u64) -> bool {
+        let state = self.fanout.state.lock();
+        state.subscribers.values().any(|subscriber| {
+            subscriber.session_id != session_id && subscriber.active.load(Ordering::Acquire)
+        })
+    }
+
+    pub(super) fn is_paused(&self, session_id: u64) -> bool {
+        let state = self.fanout.state.lock();
+        state
+            .subscribers
+            .get(&session_id)
+            .is_some_and(|subscriber| subscriber.paused.load(Ordering::Acquire))
+    }
 }
 
 impl NativeDecodeFanout {
@@ -207,6 +232,7 @@ impl NativeDecodeFanout {
             primary: first,
             subscriber_count: AtomicUsize::new(1),
             latest_initialized: AtomicBool::new(false),
+            fatal_error: Mutex::new(None),
         }
     }
 
@@ -327,11 +353,20 @@ impl NativeDecodeFanout {
     }
 
     pub(super) fn report_fatal(&self, reason: String) {
+        *self.fatal_error.lock() = Some(reason.clone());
+        let mut registry = SHARED_DECODERS.lock();
+        registry.retain(|_, weak| {
+            weak.upgrade()
+                .is_some_and(|session| session.fatal_error().is_none() && !session.is_finished())
+        });
+        drop(registry);
+
         let subscribers = self
             .state
             .lock()
             .subscribers
             .values()
+            .filter(|subscriber| subscriber.active.load(Ordering::Acquire))
             .cloned()
             .collect::<Vec<_>>();
         for subscriber in subscribers {
@@ -346,6 +381,10 @@ impl NativeDecodeFanout {
                 reason: reason.clone(),
             });
         }
+    }
+
+    pub(super) fn fatal_error(&self) -> Option<String> {
+        self.fatal_error.lock().clone()
     }
 }
 
@@ -408,9 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn one_suspended_subscriber_does_not_pause_a_powered_peer() {
-        let fanout = Arc::new(NativeDecodeFanout::new(subscriber(1)));
-        fanout.add_subscriber(subscriber(2));
+    fn peer_subscriber_detection_and_paused_queries() {
+        let sub1 = subscriber(1);
+        let fanout = Arc::new(NativeDecodeFanout::new(sub1));
         let session = Arc::new(SharedDecodeSession {
             key: SharedDecodeKey {
                 uri: "test".to_string(),
@@ -423,14 +462,56 @@ mod tests {
             stopping: AtomicBool::new(false),
             finished: Arc::new(AtomicBool::new(false)),
         });
+
+        // Solo subscriber has no peers.
+        assert!(!session.has_active_peer_subscribers(1));
+        assert!(!session.is_paused(1));
+
+        session.set_paused(1, true);
+        assert!(session.is_paused(1));
         session.set_paused(1, false);
+        assert!(!session.is_paused(1));
+
+        // Add second subscriber.
+        let sub2 = subscriber(2);
+        session.fanout.add_subscriber(sub2);
+        assert!(session.has_active_peer_subscribers(1));
+        assert!(session.has_active_peer_subscribers(2));
+
+        // A powered peer must keep a shared decoder running, and removing the
+        // last playing subscriber must leave a suspended peer paused.
         session.set_paused(1, true);
         assert!(session.control.is_playing());
         session.set_paused(2, true);
         assert!(!session.control.is_playing());
-        session.set_paused(1, false);
+        session.set_paused(2, false);
         assert!(session.control.is_playing());
-        session.release(1).unwrap();
+
+        // Release second subscriber.
+        session.release(2).unwrap();
+        assert!(!session.has_active_peer_subscribers(1));
         assert!(!session.control.is_playing());
+    }
+
+    #[test]
+    fn fatal_error_recorded_and_retained() {
+        let sub1 = subscriber(10);
+        let fanout = Arc::new(NativeDecodeFanout::new(sub1));
+        let session = Arc::new(SharedDecodeSession {
+            key: SharedDecodeKey {
+                uri: "test_err".to_string(),
+                group_id: 10,
+                max_publish_fps: None,
+            },
+            control: Arc::new(NativePlaybackControl::new()),
+            fanout,
+            worker: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert!(session.fatal_error().is_none());
+        session.fanout.report_fatal("codec boom".to_string());
+        assert_eq!(session.fatal_error().as_deref(), Some("codec boom"));
     }
 }

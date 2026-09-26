@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 pub(crate) struct VideoPlayerStartRequest {
     pub(crate) path: PathBuf,
@@ -68,6 +68,7 @@ pub(crate) fn create_and_start_video_player(
     let player_tx_clone = player_tx.clone();
     let player_event_tx_clone = player_event_tx.clone();
     tokio::spawn(async move {
+        let rt_handle = tokio::runtime::Handle::current();
         let Some(handle) = background::spawn_blocking_tracked_wait(
         BackgroundWorkKind::VideoPrepare,
         move || {
@@ -95,83 +96,153 @@ pub(crate) fn create_and_start_video_player(
             let prepare_start = Instant::now();
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match video::VideoPlayer::new(
-                    &path_str,
-                    name_arc,
-                    session_id,
-                    volume,
-                    frame_mailbox_clone,
-                    player_event_tx_clone,
-                    metrics.clone(),
-                    backend_request,
-                    decode_group_id,
-                    max_publish_fps,
-                    render_size,
-                    mpv_native_target,
-                    mpv_composed_target,
-                ) {
-                    Ok(mut vp) => {
-                        let create_duration = prepare_start.elapsed();
-                        vp.set_volume(volume);
-                        if should_abort() {
-                            let _ = vp.stop();
-                            return Ok(None);
+                let candidates = video::candidate_video_backends(backend_request);
+                let num_candidates = candidates.len();
+                let backend_is_explicitly_forced = video::backend_is_explicitly_forced(backend_request);
+                let mut last_error = None;
+
+                for (idx, candidate) in candidates.into_iter().enumerate() {
+                    let is_last = idx + 1 == num_candidates;
+                    let is_provisional = !is_last && !backend_is_explicitly_forced;
+
+                    let (attempt_event_tx, attempt_event_rx) = if is_provisional {
+                        let (tx, rx) = tokio::sync::mpsc::channel(32);
+                        (tx, Some(rx))
+                    } else {
+                        (player_event_tx_clone.clone(), None)
+                    };
+
+                    let create_start = Instant::now();
+                    let mut vp = match video::VideoPlayer::new(
+                        &path_str,
+                        name_arc.clone(),
+                        session_id,
+                        volume,
+                        frame_mailbox_clone.clone(),
+                        attempt_event_tx,
+                        metrics.clone(),
+                        candidate,
+                        decode_group_id,
+                        max_publish_fps,
+                        render_size,
+                        mpv_native_target.clone(),
+                        mpv_composed_target.clone(),
+                    ) {
+                        Ok(player) => player,
+                        Err(e) => {
+                            frame_mailbox_clone.clear_source(&name_str);
+                            if should_abort() {
+                                return Ok(None);
+                            }
+                            if is_provisional {
+                                warn!(
+                                    "[VIDEO] {}: provisional {:?} backend creation failed ({:#}); trying next backend",
+                                    name_str, candidate, e
+                                );
+                                last_error = Some(e);
+                                continue;
+                            } else {
+                                error!("[VIDEO] {}: Failed to create video player: {}", name_str, e);
+                                return Err(e);
+                            }
                         }
-                        let prebuffer_start = Instant::now();
-                        let mut prebuffer = match vp.prebuffer(should_abort) {
-                            Ok(result) => result,
-                            Err(e) => {
-                                if should_abort() {
-                                    debug!(
-                                        "[VIDEO] {}: Aborting pre-buffer for superseded/shutdown session {}",
-                                        name_str, session_id
-                                    );
-                                    let _ = vp.stop();
-                                    return Ok(None);
-                                }
+                    };
+
+                    let create_duration = create_start.elapsed();
+                    vp.set_volume(volume);
+                    if should_abort() {
+                        let _ = vp.stop();
+                        frame_mailbox_clone.clear_source(&name_str);
+                        return Ok(None);
+                    }
+
+                    let prebuffer_start = Instant::now();
+                    let mut prebuffer = match vp.prebuffer(should_abort) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            let _ = vp.stop();
+                            frame_mailbox_clone.clear_source(&name_str);
+                            if should_abort() {
+                                debug!(
+                                    "[VIDEO] {}: Aborting pre-buffer for superseded/shutdown session {}",
+                                    name_str, session_id
+                                );
+                                return Ok(None);
+                            }
+                            if is_provisional {
+                                warn!(
+                                    "[VIDEO] {}: provisional {:?} backend prebuffer failed ({:#}); trying next backend",
+                                    name_str, candidate, e
+                                );
+                                last_error = Some(e);
+                                continue;
+                            } else {
                                 error!(
                                     "[VIDEO] {}: Pre-buffering failed: {}",
                                     name_str, e
                                 );
-                                let _ = vp.stop();
                                 return Err(e);
                             }
-                        };
-                        let prebuffer_duration = prebuffer_start.elapsed();
-                        if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0) {
-                            vp.set_start_position_ns(position_ns);
-                            prebuffer.frame = None;
                         }
-                        debug!(
-                            "[VIDEO] {}: Player prepared in {:.1}ms (create {:.1}ms + prebuffer {:.1}ms, set_state {:.1}ms/{} + wait_state {:.1}ms settled={} current={:?} pending={:?} + pull_preroll {:.1}ms, preroll_frame={})",
-                            name_str,
-                            duration_ms(prepare_start.elapsed()),
-                            duration_ms(create_duration),
-                            duration_ms(prebuffer_duration),
-                            duration_ms(prebuffer.profile.set_state),
-                            prebuffer.profile.set_state_result,
-                            duration_ms(prebuffer.profile.state_wait),
-                            prebuffer.profile.state_wait_settled,
-                            prebuffer.profile.current_state,
-                            prebuffer.profile.pending_state,
-                            duration_ms(prebuffer.profile.pull_preroll),
-                            prebuffer.frame.is_some()
-                        );
+                    };
+                    let prebuffer_duration = prebuffer_start.elapsed();
+
+                    if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0) {
+                        vp.set_start_position_ns(position_ns);
+                        prebuffer.frame = None;
+                    }
+
+                    debug!(
+                        "[VIDEO] {}: Player prepared in {:.1}ms (create {:.1}ms + prebuffer {:.1}ms, set_state {:.1}ms/{} + wait_state {:.1}ms settled={} current={:?} pending={:?} + pull_preroll {:.1}ms, preroll_frame={})",
+                        name_str,
+                        duration_ms(prepare_start.elapsed()),
+                        duration_ms(create_duration),
+                        duration_ms(prebuffer_duration),
+                        duration_ms(prebuffer.profile.set_state),
+                        prebuffer.profile.set_state_result,
+                        duration_ms(prebuffer.profile.state_wait),
+                        prebuffer.profile.state_wait_settled,
+                        prebuffer.profile.current_state,
+                        prebuffer.profile.pending_state,
+                        duration_ms(prebuffer.profile.pull_preroll),
+                        prebuffer.frame.is_some()
+                    );
+
+                    if should_abort() {
+                        let _ = vp.stop();
+                        frame_mailbox_clone.clear_source(&name_str);
+                        return Ok(None);
+                    }
+
+                    if let Err(error) = vp.start() {
+                        let _ = vp.stop();
+                        frame_mailbox_clone.clear_source(&name_str);
                         if should_abort() {
-                            let _ = vp.stop();
-                            Ok(None)
-                        } else {
-                            // Render-context startup can wait on a worker;
-                            // keep that wait off the compositor event loop.
-                            vp.start()?;
-                            Ok(Some((vp, prebuffer.frame)))
+                            return Ok(None);
                         }
+                        if is_provisional {
+                            warn!("[VIDEO] {}: provisional {:?} start failed ({error:#}); trying next backend", name_str, candidate);
+                            last_error = Some(error);
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    Err(e) => {
-                        error!("[VIDEO] {}: Failed to create video player: {}", name_str, e);
-                        Err(e)
+
+                    if let Some(mut rx) = attempt_event_rx {
+                        let forward_target = player_event_tx_clone.clone();
+                        rt_handle.spawn(async move {
+                            while let Some(event) = rx.recv().await {
+                                if forward_target.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
                     }
+
+                    return Ok(Some((vp, prebuffer.frame)));
                 }
+
+                Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No video backends available")))
             }));
 
             match result {

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 fn native_color_metadata(
     frame: &ffmpeg_next::util::frame::video::Video,
@@ -307,12 +307,16 @@ impl NativePlayer {
             if should_abort() {
                 anyhow::bail!("native prebuffer aborted");
             }
+            if let Some(err) = self.shared.fatal_error() {
+                anyhow::bail!("native decoder failed: {err}");
+            }
+            if self.shared.is_finished() {
+                anyhow::bail!("native decoder exited before producing a frame");
+            }
             if Instant::now() >= deadline {
-                debug!(
-                    "[NATIVE-VIDEO] {} session={}: prebuffer timed out; playback may still start asynchronously",
-                    self.source_id, self.session_id
+                anyhow::bail!(
+                    "native decoder did not produce a frame within the prebuffer deadline"
                 );
-                return Ok(None);
             }
             match self.first_frame_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => {
@@ -321,6 +325,9 @@ impl NativePlayer {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(err) = self.shared.fatal_error() {
+                        anyhow::bail!("native decoder failed: {err}");
+                    }
                     anyhow::bail!("native decoder exited before producing a frame");
                 }
             }
@@ -350,6 +357,14 @@ impl NativePlayer {
 
     pub fn resume(&self) {
         self.shared.set_paused(self.session_id, false);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.shared.is_paused(self.session_id)
+    }
+
+    pub fn has_active_peer_subscribers(&self) -> bool {
+        self.shared.has_active_peer_subscribers(self.session_id)
     }
 
     pub fn seek_to_position_ns(&self, position_ns: u64) {

@@ -12,6 +12,37 @@ pub(crate) fn init_gst_for_tests() {
 #[path = "tests/basic.rs"]
 mod basic;
 
+#[cfg(feature = "backend-ffmpeg")]
+#[test]
+fn native_async_open_failure_is_reported_during_prebuffer() {
+    let source = Arc::new("missing-native-input".to_string());
+    let path = std::env::temp_dir().join(format!(
+        "kaleidux-missing-video-{}-{}.mp4",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+    let mut player = super::native_backend::NativePlayer::new(
+        path.to_str().unwrap(),
+        source,
+        u64::MAX,
+        0.0,
+        LatestFrameMailbox::new(),
+        event_tx,
+        Arc::new(PerformanceMetrics::new()),
+        None,
+        None,
+        std::time::Instant::now(),
+    )
+    .expect("worker creation precedes opening the input");
+    let error = player
+        .prebuffer(|| false)
+        .err()
+        .expect("failed async open must not commit the backend");
+    assert!(error.to_string().contains("native decoder"));
+    player.stop().unwrap();
+}
+
 #[test]
 fn appsink_pending_refresh_uses_slower_uncapped_default() {
     with_video_env_test_lock(|| {
@@ -298,5 +329,53 @@ fn appsink_timing_accepts_env_overrides() {
             Some(value) => set_env_var("KLD_APPSINK_MAX_LATENESS_MS", value),
             None => remove_env_var("KLD_APPSINK_MAX_LATENESS_MS"),
         }
+    });
+}
+
+#[test]
+fn backend_explicitly_forced_logic() {
+    with_video_env_test_lock(|| {
+        set_video_mode(VideoMode::Auto);
+        set_video_backend_request(VideoBackendRequest::Auto);
+
+        assert!(!backend_is_explicitly_forced(VideoBackendRequest::Auto));
+        assert!(backend_is_explicitly_forced(
+            VideoBackendRequest::ForceFfmpeg
+        ));
+        assert!(backend_is_explicitly_forced(VideoBackendRequest::ForceMpv));
+        assert!(backend_is_explicitly_forced(
+            VideoBackendRequest::ForceAppsink
+        ));
+
+        set_video_backend_request(VideoBackendRequest::ForceFfmpeg);
+        assert!(backend_is_explicitly_forced(VideoBackendRequest::Auto));
+        set_video_backend_request(VideoBackendRequest::Auto);
+
+        set_video_mode(VideoMode::StrictCuda);
+        assert!(backend_is_explicitly_forced(VideoBackendRequest::Auto));
+        set_video_mode(VideoMode::Auto);
+    });
+}
+
+#[test]
+fn candidate_video_backends_preserves_ladder_and_forced_choice() {
+    with_video_env_test_lock(|| {
+        set_video_mode(VideoMode::Auto);
+        set_video_backend_request(VideoBackendRequest::Auto);
+
+        let auto_candidates = candidate_video_backends(VideoBackendRequest::Auto);
+        assert!(!auto_candidates.is_empty());
+        if cfg!(feature = "backend-ffmpeg") {
+            assert_eq!(auto_candidates[0], VideoBackendRequest::ForceFfmpeg);
+        }
+
+        let forced_ffmpeg = candidate_video_backends(VideoBackendRequest::ForceFfmpeg);
+        assert_eq!(forced_ffmpeg, vec![VideoBackendRequest::ForceFfmpeg]);
+
+        let forced_mpv = candidate_video_backends(VideoBackendRequest::ForceMpv);
+        assert_eq!(forced_mpv, vec![VideoBackendRequest::ForceMpv]);
+
+        let forced_appsink = candidate_video_backends(VideoBackendRequest::ForceAppsink);
+        assert_eq!(forced_appsink, vec![VideoBackendRequest::ForceAppsink]);
     });
 }
