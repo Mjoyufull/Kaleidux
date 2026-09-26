@@ -14,4 +14,10 @@ fn on_tick() {
 
 // You can call functions like:
 // next("*"); // Switch all monitors
-// set_wallpaper("DP-1", "/path/to/img.jpg", "fade", 1000);
+// prev("*"); // Switch all monitors to previous wallpaper
+// pause(); // Pause playback
+// resume(); // Resume playback
+// inhibit("gaming"); // Inhibit playback with a named reason
+// uninhibit("gaming"); // Remove named pause reason
+// load_playlist("favorites"); // Load a playlist (or "" to unload)
+// clear("*"); // Clear wallpaper on all outputs

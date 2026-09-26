@@ -329,7 +329,9 @@ impl MainLoopContext {
         let mut script_manager = scripting::ScriptManager::new(script_cmd_tx);
         if let Some(path) = &script_path {
             info!("[STARTUP] Loading script from: {:?}", path);
-            let _ = script_manager.load(path).await;
+            if let Err(error) = script_manager.load(path).await {
+                warn!("[SCRIPT] Failed to load {}: {error:#}", path.display());
+            }
         }
         info!("[STARTUP] Script manager initialized");
 
