@@ -6,7 +6,7 @@ use crate::image::runtime_cache::ordered_pending_content_switches;
 use crate::main_loop::CommandContext;
 use crate::orchestration;
 use kaleidux_common::{Request, Response};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tracing::{error, info};
 
@@ -156,32 +156,61 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
             }
         }
         Request::Pause => {
-            info!("[CMD] Pausing all video players and wallpaper cycling");
-            for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
-                if let Err(e) = player.pause() {
-                    error!("[CMD] Failed to pause video for {}: {}", name, e);
-                }
+            info!("[CMD] Manual pause requested");
+            let transitioned = monitor_manager.set_paused(true);
+            if transitioned {
+                pause_active_video_players(video_players, pending_image_video_stops);
             }
-            monitor_manager.set_paused(true);
             Response::Ok
         }
         Request::Resume => {
-            info!("[CMD] Resuming all video players and wallpaper cycling");
-            monitor_manager.set_paused(false);
-            if display_power_suspended {
-                info!("[CMD] Video resume deferred until compositor outputs are powered on");
-            } else {
-                for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
-                    if let Err(e) = player.resume() {
-                        error!("[CMD] Failed to resume video for {}: {}", name, e);
-                    } else {
-                        // Demand-driven native playback needs one seed credit after pause.
-                        player.request_video_frame();
-                    }
-                }
+            info!("[CMD] Manual resume requested");
+            let transitioned = monitor_manager.set_paused(false);
+            if transitioned {
+                resume_active_video_players(
+                    video_players,
+                    pending_image_video_stops,
+                    display_power_suspended,
+                );
+            } else if monitor_manager.is_paused() {
+                info!(
+                    "[CMD] Manual pause cleared, but cycling remains inhibited by: {:?}",
+                    monitor_manager.inhibitors()
+                );
             }
             Response::Ok
         }
+        Request::Inhibit { reason } => match monitor_manager.inhibit(reason) {
+            Ok(transitioned) => {
+                if transitioned {
+                    info!("[CMD] Inhibit requested; pausing video players");
+                    pause_active_video_players(video_players, pending_image_video_stops);
+                }
+                Response::Ok
+            }
+            Err(e) => Response::Error(e.to_string()),
+        },
+        Request::Uninhibit { reason } => match monitor_manager.uninhibit(&reason) {
+            Ok(transitioned) => {
+                if transitioned {
+                    info!("[CMD] All pause reasons cleared; resuming video players");
+                    resume_active_video_players(
+                        video_players,
+                        pending_image_video_stops,
+                        display_power_suspended,
+                    );
+                } else if monitor_manager.is_paused() {
+                    info!(
+                        "[CMD] Inhibitor removed, but cycling remains paused (manual_pause={}, inhibitors={:?})",
+                        monitor_manager.is_manual_paused(),
+                        monitor_manager.inhibitors()
+                    );
+                }
+                Response::Ok
+            }
+            Err(e) => Response::Error(e.to_string()),
+        },
+        Request::Inhibitors => Response::Inhibitors(monitor_manager.inhibitors()),
         Request::Stop => {
             info!("[CMD] Stopping all video players");
             let names: HashSet<String> = video_players
@@ -230,6 +259,36 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                 }
             }
             Response::Ok
+        }
+    }
+}
+
+fn pause_active_video_players(
+    video_players: &HashMap<String, crate::video::VideoPlayer>,
+    pending_image_video_stops: &HashMap<String, crate::video::VideoPlayer>,
+) {
+    for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
+        if let Err(e) = player.pause() {
+            error!("[CMD] Failed to pause video for {}: {}", name, e);
+        }
+    }
+}
+
+fn resume_active_video_players(
+    video_players: &HashMap<String, crate::video::VideoPlayer>,
+    pending_image_video_stops: &HashMap<String, crate::video::VideoPlayer>,
+    display_power_suspended: bool,
+) {
+    if display_power_suspended {
+        info!("[CMD] Video resume deferred until compositor outputs are powered on");
+    } else {
+        for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
+            if let Err(e) = player.resume() {
+                error!("[CMD] Failed to resume video for {}: {}", name, e);
+            } else {
+                // Demand-driven native playback needs one seed credit after pause.
+                player.request_video_frame();
+            }
         }
     }
 }

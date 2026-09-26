@@ -16,7 +16,10 @@ mod transition_params;
 
 use transition_defaults::*;
 
-pub use protocol::{BlacklistCommand, KEntry, OutputInfo, PlaylistCommand, Request, Response};
+pub use protocol::{
+    BlacklistCommand, KEntry, MAX_INHIBITOR_REASON_LEN, MAX_INHIBITORS, OutputInfo,
+    PlaylistCommand, Request, Response, validate_inhibit_reason,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", tag = "type")]

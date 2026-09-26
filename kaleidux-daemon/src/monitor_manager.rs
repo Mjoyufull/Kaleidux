@@ -5,7 +5,7 @@ use crate::queue::Playlist;
 use crate::queue::SmartQueue;
 use anyhow::Result;
 use kaleidux_common::{BlacklistCommand, KEntry, PlaylistCommand, Response};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,7 +31,8 @@ pub struct MonitorManager {
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
     cache: Arc<FileCache>,                              // Shared cache instance for all queues
     metrics: Option<Arc<PerformanceMetrics>>,           // Shared metrics instance
-    paused: bool,                                       // Global pause state for wallpaper cycling
+    manual_paused: bool,                                // Global manual pause state
+    pause_reasons: BTreeSet<String>,                    // Named pause reasons (inhibitors)
     power_suspended: bool, // Automatic pause while every compositor output is powered off
     // In-memory cache of discovered file lists per directory path.
     // Avoids re-scanning the same directory when multiple outputs share the same path.

@@ -164,7 +164,8 @@ fn make_test_manager(
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
-        paused: false,
+        manual_paused: false,
+        pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
     }
@@ -267,6 +268,8 @@ fn applying_updated_config_recomputes_phase_offset() {
     assert_eq!(orch.config.duration, new_duration);
 }
 
+#[path = "tests/pause_inhibit.rs"]
+mod pause_inhibit;
 #[path = "tests/update_config.rs"]
 mod update_config;
 
@@ -356,7 +359,8 @@ fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
-        paused: false,
+        manual_paused: false,
+        pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
     };
@@ -421,7 +425,8 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
-        paused: false,
+        manual_paused: false,
+        pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
     };

@@ -96,11 +96,29 @@ enum Commands {
     #[command(visible_alias = "ll")]
     Lovelist,
 
-    /// Pause video playback (images unaffected)
+    /// Pause video playback and automatic wallpaper rotation
     Pause,
 
-    /// Resume video playback
+    /// Clear manual pause (named inhibitors still apply)
     Resume,
+
+    /// Inhibit wallpaper playback with a named reason
+    Inhibit {
+        /// Reason for inhibiting playback
+        reason: String,
+    },
+
+    /// Uninhibit wallpaper playback for a named reason
+    Uninhibit {
+        /// Reason to remove
+        reason: String,
+    },
+
+    /// List active pause inhibitors
+    Inhibitors {
+        #[command(subcommand)]
+        command: Option<InhibitorSubcommand>,
+    },
 
     /// Stop the current wallpaper
     Stop,
@@ -176,6 +194,12 @@ enum BlacklistSubcommand {
     List,
 }
 
+#[derive(Subcommand)]
+enum InhibitorSubcommand {
+    /// List active pause inhibitors
+    List,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -215,6 +239,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Lovelist => Request::LoveitList,
         Commands::Pause => Request::Pause,
         Commands::Resume => Request::Resume,
+        Commands::Inhibit { reason } => Request::Inhibit { reason },
+        Commands::Uninhibit { reason } => Request::Uninhibit { reason },
+        Commands::Inhibitors { .. } => Request::Inhibitors,
         Commands::Stop => Request::Stop,
         Commands::Query => Request::QueryOutputs,
         Commands::Reload => Request::Reload,
@@ -300,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             }
                         }
-                        Response::Error(e) => eprintln!("Error: {}", e),
+                        Response::Error(e) => anyhow::bail!("{e}"),
                         Response::Ok => println!("OK"),
                         Response::Playlists(names) => {
                             println!("Playlists:");
@@ -321,6 +348,12 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         Response::PerfSnapshot(snapshot) => println!("{}", snapshot),
+                        Response::Inhibitors(reasons) => {
+                            println!("Inhibitors:");
+                            for reason in reasons {
+                                println!(" - {}", reason);
+                            }
+                        }
                     }
                 } else {
                     println!("{}", response);
@@ -337,4 +370,45 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_inhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibit", "game"]).expect("parse inhibit");
+        match cli.command {
+            Commands::Inhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_uninhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "uninhibit", "game"]).expect("parse uninhibit");
+        match cli.command {
+            Commands::Uninhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_inhibitors_command_default_and_list() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibitors"]).expect("parse inhibitors");
+        match cli.command {
+            Commands::Inhibitors { command } => assert!(command.is_none()),
+            _ => panic!("wrong command parsed"),
+        }
+
+        let cli_list =
+            Cli::try_parse_from(["kldctl", "inhibitors", "list"]).expect("parse inhibitors list");
+        match cli_list.command {
+            Commands::Inhibitors { command } => {
+                assert!(matches!(command, Some(InhibitorSubcommand::List)))
+            }
+            _ => panic!("wrong command parsed"),
+        }
+    }
 }
