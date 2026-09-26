@@ -342,3 +342,28 @@ fn exact_output_override_keeps_zero_global_volume() {
     assert_eq!(matched.volume, 0);
     assert_eq!(matched.sorting, SortingStrategy::Ascending);
 }
+#[test]
+fn usage_guide_toml_examples_parse_as_configuration() {
+    let guide = include_str!("../../../USAGE.md");
+    let mut examples = 0;
+    for block in guide.split("```toml\n").skip(1) {
+        let snippet = block.split("```").next().unwrap();
+        let first_setting = snippet
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or("");
+        let config = if first_setting.starts_with('[') {
+            snippet.to_owned()
+        } else {
+            format!("[any]\n{snippet}")
+        };
+        super::Config::parse_str(&config)
+            .unwrap_or_else(|error| panic!("invalid usage example: {error}\n{config}"));
+        examples += 1;
+    }
+    assert!(
+        examples >= 5,
+        "the usage guide must retain configuration examples"
+    );
+}

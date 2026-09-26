@@ -168,8 +168,11 @@ kldctl
 ├── love <PATH>   Increase selection frequency for a file
 ├── unlove <PATH> Reset frequency for a file
 ├── lovelist [ll] List all "loved" wallpapers
-├── pause         Pause video playback
-├── resume        Resume video playback
+├── pause         Pause playback and rotation
+├── resume        Clear manual pause
+├── inhibit       Hold a named pause reason
+├── uninhibit     Release a named pause reason
+├── inhibitors    List named pause reasons
 ├── reload        Reload configuration from disk
 ├── kill          Stop the daemon gracefully
 ├── playlist      Manage content playlists
@@ -207,12 +210,13 @@ transition-time = 1000
 ```
 See [config.example.toml](./config.example.toml) for configuration options and
 [transitions_examples.toml](./transitions_examples.toml) for transition parameters.
-[USAGE.md](./USAGE.md) covers playback, monitor matching, caching, and diagnostics.
+[USAGE.md](./USAGE.md) is the command, configuration, transition, scripting, and
+troubleshooting reference, including gaming and sleep automation recipes.
 
 ## Troubleshooting
 
 - **Long Startup**: WGPU may wait for driver initialization on Wayland (~15s).
-- **Blank video wallpaper**: start with `--video-backend auto`; use `--log 3` to capture diagnostics. See [backend troubleshooting](./USAGE.md#diagnostics).
+- **Blank video wallpaper**: start with `--video-backend auto`; use `--log 3` to capture diagnostics. See [backend troubleshooting](./USAGE.md#blank-or-black-video-playback).
 - **Choppy video**: check `video-fps` in your config; `"unlimited"` follows the source frame rate.
 - **Shader Errors**: Ensure your GPU supports Vulkan or GLSL 450.
 
