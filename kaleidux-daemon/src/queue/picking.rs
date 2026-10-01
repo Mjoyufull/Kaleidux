@@ -9,6 +9,19 @@ use std::sync::LazyLock;
 static EMPTY_EXCLUSIONS: LazyLock<HashSet<PathBuf>> = LazyLock::new(HashSet::new);
 
 impl SmartQueue {
+    /// Put an explicitly selected image ahead of random selection and forward history.
+    pub(crate) fn enqueue_selected_image(&mut self, path: PathBuf) {
+        self.sync_root_index_if_needed();
+        if !self.pool.contains(&path) {
+            let position = self.current_index.min(self.pool.len());
+            self.pool.insert(position, path.clone());
+        }
+        self.content_type_cache
+            .insert(path.clone(), ContentType::Image);
+        self.forward_history.clear();
+        self.forward_history.push_front(path);
+    }
+
     #[inline]
     pub fn pick_next(&mut self) -> Option<PathBuf> {
         self.pick_next_excluding(&EMPTY_EXCLUSIONS)

@@ -31,7 +31,33 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         mpv_native_targets,
         mpv_composed_targets,
     } = ctx;
+    let req = match req {
+        Request::Jump { path, output } => {
+            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, Some(true))
+            {
+                return Response::Error(error.to_string());
+            }
+            Request::Next { output }
+        }
+        Request::Set { path, output } => {
+            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, Some(false))
+            {
+                return Response::Error(error.to_string());
+            }
+            Request::Next { output }
+        }
+        Request::Img { path, output } => {
+            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, None) {
+                return Response::Error(error.to_string());
+            }
+            Request::Next { output }
+        }
+        request => request,
+    };
     match req {
+        Request::Jump { .. } | Request::Set { .. } | Request::Img { .. } => {
+            unreachable!("normalized image selection")
+        }
         Request::PerfSnapshot => Response::PerfSnapshot(metrics.perf_snapshot()),
         Request::QueryOutputs => {
             let outputs = renderers

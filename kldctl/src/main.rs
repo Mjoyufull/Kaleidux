@@ -53,6 +53,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Jump to an image inside the slideshow directory
+    Jump {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Insert an image into the queue and display it now
+    Set {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Jump to a slideshow image, or insert an external image and display it
+    Img {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Show current daemon status and playback state
     #[command(visible_alias = "st")]
     Status,
@@ -233,6 +251,27 @@ async fn main() -> anyhow::Result<()> {
     let request = match cli.command {
         Commands::Status => Request::QueryOutputs,
         Commands::Next { output } => Request::Next { output },
+        Commands::Jump { path, output } => Request::Jump {
+            path: std::fs::canonicalize(path)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
+                .to_owned(),
+            output,
+        },
+        Commands::Set { path, output } => Request::Set {
+            path: std::fs::canonicalize(path)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
+                .to_owned(),
+            output,
+        },
+        Commands::Img { path, output } => Request::Img {
+            path: std::fs::canonicalize(path)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
+                .to_owned(),
+            output,
+        },
         Commands::Prev { output } => Request::Prev { output },
         Commands::Love { path, multiplier } => Request::Love { path, multiplier },
         Commands::Unlove { path } => Request::Unlove { path },

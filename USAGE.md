@@ -649,6 +649,32 @@ Performance and resource utilization depend on hardware decode availability, dri
 
 ## History, Sorting, and Content Selection
 
+### Selecting an Image by Path
+
+```bash
+kldctl jump ~/Pictures/wallpapers/forest.png
+kldctl set ~/Downloads/new-wallpaper.png -o DP-1
+kldctl img ~/Pictures/wallpapers/forest.png
+```
+
+`jump PATH` selects an image inside the target slideshow directory, including
+subdirectories. `set PATH` inserts an image into the current queue and immediately
+advances to it. `img PATH` accepts either: slideshow images are selected in place,
+and external images are inserted. Existing entries are not duplicated.
+
+These commands use the normal transition and history: `prev` returns to the
+previous wallpaper, and `next` returns to the selected image. An explicit selection
+replaces any older forward-history branch. Subsequent automatic selection follows
+the configured sorting strategy. Insertions are in-memory only; rebuilding the
+queue, changing playlists or restarting can discard external entries. No files are
+copied and the configuration is unchanged.
+
+Paths are resolved from the client's working directory; quote paths containing
+spaces. Only images are accepted. Missing files, blacklisted images, unknown
+outputs and outputs without a slideshow queue return errors. Omit `-o OUTPUT`
+to target all outputs; synchronized outputs and groups switch together, as with
+`next`. A `jump` targeting multiple directories must be inside each target directory.
+
 ### History Navigation
 
 - Each output queue retains a bounded history buffer of up to 50 entries.

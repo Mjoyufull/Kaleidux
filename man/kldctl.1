@@ -21,6 +21,15 @@ Show version information.
 Print help information.
 .SH COMMANDS
 .TP
+.B jump PATH [-o OUTPUT]
+Display an image inside the slideshow directory using the normal transition and history.
+.TP
+.B set PATH [-o OUTPUT]
+Insert an image into the current in-memory queue and advance to it immediately.
+.TP
+.B img PATH [-o OUTPUT]
+Select a slideshow image or insert an external image and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept images only and honor output groups; omitted output targets all outputs. Queue rebuilds can discard external entries.
+.TP
 .B status \fR(alias: \fBst\fR)
 Display the current status of the daemon, including active wallpapers and playback state.
 .TP

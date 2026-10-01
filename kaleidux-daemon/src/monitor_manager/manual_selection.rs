@@ -5,6 +5,79 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 impl MonitorManager {
+    /// Validate every target before changing any queue. None selects jump/set by root.
+    pub(crate) fn prepare_image_selection(
+        &mut self,
+        path: &str,
+        output: &Option<String>,
+        jump: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let path = std::fs::canonicalize(path)?;
+        anyhow::ensure!(path.is_file(), "Image path is not a file");
+        anyhow::ensure!(
+            Self::resolve_content_type(&path, "image selection")
+                == Some(crate::queue::ContentType::Image),
+            "Path is not a supported image"
+        );
+        if let Some(name) = output {
+            anyhow::ensure!(self.outputs.contains_key(name), "Unknown output: {name}");
+        }
+        let mut queues = Vec::new();
+        match &self.config.global.monitor_behavior {
+            MonitorBehavior::Synchronized => {
+                queues.push(
+                    self.shared_queue
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("No slideshow queue"))?,
+                );
+            }
+            MonitorBehavior::Independent | MonitorBehavior::Grouped(_) => {
+                let grouped = matches!(
+                    self.config.global.monitor_behavior,
+                    MonitorBehavior::Grouped(_)
+                );
+                let mut groups = std::collections::HashSet::new();
+                for (name, orch) in &mut self.outputs {
+                    if output.as_ref().is_some_and(|target| target != name) {
+                        continue;
+                    }
+                    if grouped && let Some(gid) = self.output_groups.get(name) {
+                        groups.insert(*gid);
+                    } else {
+                        queues.push(
+                            orch.queue
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("No slideshow queue for {name}"))?,
+                        );
+                    }
+                }
+                for (gid, queue) in &mut self.group_queues {
+                    if groups.remove(gid) {
+                        queues.push(queue);
+                    }
+                }
+                anyhow::ensure!(groups.is_empty(), "Missing group slideshow queue");
+            }
+        }
+        anyhow::ensure!(!queues.is_empty(), "No slideshow outputs");
+        for queue in &queues {
+            let in_root =
+                std::fs::canonicalize(&queue.root_path).is_ok_and(|root| path.starts_with(root));
+            anyhow::ensure!(
+                jump != Some(true) || in_root,
+                "Image is outside the slideshow directory"
+            );
+            anyhow::ensure!(
+                !queue.stats.blacklist.contains(&path),
+                "Image is blacklisted"
+            );
+        }
+        for queue in queues {
+            queue.enqueue_selected_image(path.clone());
+        }
+        Ok(())
+    }
+
     pub fn handle_next(
         &mut self,
         output_name: Option<String>,

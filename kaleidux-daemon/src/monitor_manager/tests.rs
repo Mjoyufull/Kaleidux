@@ -130,6 +130,43 @@ fn write_test_image(dir: &std::path::Path, name: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn image_commands_validate_then_select_internal_or_external_images() {
+    let root = unique_test_dir("image-command");
+    let outside = unique_test_dir("image-command-external");
+    let a = write_test_image(&root, "a.png");
+    let b = write_test_image(&outside, "b.png");
+    let cache = Arc::new(FileCache::new_test(&root.join("stats.redb")).unwrap());
+    let cfg = test_output_config(Duration::from_secs(60));
+    let mut orch = OutputOrchestrator::without_queue("DP-1".into(), "test".into(), cfg.clone());
+    orch.queue = Some(make_test_queue(cache.clone(), &root, vec![a.clone()], &cfg));
+    let mut manager = make_test_manager("DP-1", cache, orch, config_for_output("DP-1", &cfg));
+    assert!(
+        manager
+            .prepare_image_selection(b.to_str().unwrap(), &None, Some(true))
+            .is_err()
+    );
+    assert!(
+        manager
+            .prepare_image_selection(a.to_str().unwrap(), &Some("missing".into()), None)
+            .is_err()
+    );
+    manager
+        .prepare_image_selection(a.to_str().unwrap(), &None, Some(true))
+        .unwrap();
+    assert_eq!(manager.handle_next(None)["DP-1"].0, a);
+    manager
+        .prepare_image_selection(b.to_str().unwrap(), &None, None)
+        .unwrap();
+    assert_eq!(manager.handle_next(None)["DP-1"].0, b);
+    assert_eq!(manager.handle_prev(None)["DP-1"].0, a);
+    assert_eq!(manager.handle_next(None)["DP-1"].0, b);
+    manager
+        .prepare_image_selection(a.to_str().unwrap(), &None, Some(false))
+        .unwrap();
+    assert_eq!(manager.handle_next(None)["DP-1"].0, a);
+}
+
 fn make_test_queue(
     cache: Arc<FileCache>,
     dir: &std::path::Path,
