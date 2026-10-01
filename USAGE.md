@@ -694,7 +694,7 @@ sorting = "loveit" # Options: "loveit", "random", "ascending", "descending"
    - Computes weighted random selection using pick counts, last-seen timestamps, and love multipliers.
    - Files marked via `kldctl love <path> -m <multiplier>` receive weighted preference.
    - Statistics are persisted in an embedded redb database at `~/.cache/kaleidux/cache.redb`.
-   - In-memory cache is bounded to 10,000 LRU entries (`STATS_LRU_CAP`). Infrequently seen wallpapers eventually age out of the LRU cache.
+   - In-memory statistics are bounded to 5,000 LRU entries (`STATS_LRU_CAP`). Infrequently seen wallpapers eventually age out of the LRU cache.
 2. `random`:
    - Uniform pseudo-random selection across all non-blacklisted files in the directory.
 3. `ascending`:
@@ -747,6 +747,13 @@ These functions are available in addition to Rhai's standard language operations
 | `uninhibit(reason)` | Removes only that named reason. |
 | `load_playlist(name)` | Loads a saved playlist across queues; `""` or `"*"` restores directory selection. |
 | `clear(output)` | Clears wallpaper on the named output; `"*"` means all outputs. |
+| `jump(path, output)` | Selects an image inside the slideshow directory. |
+| `set(path, output)` | Inserts an image into the current queue and displays it. |
+| `img(path, output)` | Selects a slideshow image or inserts an external image and displays it. |
+
+For `jump`, `set` and `img`, omit `output` or pass `"*"` to target all outputs.
+Use absolute paths in scripts: relative paths use the daemon's working directory,
+not the script directory. Selection errors are handled by the daemon after enqueueing.
 
 `next()`, `prev()`, and `clear()` without an argument target all outputs.
 `load_playlist()` without an argument unloads the playlist. `resume()` clears
