@@ -9,6 +9,35 @@ use super::pipeline_cache;
 use super::pipeline_cache::PipelineLRU;
 use super::texture::TexturePoolEntry;
 
+fn cuda_warmup_needed(
+    backend: crate::video::VideoBackendRequest,
+    mode: crate::video::VideoMode,
+) -> bool {
+    backend == crate::video::VideoBackendRequest::ForceAppsink
+        && matches!(
+            mode,
+            crate::video::VideoMode::Auto | crate::video::VideoMode::StrictCuda
+        )
+}
+
+#[cfg(test)]
+mod cuda_warmup_tests {
+    use super::cuda_warmup_needed;
+    use crate::video::{VideoBackendRequest as B, VideoMode as M};
+
+    #[test]
+    fn only_cuda_capable_appsink_modes_need_an_interop_context() {
+        for backend in [B::ForceFfmpeg, B::ForceMpv, B::Auto] {
+            assert!(!cuda_warmup_needed(backend, M::Auto));
+        }
+        for mode in [M::ForceCpu, M::ForceDmaBuf, M::ForceNv12, M::ForceRgba] {
+            assert!(!cuda_warmup_needed(B::ForceAppsink, mode));
+        }
+        assert!(cuda_warmup_needed(B::ForceAppsink, M::Auto));
+        assert!(cuda_warmup_needed(B::ForceAppsink, M::StrictCuda));
+    }
+}
+
 pub struct WgpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
@@ -451,6 +480,14 @@ impl WgpuContext {
     }
 
     pub fn warmup_cuda_interop(&self) {
+        // Only appsink publishes CUDA allocations to this interop context.
+        // FFmpeg/NVDEC and mpv own their decoder contexts independently.
+        if !cuda_warmup_needed(
+            crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
+            crate::video::get_video_mode(),
+        ) {
+            return;
+        }
         if self
             .cuda_interop_failed
             .load(std::sync::atomic::Ordering::Acquire)
