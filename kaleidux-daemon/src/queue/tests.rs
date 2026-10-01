@@ -12,6 +12,41 @@ fn empty_stats() -> LoveitData {
     }
 }
 
+#[test]
+fn selected_image_overrides_random_and_preserves_back_forward_history() {
+    let a = PathBuf::from("/a.png");
+    let b = PathBuf::from("/b.png");
+    let external = PathBuf::from("/external.png");
+    for strategy in [
+        crate::orchestration::SortingStrategy::Random,
+        crate::orchestration::SortingStrategy::Ascending,
+    ] {
+        let mut queue = make_test_queue(
+            vec![a.clone(), b.clone()],
+            strategy,
+            0,
+            HashMap::from([
+                (a.clone(), ContentType::Image),
+                (b.clone(), ContentType::Image),
+            ]),
+        );
+        queue.enqueue_selected_image(a.clone());
+        assert_eq!(queue.pick_next(), Some(a.clone()));
+        queue.enqueue_selected_image(b.clone());
+        assert_eq!(queue.pick_next(), Some(b.clone()));
+        assert_eq!(queue.pool.len(), 2);
+        queue.enqueue_selected_image(external.clone());
+        assert_eq!(
+            queue.peek_next(),
+            Some((external.clone(), ContentType::Image))
+        );
+        assert_eq!(queue.pick_next(), Some(external.clone()));
+        assert_eq!(queue.pick_prev(), Some(b.clone()));
+        assert_eq!(queue.pick_next(), Some(external.clone()));
+        assert_eq!(queue.pool.len(), 3);
+    }
+}
+
 fn make_test_queue(
     pool: Vec<PathBuf>,
     strategy: crate::orchestration::SortingStrategy,

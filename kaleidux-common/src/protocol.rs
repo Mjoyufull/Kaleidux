@@ -14,6 +14,21 @@ pub enum Request {
     QueryOutputs,
     #[serde(rename = "next")]
     Next { output: Option<String> },
+    #[serde(rename = "jump")]
+    Jump {
+        path: String,
+        output: Option<String>,
+    },
+    #[serde(rename = "set")]
+    Set {
+        path: String,
+        output: Option<String>,
+    },
+    #[serde(rename = "img")]
+    Img {
+        path: String,
+        output: Option<String>,
+    },
     #[serde(rename = "prev")]
     Prev { output: Option<String> },
     #[serde(rename = "love")]
