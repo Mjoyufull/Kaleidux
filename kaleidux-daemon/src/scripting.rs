@@ -37,6 +37,26 @@ impl ScriptManager {
             info!("[Script] {}", text);
         });
 
+        type ImageRequest = fn(String, Option<String>) -> Request;
+        let image_commands: [(&str, ImageRequest); 3] = [
+            ("jump", |path, output| Request::Jump { path, output }),
+            ("set", |path, output| Request::Set { path, output }),
+            ("img", |path, output| Request::Img { path, output }),
+        ];
+        for (name, request) in image_commands {
+            let tx = cmd_tx.clone();
+            engine.register_fn(name, move |path: String| {
+                let (resp_tx, _) = oneshot::channel();
+                enqueue_script_command(&tx, request(path, None), resp_tx)
+            });
+            let tx = cmd_tx.clone();
+            engine.register_fn(name, move |path: String, output: String| {
+                let (resp_tx, _) = oneshot::channel();
+                let output = if output == "*" { None } else { Some(output) };
+                enqueue_script_command(&tx, request(path, output), resp_tx)
+            });
+        }
+
         let tx = cmd_tx.clone();
         engine.register_fn("next", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
@@ -227,6 +247,24 @@ fn enqueue_script_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_commands_support_all_outputs_and_targeted_selection() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut manager = ScriptManager::new(tx);
+        manager
+            .eval(r#"jump("/a.png"); set("/b.png", "DP-1"); img("/c.png", "*");"#)
+            .unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap().0, Request::Jump { path, output: None } if path == "/a.png")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap().0, Request::Set { path, output: Some(output) } if path == "/b.png" && output == "DP-1")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap().0, Request::Img { path, output: None } if path == "/c.png")
+        );
+    }
 
     #[test]
     fn globals_persist_and_initialization_runs_once() {
