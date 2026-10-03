@@ -74,7 +74,9 @@ impl MainLoopContext {
                             self.mark_startup_output_ready(&name, loop_start);
                         }
 
-                        if let Err(e) = player.start() {
+                        if let Err(e) = player.start_with_pause(
+                            self.monitor_manager.is_paused() || self.display_power_suspended,
+                        ) {
                             error!(
                                 "[VIDEO] {}: Failed to start deferred video player: {}",
                                 name, e
@@ -92,11 +94,6 @@ impl MainLoopContext {
                         }
 
                         let old_player = self.video_players.remove(&name);
-                        // start() transitions FFmpeg/appsink back to playing.
-                        // A pause received during preparation must win over it.
-                        if self.monitor_manager.is_paused() || self.display_power_suspended {
-                            let _ = player.pause();
-                        }
                         self.video_players.insert(name.clone(), player);
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);
@@ -131,7 +128,9 @@ impl MainLoopContext {
                     } else if self.renderers.get(&name).map(|r| r.active_video_session_id)
                         == Some(session_id)
                     {
-                        if let Err(e) = player.start() {
+                        if let Err(e) = player.start_with_pause(
+                            self.monitor_manager.is_paused() || self.display_power_suspended,
+                        ) {
                             error!("[VIDEO] {}: Failed to start video player: {}", name, e);
                             set_pending_video_session(&self.pending_video_sessions, &name, None);
                             if let Some(r) = self.renderers.get_mut(&name) {

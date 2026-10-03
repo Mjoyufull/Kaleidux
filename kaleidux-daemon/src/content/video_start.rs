@@ -187,6 +187,18 @@ pub(crate) fn create_and_start_video_player(
                     };
                     let prebuffer_duration = prebuffer_start.elapsed();
 
+                    if is_provisional && vp.is_native_experimental_backend() && prebuffer.frame.is_none() {
+                        // Auto must not commit an unproven decoder and lose its
+                        // fallback chain; forced FFmpeg can keep loading instead.
+                        let _ = vp.stop();
+                        frame_mailbox_clone.clear_session(&name_str, session_id);
+                        if should_abort() {
+                            return Ok(None);
+                        }
+                        last_error = Some(anyhow::anyhow!("native decoder exceeded the provisional prebuffer deadline"));
+                        continue;
+                    }
+
                     if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0) {
                         vp.set_start_position_ns(position_ns);
                         prebuffer.frame = None;
@@ -214,7 +226,7 @@ pub(crate) fn create_and_start_video_player(
                         return Ok(None);
                     }
 
-                    if let Err(error) = vp.start() {
+                    if let Err(error) = vp.start_with_pause(true) {
                         let _ = vp.stop();
                         frame_mailbox_clone.clear_session(&name_str, session_id);
                         if should_abort() {

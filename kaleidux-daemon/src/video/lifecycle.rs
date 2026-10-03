@@ -259,8 +259,13 @@ impl VideoPlayer {
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
+        self.start_with_pause(false)
+    }
+
+    /// Initialize backend workers without advancing media before session commit.
+    pub fn start_with_pause(&mut self, paused: bool) -> anyhow::Result<()> {
         if self.is_running.load(Ordering::SeqCst) {
-            return Ok(());
+            return if paused { self.pause() } else { self.resume() };
         }
         info!(
             "[VIDEO] {}: Starting playback for {}",
@@ -273,7 +278,11 @@ impl VideoPlayer {
         self.log_backend_snapshot("start");
 
         if let Some(native) = self.native.as_ref() {
-            native.start();
+            if paused {
+                native.pause();
+            } else {
+                native.start();
+            }
             if let Some(position_ns) = self.pending_start_position_ns.take() {
                 native.seek_to_position_ns(position_ns);
             }
@@ -281,7 +290,7 @@ impl VideoPlayer {
             return Ok(());
         }
         if let Some(mpv) = self.mpv.as_mut() {
-            mpv.start()?;
+            mpv.start(paused)?;
             if let Some(position_ns) = self.pending_start_position_ns.take()
                 && let Err(e) = mpv.seek_to_position_ns(position_ns)
             {
@@ -300,22 +309,30 @@ impl VideoPlayer {
             .pipeline
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("GStreamer pipeline missing for start"))?;
-        let ret = pipeline.set_state(gst::State::Playing)?;
+        let target_state = if paused {
+            gst::State::Paused
+        } else {
+            gst::State::Playing
+        };
+        let ret = pipeline.set_state(target_state)?;
         let duration = self.start_time.elapsed();
         match ret {
             gst::StateChangeSuccess::Success => info!(
-                "[VIDEO] {}: Pipeline state -> Playing in {:.3}ms",
+                "[VIDEO] {}: Pipeline state -> {:?} in {:.3}ms",
                 self.source_id,
+                target_state,
                 duration.as_secs_f64() * 1000.0
             ),
             gst::StateChangeSuccess::Async => info!(
-                "[VIDEO] {}: Pipeline state -> Playing (Async) in {:.3}ms",
+                "[VIDEO] {}: Pipeline state -> {:?} (Async) in {:.3}ms",
                 self.source_id,
+                target_state,
                 duration.as_secs_f64() * 1000.0
             ),
             gst::StateChangeSuccess::NoPreroll => info!(
-                "[VIDEO] {}: Pipeline state -> Playing (Live) in {:.3}ms",
+                "[VIDEO] {}: Pipeline state -> {:?} (Live) in {:.3}ms",
                 self.source_id,
+                target_state,
                 duration.as_secs_f64() * 1000.0
             ),
         }
