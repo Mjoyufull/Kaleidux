@@ -22,6 +22,9 @@ const PREPARED_CACHE_TEMP_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static POLICY: OnceLock<CachePolicy> = OnceLock::new();
+// Serialize capacity checks through index commit, including streamed writes.
+// Readers keep using CACHE_INDEX independently while compression/I/O runs.
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static CACHE_INDEX: LazyLock<Mutex<CacheIndex>> =
     LazyLock::new(|| Mutex::new(CacheIndex::default()));
 
@@ -300,6 +303,9 @@ fn store_by_key_with_policy(
     payload: &DecodedImagePayload,
     policy: CachePolicy,
 ) {
+    let _writer = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let Some(cache_path) = path_for_key(key) else {
         return;
     };
