@@ -1,4 +1,4 @@
-use crate::background::{self, BackgroundWorkKind};
+use crate::background;
 use crate::queue;
 use crate::video;
 use kaleidux_common::Transition;
@@ -30,28 +30,10 @@ pub struct PendingVideoSwitch {
     pub transition: Transition,
 }
 
-pub(crate) fn stop_video_player_in_background(name: String, player: video::VideoPlayer) {
-    // Keep ownership out of the caller even while the bounded pool is full.
-    // In shutdown the registry closes, but player destruction still belongs
-    // on a blocking thread because its backend Drop can join render workers.
-    tokio::spawn(async move {
-        let pending = Arc::new(Mutex::new(Some(player)));
-        let work = pending.clone();
-        let handle =
-            background::spawn_blocking_tracked_wait(BackgroundWorkKind::PlayerStop, move || {
-                debug!("[VIDEO] {}: Finalizing player stop on blocking pool", name);
-                if let Some(mut player) = work.lock().expect("player stop ownership").take() {
-                    let _ = player.stop();
-                }
-            })
-            .await;
-        if handle.is_none() {
-            tokio::task::spawn_blocking(move || {
-                if let Some(mut player) = pending.lock().expect("player stop ownership").take() {
-                    let _ = player.stop();
-                }
-            });
-        }
+pub(crate) fn stop_video_player_in_background(name: String, mut player: video::VideoPlayer) {
+    background::spawn_blocking_cleanup(move || {
+        debug!("[VIDEO] {}: Finalizing player stop on blocking pool", name);
+        let _ = player.stop();
     });
 }
 
