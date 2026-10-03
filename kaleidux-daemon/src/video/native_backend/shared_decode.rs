@@ -213,6 +213,24 @@ impl SharedDecodeSession {
         })
     }
 
+    pub(super) fn restart_if_solo(&self, session_id: u64, paused: bool) -> bool {
+        // acquire() adds subscribers under this same state lock. Checking and
+        // enqueueing the seek together prevents resetting an existing peer.
+        let state = self.fanout.state.lock();
+        if state.subscribers.values().any(|subscriber| {
+            subscriber.session_id != session_id && subscriber.active.load(Ordering::Acquire)
+        }) {
+            return false;
+        }
+        let Some(subscriber) = state.subscribers.get(&session_id) else {
+            return false;
+        };
+        subscriber.paused.store(paused, Ordering::Release);
+        self.control.seek(0);
+        self.update_playback(&state);
+        true
+    }
+
     pub(super) fn is_paused(&self, session_id: u64) -> bool {
         let state = self.fanout.state.lock();
         state
@@ -466,6 +484,10 @@ mod tests {
         // Solo subscriber has no peers.
         assert!(!session.has_active_peer_subscribers(1));
         assert!(!session.is_paused(1));
+        assert!(session.restart_if_solo(1, true));
+        assert_eq!(session.control.take_seek(), Some(0));
+        assert!(session.is_paused(1));
+        assert!(!session.control.is_playing());
 
         session.set_paused(1, true);
         assert!(session.is_paused(1));
@@ -477,6 +499,9 @@ mod tests {
         session.fanout.add_subscriber(sub2);
         assert!(session.has_active_peer_subscribers(1));
         assert!(session.has_active_peer_subscribers(2));
+        assert!(!session.restart_if_solo(1, true));
+        assert_eq!(session.control.take_seek(), None);
+        assert!(!session.is_paused(1));
 
         // A powered peer must keep a shared decoder running, and removing the
         // last playing subscriber must leave a suspended peer paused.
