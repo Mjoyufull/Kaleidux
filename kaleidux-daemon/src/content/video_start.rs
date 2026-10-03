@@ -130,7 +130,7 @@ pub(crate) fn create_and_start_video_player(
                     ) {
                         Ok(player) => player,
                         Err(e) => {
-                            frame_mailbox_clone.clear_source(&name_str);
+                            frame_mailbox_clone.clear_session(&name_str, session_id);
                             if should_abort() {
                                 return Ok(None);
                             }
@@ -152,7 +152,7 @@ pub(crate) fn create_and_start_video_player(
                     vp.set_volume(volume);
                     if should_abort() {
                         let _ = vp.stop();
-                        frame_mailbox_clone.clear_source(&name_str);
+                        frame_mailbox_clone.clear_session(&name_str, session_id);
                         return Ok(None);
                     }
 
@@ -161,7 +161,7 @@ pub(crate) fn create_and_start_video_player(
                         Ok(result) => result,
                         Err(e) => {
                             let _ = vp.stop();
-                            frame_mailbox_clone.clear_source(&name_str);
+                            frame_mailbox_clone.clear_session(&name_str, session_id);
                             if should_abort() {
                                 debug!(
                                     "[VIDEO] {}: Aborting pre-buffer for superseded/shutdown session {}",
@@ -210,13 +210,13 @@ pub(crate) fn create_and_start_video_player(
 
                     if should_abort() {
                         let _ = vp.stop();
-                        frame_mailbox_clone.clear_source(&name_str);
+                        frame_mailbox_clone.clear_session(&name_str, session_id);
                         return Ok(None);
                     }
 
                     if let Err(error) = vp.start() {
                         let _ = vp.stop();
-                        frame_mailbox_clone.clear_source(&name_str);
+                        frame_mailbox_clone.clear_session(&name_str, session_id);
                         if should_abort() {
                             return Ok(None);
                         }

@@ -92,6 +92,11 @@ impl MainLoopContext {
                         }
 
                         let old_player = self.video_players.remove(&name);
+                        // start() transitions FFmpeg/appsink back to playing.
+                        // A pause received during preparation must win over it.
+                        if self.monitor_manager.is_paused() || self.display_power_suspended {
+                            let _ = player.pause();
+                        }
                         self.video_players.insert(name.clone(), player);
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);

@@ -116,6 +116,20 @@ impl LatestFrameMailbox {
         state.pending_since.remove(source_id);
     }
 
+    /// Retiring a player must not discard a replacement player's pending frame.
+    pub fn clear_session(&self, source_id: &str, session_id: u64) {
+        let mut state = self.state.lock();
+        if state
+            .frames
+            .get(source_id)
+            .is_some_and(|frame| frame.session_id == session_id)
+        {
+            state.frames.remove(source_id);
+            state.pending_notifications.remove(source_id);
+            state.pending_since.remove(source_id);
+        }
+    }
+
     pub fn take_overwrite_count(&self) -> u64 {
         self.overwrite_count.swap(0, Ordering::Relaxed)
     }

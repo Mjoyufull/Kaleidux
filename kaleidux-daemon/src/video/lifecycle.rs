@@ -500,7 +500,8 @@ impl VideoPlayer {
         let was_running = self.is_running.swap(false, Ordering::SeqCst);
         self.remove_bus_watch();
         self.accept_samples.store(false, Ordering::SeqCst);
-        self.frame_mailbox.clear_source(self.source_id.as_ref());
+        self.frame_mailbox
+            .clear_session(self.source_id.as_ref(), self.session_id);
         if let Some(native) = self.native.as_mut() {
             native.stop()?;
             return Ok(());

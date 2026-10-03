@@ -39,7 +39,7 @@ fn native_async_open_failure_is_reported_during_prebuffer() {
         .prebuffer(|| false)
         .err()
         .expect("failed async open must not commit the backend");
-    assert!(error.to_string().contains("native decoder"));
+    assert!(error.to_string().contains("native decoder failed:"));
     player.stop().unwrap();
 }
 
@@ -266,6 +266,22 @@ fn latest_frame_mailbox_coalesces_same_source_frames() {
             .session_id,
         2
     );
+}
+
+#[test]
+fn retired_session_cannot_clear_replacement_or_other_output() {
+    let mailbox = LatestFrameMailbox::new();
+    mailbox.publish_frame("DP-1", dummy_frame(2));
+    mailbox.publish_frame("DP-2", dummy_frame(1));
+    mailbox.clear_session("DP-1", 1);
+    assert!(mailbox.has_pending_frame("DP-1"));
+    assert!(mailbox.pending_frame_age("DP-1").is_some());
+    assert!(mailbox.has_pending_frame("DP-2"));
+    mailbox.clear_session("DP-1", 2);
+    assert!(!mailbox.has_pending_frame("DP-1"));
+    assert!(mailbox.has_pending_frame("DP-2"));
+    mailbox.publish_frame("DP-1", dummy_frame(3));
+    assert!(mailbox.pending_sources().contains(&"DP-1".to_owned()));
 }
 
 #[test]

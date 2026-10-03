@@ -320,7 +320,8 @@ impl NativePlayer {
             }
             match self.first_frame_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => {
-                    self.mailbox.clear_source(self.source_id.as_ref());
+                    self.mailbox
+                        .clear_session(self.source_id.as_ref(), self.session_id);
                     return Ok(Some(frame));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -343,7 +344,8 @@ impl NativePlayer {
     }
 
     pub fn stop(&mut self) -> anyhow::Result<()> {
-        self.mailbox.clear_source(self.source_id.as_ref());
+        self.mailbox
+            .clear_session(self.source_id.as_ref(), self.session_id);
         if self.subscribed {
             self.subscribed = false;
             self.shared.release(self.session_id)?;

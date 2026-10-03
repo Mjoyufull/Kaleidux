@@ -312,7 +312,8 @@ impl MpvPlayer {
         if let Some(wake) = &self.render_stop_wake {
             wake.signal();
         }
-        self.frame_mailbox.clear_source(self.source_id.as_ref());
+        self.frame_mailbox
+            .clear_session(self.source_id.as_ref(), self.session_id);
         let _ = self.mpv.command("stop", &[]);
         let _ = self.mpv.command("quit", &[]);
         if let Some(handle) = self.frame_thread.take() {
