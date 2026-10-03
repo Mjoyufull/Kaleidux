@@ -102,6 +102,7 @@ impl SmartQueue {
                 planned_sequential_type: None,
                 history: VecDeque::new(),
                 forward_history: VecDeque::new(),
+                selected_images: VecDeque::new(),
                 root_path: path.to_path_buf(),
                 active_playlist: None,
                 cache,
@@ -145,6 +146,7 @@ impl SmartQueue {
                             planned_sequential_type: None,
                             history: VecDeque::new(),
                             forward_history: VecDeque::new(),
+                            selected_images: VecDeque::new(),
                             root_path: path.to_path_buf(),
                             active_playlist: None,
                             cache,
@@ -171,29 +173,29 @@ impl SmartQueue {
                     let bg_metrics = metrics.clone();
 
                     tokio::spawn(async move {
-                        let handle = background::spawn_blocking_tracked_wait(
-                        BackgroundWorkKind::QueueDiscovery,
-                        move || match Self::discover_content(
-                            &bg_path,
-                            &bg_blacklist,
-                            bg_cache,
-                            bg_metrics,
-                        ) {
-                            Ok((pool, _)) => {
-                                tracing::info!(
-                                    "[QUEUE] Background pool refresh finished ({} files) for {:?}",
-                                    pool.len(),
-                                    bg_path
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
-                            }
-                        },
-                    ).await;
+                        let handle = background::spawn_blocking_tracked(
+                            BackgroundWorkKind::QueueDiscovery,
+                            move || match Self::discover_content(
+                                &bg_path,
+                                &bg_blacklist,
+                                bg_cache,
+                                bg_metrics,
+                            ) {
+                                Ok((pool, _)) => {
+                                    tracing::info!(
+                                        "[QUEUE] Background pool refresh finished ({} files) for {:?}",
+                                        pool.len(),
+                                        bg_path
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
+                                }
+                            },
+                        );
                         if handle.is_none() {
                             tracing::debug!(
-                                "[QUEUE] Skipping background pool refresh: shutdown in progress"
+                                "[QUEUE] Skipping speculative pool refresh: worker budget full or shutdown in progress"
                             );
                         }
                     });
@@ -250,6 +252,7 @@ impl SmartQueue {
             planned_sequential_type: None,
             history: VecDeque::new(),
             forward_history: VecDeque::new(),
+            selected_images: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,
@@ -290,6 +293,7 @@ impl SmartQueue {
     ) -> Result<Self> {
         let stats = Self::load_stats_from_cache(&cache)?;
         let mut pool = pool;
+        pool.retain(|path| !stats.blacklist.contains(path));
         pool.sort();
 
         let current_index = Self::fallback_current_index(strategy, pool.len());
@@ -307,6 +311,7 @@ impl SmartQueue {
             planned_sequential_type: None,
             history: VecDeque::new(),
             forward_history: VecDeque::new(),
+            selected_images: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
             cache,

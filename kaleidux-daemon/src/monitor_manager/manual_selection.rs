@@ -68,7 +68,8 @@ impl MonitorManager {
                 "Image is outside the slideshow directory"
             );
             anyhow::ensure!(
-                !queue.stats.blacklist.contains(&path),
+                !queue.stats.blacklist.iter().any(|blocked| blocked == &path
+                    || std::fs::canonicalize(blocked).is_ok_and(|resolved| resolved == path)),
                 "Image is blacklisted"
             );
         }

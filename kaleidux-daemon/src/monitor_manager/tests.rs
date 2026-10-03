@@ -165,6 +165,30 @@ fn image_commands_validate_then_select_internal_or_external_images() {
         .prepare_image_selection(a.to_str().unwrap(), &None, Some(false))
         .unwrap();
     assert_eq!(manager.handle_next(None)["DP-1"].0, a);
+    let alias = root.join("blocked-alias.png");
+    std::os::unix::fs::symlink(&b, &alias).unwrap();
+    manager
+        .outputs
+        .get_mut("DP-1")
+        .unwrap()
+        .queue
+        .as_mut()
+        .unwrap()
+        .stats
+        .blacklist
+        .insert(alias);
+    assert!(
+        manager
+            .prepare_image_selection(b.to_str().unwrap(), &None, None)
+            .is_err()
+    );
+    manager.discovered_files_cache.insert(root.clone(), vec![a]);
+    manager
+        .discovered_files_cache
+        .insert(outside.clone(), vec![b]);
+    manager.invalidate_cache(&root.join("nested/new.png"));
+    assert!(!manager.discovered_files_cache.contains_key(&root));
+    assert!(manager.discovered_files_cache.contains_key(&outside));
 }
 
 fn make_test_queue(

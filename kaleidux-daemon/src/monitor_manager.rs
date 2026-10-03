@@ -418,13 +418,10 @@ impl MonitorManager {
         None
     }
 
-    pub fn invalidate_cache(&mut self, path: &PathBuf) {
-        // Invalidate entry for the file itself (if it was cached directly)
-        self.discovered_files_cache.remove(path);
-        // Also invalidate the parent directory as the list of files has changed
-        if let Some(parent) = path.parent() {
-            self.discovered_files_cache.remove(&parent.to_path_buf());
-        }
+    pub fn invalidate_cache(&mut self, path: &std::path::Path) {
+        // A nested file changes every cached ancestor root, not only its parent.
+        self.discovered_files_cache
+            .retain(|root, _| !path.starts_with(root));
     }
 
     pub fn get_history(&self, output_name: Option<String>) -> Vec<String> {

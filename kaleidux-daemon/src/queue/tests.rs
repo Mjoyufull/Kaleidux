@@ -42,9 +42,32 @@ fn selected_image_overrides_random_and_preserves_back_forward_history() {
         );
         assert_eq!(queue.pick_next(), Some(external.clone()));
         assert_eq!(queue.pick_prev(), Some(b.clone()));
+        queue.root_index.replace(
+            &[a.clone(), b.clone()],
+            &HashMap::from([
+                (a.clone(), ContentType::Image),
+                (b.clone(), ContentType::Image),
+            ]),
+        );
         assert_eq!(queue.pick_next(), Some(external.clone()));
         assert_eq!(queue.pool.len(), 3);
     }
+}
+
+#[test]
+fn missing_active_playlist_does_not_expand_to_root_after_refresh() {
+    let path = PathBuf::from("/a.png");
+    let types = HashMap::from([(path.clone(), ContentType::Image)]);
+    let mut queue = make_test_queue(
+        vec![path.clone()],
+        crate::orchestration::SortingStrategy::Random,
+        0,
+        types.clone(),
+    );
+    queue.active_playlist = Some("deleted".into());
+    queue.root_index.replace(&[path], &types);
+    assert_eq!(queue.pick_next(), None);
+    assert!(queue.pool.is_empty());
 }
 
 fn make_test_queue(
@@ -71,6 +94,7 @@ fn make_test_queue(
         strategy,
         history: VecDeque::new(),
         forward_history: VecDeque::new(),
+        selected_images: VecDeque::new(),
         root_path,
         active_playlist: None,
         cache: test_cache(),
