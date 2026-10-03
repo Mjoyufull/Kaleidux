@@ -138,10 +138,11 @@ impl WgpuContext {
             ) {
                 Ok(device) => device,
                 Err(error)
-                    if crate::video::get_video_backend_request()
-                        == crate::video::VideoBackendRequest::Auto
-                        || (!super::context_vulkan::native_dmabuf_interop_requested()
-                            && !crate::video::mpv_backend_is_explicitly_forced()) =>
+                    if cfg!(feature = "backend-appsink")
+                        && (crate::video::get_video_backend_request()
+                            == crate::video::VideoBackendRequest::Auto
+                            || (!super::context_vulkan::native_dmabuf_interop_requested()
+                                && !crate::video::mpv_backend_is_explicitly_forced())) =>
                 {
                     warn!(
                         "[VIDEO] Default external-video device unavailable ({error:#}); falling back to appsink with the standard WGPU device"
