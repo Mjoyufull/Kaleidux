@@ -615,6 +615,14 @@ impl VideoPlayer {
         false
     }
 
+    pub fn restart_native_if_solo(&self, _paused: bool) -> bool {
+        #[cfg(feature = "backend-ffmpeg")]
+        if let Some(native) = self.native.as_ref() {
+            return native.restart_if_solo(_paused);
+        }
+        false
+    }
+
     pub fn is_paused(&self) -> bool {
         #[cfg(feature = "backend-ffmpeg")]
         if let Some(native) = self.native.as_ref() {

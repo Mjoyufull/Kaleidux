@@ -369,6 +369,10 @@ impl NativePlayer {
         self.shared.has_active_peer_subscribers(self.session_id)
     }
 
+    pub fn restart_if_solo(&self, paused: bool) -> bool {
+        self.shared.restart_if_solo(self.session_id, paused)
+    }
+
     pub fn seek_to_position_ns(&self, position_ns: u64) {
         self.shared.control.seek(position_ns);
     }

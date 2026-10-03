@@ -174,10 +174,11 @@ pub(crate) fn switch_wallpaper_content(
     );
 
     if content_type == queue::ContentType::Video
+        && renderers.contains_key(&name)
         && video_players.get(&name).is_some_and(|player| {
             player.is_native_experimental_backend()
                 && std::path::Path::new(player.source_uri()) == path.as_path()
-                && !player.has_active_peer_subscribers()
+                && player.restart_native_if_solo(monitor_manager.is_paused() || player.is_paused())
         })
         && let Some(renderer) = renderers.get_mut(&name)
     {
@@ -194,28 +195,12 @@ pub(crate) fn switch_wallpaper_content(
             .get(&name)
             .expect("same-source native player was checked above");
         let was_paused = monitor_manager.is_paused() || player.is_paused();
-        let restart_result = if was_paused {
-            player.pause().and_then(|()| player.seek_to_position_ns(0))
-        } else {
-            player
-                .pause()
-                .and_then(|()| player.seek_to_position_ns(0))
-                .and_then(|()| player.resume())
-        };
-        if let Err(error) = restart_result {
-            warn!(
-                "[NATIVE-REUSE] {} session={}: same-source restart failed: {error:#}; retaining current session",
-                name,
-                player.session_id()
-            );
-        } else {
-            info!(
-                "[NATIVE-REUSE] {} session={}: reused demux/decoder/device/import contexts for same-source switch (paused={})",
-                name,
-                player.session_id(),
-                was_paused
-            );
-        }
+        info!(
+            "[NATIVE-REUSE] {} session={}: reused demux/decoder/device/import contexts for same-source switch (paused={})",
+            name,
+            player.session_id(),
+            was_paused
+        );
         return;
     }
 
