@@ -360,6 +360,14 @@ fn usage_guide_toml_examples_parse_as_configuration() {
         };
         super::Config::parse_str(&config)
             .unwrap_or_else(|error| panic!("invalid usage example: {error}\n{config}"));
+        let table: toml::Table = toml::from_str(&config).unwrap();
+        for (name, value) in table {
+            if name != "global" {
+                let _: PartialOutputConfig = value
+                    .try_into()
+                    .unwrap_or_else(|error| panic!("invalid output {name}: {error}\n{config}"));
+            }
+        }
         examples += 1;
     }
     assert!(
