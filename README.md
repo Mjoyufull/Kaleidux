@@ -126,6 +126,8 @@ with the Cargo feature required to enable it.
 After installation, copy [config.example.toml](./config.example.toml) to
 `~/.config/kaleidux/config.toml` and set your wallpaper directory.
 For a source build, the binaries are in `target/release/`.
+Run `export PATH="$PWD/target/release:$PATH"` from the repository root to use
+the commands below in that terminal, or invoke the binaries by their full paths.
 
 ```bash
 kaleidux-daemon &

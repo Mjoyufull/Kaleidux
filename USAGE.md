@@ -666,7 +666,8 @@ These commands use the normal transition and history: `prev` returns to the
 previous wallpaper, and `next` returns to the selected image. An explicit selection
 replaces any older forward-history branch. Subsequent automatic selection follows
 the configured sorting strategy. Insertions are in-memory only; rebuilding the
-queue, changing playlists or restarting can discard external entries. No files are
+queue by changing playlists or restarting discards external entries. The most
+recent 50 explicit selections survive background directory refreshes. No files are
 copied and the configuration is unchanged.
 
 Paths are resolved from the client's working directory; quote paths containing
@@ -845,6 +846,9 @@ sh /path/to/Kaleidux/examples/automation/run-paused.sh %command%
 Keep the launched process in the foreground. A launcher that exits after spawning
 a detached game releases the reason too early. The wrapper forwards signals to
 its direct child, not an entire descendant process tree.
+It uses GNU `env --default-signal` to undo the shell's background-job SIGINT
+mask. A command that deliberately ignores termination can still keep the
+wrapper waiting; stop that command separately before removing its inhibitor.
 
 #### Low-Battery Pause
 
