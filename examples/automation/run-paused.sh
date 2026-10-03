@@ -33,7 +33,9 @@ trap 'interrupt INT 130' INT
 trap 'interrupt TERM 143' TERM
 trap 'interrupt HUP 129' HUP
 
-"$@" <&0 &
+# A non-interactive shell makes asynchronous children ignore INT/QUIT.
+# Restore their defaults before exec so forwarded Ctrl-C reaches the command.
+env --default-signal=INT,QUIT -- "$@" <&0 &
 child=$!
 wait "$child"
 status=$?

@@ -154,12 +154,17 @@ impl ScriptManager {
     }
 
     pub async fn load(&mut self, path: &PathBuf) -> anyhow::Result<()> {
-        let mut content = String::new();
+        let mut bytes = Vec::new();
         tokio::fs::File::open(path)
             .await?
             .take((SCRIPT_MAX_SOURCE_BYTES + 1) as u64)
-            .read_to_string(&mut content)
+            .read_to_end(&mut bytes)
             .await?;
+        anyhow::ensure!(
+            bytes.len() <= SCRIPT_MAX_SOURCE_BYTES,
+            "script exceeds 1 MiB source limit"
+        );
+        let content = String::from_utf8(bytes)?;
         self.load_from_str(&content)?;
         info!("Rhai script loaded from {:?}", path);
         Ok(())
@@ -247,6 +252,22 @@ fn enqueue_script_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_unicode_script_reports_size_before_utf8() {
+        let path = std::env::temp_dir().join(format!(
+            "kld-script-limit-{}-{}.rhai",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut content = " ".repeat(SCRIPT_MAX_SOURCE_BYTES);
+        content.push('界');
+        tokio::fs::write(&path, content).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let error = ScriptManager::new(tx).load(&path).await.unwrap_err();
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(error.to_string().contains("1 MiB source limit"));
+    }
 
     #[test]
     fn image_commands_support_all_outputs_and_targeted_selection() {
