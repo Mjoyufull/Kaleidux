@@ -23,6 +23,28 @@ const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 const GL_HANDLE_TYPE_OPAQUE_FD_EXT: u32 = 0x9586;
 const GL_LAYOUT_SHADER_READ_ONLY_EXT: u32 = 0x9591;
 
+// Declared before GL allocations so error unwinding deletes them while their
+// context is still current, then releases the EGL context and pbuffer.
+struct EglConstructionGuard<'a> {
+    egl: &'a EglApi,
+    display: egl::Display,
+    context: egl::Context,
+    surface: Option<egl::Surface>,
+    armed: bool,
+}
+
+impl Drop for EglConstructionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.egl.make_current(self.display, None, None, None);
+            if let Some(surface) = self.surface {
+                let _ = self.egl.destroy_surface(self.display, surface);
+            }
+            let _ = self.egl.destroy_context(self.display, self.context);
+        }
+    }
+}
+
 pub(super) struct ComposedGlRenderContext {
     egl: Box<EglApi>,
     display: egl::Display,
@@ -100,9 +122,17 @@ impl ComposedGlRenderContext {
             )
             .or_else(|_| egl.create_context(display, config, None, &[egl::NONE]))
             .context("creating composed mpv EGL context")?;
+        let mut construction = EglConstructionGuard {
+            egl: &egl,
+            display,
+            context,
+            surface: None,
+            armed: true,
+        };
         let surface = egl
             .create_pbuffer_surface(display, config, &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE])
             .context("creating composed mpv EGL pbuffer")?;
+        construction.surface = Some(surface);
         egl.make_current(display, Some(surface), Some(surface), Some(context))
             .context("making composed mpv EGL context current")?;
         let gl = GlApi::load(&egl)?;
@@ -129,6 +159,8 @@ impl ComposedGlRenderContext {
                 update_wake.callback_context(),
             );
         }
+        construction.armed = false;
+        drop(construction);
         Ok(Self {
             egl,
             display,
@@ -277,13 +309,7 @@ impl Drop for ComposedGlRenderContext {
                 std::ptr::null_mut(),
             );
             sys::mpv_render_context_free(self.mpv_context);
-            for slot in &self.slots {
-                (self.gl.delete_framebuffers)(1, &slot.framebuffer);
-                (self.gl.delete_textures)(1, &slot.gl_texture);
-                (self.gl.delete_memory_objects)(1, &slot.memory_object);
-                (self.gl.delete_semaphores)(1, &slot.gl_to_vulkan_semaphore);
-                (self.gl.delete_semaphores)(1, &slot.vulkan_to_gl_semaphore);
-            }
+            self.slots.clear();
         }
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_surface(self.display, self.surface);
@@ -292,6 +318,7 @@ impl Drop for ComposedGlRenderContext {
 }
 
 struct SharedGlSlot {
+    gl: GlApi,
     _texture: Arc<wgpu::Texture>,
     view: Arc<wgpu::TextureView>,
     sync: Arc<crate::renderer::GlInteropSync>,
@@ -358,12 +385,16 @@ impl SharedGlSlot {
             let status = (gl.check_framebuffer_status)(GL_FRAMEBUFFER);
             (gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
             if status != GL_FRAMEBUFFER_COMPLETE {
+                (gl.delete_framebuffers)(1, &framebuffer);
+                (gl.delete_textures)(1, &gl_texture);
+                (gl.delete_memory_objects)(1, &memory_object);
+                (gl.delete_semaphores)(1, &gl_to_vulkan_semaphore);
+                (gl.delete_semaphores)(1, &vulkan_to_gl_semaphore);
                 anyhow::bail!("shared OpenGL framebuffer is incomplete: 0x{status:x}");
             }
         }
-        prime_shared_texture_for_gl(wgpu_ctx, &exported.view, &exported.sync)
-            .context("priming WGPU shared texture state for OpenGL")?;
-        Ok(Self {
+        let slot = Self {
+            gl: *gl,
             _texture: exported.texture,
             view: exported.view,
             sync: exported.sync,
@@ -374,7 +405,10 @@ impl SharedGlSlot {
             framebuffer,
             gl_to_vulkan_semaphore,
             vulkan_to_gl_semaphore,
-        })
+        };
+        prime_shared_texture_for_gl(wgpu_ctx, &slot.view, &slot.sync)
+            .context("priming WGPU shared texture state for OpenGL")?;
+        Ok(slot)
     }
 
     fn acquire_for_gl(&self, gl: &GlApi) {
@@ -403,6 +437,20 @@ impl SharedGlSlot {
                 &self.gl_texture,
                 &GL_LAYOUT_SHADER_READ_ONLY_EXT,
             );
+        }
+    }
+}
+
+impl Drop for SharedGlSlot {
+    fn drop(&mut self) {
+        // SAFETY: slots are destroyed on their owner render thread before EGL
+        // teardown, including partial construction and libmpv init failures.
+        unsafe {
+            (self.gl.delete_framebuffers)(1, &self.framebuffer);
+            (self.gl.delete_textures)(1, &self.gl_texture);
+            (self.gl.delete_memory_objects)(1, &self.memory_object);
+            (self.gl.delete_semaphores)(1, &self.gl_to_vulkan_semaphore);
+            (self.gl.delete_semaphores)(1, &self.vulkan_to_gl_semaphore);
         }
     }
 }

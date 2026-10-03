@@ -187,6 +187,7 @@ unsafe extern "C" fn mpv_get_proc_address(ctx: *mut c_void, name: *const c_char)
         .unwrap_or(std::ptr::null_mut())
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct GlApi {
     pub(super) create_memory_objects: unsafe extern "system" fn(i32, *mut u32),
     pub(super) delete_memory_objects: unsafe extern "system" fn(i32, *const u32),
