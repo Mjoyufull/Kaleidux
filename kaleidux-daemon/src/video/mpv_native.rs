@@ -299,7 +299,7 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
             // Unblock the player thread before reporting: it is waiting on this
             // signal and must fail fast rather than sit out the whole timeout.
             config.render_ready.signal(Err(error.to_string()));
-            report_gl_renderer_failure(&config, &error);
+            report_gl_renderer_failure(&config, &error, "initialize");
             return;
         }
     };
@@ -338,20 +338,7 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
             }
             Ok(None) => {}
             Err(error) => {
-                warn!(
-                    "[VIDEO] {}: composed libmpv GL render failed: {error}",
-                    config.source_id
-                );
-                config
-                    .metrics
-                    .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
-                let _ = config.player_event_tx.blocking_send(PlayerEvent {
-                    source_id: config.source_id.to_string(),
-                    session_id: config.session_id,
-                    backend_kind: VideoBackendKind::Mpv,
-                    kind: PlayerEventKind::Error,
-                    reason: format!("composed libmpv GL render failed: {error}"),
-                });
+                report_gl_renderer_failure(&config, &error, "render");
                 break;
             }
         }
@@ -362,15 +349,19 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
     );
 }
 
-fn report_gl_renderer_failure(config: &MpvComposedRenderThreadConfig, error: &anyhow::Error) {
+fn report_gl_renderer_failure(
+    config: &MpvComposedRenderThreadConfig,
+    error: &anyhow::Error,
+    stage: &str,
+) {
     warn!(
-        "[VIDEO] {}: composed libmpv GL renderer failed to initialize: {}",
-        config.source_id, error
+        "[VIDEO] {}: composed libmpv GL renderer failed to {}: {}",
+        config.source_id, stage, error
     );
     config
         .metrics
         .record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
-    if !super::mpv_backend_is_explicitly_forced() {
+    if cfg!(feature = "backend-appsink") && !super::mpv_backend_is_explicitly_forced() {
         warn!("[VIDEO] Switching automatic backend selection to appsink after mpv GL failure");
         super::set_video_backend_request(super::VideoBackendRequest::ForceAppsink);
     }
@@ -379,7 +370,7 @@ fn report_gl_renderer_failure(config: &MpvComposedRenderThreadConfig, error: &an
         session_id: config.session_id,
         backend_kind: VideoBackendKind::Mpv,
         kind: PlayerEventKind::Error,
-        reason: format!("composed libmpv GL renderer failed to initialize: {error}"),
+        reason: format!("composed libmpv GL renderer failed to {stage}: {error}"),
     });
 }
 

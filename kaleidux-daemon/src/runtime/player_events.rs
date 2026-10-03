@@ -40,6 +40,10 @@ impl MainLoopContext {
 
             match event.kind {
                 PlayerEventKind::FirstPresent => {
+                    // Native mpv overlays bypass WGPU's transition completion
+                    // callback, so this presentation starts their display timer.
+                    self.monitor_manager
+                        .mark_transition_completed(&event.source_id);
                     self.mark_startup_output_ready(&event.source_id, loop_start);
                     self.mark_startup_output_presented(&event.source_id, loop_start);
                     self.maybe_clear_startup_present_barrier();
