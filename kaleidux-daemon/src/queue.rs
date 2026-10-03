@@ -43,6 +43,7 @@ pub struct SmartQueue {
     planned_sequential_type: Option<ContentType>,
     pub history: VecDeque<PathBuf>,
     forward_history: VecDeque<PathBuf>,
+    selected_images: VecDeque<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
     pub cache: Arc<FileCache>,

@@ -28,7 +28,8 @@ impl SmartQueue {
             .iter()
             .filter(|entry| {
                 !self.stats.blacklist.contains(&entry.path)
-                    && playlist.is_none_or(|playlist| playlist.paths.contains(&entry.path))
+                    && (self.active_playlist.is_none()
+                        || playlist.is_some_and(|playlist| playlist.paths.contains(&entry.path)))
             })
             .map(|entry| entry.path.clone())
             .collect();
@@ -38,6 +39,13 @@ impl SmartQueue {
             .map(|entry| (entry.path.clone(), entry.content_type))
             .collect();
         self.root_generation = snapshot.generation;
+        for path in &self.selected_images {
+            if !self.stats.blacklist.contains(path) && !self.pool.contains(path) {
+                self.pool.push(path.clone());
+                self.content_type_cache
+                    .insert(path.clone(), ContentType::Image);
+            }
+        }
         self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
         self.planned_sequential_type = None;
     }
@@ -116,6 +124,7 @@ impl SmartQueue {
                     }
                 }
                 PoolEvent::Removed(path) => {
+                    self.selected_images.retain(|selected| selected != &path);
                     if !path.starts_with(&self.root_path) {
                         continue;
                     }

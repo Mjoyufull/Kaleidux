@@ -122,6 +122,7 @@ impl SmartQueue {
         }
 
         self.active_playlist = name;
+        self.selected_images.clear();
         self.pool.sort(); // Always sort generic pool
         self.current_index = Self::fallback_current_index(self.strategy, self.pool.len());
         self.planned_sequential_type = None;
