@@ -142,6 +142,30 @@ impl BackgroundWorkRegistry {
         self.try_begin_inner(kind, true)
     }
 
+    fn begin_cleanup(&self) -> BackgroundWorkGuard {
+        // Retirement releases existing resources; it must not wait behind
+        // allocations or be rejected once shutdown closes admission. Count it
+        // against admission so new preparations wait while cleanup is pending.
+        let total = self
+            .inner
+            .counters
+            .total_in_flight
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.inner
+            .counters
+            .high_water
+            .fetch_max(total, Ordering::Relaxed);
+        self.inner
+            .counters
+            .player_stop
+            .fetch_add(1, Ordering::SeqCst);
+        BackgroundWorkGuard {
+            registry: self.clone(),
+            kind: BackgroundWorkKind::PlayerStop,
+        }
+    }
+
     fn try_begin_inner(
         &self,
         kind: BackgroundWorkKind,
@@ -275,6 +299,20 @@ pub fn snapshot() -> BackgroundWorkSnapshot {
     global_registry().snapshot()
 }
 
+/// Submit retirement without a cancellable admission future owning the resource.
+/// Cleanup can temporarily exceed the admission limit, including after close;
+/// its guard still prevents new allocations and participates in shutdown waits.
+pub fn spawn_blocking_cleanup<F>(work: F) -> JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let guard = global_registry().begin_cleanup();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        work();
+    })
+}
+
 pub fn spawn_blocking_tracked<T, F>(kind: BackgroundWorkKind, work: F) -> Option<JoinHandle<T>>
 where
     T: Send + 'static,
@@ -309,6 +347,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_bypasses_admission_but_holds_back_new_work() {
+        let registry = BackgroundWorkRegistry::with_limit(1);
+        let prepare = registry
+            .try_begin(BackgroundWorkKind::VideoPrepare)
+            .unwrap();
+        let cleanup = registry.begin_cleanup();
+        assert_eq!(registry.snapshot().total_in_flight, 2);
+        assert_eq!(registry.snapshot().player_stop, 1);
+        drop(prepare);
+        assert!(
+            registry
+                .try_begin(BackgroundWorkKind::VideoPrepare)
+                .is_none()
+        );
+        registry.close();
+        let shutdown_cleanup = registry.begin_cleanup();
+        assert_eq!(registry.snapshot().player_stop, 2);
+        drop(cleanup);
+        drop(shutdown_cleanup);
+        assert_eq!(registry.snapshot().total_in_flight, 0);
+    }
 
     #[tokio::test]
     async fn registry_waits_for_tracked_work_to_finish() {
