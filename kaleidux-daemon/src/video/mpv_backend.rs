@@ -267,7 +267,7 @@ impl MpvPlayer {
         Ok(None)
     }
 
-    pub fn start(&mut self) -> anyhow::Result<()> {
+    pub fn start(&mut self, paused: bool) -> anyhow::Result<()> {
         self.stop_requested.store(false, Ordering::SeqCst);
         self.spawn_event_thread()?;
         if self.renders_natively() {
@@ -291,7 +291,7 @@ impl MpvPlayer {
             }
             self.load_file(&uri)?;
         }
-        self.mpv.set_property("pause", false)?;
+        self.mpv.set_property("pause", paused)?;
         info!(
             "[VIDEO] {}: libmpv backend started (session={})",
             self.source_id, self.session_id

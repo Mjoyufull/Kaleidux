@@ -314,9 +314,9 @@ impl NativePlayer {
                 anyhow::bail!("native decoder exited before producing a frame");
             }
             if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "native decoder did not produce a frame within the prebuffer deadline"
-                );
+                // A live decoder without a frame is not a fatal decoder error.
+                // Forced FFmpeg may continue loading after this preroll budget.
+                return Ok(None);
             }
             match self.first_frame_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => {

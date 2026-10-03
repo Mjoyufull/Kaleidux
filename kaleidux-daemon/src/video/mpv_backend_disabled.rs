@@ -33,7 +33,7 @@ impl MpvPlayer {
         anyhow::bail!("mpv backend is disabled in this build")
     }
 
-    pub fn start(&mut self) -> anyhow::Result<()> {
+    pub fn start(&mut self, _paused: bool) -> anyhow::Result<()> {
         Ok(())
     }
 
