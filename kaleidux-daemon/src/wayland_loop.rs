@@ -393,7 +393,8 @@ pub async fn run(
                     !r.steady_video_uses_frame_callbacks()
                         || !had_current_texture
                         || !r.frame_callback_pending
-                        || r.frame_callback_pending_too_long(1000)
+                        || (!r.should_hold_video_frame_for_callback()
+                            && r.frame_callback_pending_too_long(1000))
                 } else {
                     !r.frame_callback_pending || !r.has_current_texture()
                 };
@@ -420,7 +421,8 @@ pub async fn run(
                         || crate::wayland::video_immediate_present_enabled();
                     let should_render_now = (mark_ready
                         && (immediate_video || !had_current_texture))
-                        || r.frame_callback_pending_too_long(1000);
+                        || (!r.should_hold_video_frame_for_callback()
+                            && r.frame_callback_pending_too_long(1000));
                     if crate::observability::trace_all::trace_all_enabled() {
                         tracing::trace!(
                             "[TRACE5][VIDEO-PRESENT-DECISION] output={} mark_ready={} immediate={} had_current={} callback_pending={} should_render_now={} callback_too_long={} transition_just_completed={}",
