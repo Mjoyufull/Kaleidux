@@ -128,6 +128,13 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
     let mut packet = ffmpeg::Packet::empty();
     let mut eof_sent = false;
 
+    if !allow_hardware {
+        let position = config.control.position_ns();
+        if position > 0 {
+            seek_input(&mut input, &mut decoder.decoder, position)?;
+        }
+    }
+
     loop {
         if config.control.is_stopped() {
             return Ok(());
