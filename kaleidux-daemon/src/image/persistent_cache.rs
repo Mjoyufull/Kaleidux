@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{File, FileTimes, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,9 +304,6 @@ fn store_by_key_with_policy(
     payload: &DecodedImagePayload,
     policy: CachePolicy,
 ) {
-    let _writer = CACHE_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
     let Some(cache_path) = path_for_key(key) else {
         return;
     };
@@ -323,6 +321,12 @@ fn store_by_key_with_policy(
         .saturating_add(source_format.len() as u64)
         .saturating_add(expected_len);
     let Some(dir) = cache_path.parent() else {
+        return;
+    };
+    let _writer = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Ok(_process_writer) = lock_cache_writer(dir) else {
         return;
     };
     if !ensure_capacity(dir, &cache_path, total_len, policy) {
@@ -349,6 +353,33 @@ fn store_by_key_with_policy(
         return;
     }
     update_index_entry(&cache_path, total_len, SystemTime::now());
+}
+
+fn lock_cache_writer(dir: &Path) -> std::io::Result<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".writer.lock"))?;
+    // SAFETY: the descriptor belongs to this live File; flock neither takes
+    // ownership nor accesses Rust memory. Closing File releases this lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut previous = [0; 4];
+    let ours = std::process::id().to_le_bytes();
+    if file.read_exact(&mut previous).is_err() || previous != ours {
+        // Another daemon may have changed the directory since our last write.
+        // Rebuild only on writer handoff, not on every cache store.
+        CACHE_INDEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .root = None;
+    }
+    file.rewind()?;
+    file.write_all(&ours)?;
+    Ok(file)
 }
 
 fn write_streamed(
@@ -599,6 +630,41 @@ fn read_u64(reader: &mut impl Read) -> std::io::Result<u64> {
 mod tests {
     use super::*;
     use crate::image::types::ImageSourceIdentity;
+
+    #[test]
+    fn writer_lock_excludes_independent_file_handles() {
+        let _thread_writer = CACHE_WRITE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "kaleidux-writer-lock-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let writer = lock_cache_writer(&dir).unwrap();
+        let competitor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(".writer.lock"))
+            .unwrap();
+        // SAFETY: both descriptors remain open, and the nonblocking lock call
+        // accesses no Rust memory or descriptor ownership.
+        assert_eq!(
+            unsafe { libc::flock(competitor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(writer);
+        // SAFETY: the competitor descriptor is still live after releasing writer.
+        assert_eq!(
+            unsafe { libc::flock(competitor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(competitor);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn unique_key(label: &str) -> PreparedImageKey {
         PreparedImageKey {
