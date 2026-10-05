@@ -315,7 +315,8 @@ The daemon outputs key-value metrics partitioned across subsystem categories:
 - `channel_high_water`: High-water mark for internal actor message queues (`cmd`, `img`, `player_ready`, `player_event`, `mailbox`).
 - `background`: In-flight work by kind and the admission limit. Player cleanup
   is admitted immediately, even at the limit or during shutdown, so this count
-  can temporarily exceed the limit. New preparations wait until capacity returns.
+  can temporarily exceed the limit. While admission is open, new preparations
+  wait until capacity returns; shutdown rejects new preparations.
 - `wake`: Main loop wakeup reason counters (`timer`, `fd`, `signal`) and sleep durations.
 - `monitor_self_cost`: Scheduling loop overhead for output refresh, GPU surface updates, and metric logging.
 - `thread_cpu`: CPU utilization percentages for the `main` loop and `worker` threads.
