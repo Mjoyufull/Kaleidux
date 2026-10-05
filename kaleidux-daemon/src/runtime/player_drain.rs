@@ -75,7 +75,9 @@ impl MainLoopContext {
                         }
 
                         if let Err(e) = player.start_with_pause(
-                            self.monitor_manager.is_paused() || self.display_power_suspended,
+                            self.monitor_manager.is_paused()
+                                || self.display_power_suspended
+                                || self.powered_off_outputs.contains(&name),
                         ) {
                             error!(
                                 "[VIDEO] {}: Failed to start deferred video player: {}",
@@ -95,6 +97,9 @@ impl MainLoopContext {
 
                         let old_player = self.video_players.remove(&name);
                         self.video_players.insert(name.clone(), player);
+                        if self.pending_native_presentations.remove(&name) == Some(session_id) {
+                            self.monitor_manager.mark_transition_completed(&name);
+                        }
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);
                         }
@@ -129,7 +134,9 @@ impl MainLoopContext {
                         == Some(session_id)
                     {
                         if let Err(e) = player.start_with_pause(
-                            self.monitor_manager.is_paused() || self.display_power_suspended,
+                            self.monitor_manager.is_paused()
+                                || self.display_power_suspended
+                                || self.powered_off_outputs.contains(&name),
                         ) {
                             error!("[VIDEO] {}: Failed to start video player: {}", name, e);
                             set_pending_video_session(&self.pending_video_sessions, &name, None);

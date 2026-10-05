@@ -153,6 +153,9 @@ pub struct MainLoopContext {
     pub(crate) display_power_suspended: bool,
 
     pub next_session_id: u64,
+    pub(crate) powered_off_outputs: std::collections::HashSet<String>,
+    pub(crate) pending_native_presentations: HashMap<String, u64>,
+    pub(crate) low_power_prefetch_deferrals: HashMap<String, PathBuf>,
     pub first_frame_recorded: bool,
     pub last_metrics_log: Instant,
     pub last_stats_flush: Instant,
@@ -286,10 +289,11 @@ impl MainLoopContext {
                             };
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             let response = match cmd_tx.try_send((req, resp_tx)) {
-                                Ok(()) => tokio::time::timeout(IPC_RESPONSE_TIMEOUT, resp_rx)
-                                    .await
-                                    .ok()
-                                    .and_then(Result::ok),
+                                Ok(()) => Some(match tokio::time::timeout(IPC_RESPONSE_TIMEOUT, resp_rx).await {
+                                    Ok(Ok(response)) => response,
+                                    Ok(Err(_)) => Response::Error("command handler closed without a response".to_string()),
+                                    Err(_) => Response::Error("command response timed out; command may still complete".to_string()),
+                                }),
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     Some(Response::Error(
                                         "control queue busy; retry shortly".to_string(),
@@ -363,6 +367,9 @@ impl MainLoopContext {
             shutdown_flag,
             display_power_suspended: false,
             next_session_id: 1,
+            powered_off_outputs: std::collections::HashSet::new(),
+            pending_native_presentations: HashMap::new(),
+            low_power_prefetch_deferrals: HashMap::new(),
             first_frame_recorded: false,
             last_metrics_log: now,
             last_stats_flush: now,
