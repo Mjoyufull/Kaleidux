@@ -23,11 +23,12 @@ impl SmartQueue {
             .active_playlist
             .as_ref()
             .and_then(|name| self.stats.playlists.get(name));
+        let blacklist = super::BlacklistIdentity::new(&self.stats.blacklist);
         self.pool = snapshot
             .entries
             .iter()
             .filter(|entry| {
-                !self.stats.blacklist.contains(&entry.path)
+                !blacklist.contains(&entry.path)
                     && (self.active_playlist.is_none()
                         || playlist.is_some_and(|playlist| playlist.paths.contains(&entry.path)))
             })
@@ -39,13 +40,16 @@ impl SmartQueue {
             .map(|entry| (entry.path.clone(), entry.content_type))
             .collect();
         self.root_generation = snapshot.generation;
+        self.selected_images
+            .retain(|path| path.is_file() && !blacklist.contains(path));
         for path in &self.selected_images {
-            if !self.stats.blacklist.contains(path) && !self.pool.contains(path) {
+            if !self.pool.contains(path) {
                 self.pool.push(path.clone());
                 self.content_type_cache
                     .insert(path.clone(), ContentType::Image);
             }
         }
+        self.pool.sort();
         self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
         self.planned_sequential_type = None;
     }

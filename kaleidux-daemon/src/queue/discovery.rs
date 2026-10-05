@@ -77,15 +77,17 @@ impl SmartQueue {
         let shared_index = super::media_index::shared_root_index(path);
         let shared_snapshot = shared_index.snapshot();
         if !shared_snapshot.entries.is_empty() {
+            let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
             let mut pool = Vec::with_capacity(shared_snapshot.entries.len());
             let mut content_type_cache = HashMap::with_capacity(shared_snapshot.entries.len());
             for entry in shared_snapshot.entries.iter() {
-                if !stats.blacklist.contains(&entry.path) {
+                if !blacklist.contains(&entry.path) {
                     pool.push(entry.path.clone());
                     content_type_cache.insert(entry.path.clone(), entry.content_type);
                 }
             }
             pool.sort();
+            drop(blacklist);
             let current_index = Self::fallback_current_index(strategy, pool.len());
             tracing::info!(
                 "[QUEUE] Reusing shared root media index generation {} ({} files) for {:?}",
@@ -293,7 +295,9 @@ impl SmartQueue {
     ) -> Result<Self> {
         let stats = Self::load_stats_from_cache(&cache)?;
         let mut pool = pool;
-        pool.retain(|path| !stats.blacklist.contains(path));
+        let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
+        pool.retain(|path| !blacklist.contains(path));
+        drop(blacklist);
         pool.sort();
 
         let current_index = Self::fallback_current_index(strategy, pool.len());
@@ -372,6 +376,7 @@ impl SmartQueue {
         metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
     ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
         let discovery_start = std::time::Instant::now();
+        let blacklist = super::BlacklistIdentity::new(blacklist);
         let mut files = Vec::new();
         let mut ct_cache: HashMap<PathBuf, ContentType> = HashMap::new();
         let mut cache_updates: Vec<(PathBuf, crate::cache::FileMetadata)> = Vec::new();

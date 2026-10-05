@@ -8,6 +8,31 @@ use std::sync::Arc;
 /// Stats capacity for LRU eviction — entries beyond this are auto-evicted
 pub(crate) const STATS_LRU_CAP: usize = 5000;
 
+pub(crate) struct BlacklistIdentity<'a> {
+    paths: &'a std::collections::HashSet<PathBuf>,
+    resolved: std::collections::HashSet<PathBuf>,
+}
+
+impl<'a> BlacklistIdentity<'a> {
+    pub(crate) fn new(paths: &'a std::collections::HashSet<PathBuf>) -> Self {
+        Self {
+            paths,
+            resolved: paths
+                .iter()
+                .filter_map(|path| path.canonicalize().ok())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn contains(&self, path: &std::path::Path) -> bool {
+        self.paths.contains(path)
+            || (!self.resolved.is_empty()
+                && path
+                    .canonicalize()
+                    .is_ok_and(|resolved| self.resolved.contains(&resolved)))
+    }
+}
+
 #[derive(Debug)]
 pub struct LoveitData {
     pub files: lru::LruCache<PathBuf, FileStats>,
