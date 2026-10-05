@@ -248,7 +248,7 @@ pub struct NativePlayer {
     session_id: u64,
     mailbox: LatestFrameMailbox,
     shared: Arc<shared_decode::SharedDecodeSession>,
-    first_frame_rx: Receiver<VideoFrame>,
+    first_frame_rx: Option<Receiver<VideoFrame>>,
     subscribed: bool,
     volume: f64,
 }
@@ -292,7 +292,7 @@ impl NativePlayer {
             session_id,
             mailbox,
             shared,
-            first_frame_rx,
+            first_frame_rx: Some(first_frame_rx),
             subscribed: true,
             volume,
         })
@@ -302,6 +302,9 @@ impl NativePlayer {
     where
         F: Fn() -> bool,
     {
+        let Some(first_frame_rx) = self.first_frame_rx.take() else {
+            return Ok(None);
+        };
         let deadline = Instant::now() + Duration::from_millis(2_000);
         loop {
             if should_abort() {
@@ -318,7 +321,7 @@ impl NativePlayer {
                 // Forced FFmpeg may continue loading after this preroll budget.
                 return Ok(None);
             }
-            match self.first_frame_rx.recv_timeout(Duration::from_millis(50)) {
+            match first_frame_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => {
                     self.mailbox
                         .clear_session(self.source_id.as_ref(), self.session_id);
