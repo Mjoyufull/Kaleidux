@@ -12,6 +12,9 @@ impl SmartQueue {
     /// Put an explicitly selected image ahead of random selection and forward history.
     pub(crate) fn enqueue_selected_image(&mut self, path: PathBuf) {
         self.sync_root_index_if_needed();
+        if super::BlacklistIdentity::new(&self.stats.blacklist).contains(&path) {
+            return;
+        }
         self.selected_images.retain(|selected| selected != &path);
         self.selected_images.push_back(path.clone());
         while self.selected_images.len() > 50 {

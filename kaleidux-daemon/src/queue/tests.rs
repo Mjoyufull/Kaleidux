@@ -14,9 +14,13 @@ fn empty_stats() -> LoveitData {
 
 #[test]
 fn selected_image_overrides_random_and_preserves_back_forward_history() {
-    let a = PathBuf::from("/a.png");
-    let b = PathBuf::from("/b.png");
-    let external = PathBuf::from("/external.png");
+    let dir = unique_test_dir("selected-history");
+    let a = dir.join("a.png");
+    let b = dir.join("b.png");
+    let external = dir.join("external.png");
+    for path in [&a, &b, &external] {
+        fs::write(path, b"fixture").unwrap();
+    }
     for strategy in [
         crate::orchestration::SortingStrategy::Random,
         crate::orchestration::SortingStrategy::Ascending,
@@ -52,6 +56,38 @@ fn selected_image_overrides_random_and_preserves_back_forward_history() {
         assert_eq!(queue.pick_next(), Some(external.clone()));
         assert_eq!(queue.pool.len(), 3);
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn selected_images_respect_alias_blacklists_and_missing_files_on_refresh() {
+    let dir = unique_test_dir("selected-blacklist");
+    let path = dir.join("image.png");
+    let alias = dir.join("alias.png");
+    fs::write(&path, b"fixture").unwrap();
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let mut queue = make_test_queue(
+        Vec::new(),
+        crate::orchestration::SortingStrategy::Random,
+        0,
+        HashMap::new(),
+    );
+    queue.enqueue_selected_image(path.clone());
+    queue.stats.blacklist.insert(alias);
+    queue.root_index.replace(
+        std::slice::from_ref(&path),
+        &HashMap::from([(path.clone(), ContentType::Image)]),
+    );
+    assert_eq!(queue.pick_next(), None);
+    queue.enqueue_selected_image(path.clone());
+    assert!(queue.selected_images.is_empty());
+    queue.stats.blacklist.clear();
+    queue.enqueue_selected_image(path.clone());
+    fs::remove_file(&path).unwrap();
+    queue.root_index.replace(&[], &HashMap::new());
+    assert_eq!(queue.pick_next(), None);
+    assert!(queue.selected_images.is_empty());
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -68,6 +104,33 @@ fn missing_active_playlist_does_not_expand_to_root_after_refresh() {
     queue.root_index.replace(&[path], &types);
     assert_eq!(queue.pick_next(), None);
     assert!(queue.pool.is_empty());
+}
+
+#[test]
+fn selected_image_retention_deduplicates_and_evicts_oldest_on_refresh() {
+    let dir = unique_test_dir("selected-cap");
+    let paths: Vec<_> = (0..51).map(|i| dir.join(format!("{i:02}.png"))).collect();
+    let mut queue = make_test_queue(
+        Vec::new(),
+        crate::orchestration::SortingStrategy::Ascending,
+        0,
+        HashMap::new(),
+    );
+    for path in &paths {
+        fs::write(path, b"fixture").unwrap();
+        queue.enqueue_selected_image(path.clone());
+    }
+    assert_eq!(queue.selected_images.len(), 50);
+    assert!(!queue.selected_images.contains(&paths[0]));
+    queue.enqueue_selected_image(paths[1].clone());
+    assert_eq!(queue.selected_images.len(), 50);
+    assert_eq!(queue.selected_images.back(), Some(&paths[1]));
+    queue.root_index.replace(&[], &HashMap::new());
+    queue.sync_root_index_if_needed();
+    assert_eq!(queue.pool.len(), 50);
+    assert!(!queue.pool.contains(&paths[0]));
+    assert!(queue.pool.windows(2).all(|pair| pair[0] < pair[1]));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 fn make_test_queue(
