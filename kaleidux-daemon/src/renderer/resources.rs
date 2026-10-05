@@ -247,7 +247,6 @@ impl super::Renderer {
             && self.has_current_texture()
             && !self.content_swap_pending
             && !self.transition_active
-            && !self.frame_callback_pending_too_long(1000)
     }
 
     pub fn should_upload_video_frame_on_callback(&self) -> bool {
