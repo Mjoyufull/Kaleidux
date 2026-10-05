@@ -31,7 +31,10 @@ struct HyprlandMonitor {
 }
 
 pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: PowerUpdate) {
+    ctx.powered_off_outputs
+        .retain(|name| ctx.monitor_manager.outputs.contains_key(name));
     for name in &update.powered_off {
+        ctx.powered_off_outputs.insert(name.clone());
         if let Some(player) = ctx.video_players.get(name) {
             if let Err(error) = player.pause() {
                 warn!("[DISPLAY-POWER] Failed to pause {name}: {error}");
@@ -45,6 +48,7 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
         }
     }
     for (name, suspended_for) in &update.powered_on {
+        ctx.powered_off_outputs.remove(name);
         if let Some(renderer) = ctx.renderers.get_mut(name) {
             if let Some(start) = renderer.transition_start_time.as_mut() {
                 *start += *suspended_for;

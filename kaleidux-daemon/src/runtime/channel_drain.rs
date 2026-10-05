@@ -55,6 +55,7 @@ impl MainLoopContext {
             let ordered_changes =
                 ordered_pending_content_switches(&self.renderers, scheduled_changes);
             for change in ordered_changes {
+                self.low_power_prefetch_deferrals.remove(&change.name);
                 switch_wallpaper_content(
                     ContentSwitchRequest {
                         name: change.name,
@@ -91,6 +92,8 @@ impl MainLoopContext {
         &mut self,
         loop_start: Instant,
     ) -> bool {
+        self.low_power_prefetch_deferrals
+            .retain(|name, _| self.monitor_manager.outputs.contains_key(name));
         for name in self.monitor_manager.due_low_power_outputs(loop_start) {
             let Some(orchestrator) = self.monitor_manager.outputs.get(&name) else {
                 continue;
@@ -98,6 +101,11 @@ impl MainLoopContext {
             let Some((path, queue::ContentType::Image)) = orchestrator.peek_next() else {
                 continue;
             };
+            // One grace period per candidate; failed prefetch must eventually
+            // reach foreground loading and its normal error/recovery path.
+            if self.low_power_prefetch_deferrals.get(&name) == Some(&path) {
+                continue;
+            }
             let Some(renderer) = self.renderers.get(&name) else {
                 continue;
             };
@@ -122,6 +130,7 @@ impl MainLoopContext {
                 path.display()
             );
             schedule_image_prefetch_plan(&name, generation, prefetch_plan, self.metrics.clone());
+            self.low_power_prefetch_deferrals.insert(name.clone(), path);
             self.monitor_manager
                 .defer_switch_deadline(&name, LOW_POWER_IMAGE_PREFETCH_DEFER);
             return true;
