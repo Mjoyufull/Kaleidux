@@ -274,6 +274,7 @@ fn retired_session_cannot_clear_replacement_or_other_output() {
     mailbox.publish_frame("DP-1", dummy_frame(2));
     mailbox.publish_frame("DP-2", dummy_frame(1));
     mailbox.clear_session("DP-1", 1);
+    assert!(mailbox.pending_sources().contains(&"DP-1".to_owned()));
     assert!(mailbox.has_pending_frame("DP-1"));
     assert!(mailbox.pending_frame_age("DP-1").is_some());
     assert!(mailbox.has_pending_frame("DP-2"));
