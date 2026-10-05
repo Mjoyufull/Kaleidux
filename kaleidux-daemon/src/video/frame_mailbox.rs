@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 struct MailboxState {
     frames: HashMap<Arc<str>, VideoFrame>,
+    // Keep the watermark after consumption/clear: a retiring producer may
+    // already be inside its callback when the replacement publishes.
+    latest_sessions: HashMap<Arc<str>, u64>,
     pending_notifications: HashSet<Arc<str>>,
     pending_since: HashMap<Arc<str>, Instant>,
 }
@@ -32,6 +35,9 @@ impl LatestFrameMailbox {
 
     pub(crate) fn publish_frame_key(&self, source_id: Arc<str>, frame: VideoFrame) {
         let mut state = self.state.lock();
+        if !state.accept_session(&source_id, frame.session_id) {
+            return;
+        }
         if state.frames.insert(source_id.clone(), frame).is_some() {
             self.overwrite_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -59,6 +65,9 @@ impl LatestFrameMailbox {
         {
             let mut state = self.state.lock();
             for (source_id, frame) in frames_to_publish {
+                if !state.accept_session(&source_id, frame.session_id) {
+                    continue;
+                }
                 if state.frames.insert(source_id.clone(), frame).is_some() {
                     self.overwrite_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -187,6 +196,20 @@ impl LatestFrameMailbox {
     }
 }
 
+impl MailboxState {
+    fn accept_session(&mut self, source: &Arc<str>, session: u64) -> bool {
+        let latest = self
+            .latest_sessions
+            .entry(source.clone())
+            .or_insert(session);
+        if session < *latest {
+            return false;
+        }
+        *latest = session;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +229,19 @@ mod tests {
             color: Default::default(),
             geometry: crate::video::VideoGeometry::for_dimensions(1, 1),
         }
+    }
+
+    #[test]
+    fn retired_producer_cannot_overwrite_or_repopulate_a_newer_session() {
+        let mailbox = LatestFrameMailbox::new();
+        mailbox.publish_frame("DP-1", test_frame(2));
+        mailbox.publish_frame("DP-1", test_frame(1));
+        assert_eq!(mailbox.take_frame("DP-1").unwrap().session_id, 2);
+        mailbox.clear_session("DP-1", 1);
+        mailbox.publish_frame_batch(vec![(Arc::from("DP-1"), test_frame(1))]);
+        assert!(!mailbox.has_pending_frame("DP-1"));
+        mailbox.publish_frame("DP-1", test_frame(2));
+        assert_eq!(mailbox.take_frame("DP-1").unwrap().session_id, 2);
     }
 
     #[test]
