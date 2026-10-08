@@ -86,6 +86,15 @@ pub enum ContentType {
 }
 
 impl ContentType {
+    fn supported(self) -> bool {
+        self == Self::Image
+            || cfg!(any(
+                feature = "backend-ffmpeg",
+                feature = "backend-mpv",
+                feature = "backend-appsink"
+            ))
+    }
+
     fn other(self) -> Self {
         match self {
             Self::Image => Self::Video,
