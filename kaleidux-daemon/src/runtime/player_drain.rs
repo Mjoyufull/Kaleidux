@@ -97,7 +97,9 @@ impl MainLoopContext {
 
                         let old_player = self.video_players.remove(&name);
                         self.video_players.insert(name.clone(), player);
-                        if self.pending_native_presentations.remove(&name) == Some(session_id) {
+                        if !self.powered_off_outputs.contains(&name)
+                            && self.pending_native_presentations.remove(&name) == Some(session_id)
+                        {
                             self.monitor_manager.mark_transition_completed(&name);
                         }
                         if let Some(old) = old_player {

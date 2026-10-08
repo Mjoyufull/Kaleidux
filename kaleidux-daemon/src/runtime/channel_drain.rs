@@ -174,6 +174,7 @@ impl MainLoopContext {
                     loop_start,
                     shutdown_flag: &self.shutdown_flag,
                     display_power_suspended: self.display_power_suspended,
+                    powered_off_outputs: &self.powered_off_outputs,
                     mpv_native_targets: Some(&self.mpv_native_targets),
                     mpv_composed_targets: Some(&self.mpv_composed_targets),
                 },

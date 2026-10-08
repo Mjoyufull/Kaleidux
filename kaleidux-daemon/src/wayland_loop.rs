@@ -291,6 +291,7 @@ pub async fn run(
                 if let Some(r) = ctx.renderers.get_mut(&name) {
                     let width = if w == 0 { r.config.width } else { w };
                     let height = if h == 0 { r.config.height } else { h };
+                    let size_changed = (width, height) != (r.config.width, r.config.height);
                     let _ = r.resize_checked(width, height);
                     if r.configured {
                         if let Some(layer_surface) = backend.surfaces.get(&name) {
@@ -304,6 +305,11 @@ pub async fn run(
                             );
                             callback_flush_needed |= r.request_frame_callback(layer_surface, &qh);
                         }
+                    }
+                    if size_changed {
+                        crate::wayland::hotplug::refresh_mpv_targets_after_resize(
+                            &mut ctx, &conn, &backend, &name, width, height,
+                        );
                     }
                 } else {
                     // Hotplug renderer creation is asynchronous. Preserve the

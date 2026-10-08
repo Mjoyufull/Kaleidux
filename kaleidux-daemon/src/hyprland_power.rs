@@ -49,6 +49,16 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
     }
     for (name, suspended_for) in &update.powered_on {
         ctx.powered_off_outputs.remove(name);
+        if let Some(session) = ctx.pending_native_presentations.get(name).copied()
+            && ctx
+                .renderers
+                .get(name)
+                .is_some_and(|renderer| renderer.active_video_session_id == session)
+            && !ctx.pending_video_switches.contains_key(name)
+        {
+            ctx.pending_native_presentations.remove(name);
+            ctx.monitor_manager.mark_transition_completed(name);
+        }
         if let Some(renderer) = ctx.renderers.get_mut(name) {
             if let Some(start) = renderer.transition_start_time.as_mut() {
                 *start += *suspended_for;

@@ -620,6 +620,7 @@ async fn reconcile_monitors(
             barrier.outputs.remove(&name);
         }
         ctx.monitor_manager.remove_output(&name);
+        ctx.retire_output_bookkeeping(&name);
         if !renderer_still_initializing
             && let Some(window) = backend.destroy_wallpaper_window(&name)?
         {
@@ -860,6 +861,7 @@ fn rollback_added_output(
     ctx.renderers.remove(name);
     ctx.mpv_composed_targets.remove(name);
     ctx.monitor_manager.remove_output(name);
+    ctx.retire_output_bookkeeping(name);
     if let Some(window) = backend.destroy_wallpaper_window(name)? {
         window_to_renderer.remove(&window);
     }
@@ -874,10 +876,10 @@ fn refresh_x11_mpv_composed_target(
     width: u32,
     height: u32,
 ) {
-    let should_create = matches!(
-        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
-        crate::video::VideoBackendRequest::ForceMpv
-    ) && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl();
+    let should_create =
+        crate::video::candidate_video_backends(crate::video::VideoBackendRequest::Auto)
+            .contains(&crate::video::VideoBackendRequest::ForceMpv)
+            && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl();
     if !should_create {
         ctx.mpv_composed_targets.remove(name);
         return;

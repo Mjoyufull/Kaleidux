@@ -216,6 +216,10 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
+    pub(crate) fn uses_mpv(&self) -> bool {
+        self.backend_kind == VideoBackendKind::Mpv
+    }
+
     fn backend_label(&self) -> &'static str {
         match self.backend_kind {
             VideoBackendKind::Appsink => "appsink",
