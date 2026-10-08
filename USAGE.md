@@ -965,7 +965,7 @@ Kaleidux evaluates environment variables at startup and during playback to confi
 | `KALEIDUX_IMAGE_CACHE_MIN_FREE_MIB` | Integer | `2048` | Free disk space floor in MiB on the cache filesystem. If remaining disk space falls below this, cache writes are halted. Set to `0` to disable. |
 | `KALEIDUX_IMAGE_CACHE_UNLIMITED` | Boolean (`1`/`true`) | Unset | Disables all four cache limits above when set to `1`, `true`, `yes`, or `on`. |
 | `KALEIDUX_IMAGE_CACHE_FSYNC` | Boolean (`1`/`true`) | Unset | When enabled (`1`, `true`, `yes`, on), executes `fsync` on prepared image cache payloads prior to atomic file rename. |
-| `KALEIDUX_IMAGE_CHANNEL_MAX_MIB` | Integer | `256` | Memory budget in MiB for waiting image upload channels (enforced in 64 KiB permit units). |
+| `KALEIDUX_IMAGE_CHANNEL_MAX_MIB` | Integer | `256` | Memory budget in MiB for waiting image upload channels (enforced in 64 KiB permit units). Oversized reservations fail through normal image-load recovery; unknown dimensions reserve 256 MiB before decoding. |
 | `KLD_IMAGE_DECODE_WORKERS` | Integer | `1` | Number of concurrent background worker threads allocated for decoding source images (clamped between 1 and 8). |
 | `MALLOC_MMAP_THRESHOLD_` | Integer | Unset | Explicit glibc mmap threshold. Under glibc without jemalloc, Kaleidux calls `mallopt(M_MMAP_THRESHOLD, 128 KiB)` unless this variable, `MALLOC_TRIM_THRESHOLD_`, or `GLIBC_TUNABLES` is set. |
 | `MALLOC_TRIM_THRESHOLD_` | Integer | Unset | Explicit glibc trim threshold. Under glibc without jemalloc, Kaleidux calls `mallopt(M_TRIM_THRESHOLD, 128 KiB)` unless this variable, `MALLOC_MMAP_THRESHOLD_`, or `GLIBC_TUNABLES` is set. |

@@ -59,6 +59,9 @@ impl ImageChannelBudget {
     }
 
     async fn acquire(self: &Arc<Self>, bytes: usize) -> Option<ImageChannelPermit> {
+        if bytes > self.capacity_units as usize * PERMIT_BYTES {
+            return None;
+        }
         let requested_units = bytes
             .max(1)
             .div_ceil(PERMIT_BYTES)
@@ -102,6 +105,13 @@ pub(crate) fn snapshot() -> ImageChannelBudgetSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_payload_is_rejected_without_charging_budget() {
+        let budget = Arc::new(ImageChannelBudget::new(PERMIT_BYTES));
+        assert!(budget.acquire(PERMIT_BYTES + 1).await.is_none());
+        assert_eq!(budget.snapshot().current_bytes, 0);
+    }
 
     #[tokio::test]
     async fn weighted_permit_tracks_bytes_and_releases_on_drop() {

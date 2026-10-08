@@ -125,6 +125,14 @@ impl LatestFrameMailbox {
         state.pending_since.remove(source_id);
     }
 
+    pub(crate) fn accepts_session(&self, source_id: &str, session_id: u64) -> bool {
+        self.state
+            .lock()
+            .latest_sessions
+            .get(source_id)
+            .is_none_or(|latest| session_id >= *latest)
+    }
+
     /// Retiring a player must not discard a replacement player's pending frame.
     pub fn clear_session(&self, source_id: &str, session_id: u64) {
         let mut state = self.state.lock();
@@ -235,6 +243,8 @@ mod tests {
     fn retired_producer_cannot_overwrite_or_repopulate_a_newer_session() {
         let mailbox = LatestFrameMailbox::new();
         mailbox.publish_frame("DP-1", test_frame(2));
+        assert!(!mailbox.accepts_session("DP-1", 1));
+        assert!(mailbox.accepts_session("DP-1", 3));
         mailbox.publish_frame("DP-1", test_frame(1));
         assert_eq!(mailbox.take_frame("DP-1").unwrap().session_id, 2);
         mailbox.clear_session("DP-1", 1);
