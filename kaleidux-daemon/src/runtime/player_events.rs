@@ -42,7 +42,7 @@ impl MainLoopContext {
                 PlayerEventKind::FirstPresent => {
                     // Native mpv overlays bypass WGPU's transition completion
                     // callback, so this presentation starts their display timer.
-                    if is_pending {
+                    if is_pending || self.powered_off_outputs.contains(&event.source_id) {
                         self.pending_native_presentations
                             .insert(event.source_id.clone(), event.session_id);
                     } else {

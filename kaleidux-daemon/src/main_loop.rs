@@ -119,6 +119,7 @@ pub(crate) struct CommandContext<'a> {
     pub(crate) loop_start: Instant,
     pub(crate) shutdown_flag: &'a Arc<AtomicBool>,
     pub(crate) display_power_suspended: bool,
+    pub(crate) powered_off_outputs: &'a std::collections::HashSet<String>,
     pub(crate) mpv_native_targets: Option<&'a HashMap<String, video::MpvNativeVideoTarget>>,
     pub(crate) mpv_composed_targets: Option<&'a HashMap<String, video::MpvComposedVideoTarget>>,
 }
@@ -168,6 +169,12 @@ pub struct MainLoopContext {
 }
 
 impl MainLoopContext {
+    pub(crate) fn retire_output_bookkeeping(&mut self, name: &str) {
+        self.powered_off_outputs.remove(name);
+        self.pending_native_presentations.remove(name);
+        self.low_power_prefetch_deferrals.remove(name);
+    }
+
     /// Create a new `MainLoopContext` with all shared state initialized.
     /// This is the common pre-loop setup for both Wayland and X11.
     pub async fn new(

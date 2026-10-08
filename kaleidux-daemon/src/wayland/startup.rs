@@ -8,10 +8,9 @@ use tracing::{error, info, warn};
 use wayland_client::{Connection, QueueHandle};
 
 pub(crate) fn should_create_mpv_native_surfaces() -> bool {
-    if !matches!(
-        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
-        crate::video::VideoBackendRequest::ForceMpv
-    ) {
+    if !crate::video::candidate_video_backends(crate::video::VideoBackendRequest::Auto)
+        .contains(&crate::video::VideoBackendRequest::ForceMpv)
+    {
         return false;
     }
 
@@ -19,10 +18,9 @@ pub(crate) fn should_create_mpv_native_surfaces() -> bool {
 }
 
 pub(crate) fn should_create_mpv_composed_targets() -> bool {
-    matches!(
-        crate::video::resolve_video_backend_request(crate::video::VideoBackendRequest::Auto),
-        crate::video::VideoBackendRequest::ForceMpv
-    ) && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl()
+    crate::video::candidate_video_backends(crate::video::VideoBackendRequest::Auto)
+        .contains(&crate::video::VideoBackendRequest::ForceMpv)
+        && crate::video::MpvRenderApiRequest::from_env().enables_composed_gl()
 }
 
 pub(crate) async fn initialize_outputs_and_renderers(

@@ -28,6 +28,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         loop_start,
         shutdown_flag,
         display_power_suspended,
+        powered_off_outputs,
         mpv_native_targets,
         mpv_composed_targets,
     } = ctx;
@@ -197,6 +198,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                     video_players,
                     pending_image_video_stops,
                     display_power_suspended,
+                    powered_off_outputs,
                 );
             } else if monitor_manager.is_paused() {
                 info!(
@@ -224,6 +226,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                         video_players,
                         pending_image_video_stops,
                         display_power_suspended,
+                        powered_off_outputs,
                     );
                 } else if monitor_manager.is_paused() {
                     info!(
@@ -304,11 +307,15 @@ fn resume_active_video_players(
     video_players: &HashMap<String, crate::video::VideoPlayer>,
     pending_image_video_stops: &HashMap<String, crate::video::VideoPlayer>,
     display_power_suspended: bool,
+    powered_off_outputs: &std::collections::HashSet<String>,
 ) {
     if display_power_suspended {
         info!("[CMD] Video resume deferred until compositor outputs are powered on");
     } else {
         for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
+            if powered_off_outputs.contains(name) {
+                continue;
+            }
             if let Err(e) = player.resume() {
                 error!("[CMD] Failed to resume video for {}: {}", name, e);
             } else {

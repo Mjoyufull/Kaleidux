@@ -53,6 +53,50 @@ pub(crate) fn pending_renderer_deadline(
     Some(now + interval)
 }
 
+pub(crate) fn refresh_mpv_targets_after_resize(
+    ctx: &mut MainLoopContext,
+    conn: &Connection,
+    backend: &crate::wayland::WaylandBackend,
+    name: &str,
+    width: u32,
+    height: u32,
+) {
+    let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
+    if startup::should_create_mpv_composed_targets()
+        && let Some(wgpu_ctx) = ctx.wgpu_ctx.clone()
+        && let Some(target) =
+            crate::video::MpvComposedVideoTarget::new(display_ptr, wgpu_ctx, width, height)
+    {
+        ctx.mpv_composed_targets.insert(name.to_string(), target);
+    }
+    if let Some(surface) = backend.mpv_video_surfaces.get(name)
+        && let Some(target) =
+            crate::video::MpvNativeVideoTarget::new(display_ptr, surface.clone(), width, height)
+    {
+        ctx.mpv_native_targets.insert(name.to_string(), target);
+    }
+    if (ctx
+        .video_players
+        .get(name)
+        .is_some_and(crate::video::VideoPlayer::uses_mpv)
+        || ctx.pending_video_switches.contains_key(name))
+        && let Some(path) = ctx
+            .monitor_manager
+            .outputs
+            .get(name)
+            .and_then(|output| output.current_path.clone())
+    {
+        ctx.load_content_changes(
+            std::collections::HashMap::from([(
+                name.to_string(),
+                (path, crate::queue::ContentType::Video),
+            )]),
+            "MPV-RESIZE",
+            false,
+        );
+    }
+}
+
 pub(crate) fn record_pending_resize(
     pending: &mut HashMap<String, PendingRendererAdd>,
     name: &str,
@@ -131,6 +175,7 @@ fn retire_output(
     crate::image::runtime_cache::remove_image_prefetch_generation(name);
     ctx.latest_video_frames.clear_source(name);
     ctx.monitor_manager.remove_output(name);
+    ctx.retire_output_bookkeeping(name);
     ctx.mpv_native_targets.remove(name);
     ctx.mpv_composed_targets.remove(name);
     if let Some(player) = ctx.pending_image_video_stops.remove(name) {
