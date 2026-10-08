@@ -12,6 +12,37 @@ fn empty_stats() -> LoveitData {
     }
 }
 
+#[cfg(not(any(
+    feature = "backend-ffmpeg",
+    feature = "backend-mpv",
+    feature = "backend-appsink"
+)))]
+#[test]
+fn minimal_static_filters_video_from_discovery_and_seeded_pools() {
+    let dir = unique_test_dir("minimal-static");
+    let image = dir.join("image.png");
+    let video = dir.join("video.webm");
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&[0x89, 0x50, 0x4e, 0x47]);
+    fs::write(&image, bytes).unwrap();
+    bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+    fs::write(&video, bytes).unwrap();
+    let cache = test_cache();
+    let (pool, _) =
+        SmartQueue::discover_content(&dir, &HashSet::new(), cache.clone(), None).unwrap();
+    assert_eq!(pool, vec![image.clone()]);
+    let queue = SmartQueue::new_from_pool(
+        &dir,
+        vec![image.clone(), video],
+        50,
+        crate::orchestration::SortingStrategy::Random,
+        cache,
+    )
+    .unwrap();
+    assert_eq!(queue.pool, vec![image]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn selected_image_overrides_random_and_preserves_back_forward_history() {
     let dir = unique_test_dir("selected-history");

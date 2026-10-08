@@ -19,6 +19,7 @@ impl SmartQueue {
         if snapshot.generation == self.root_generation {
             return;
         }
+        let next_path = self.pool.get(self.current_index).cloned();
         let playlist = self
             .active_playlist
             .as_ref()
@@ -28,7 +29,8 @@ impl SmartQueue {
             .entries
             .iter()
             .filter(|entry| {
-                !blacklist.contains(&entry.path)
+                entry.content_type.supported()
+                    && !blacklist.contains(&entry.path)
                     && (self.active_playlist.is_none()
                         || playlist.is_some_and(|playlist| playlist.paths.contains(&entry.path)))
             })
@@ -50,7 +52,9 @@ impl SmartQueue {
             }
         }
         self.pool.sort();
-        self.current_index = self.current_index.min(self.pool.len().saturating_sub(1));
+        self.current_index = next_path
+            .and_then(|path| self.pool.iter().position(|entry| entry == &path))
+            .unwrap_or_else(|| self.current_index.min(self.pool.len().saturating_sub(1)));
         self.planned_sequential_type = None;
     }
 

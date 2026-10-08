@@ -81,7 +81,7 @@ impl SmartQueue {
             let mut pool = Vec::with_capacity(shared_snapshot.entries.len());
             let mut content_type_cache = HashMap::with_capacity(shared_snapshot.entries.len());
             for entry in shared_snapshot.entries.iter() {
-                if !blacklist.contains(&entry.path) {
+                if entry.content_type.supported() && !blacklist.contains(&entry.path) {
                     pool.push(entry.path.clone());
                     content_type_cache.insert(entry.path.clone(), entry.content_type);
                 }
@@ -126,8 +126,15 @@ impl SmartQueue {
                     let Some(handle) = background::spawn_blocking_tracked_wait(
                         BackgroundWorkKind::QueueDiscovery,
                         move || {
+                            let bl = super::BlacklistIdentity::new(&bl);
                             cp.into_iter()
-                                .filter(|p| p.exists() && !bl.contains(p))
+                                .filter(|p| {
+                                    p.exists()
+                                        && !bl.contains(p)
+                                        && (ContentType::Video.supported()
+                                            || Self::get_content_type(p)
+                                                == Some(ContentType::Image))
+                                })
                                 .collect::<Vec<PathBuf>>()
                         },
                     )
@@ -296,7 +303,11 @@ impl SmartQueue {
         let stats = Self::load_stats_from_cache(&cache)?;
         let mut pool = pool;
         let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
-        pool.retain(|path| !blacklist.contains(path));
+        pool.retain(|path| {
+            !blacklist.contains(path)
+                && (ContentType::Video.supported()
+                    || Self::get_content_type(path) == Some(ContentType::Image))
+        });
         drop(blacklist);
         pool.sort();
 
@@ -355,7 +366,7 @@ impl SmartQueue {
         }
         // EBML (MKV/WebM): 1A 45 DF A3
         if buffer[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-            return Some(ContentType::Video);
+            return ContentType::Video.supported().then_some(ContentType::Video);
         }
         // ISO BMFF container: ....ftyp (shared by MP4/MOV video and AVIF/HEIF images)
         if &buffer[4..8] == b"ftyp" {
@@ -363,7 +374,7 @@ impl SmartQueue {
             if &buffer[8..12] == b"avif" || &buffer[8..12] == b"avis" || &buffer[8..12] == b"mif1" {
                 return Some(ContentType::Image);
             }
-            return Some(ContentType::Video);
+            return ContentType::Video.supported().then_some(ContentType::Video);
         }
 
         None
@@ -462,7 +473,7 @@ impl SmartQueue {
                 }
             };
 
-            if let Some(ct) = content_type {
+            if let Some(ct) = content_type.filter(|ct| ct.supported()) {
                 files.push(p.clone());
                 ct_cache.insert(p.clone(), ct);
 
