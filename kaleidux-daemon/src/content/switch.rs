@@ -177,6 +177,7 @@ pub(crate) fn switch_wallpaper_content(
         && renderers.contains_key(&name)
         && video_players.get(&name).is_some_and(|player| {
             player.is_native_experimental_backend()
+                && frame_mailbox.accepts_session(&name, player.session_id())
                 && std::path::Path::new(player.source_uri()) == path.as_path()
                 && player.restart_native_if_solo(monitor_manager.is_paused() || player.is_paused())
         })
@@ -283,18 +284,21 @@ pub(crate) fn switch_wallpaper_content(
                         .map(|(width, height)| width as usize * height as usize * 4)
                         .unwrap_or(256 * 1024 * 1024);
                 let byte_permit = crate::image::channel_budget::acquire(reserved_bytes).await;
-                if byte_permit.is_none() {
-                    return;
-                }
-                let decode_result = request_prepared_image_payload(
-                    &path_clone,
-                    target_width,
-                    target_height,
-                    BackgroundWorkKind::ImageDecode,
-                    reserved_bytes,
-                    &metrics,
-                )
-                .await;
+                let decode_result = if byte_permit.is_none() {
+                    Err(anyhow::anyhow!(
+                        "prepared image reservation exceeds the image-channel budget ({reserved_bytes} bytes)"
+                    ))
+                } else {
+                    request_prepared_image_payload(
+                        &path_clone,
+                        target_width,
+                        target_height,
+                        BackgroundWorkKind::ImageDecode,
+                        reserved_bytes,
+                        &metrics,
+                    )
+                    .await
+                };
 
                 if shutdown_flag.load(Ordering::SeqCst) || !background::is_accepting_new_work() {
                     debug!(

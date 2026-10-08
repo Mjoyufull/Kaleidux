@@ -130,8 +130,13 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
 
     if !allow_hardware {
         let position = config.control.position_ns();
-        if position > 0 {
-            seek_input(&mut input, &mut decoder.decoder, position)?;
+        if position > 0
+            && let Err(error) = seek_input(&mut input, &mut decoder.decoder, position)
+        {
+            warn!(
+                "[NATIVE-VIDEO] {}: software fallback cannot restore playback position: {error:#}; continuing from reopened input",
+                config.source_id
+            );
         }
     }
 
