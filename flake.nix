@@ -14,7 +14,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
         naersk-lib = pkgs.callPackage naersk { };
         projectSource = self.outPath;
-        rustMinVersion = "1.89.0";
+        rustMinVersion = "1.95.0";
         vaDriverDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
           pkgs.intel-media-driver
         ];
