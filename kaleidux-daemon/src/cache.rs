@@ -1,13 +1,9 @@
 use anyhow::{Context, Result, bail};
-use notify::event::{ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use tokio::sync::mpsc;
 
 // Table definitions for redb
 const FILE_CACHE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_cache");
@@ -18,7 +14,8 @@ const HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("histor
 const POOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_cache");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
-const CACHE_VERSION: u64 = 4;
+const CACHE_VERSION: u64 = 5;
+const STATS_PRUNE_TRIGGER: usize = crate::queue::STATS_LRU_CAP + crate::queue::STATS_LRU_CAP / 10;
 
 fn path_from_redb_key(key: &[u8]) -> Option<PathBuf> {
     #[cfg(unix)]
@@ -41,11 +38,14 @@ pub enum PoolEvent {
     Removed(PathBuf),
     /// A file was modified in a watched directory
     Modified(PathBuf),
+    /// The bounded watcher queue overflowed; rebuild this root from disk.
+    Rescan(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
-    pub mtime: u64, // Unix timestamp
+    pub mtime: u64, // Whole Unix timestamp seconds
+    pub mtime_nanos: u32,
     pub size: u64,
     pub content_type: u8,   // 0 = Image, 1 = Video
     pub discovered_at: u64, // Unix timestamp
@@ -73,57 +73,73 @@ impl FileCache {
         let db_preexisting = std::fs::metadata(db_path)
             .map(|meta| meta.len() > 0)
             .unwrap_or(false);
-        let mut db = Database::create(db_path)?;
+        let db = Database::create(db_path)?;
 
-        // Check version
-        let mut needs_wipe = false;
-        if db_preexisting {
+        let stored_version = if db_preexisting {
             let read_txn = db.begin_read()?;
             if let Ok(table) = read_txn.open_table(META_TABLE) {
-                if let Some(v) = table.get("version")? {
-                    if v.value() != CACHE_VERSION {
-                        needs_wipe = true;
-                    }
-                } else {
-                    needs_wipe = true;
-                }
+                table.get("version")?.map(|version| version.value())
             } else {
-                needs_wipe = true;
+                None
             }
+        } else {
+            None
+        };
+
+        if stored_version.is_some_and(|version| version > CACHE_VERSION) {
+            bail!(
+                "Cache database version {} is newer than supported version {}",
+                stored_version.unwrap_or_default(),
+                CACHE_VERSION
+            );
         }
 
-        if needs_wipe {
-            tracing::info!("[CACHE] Cache version mismatch or missing, wiping database...");
-            drop(db);
-            match std::fs::remove_file(db_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).context("Failed to remove stale cache database before recreate");
-                }
-            }
-            if std::fs::metadata(db_path).is_ok() {
-                bail!(
-                    "Stale cache file {:?} still exists after remove_file; refusing to recreate to avoid corruption",
-                    db_path
-                );
-            }
-            db = Database::create(db_path)?;
-        }
-
-        // Initialize tables
+        // Schema v5 changed only transient discovery metadata and pool rows. Keep
+        // user history, playlists, blacklist entries, and learned file stats.
         let write_txn = db.begin_write()?;
         {
-            let _ = write_txn.open_table(FILE_CACHE_TABLE)?;
+            let mut file_cache = write_txn.open_table(FILE_CACHE_TABLE)?;
+            if stored_version != Some(CACHE_VERSION) {
+                let keys = file_cache
+                    .iter()?
+                    .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    file_cache.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
             let _ = write_txn.open_table(FILE_STATS_TABLE)?;
             let _ = write_txn.open_table(PLAYLISTS_TABLE)?;
             let _ = write_txn.open_table(BLACKLIST_TABLE)?;
             let _ = write_txn.open_table(HISTORY_TABLE)?;
-            let _ = write_txn.open_table(POOL_TABLE)?;
+        }
+        {
+            let mut pools = write_txn.open_table(POOL_TABLE)?;
+            if stored_version != Some(CACHE_VERSION) {
+                let keys = pools
+                    .iter()?
+                    .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    pools.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
             let mut meta = write_txn.open_table(META_TABLE)?;
             meta.insert("version", CACHE_VERSION)?;
         }
         write_txn.commit()?;
+
+        if stored_version != Some(CACHE_VERSION) && db_preexisting {
+            tracing::info!(
+                "[CACHE] Migrated cache schema from {:?} to {} while preserving durable user data",
+                stored_version,
+                CACHE_VERSION
+            );
+        }
 
         Ok(Self { db })
     }
@@ -160,6 +176,32 @@ impl FileCache {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Read all requested metadata rows under one redb snapshot transaction.
+    /// Missing paths are omitted from the returned map.
+    pub fn batch_get_file_metadata(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, FileMetadata>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FILE_CACHE_TABLE)?;
+        let mut metadata = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            if let Some(data) = table.get(path_bytes)? {
+                match postcard::from_bytes(data.value()) {
+                    Ok(value) => {
+                        metadata.insert(path.clone(), value);
+                    }
+                    Err(error) => tracing::warn!(
+                        "[CACHE] Ignoring corrupt metadata row for {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        Ok(metadata)
     }
 
     pub fn set_file_metadata(&self, path: &Path, metadata: &FileMetadata) -> Result<()> {
@@ -245,10 +287,12 @@ impl FileCache {
     #[allow(dead_code)]
     pub fn is_file_valid(&self, path: &Path) -> Result<bool> {
         let metadata = std::fs::metadata(path)?;
-        let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+        let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
 
         if let Some(cached) = self.get_file_metadata(path)? {
-            Ok(cached.mtime == mtime)
+            Ok(cached.mtime == modified.as_secs()
+                && cached.mtime_nanos == modified.subsec_nanos()
+                && cached.size == metadata.len())
         } else {
             Ok(false)
         }
@@ -260,39 +304,79 @@ impl FileCache {
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
 
         let path_bytes = path.as_os_str().as_encoded_bytes();
-        match table.get(path_bytes)? {
-            Some(data) => {
-                let stats: crate::queue::FileStats = postcard::from_bytes(data.value())?;
-                Ok(Some(stats))
+        let decoded = table
+            .get(path_bytes)?
+            .map(|data| postcard::from_bytes(data.value()))
+            .transpose();
+        drop(table);
+        drop(read_txn);
+
+        match decoded {
+            Ok(stats) => Ok(stats),
+            Err(error) => {
+                tracing::warn!(
+                    "[CACHE] Removing corrupt file_stats row for {}: {error}",
+                    path.display()
+                );
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+                    table.remove(path_bytes)?;
+                }
+                write_txn.commit()?;
+                Ok(None)
             }
-            _ => Ok(None),
         }
     }
 
     #[allow(dead_code)]
     pub fn set_file_stats(&self, path: &Path, stats: &crate::queue::FileStats) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
-            let path_bytes = path.as_os_str().as_encoded_bytes();
-            let data = postcard::to_allocvec(stats)?;
-            table.insert(path_bytes, data.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.batch_set_file_stats(&[(path.to_path_buf(), stats.clone())])
     }
 
     pub fn batch_set_file_stats(
         &self,
         updates: &[(PathBuf, crate::queue::FileStats)],
     ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         let write_txn = self.db.begin_write()?;
-        {
+        let should_prune = {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
             for (path, stats) in updates {
                 let path_bytes = path.as_os_str().as_encoded_bytes();
                 let data = postcard::to_allocvec(stats)?;
                 table.insert(path_bytes, data.as_slice())?;
+            }
+            usize::try_from(table.len()?).unwrap_or(usize::MAX) > STATS_PRUNE_TRIGGER
+        };
+        write_txn.commit()?;
+        if should_prune {
+            self.prune_file_stats(crate::queue::STATS_LRU_CAP)?;
+        }
+        Ok(())
+    }
+
+    fn prune_file_stats(&self, limit: usize) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+            let len = usize::try_from(table.len()?).unwrap_or(usize::MAX);
+            if len > limit {
+                let mut rows = Vec::with_capacity(len);
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let last_seen = postcard::from_bytes::<crate::queue::FileStats>(value.value())
+                        .ok()
+                        .and_then(|stats| stats.last_seen)
+                        .map_or(i64::MIN, |timestamp| timestamp.timestamp_millis());
+                    rows.push((last_seen, key.value().to_vec()));
+                }
+                rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (_, key) in rows.into_iter().take(len.saturating_sub(limit)) {
+                    table.remove(key.as_slice())?;
+                }
             }
         }
         write_txn.commit()?;
@@ -305,15 +389,40 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FILE_STATS_TABLE)?;
         let mut stats = std::collections::HashMap::new();
+        let mut corrupt_keys = Vec::new();
 
         for item in table.iter()? {
             let (key, value) = item?;
             let Some(path) = path_from_redb_key(key.value()) else {
                 tracing::warn!("[CACHE] Skipping file_stats row with invalid path encoding");
+                corrupt_keys.push(key.value().to_vec());
                 continue;
             };
-            let file_stats: crate::queue::FileStats = postcard::from_bytes(value.value())?;
-            stats.insert(path, file_stats);
+            match postcard::from_bytes(value.value()) {
+                Ok(file_stats) => {
+                    stats.insert(path, file_stats);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[CACHE] Removing corrupt file_stats row for {}: {error}",
+                        path.display()
+                    );
+                    corrupt_keys.push(key.value().to_vec());
+                }
+            }
+        }
+        drop(table);
+        drop(read_txn);
+
+        if !corrupt_keys.is_empty() {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+                for key in corrupt_keys {
+                    table.remove(key.as_slice())?;
+                }
+            }
+            write_txn.commit()?;
         }
 
         Ok(stats)
@@ -323,13 +432,25 @@ impl FileCache {
     pub fn get_playlist(&self, name: &str) -> Result<Option<crate::queue::Playlist>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
+        let decoded = match table.get(name)? {
+            Some(data) => postcard::from_bytes(data.value()).map(Some),
+            None => Ok(None),
+        };
+        drop(table);
+        drop(read_txn);
 
-        match table.get(name)? {
-            Some(data) => {
-                let playlist: crate::queue::Playlist = postcard::from_bytes(data.value())?;
-                Ok(Some(playlist))
+        match decoded {
+            Ok(playlist) => Ok(playlist),
+            Err(error) => {
+                tracing::warn!("[CACHE] Removing corrupt playlist row {name:?}: {error}");
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(PLAYLISTS_TABLE)?;
+                    table.remove(name)?;
+                }
+                write_txn.commit()?;
+                Ok(None)
             }
-            _ => Ok(None),
         }
     }
 
@@ -350,12 +471,33 @@ impl FileCache {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PLAYLISTS_TABLE)?;
         let mut playlists = std::collections::HashMap::new();
+        let mut corrupt_names = Vec::new();
 
         for item in table.iter()? {
             let (key, value) = item?;
             let name = key.value().to_string();
-            let playlist: crate::queue::Playlist = postcard::from_bytes(value.value())?;
-            playlists.insert(name, playlist);
+            match postcard::from_bytes(value.value()) {
+                Ok(playlist) => {
+                    playlists.insert(name, playlist);
+                }
+                Err(error) => {
+                    tracing::warn!("[CACHE] Removing corrupt playlist row {name:?}: {error}");
+                    corrupt_names.push(name);
+                }
+            }
+        }
+        drop(table);
+        drop(read_txn);
+
+        if !corrupt_names.is_empty() {
+            let write_txn = self.db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(PLAYLISTS_TABLE)?;
+                for name in corrupt_names {
+                    table.remove(name.as_str())?;
+                }
+            }
+            write_txn.commit()?;
         }
 
         Ok(playlists)
@@ -429,12 +571,25 @@ impl FileCache {
     pub fn get_history(&self, output_name: &str) -> Result<Vec<PathBuf>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(HISTORY_TABLE)?;
-        match table.get(output_name)? {
-            Some(data) => {
-                let paths: Vec<PathBuf> = postcard::from_bytes(data.value())?;
-                Ok(paths)
+        let decoded = match table.get(output_name)? {
+            Some(data) => postcard::from_bytes(data.value()),
+            None => Ok(Vec::new()),
+        };
+        drop(table);
+        drop(read_txn);
+
+        match decoded {
+            Ok(paths) => Ok(paths),
+            Err(error) => {
+                tracing::warn!("[CACHE] Removing corrupt history row {output_name:?}: {error}");
+                let write_txn = self.db.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(HISTORY_TABLE)?;
+                    table.remove(output_name)?;
+                }
+                write_txn.commit()?;
+                Ok(Vec::new())
             }
-            _ => Ok(Vec::new()),
         }
     }
 
@@ -463,8 +618,23 @@ impl FileCache {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
-            let path_bytes = path.as_os_str().as_encoded_bytes();
-            table.remove(path_bytes)?;
+            table.remove(path.as_os_str().as_encoded_bytes())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_invalidate_files(&self, paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FILE_CACHE_TABLE)?;
+            for path in paths {
+                let path_bytes = path.as_os_str().as_encoded_bytes();
+                table.remove(path_bytes)?;
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -472,284 +642,199 @@ impl FileCache {
 }
 
 /// Directory watcher for cache invalidation
-pub struct DirectoryWatcher {
-    watcher: RecommendedWatcher,
-    event_rx: mpsc::Receiver<notify::Result<Event>>,
-    cache: Arc<FileCache>,
-    watched_dirs: Vec<PathBuf>,
-    known_files: HashSet<PathBuf>,
-}
-
-impl DirectoryWatcher {
-    pub fn new(cache: Arc<FileCache>) -> Result<Self> {
-        let (event_tx, event_rx) = mpsc::channel(100);
-
-        let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            let _ = event_tx.blocking_send(res);
-        })?;
-
-        Ok(Self {
-            watcher,
-            event_rx,
-            cache,
-            watched_dirs: Vec::new(),
-            known_files: HashSet::new(),
-        })
-    }
-
-    /// Watch a directory for changes
-    pub fn watch(&mut self, path: &Path) -> Result<()> {
-        if path.exists() && path.is_dir() {
-            self.watcher.watch(path, RecursiveMode::Recursive)?;
-            self.watched_dirs.push(path.to_path_buf());
-            tracing::info!("[CACHE] Watching directory for changes: {}", path.display());
-        }
-        Ok(())
-    }
-
-    fn is_known_file(&self, path: &Path) -> bool {
-        self.known_files.contains(path) || matches!(self.cache.get_file_metadata(path), Ok(Some(_)))
-    }
-
-    fn emit_added_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
-        if path.is_file() {
-            self.known_files.insert(path.clone());
-            tracing::debug!("[CACHE] File created: {}", path.display());
-            pool_events.push(PoolEvent::Added(path));
-        }
-    }
-
-    fn emit_modified_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
-        if path.is_file() {
-            self.known_files.insert(path.clone());
-            if let Err(e) = self.cache.invalidate_file(&path) {
-                tracing::warn!(
-                    "[CACHE] Failed to invalidate cache for {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-            pool_events.push(PoolEvent::Modified(path));
-        }
-    }
-
-    fn emit_removed_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
-        if self.known_files.remove(&path) || self.is_known_file(&path) {
-            if let Err(e) = self.cache.invalidate_file(&path) {
-                tracing::debug!(
-                    "[CACHE] Invalidation for removed path {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-            pool_events.push(PoolEvent::Removed(path));
-        }
-    }
-
-    fn process_rename_event(
-        &mut self,
-        rename_mode: RenameMode,
-        paths: Vec<PathBuf>,
-        pool_events: &mut Vec<PoolEvent>,
-    ) {
-        match (rename_mode, paths.as_slice()) {
-            (RenameMode::Both, [from, to]) => {
-                self.emit_removed_file(from.clone(), pool_events);
-                self.emit_added_file(to.clone(), pool_events);
-                return;
-            }
-            (RenameMode::From, [from]) => {
-                self.emit_removed_file(from.clone(), pool_events);
-                return;
-            }
-            (RenameMode::To, [to]) => {
-                self.emit_added_file(to.clone(), pool_events);
-                return;
-            }
-            _ => {}
-        }
-
-        for path in paths {
-            if path.is_file() {
-                self.emit_added_file(path, pool_events);
-            } else {
-                self.emit_removed_file(path, pool_events);
-            }
-        }
-    }
-
-    fn process_notify_event(&mut self, event: Event, pool_events: &mut Vec<PoolEvent>) {
-        let Event { kind, paths, .. } = event;
-        match kind {
-            EventKind::Create(_) => {
-                for path in paths {
-                    self.emit_added_file(path, pool_events);
-                }
-            }
-            EventKind::Modify(ModifyKind::Name(rename_mode)) => {
-                self.process_rename_event(rename_mode, paths, pool_events);
-            }
-            EventKind::Modify(_) => {
-                for path in paths {
-                    self.emit_modified_file(path, pool_events);
-                }
-            }
-            EventKind::Remove(_) => {
-                for path in paths {
-                    self.emit_removed_file(path, pool_events);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Process file system events, invalidate cache entries, and return pool-affecting events
-    pub async fn process_events(&mut self) -> Vec<PoolEvent> {
-        let mut pool_events = Vec::new();
-
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(Ok(event)) => {
-                    self.process_notify_event(event, &mut pool_events);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("[CACHE] Watcher error: {}", e);
-                }
-                Err(_) => break, // Empty or disconnected
-            }
-        }
-
-        pool_events
-    }
-}
+mod watcher;
+pub use watcher::DirectoryWatcher;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::RemoveKind;
+    use chrono::{TimeZone, Utc};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn sample_metadata() -> FileMetadata {
-        FileMetadata {
-            mtime: 1,
-            size: 2,
-            content_type: 0,
-            discovered_at: 3,
-        }
-    }
-
-    fn unique_test_dir(name: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
+    fn test_cache(label: &str) -> FileCache {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "kaleidux-cache-test-{}-{}-{}",
-            name,
+            "kaleidux-redb-{label}-{}-{}",
             std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst)
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).expect("test dir should be created");
-        dir
+        FileCache::new_test(&dir.join("cache.redb")).expect("test cache")
+    }
+
+    fn test_cache_path(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(10_000);
+        std::env::temp_dir()
+            .join(format!(
+                "kaleidux-redb-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("cache.redb")
     }
 
     #[test]
-    fn remove_event_uses_cached_metadata_for_extensionless_files() {
-        let temp = unique_test_dir("remove-extensionless");
-        let cache = Arc::new(
-            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
-        );
-        let mut watcher =
-            DirectoryWatcher::new(cache.clone()).expect("directory watcher should be created");
-        let path = temp.join("LICENSE");
+    fn schema_migration_preserves_durable_user_tables() {
+        let db_path = test_cache_path("migration");
+        std::fs::create_dir_all(db_path.parent().expect("cache parent")).unwrap();
+        let db = Database::create(&db_path).expect("create old cache");
+        let write_txn = db.begin_write().unwrap();
+        {
+            write_txn
+                .open_table(FILE_CACHE_TABLE)
+                .unwrap()
+                .insert(b"/media/a".as_slice(), b"metadata".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(POOL_TABLE)
+                .unwrap()
+                .insert(b"/media".as_slice(), b"pool".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(FILE_STATS_TABLE)
+                .unwrap()
+                .insert(b"/media/a".as_slice(), b"stats".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(PLAYLISTS_TABLE)
+                .unwrap()
+                .insert("favorites", b"playlist".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(BLACKLIST_TABLE)
+                .unwrap()
+                .insert(b"/media/b".as_slice(), true)
+                .unwrap();
+            write_txn
+                .open_table(HISTORY_TABLE)
+                .unwrap()
+                .insert("DP-1", b"history".as_slice())
+                .unwrap();
+            write_txn
+                .open_table(META_TABLE)
+                .unwrap()
+                .insert("version", 4)
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db);
 
-        cache
-            .set_file_metadata(&path, &sample_metadata())
-            .expect("metadata should be stored");
-
-        let mut pool_events = Vec::new();
-        watcher.process_notify_event(
-            Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path.clone()),
-            &mut pool_events,
-        );
-
-        assert_eq!(pool_events, vec![PoolEvent::Removed(path.clone())]);
+        let migrated = FileCache::new_test(&db_path).expect("migrate cache");
+        let read_txn = migrated.db.begin_read().unwrap();
         assert!(
-            cache
-                .get_file_metadata(&path)
-                .expect("metadata lookup should succeed")
+            read_txn
+                .open_table(FILE_CACHE_TABLE)
+                .unwrap()
+                .get(b"/media/a".as_slice())
+                .unwrap()
                 .is_none()
         );
+        assert!(
+            read_txn
+                .open_table(POOL_TABLE)
+                .unwrap()
+                .get(b"/media".as_slice())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            read_txn
+                .open_table(FILE_STATS_TABLE)
+                .unwrap()
+                .len()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(PLAYLISTS_TABLE).unwrap().len().unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(BLACKLIST_TABLE).unwrap().len().unwrap(),
+            1
+        );
+        assert_eq!(
+            read_txn.open_table(HISTORY_TABLE).unwrap().len().unwrap(),
+            1
+        );
     }
 
     #[test]
-    fn rename_event_removes_old_path_and_adds_new_path() {
-        let temp = unique_test_dir("rename");
-        let cache = Arc::new(
-            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
-        );
-        let mut watcher =
-            DirectoryWatcher::new(cache.clone()).expect("directory watcher should be created");
-        let old_path = temp.join("old_name");
-        let new_path = temp.join("new_name");
-
+    fn corrupt_file_stats_are_skipped_and_removed() {
+        let cache = test_cache("corrupt-stats");
+        let path = Path::new("/media/corrupt");
         cache
-            .set_file_metadata(&old_path, &sample_metadata())
-            .expect("old metadata should be stored");
-        std::fs::write(&new_path, b"new").expect("new file should be created");
+            .insert_invalid_file_stats_bytes(path, &[0xff, 0x00, 0x01])
+            .unwrap();
 
-        let mut pool_events = Vec::new();
-        watcher.process_notify_event(
-            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
-                .add_path(old_path.clone())
-                .add_path(new_path.clone()),
-            &mut pool_events,
-        );
+        assert!(cache.get_file_stats(path).unwrap().is_none());
+        cache
+            .insert_invalid_file_stats_bytes(path, &[0xff, 0x00, 0x01])
+            .unwrap();
+        assert!(cache.get_all_file_stats().unwrap().is_empty());
+        assert!(cache.get_file_stats(path).unwrap().is_none());
+    }
 
+    #[test]
+    fn corrupt_playlist_and_history_rows_are_skipped_and_removed() {
+        let cache = test_cache("corrupt-durable-rows");
+        let write_txn = cache.db.begin_write().unwrap();
+        {
+            let mut playlists = write_txn.open_table(PLAYLISTS_TABLE).unwrap();
+            playlists.insert("one", &[0xff][..]).unwrap();
+            playlists.insert("two", &[0xfe][..]).unwrap();
+            let mut history = write_txn.open_table(HISTORY_TABLE).unwrap();
+            history.insert("DP-1", &[0xfd][..]).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        assert!(cache.get_playlist("one").unwrap().is_none());
+        assert!(cache.get_all_playlists().unwrap().is_empty());
+        assert!(cache.get_history("DP-1").unwrap().is_empty());
+
+        let read_txn = cache.db.begin_read().unwrap();
         assert_eq!(
-            pool_events,
-            vec![
-                PoolEvent::Removed(old_path.clone()),
-                PoolEvent::Added(new_path.clone())
-            ]
+            read_txn.open_table(PLAYLISTS_TABLE).unwrap().len().unwrap(),
+            0
+        );
+        assert_eq!(
+            read_txn.open_table(HISTORY_TABLE).unwrap().len().unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn persisted_file_stats_prune_oldest_rows() {
+        let cache = test_cache("stats-bound");
+        for second in 1..=3 {
+            cache
+                .set_file_stats(
+                    Path::new(&format!("/media/{second}")),
+                    &crate::queue::FileStats {
+                        count: second,
+                        last_seen: Utc.timestamp_opt(second.into(), 0).single(),
+                        love_multiplier: 1.0,
+                    },
+                )
+                .expect("insert stats");
+        }
+        cache.prune_file_stats(2).expect("prune stats");
+        assert!(
+            cache
+                .get_file_stats(Path::new("/media/1"))
+                .unwrap()
+                .is_none()
         );
         assert!(
             cache
-                .get_file_metadata(&old_path)
-                .expect("old metadata lookup should succeed")
-                .is_none()
+                .get_file_stats(Path::new("/media/2"))
+                .unwrap()
+                .is_some()
         );
-    }
-
-    #[test]
-    fn remove_event_after_modify_uses_known_file_tracking() {
-        let temp = unique_test_dir("remove-after-modify");
-        let cache = Arc::new(
-            FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
-        );
-        let mut watcher =
-            DirectoryWatcher::new(cache.clone()).expect("directory watcher should be created");
-        let path = temp.join("clip.mp4");
-        std::fs::write(&path, b"clip").expect("media file should be created");
-        cache
-            .set_file_metadata(&path, &sample_metadata())
-            .expect("metadata should be stored");
-
-        let mut pool_events = Vec::new();
-        watcher.process_notify_event(
-            Event::new(EventKind::Modify(ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )))
-            .add_path(path.clone()),
-            &mut pool_events,
-        );
-
-        std::fs::remove_file(&path).expect("media file should be removed");
-        watcher.process_notify_event(
-            Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone()),
-            &mut pool_events,
-        );
-
-        assert_eq!(
-            pool_events,
-            vec![PoolEvent::Modified(path.clone()), PoolEvent::Removed(path)]
+        assert!(
+            cache
+                .get_file_stats(Path::new("/media/3"))
+                .unwrap()
+                .is_some()
         );
     }
 }

@@ -21,6 +21,15 @@ Show version information.
 Print help information.
 .SH COMMANDS
 .TP
+.B jump PATH [-o OUTPUT]
+Display an image inside the slideshow directory using the normal transition and history.
+.TP
+.B set PATH [-o OUTPUT]
+Insert supported media into the current in-memory queue and advance to it immediately.
+.TP
+.B img PATH [-o OUTPUT]
+Select slideshow media or insert external media and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept supported images and videos and honor output groups; omitted output uses main-monitor. Use -o all for every output. Queue rebuilds can discard external entries.
+.TP
 .B status \fR(alias: \fBst\fR)
 Display the current status of the daemon, including active wallpapers and playback state.
 .TP
@@ -40,10 +49,23 @@ Remove the love status from a file, resetting its selection weight.
 List all files currently in the love list.
 .TP
 .B pause
-Pause video wallpaper playback.
+Pause video playback and automatic wallpaper rotation independently of named inhibitors.
 .TP
 .B resume
-Resume paused video playback.
+Clear manual pause. Playback remains paused while named inhibitors are active.
+.TP
+.B inhibit \fI<REASON>\fR
+Inhibit wallpaper playback and rotation with a named reason. Playback remains paused as long as any inhibitor is active or manual pause is engaged.
+.TP
+.B uninhibit \fI<REASON>\fR
+Remove a named pause inhibitor. Removing an inhibitor will not resume playback if other inhibitors or manual pause remain active.
+.TP
+.B inhibitors \fR[\fBlist\fR]
+List all currently active pause inhibitors.
+Names are case-sensitive, at most 64 UTF-8 bytes, nonblank, and cannot contain control characters. Up to 64 names may be active. Duplicate acquisition is idempotent, not reference-counted. Reasons remain until released or the daemon exits; they do not expire when the calling process exits.
+.TP
+.B clear \fR[\fI-o OUTPUT\fR]
+Clear wallpaper on the specified output or all outputs.
 .TP
 .B query \fR(alias: \fBq\fR)
 Query connected outputs and their current content state.
@@ -59,6 +81,8 @@ Manage content playlists. Subcommands include: \fBcreate\fR, \fBadd\fR, \fBremov
 .TP
 .B blacklist \fI<SUBCOMMAND>\fR
 Manage the blacklist of files to exclude from rotation. Subcommands include: \fBadd\fR, \fBremove\fR, \fBlist\fR.
+.SH EXIT STATUS
+Zero indicates success. Connection failures, invalid arguments, and errors reported by the daemon return a nonzero status.
 .SH SEE ALSO
 .BR kaleidux-daemon (1)
 .SH AUTHOR

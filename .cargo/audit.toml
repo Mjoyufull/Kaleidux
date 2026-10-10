@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+  # Transitive-only through gstreamer, wgpu-hal/metal, and image/ravif. There is
+  # no direct replacement available in this dependency set yet, so we track it as
+  # an accepted unmaintained warning until upstream crates remove `paste`.
+  "RUSTSEC-2024-0436",
+]
