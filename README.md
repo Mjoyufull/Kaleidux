@@ -79,15 +79,19 @@ $ paru -S kaleidux-git
 **Build Requirements:**
 
 - Rust 1.95+ **stable**
+- FFmpeg and libva development headers (including libswresample)
 - mpv/libmpv with development headers
 - GStreamer 1.24+ with development headers and plugins
-- Wayland and/or X11 development headers
+- Wayland development headers; X11 development headers for X11 support
+
+The X11 Cargo feature adds X11 support to the shared Wayland/EGL display stack.
+X11 builds also require the Wayland development libraries.
 
 **Arch Linux Setup:**
 
 ```bash
 sudo pacman -S mpv gstreamer gst-plugins-base gst-plugins-good \
-               gst-plugins-bad gst-libav wayland libx11 \
+               gst-plugins-bad gst-libav ffmpeg libva wayland libx11 \
                vulkan-devel pkgconf cmake
 ```
 

@@ -1,7 +1,7 @@
 use super::RetainedTextureFootprint;
 use super::texture::texture_byte_size;
 use super::video_layout::yuv420_aux_byte_size;
-use tracing::{debug, warn};
+use tracing::debug;
 
 impl super::Renderer {
     pub(super) fn release_cuda_cache(&mut self) {
@@ -12,24 +12,8 @@ impl super::Renderer {
         {
             self.active_yuv_source = None;
         }
-        if let Some(mut cuda_cache) = self.cuda_textures.take() {
-            if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
-                if let Some(timeline) = cuda_cache.timeline.take() {
-                    timeline.destroy(interop);
-                }
-                cuda_cache.in_flight_frames.clear();
-                drop(cuda_cache.y_view);
-                drop(cuda_cache.uv_view);
-                drop(cuda_cache.y_texture);
-                drop(cuda_cache.uv_texture);
-                interop.free_exportable(cuda_cache.y_cuda_alloc);
-                interop.free_exportable(cuda_cache.uv_cuda_alloc);
-            } else {
-                warn!(
-                    "[VIDEO] {}: Dropping CUDA texture cache without CUDA interop; exportable allocations will leak until process exit",
-                    self.name
-                );
-            }
+        if let Some(cache) = self.cuda_textures.take() {
+            super::cuda_retirement::retire(self.ctx.clone(), cache);
         }
     }
 
@@ -159,6 +143,7 @@ impl super::Renderer {
                 self.name, reason
             );
         }
+        self.transition_has_rendered = false;
         self.composition_texture = None;
         self.composition_texture_view = None;
         self.transition_bind_group = None;
@@ -186,6 +171,10 @@ impl super::Renderer {
         let mut video_aux_bytes = 0u64;
         if let Some((w, h)) = self.nv12_staging_size {
             video_aux_bytes = video_aux_bytes.saturating_add(yuv420_aux_byte_size(w, h));
+        }
+        if let Some((w, h)) = self.p010_staging_size {
+            video_aux_bytes =
+                video_aux_bytes.saturating_add(yuv420_aux_byte_size(w, h).saturating_mul(2));
         }
         if let Some((w, h)) = self.i420_staging_size {
             video_aux_bytes = video_aux_bytes.saturating_add(yuv420_aux_byte_size(w, h));
@@ -320,26 +309,7 @@ impl Drop for super::Renderer {
             handle.abort();
         }
 
-        // Clean up CUDA exportable allocations (Audit Point 1 in renderer.rs)
-        if let Some(mut cuda_cache) = self.cuda_textures.take() {
-            if let Some(interop) = self.ctx.cuda_interop.lock().as_ref() {
-                if let Some(timeline) = cuda_cache.timeline.take() {
-                    timeline.destroy(interop);
-                }
-                cuda_cache.in_flight_frames.clear();
-                drop(cuda_cache.y_view);
-                drop(cuda_cache.uv_view);
-                drop(cuda_cache.y_texture);
-                drop(cuda_cache.uv_texture);
-                interop.free_exportable(cuda_cache.y_cuda_alloc);
-                interop.free_exportable(cuda_cache.uv_cuda_alloc);
-            } else {
-                warn!(
-                    "[VIDEO] {}: Renderer dropped without CUDA interop; exportable allocations will leak until process exit",
-                    self.name
-                );
-            }
-        }
+        self.release_cuda_cache();
         {
             let cur = self.current_external_frame.take();
             let prev = self.prev_external_frame.take();

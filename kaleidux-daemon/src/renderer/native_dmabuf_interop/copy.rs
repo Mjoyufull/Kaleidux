@@ -188,7 +188,11 @@ pub(super) fn record_copy_to_linear(
             } else {
                 vk::QUEUE_FAMILY_IGNORED
             })
-            .dst_queue_family_index(queue_family_index)
+            .dst_queue_family_index(if output.initialized {
+                queue_family_index
+            } else {
+                vk::QUEUE_FAMILY_IGNORED
+            })
             .image(output.image)
             .subresource_range(nv12_plane_range()),
     );

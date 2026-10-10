@@ -430,6 +430,9 @@ fn discard_corrupt(path: &Path) {
 }
 
 fn ensure_capacity(dir: &Path, path: &Path, incoming: u64, policy: CachePolicy) -> bool {
+    if policy.max_bytes.is_some_and(|max| incoming > max) {
+        return false;
+    }
     let mut index = CACHE_INDEX
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());

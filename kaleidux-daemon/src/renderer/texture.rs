@@ -144,12 +144,10 @@ impl super::WgpuContext {
         }
 
         let entries = pool.entry(key).or_default();
-        if entries.is_empty() {
-            entries.push(TexturePoolEntry {
-                texture,
-                last_used: std::time::Instant::now(),
-            });
-        }
+        entries.push(TexturePoolEntry {
+            texture,
+            last_used: std::time::Instant::now(),
+        });
     }
 
     /// Clean up old textures from pool

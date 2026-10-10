@@ -27,7 +27,9 @@ impl MainLoopContext {
 
         // Flush stats every 5 seconds (batched writes)
         if self.last_stats_flush.elapsed().as_secs() >= 5 {
-            let _ = self.monitor_manager.flush_all_stats();
+            if let Err(error) = self.monitor_manager.flush_all_stats() {
+                warn!("[CACHE] periodic stats flush failed; retaining updates: {error}");
+            }
             self.last_stats_flush = Instant::now();
         }
 

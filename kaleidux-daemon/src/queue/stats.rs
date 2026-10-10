@@ -34,7 +34,10 @@ impl SmartQueue {
 
         let updates: Vec<_> = self.pending_stats_updates.drain().collect();
 
-        self.cache.batch_set_file_stats(&updates)?;
+        if let Err(error) = self.cache.batch_set_file_stats(&updates) {
+            self.pending_stats_updates.extend(updates);
+            return Err(error);
+        }
         Ok(())
     }
 

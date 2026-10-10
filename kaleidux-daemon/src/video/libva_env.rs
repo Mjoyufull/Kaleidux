@@ -21,7 +21,7 @@ fn drm_node_vendor(minor: u32) -> Option<u32> {
 
 fn single_drm_vendor() -> Option<u32> {
     let mut selected = None;
-    for minor in 128..=143 {
+    for minor in 128..=191 {
         let Some(vendor) = drm_node_vendor(minor) else {
             continue;
         };

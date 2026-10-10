@@ -47,8 +47,10 @@ impl SmartQueue {
         for path in &self.selected_images {
             if !self.pool.contains(path) {
                 self.pool.push(path.clone());
-                self.content_type_cache
-                    .insert(path.clone(), ContentType::Image);
+                self.content_type_cache.insert(
+                    path.clone(),
+                    Self::get_content_type(path).unwrap_or(ContentType::Image),
+                );
             }
         }
         self.pool.sort();
@@ -245,12 +247,21 @@ impl SmartQueue {
     }
 
     fn schedule_root_rescan(&self) {
-        let Some(mut generation) = self.root_index.request_rescan() else {
+        Self::schedule_root_rescan_for(
+            self.root_index.clone(),
+            self.root_path.clone(),
+            self.cache.clone(),
+        );
+    }
+
+    pub(super) fn schedule_root_rescan_for(
+        index: std::sync::Arc<super::media_index::RootMediaIndex>,
+        root: std::path::PathBuf,
+        cache: std::sync::Arc<crate::cache::FileCache>,
+    ) {
+        let Some(mut generation) = index.request_rescan() else {
             return;
         };
-        let index = self.root_index.clone();
-        let root = self.root_path.clone();
-        let cache = self.cache.clone();
         tokio::spawn(async move {
             loop {
                 let scan_root = root.clone();

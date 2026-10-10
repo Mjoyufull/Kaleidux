@@ -1,23 +1,8 @@
 use super::*;
 
-fn with_env_lock<T>(test: impl FnOnce() -> T) -> T {
-    static ENV_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
-        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
-    let _guard = ENV_LOCK
-        .lock()
-        .expect("env test lock should not be poisoned");
-    test()
-}
-
-fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-    // SAFETY: these tests serialize environment mutation through `ENV_LOCK`.
-    unsafe { std::env::set_var(key, value) }
-}
-
-fn remove_env_var(key: &str) {
-    // SAFETY: these tests serialize environment mutation through `ENV_LOCK`.
-    unsafe { std::env::remove_var(key) }
-}
+use crate::video::test_support::{
+    remove_env_var, set_env_var, with_video_env_test_lock as with_env_lock,
+};
 
 fn restore_env_var(key: &str, old_value: Option<std::ffi::OsString>) {
     match old_value {
@@ -79,6 +64,7 @@ fn video_publish_fps_accepts_bounded_override() {
         assert_eq!(configured_max_publish_fps(VideoFpsProfile::High), Some(48));
         assert_eq!(configured_max_publish_fps(VideoFpsProfile::Unlimited), None);
         set_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", "invalid");
+        assert_eq!(configured_max_publish_fps(VideoFpsProfile::Low), Some(12));
         assert_eq!(configured_max_publish_fps(VideoFpsProfile::High), Some(48));
 
         restore_env_var("KLD_LOW_POWER_MAX_PUBLISH_FPS", old_value);

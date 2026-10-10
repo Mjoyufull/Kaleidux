@@ -72,6 +72,7 @@ impl super::Renderer {
         );
 
         if !matches!(context, BackendContext::X11) {
+            self.needs_redraw = false;
             return;
         }
 

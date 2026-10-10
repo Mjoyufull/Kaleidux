@@ -49,9 +49,14 @@ impl MainLoopContext {
                         self.monitor_manager
                             .mark_transition_completed(&event.source_id);
                     }
-                    self.mark_startup_output_ready(&event.source_id, loop_start);
-                    self.mark_startup_output_presented(&event.source_id, loop_start);
-                    self.maybe_clear_startup_present_barrier();
+                    if is_active
+                        && !is_pending
+                        && !self.powered_off_outputs.contains(&event.source_id)
+                    {
+                        self.mark_startup_output_ready(&event.source_id, loop_start);
+                        self.mark_startup_output_presented(&event.source_id, loop_start);
+                        self.maybe_clear_startup_present_barrier();
+                    }
                 }
                 PlayerEventKind::Eos => {
                     debug!(

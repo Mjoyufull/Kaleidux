@@ -62,14 +62,12 @@ pub struct WgpuContext {
     pub final_i420_blit_bind_group_layout: wgpu::BindGroupLayout,
     pub final_i420_blit_pipelines:
         parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
-    pub i420_bind_group_layout: wgpu::BindGroupLayout,
-    pub i420_pipeline: wgpu::RenderPipeline,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
     pub(super) pipeline_cache_path: Option<PathBuf>,
     // Texture pool: (width, height, mip_level_count) -> Vec of available textures
     pub texture_pool: parking_lot::Mutex<HashMap<(u32, u32, u32), Vec<TexturePoolEntry>>>,
     // Shared CUDA interop context (one per GPU, shared across all renderers)
-    pub(super) cuda_interop: parking_lot::Mutex<Option<crate::cuda_interop::CudaInterop>>,
+    pub(super) cuda_interop: parking_lot::Mutex<Option<Arc<crate::cuda_interop::CudaInterop>>>,
     pub(super) cuda_interop_failed: std::sync::atomic::AtomicBool,
     pub(super) device_poll_requested: std::sync::atomic::AtomicBool,
 }
@@ -363,89 +361,6 @@ impl WgpuContext {
         let final_i420_blit_bind_group_layout =
             super::context_pipelines::create_final_i420_blit_bind_group_layout(&device);
 
-        let i420_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("I420 Convert Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let i420_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("I420 Convert Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/i420_convert.wgsl").into()),
-        });
-
-        let i420_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("I420 Convert Pipeline Layout"),
-            bind_group_layouts: &[&i420_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let i420_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("I420 Convert Pipeline"),
-            layout: Some(&i420_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &i420_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &i420_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: pipeline_cache.as_ref(),
-        });
-
         Ok((
             Arc::new(Self {
                 instance,
@@ -467,8 +382,6 @@ impl WgpuContext {
                 native_nv12_blit_pipelines: parking_lot::Mutex::new(HashMap::new()),
                 final_i420_blit_bind_group_layout,
                 final_i420_blit_pipelines: parking_lot::Mutex::new(HashMap::new()),
-                i420_bind_group_layout,
-                i420_pipeline,
                 pipeline_cache,
                 pipeline_cache_path,
                 texture_pool: parking_lot::Mutex::new(HashMap::new()),
@@ -503,7 +416,7 @@ impl WgpuContext {
             if ci_lock.is_none() {
                 match crate::cuda_interop::CudaInterop::new(&self.device) {
                     Ok(interop) => {
-                        *ci_lock = Some(interop);
+                        *ci_lock = Some(Arc::new(interop));
                         created_context = true;
                     }
                     Err(e) => {

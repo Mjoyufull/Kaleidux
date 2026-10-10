@@ -149,15 +149,15 @@ impl VideoPlayer {
             current = current_state;
             pending = pending_state;
             match state_result {
+                Ok(gst::StateChangeSuccess::Async) => {}
                 Ok(_) => {
                     state_settled = true;
                     break;
                 }
-                Err(_) if pending != gst::State::VoidPending => {
+                Err(_) => {
                     state_failed = true;
                     break;
                 }
-                Err(_) => {}
             }
         }
         let state_wait_duration = state_wait_start.elapsed();
@@ -278,11 +278,7 @@ impl VideoPlayer {
         self.log_backend_snapshot("start");
 
         if let Some(native) = self.native.as_ref() {
-            if paused {
-                native.pause();
-            } else {
-                native.start();
-            }
+            native.start(paused);
             if let Some(position_ns) = self.pending_start_position_ns.take() {
                 native.seek_to_position_ns(position_ns);
             }

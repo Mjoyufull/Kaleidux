@@ -257,86 +257,95 @@ impl X11Backend {
             // Keep startup black until the renderer presents real content.
             .background_pixel(screen.black_pixel);
 
-        self.conn.create_window(
-            x11rb::COPY_DEPTH_FROM_PARENT,
-            win_id,
-            self.root,
-            x,
-            y,
-            width,
-            height,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &win_aux,
-        )?;
+        let created = (|| -> anyhow::Result<()> {
+            self.conn.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                win_id,
+                self.root,
+                x,
+                y,
+                width,
+                height,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &win_aux,
+            )?;
 
-        // Set _NET_WM_WINDOW_TYPE = _NET_WM_WINDOW_TYPE_DESKTOP
-        self.conn.change_property(
-            PropMode::REPLACE,
-            win_id,
-            self.atoms._net_wm_window_type,
-            x11rb::protocol::xproto::AtomEnum::ATOM,
-            32,
-            1,
-            &self.atoms._net_wm_window_type_desktop.to_ne_bytes(),
-        )?;
+            // Set _NET_WM_WINDOW_TYPE = _NET_WM_WINDOW_TYPE_DESKTOP
+            self.conn.change_property(
+                PropMode::REPLACE,
+                win_id,
+                self.atoms._net_wm_window_type,
+                x11rb::protocol::xproto::AtomEnum::ATOM,
+                32,
+                1,
+                &self.atoms._net_wm_window_type_desktop.to_ne_bytes(),
+            )?;
 
-        // Give compositors and diagnostics a stable identity even when the
-        // rootless Xwayland window is override-redirect.
-        self.conn.change_property8(
-            PropMode::REPLACE,
-            win_id,
-            x11rb::protocol::xproto::AtomEnum::WM_CLASS,
-            x11rb::protocol::xproto::AtomEnum::STRING,
-            b"kaleidux-wallpaper\0KaleiduxWallpaper\0",
-        )?;
-        self.conn.change_property8(
-            PropMode::REPLACE,
-            win_id,
-            x11rb::protocol::xproto::AtomEnum::WM_NAME,
-            x11rb::protocol::xproto::AtomEnum::STRING,
-            b"Kaleidux Wallpaper",
-        )?;
+            // Give compositors and diagnostics a stable identity even when the
+            // rootless Xwayland window is override-redirect.
+            self.conn.change_property8(
+                PropMode::REPLACE,
+                win_id,
+                x11rb::protocol::xproto::AtomEnum::WM_CLASS,
+                x11rb::protocol::xproto::AtomEnum::STRING,
+                b"kaleidux-wallpaper\0KaleiduxWallpaper\0",
+            )?;
+            self.conn.change_property8(
+                PropMode::REPLACE,
+                win_id,
+                x11rb::protocol::xproto::AtomEnum::WM_NAME,
+                x11rb::protocol::xproto::AtomEnum::STRING,
+                b"Kaleidux Wallpaper",
+            )?;
 
-        // Set _NET_WM_STATE = [_NET_WM_STATE_FULLSCREEN, _NET_WM_STATE_BELOW]
-        let states = [
-            self.atoms._net_wm_state_fullscreen,
-            self.atoms._net_wm_state_below,
-            self.atoms._net_wm_state_sticky,
-            self.atoms._net_wm_state_skip_taskbar,
-        ];
+            // Set _NET_WM_STATE = [_NET_WM_STATE_FULLSCREEN, _NET_WM_STATE_BELOW]
+            let states = [
+                self.atoms._net_wm_state_fullscreen,
+                self.atoms._net_wm_state_below,
+                self.atoms._net_wm_state_sticky,
+                self.atoms._net_wm_state_skip_taskbar,
+            ];
 
-        let mut stated_bytes = Vec::new();
-        for s in states {
-            stated_bytes.extend_from_slice(&s.to_ne_bytes());
+            let mut stated_bytes = Vec::new();
+            for s in states {
+                stated_bytes.extend_from_slice(&s.to_ne_bytes());
+            }
+
+            self.conn.change_property(
+                PropMode::REPLACE,
+                win_id,
+                self.atoms._net_wm_state,
+                x11rb::protocol::xproto::AtomEnum::ATOM,
+                32, // atom is 32-bit
+                states.len() as u32,
+                &stated_bytes,
+            )?;
+
+            // Map window
+            self.conn.map_window(win_id)?;
+
+            self.probe_window_present(win_id)?;
+
+            // Lower window to the bottom of the stack
+            use x11rb::protocol::xproto::StackMode;
+            self.conn.configure_window(
+                win_id,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+            )?;
+
+            self.conn.flush()?;
+            // Wait for server to process all requests (Audit Point 11)
+            self.conn.sync()?;
+
+            Ok(())
+        })();
+        if let Err(error) = created {
+            let _ = self.conn.destroy_window(win_id);
+            let _ = self.conn.flush();
+            return Err(error);
         }
-
-        self.conn.change_property(
-            PropMode::REPLACE,
-            win_id,
-            self.atoms._net_wm_state,
-            x11rb::protocol::xproto::AtomEnum::ATOM,
-            32, // atom is 32-bit
-            states.len() as u32,
-            &stated_bytes,
-        )?;
-
-        // Map window
-        self.conn.map_window(win_id)?;
-
-        self.probe_window_present(win_id)?;
-
-        // Lower window to the bottom of the stack
-        use x11rb::protocol::xproto::StackMode;
-        self.conn.configure_window(
-            win_id,
-            &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
-        )?;
-
-        self.conn.flush()?;
-        // Wait for server to process all requests (Audit Point 11)
-        self.conn.sync()?;
 
         self.windows.insert(name.to_string(), win_id);
 

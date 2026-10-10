@@ -605,3 +605,28 @@ fn playlist_events_do_not_replace_the_shared_root_index() {
     assert_eq!(filtered.pool, vec![first.clone()]);
     assert_eq!(unfiltered.pool, vec![first, second, third]);
 }
+
+#[cfg(any(
+    feature = "backend-ffmpeg",
+    feature = "backend-mpv",
+    feature = "backend-appsink"
+))]
+#[test]
+fn retained_external_video_keeps_its_type_after_root_refresh() {
+    let directory = unique_test_dir("selected-video-refresh");
+    let video = directory.join("external.mp4");
+    fs::write(&video, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+    let mut queue = make_test_queue(
+        Vec::new(),
+        crate::orchestration::SortingStrategy::Ascending,
+        0,
+        HashMap::new(),
+    );
+    queue.enqueue_selected_image(video.clone());
+    assert_eq!(queue.cached_content_type(&video), Some(ContentType::Video));
+    queue.root_index.replace(&[], &HashMap::new());
+    queue.sync_root_index_if_needed();
+    assert!(queue.pool.contains(&video));
+    assert_eq!(queue.cached_content_type(&video), Some(ContentType::Video));
+    fs::remove_dir_all(directory).unwrap();
+}

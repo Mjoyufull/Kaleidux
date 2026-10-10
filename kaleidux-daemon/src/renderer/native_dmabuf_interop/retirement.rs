@@ -72,7 +72,7 @@ impl CachedSource {
         nonblocking: bool,
     ) -> anyhow::Result<()> {
         unsafe {
-            if self.has_submitted {
+            if self.fence_in_flight {
                 if nonblocking {
                     anyhow::ensure!(
                         device.get_fence_status(self.fence).unwrap_or(false),
@@ -80,7 +80,7 @@ impl CachedSource {
                     );
                 } else {
                     device
-                        .wait_for_fences(std::slice::from_ref(&self.fence), true, u64::MAX)
+                        .wait_for_fences(std::slice::from_ref(&self.fence), true, 100_000_000)
                         .map_err(|error| {
                             anyhow::anyhow!("waiting for DMA-BUF surface: {error:?}")
                         })?;
@@ -89,6 +89,7 @@ impl CachedSource {
             device
                 .reset_fences(std::slice::from_ref(&self.fence))
                 .map_err(|error| anyhow::anyhow!("resetting DMA-BUF copy fence: {error:?}"))?;
+            self.fence_in_flight = false;
         }
         self.owner = None;
         Ok(())

@@ -218,6 +218,12 @@ impl NativeGlSurfaceRenderer {
         let VideoFrameFormat::NativeDmaBufNv12 { frame: descriptor } = &frame.format else {
             anyhow::bail!("native GL presenter requires a DMA-BUF NV12 frame");
         };
+        anyhow::ensure!(
+            frame.color == crate::video::VideoColorMetadata::default()
+                && frame.geometry
+                    == crate::video::VideoGeometry::for_dimensions(frame.width, frame.height),
+            "native GL shader requires ordinary BT.709 geometry; use the WGPU metadata path"
+        );
         self.make_current()?;
         self.resize(output_size)?;
         if self.active_session != Some(frame.session_id) {

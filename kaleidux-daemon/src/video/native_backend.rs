@@ -348,12 +348,12 @@ impl NativePlayer {
         }
     }
 
-    pub fn start(&self) {
+    pub fn start(&self, paused: bool) {
         info!(
             "[NATIVE-VIDEO] {} session={}: playback started",
             self.source_id, self.session_id
         );
-        self.shared.set_paused(self.session_id, false);
+        self.shared.start(self.session_id, paused);
     }
 
     pub fn stop(&mut self) -> anyhow::Result<()> {

@@ -162,6 +162,8 @@ impl super::Renderer {
         // Reclaim memory immediately - this ensures GPU resources are freed
         // rather than waiting for WGPU's automatic cleanup
         self.active_video_session_id = 0; // Invalidate current video session
+        self.active_image_session_id = 0;
+        self.valid_content_type = crate::queue::ContentType::Image;
         self.configured = false; // Force re-config next time
         self.ctx.request_device_poll();
     }
@@ -203,7 +205,7 @@ impl super::Renderer {
     }
 
     fn freeze_active_transition_to_current(&mut self) -> bool {
-        if !self.transition_active {
+        if !self.transition_active || !self.transition_has_rendered {
             return false;
         }
         let Some(composition_texture) = self.composition_texture.take() else {

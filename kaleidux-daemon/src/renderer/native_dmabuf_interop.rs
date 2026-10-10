@@ -24,6 +24,7 @@ struct CachedSource {
     producer_semaphore: vk::Semaphore,
     owner: Option<VideoFrameStorage>,
     has_submitted: bool,
+    fence_in_flight: bool,
     reusable_command: bool,
     copy_mode: Option<CopyMode>,
     linear_bridge: Option<linear::LinearBridge>,
@@ -159,15 +160,16 @@ impl NativeDmaBufInterop {
         // is already signaled by the time the same surface returns. Retaining
         // the AVFrame owner until then prevents decoder reuse during the copy.
         unsafe {
-            if source.owner.is_some() {
+            if source.fence_in_flight {
                 self.device
-                    .wait_for_fences(std::slice::from_ref(&source.fence), true, u64::MAX)
+                    .wait_for_fences(std::slice::from_ref(&source.fence), true, 100_000_000)
                     .map_err(|error| anyhow::anyhow!("waiting for DMA-BUF surface: {error:?}"))?;
                 source.owner = None;
             }
             self.device
                 .reset_fences(std::slice::from_ref(&source.fence))
                 .map_err(|error| anyhow::anyhow!("resetting DMA-BUF copy fence: {error:?}"))?;
+            source.fence_in_flight = false;
         }
 
         // The first recording imports an undefined external layout. Record once
@@ -224,6 +226,7 @@ impl NativeDmaBufInterop {
             }
         });
         result.map_err(|error| anyhow::anyhow!("submitting DMA-BUF plane copy: {error:?}"))?;
+        source.fence_in_flight = true;
         source.owner = Some(owner);
         Ok(cache_hit)
     }
@@ -339,6 +342,7 @@ impl NativeDmaBufInterop {
                 .queue_submit(self.queue, std::slice::from_ref(&submit), source.fence)
         })
         .map_err(|error| anyhow::anyhow!("submitting linear bridge copy: {error:?}"))?;
+        source.fence_in_flight = true;
         source.owner = Some(owner);
         let acquire_fence = if asynchronous {
             let fd_info = vk::SemaphoreGetFdInfoKHR::default()
@@ -356,7 +360,7 @@ impl NativeDmaBufInterop {
             // CPU fence fallback when the compositor does not expose it.
             unsafe {
                 self.device
-                    .wait_for_fences(std::slice::from_ref(&source.fence), true, u64::MAX)
+                    .wait_for_fences(std::slice::from_ref(&source.fence), true, 100_000_000)
             }
             .map_err(|error| anyhow::anyhow!("waiting for linear bridge copy: {error:?}"))?;
             source.owner = None;
@@ -470,6 +474,7 @@ impl NativeDmaBufInterop {
             producer_semaphore,
             owner: None,
             has_submitted: false,
+            fence_in_flight: false,
             reusable_command: false,
             copy_mode: None,
             linear_bridge: None,

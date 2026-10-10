@@ -101,6 +101,9 @@ impl MainLoopContext {
                             && self.pending_native_presentations.remove(&name) == Some(session_id)
                         {
                             self.monitor_manager.mark_transition_completed(&name);
+                            self.mark_startup_output_ready(&name, loop_start);
+                            self.mark_startup_output_presented(&name, loop_start);
+                            self.maybe_clear_startup_present_barrier();
                         }
                         if let Some(old) = old_player {
                             stop_video_player_in_background(name.clone(), old);

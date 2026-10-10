@@ -151,6 +151,9 @@ pub(crate) fn df_8_f() -> f32 {
 pub(crate) fn df_dark_grey() -> [f32; 4] {
     [0.15, 0.15, 0.15, 1.0]
 }
+pub(crate) fn df_0_88() -> f32 {
+    0.88
+}
 pub(crate) fn df_0_8() -> f32 {
     0.8
 }
@@ -170,7 +173,7 @@ pub(crate) fn df_10() -> f32 {
     10.0
 }
 pub(crate) fn df_x_up() -> [f32; 2] {
-    [1.0, 0.0]
+    [1.0, -0.5]
 }
 pub(crate) fn df_120() -> f32 {
     120.0

@@ -44,6 +44,8 @@ mod image_upload;
 #[path = "renderer/state.rs"]
 mod state;
 
+#[path = "renderer/cuda_retirement.rs"]
+mod cuda_retirement;
 #[path = "renderer/mpv_gl_interop.rs"]
 #[cfg_attr(not(feature = "backend-mpv"), allow(dead_code))]
 mod mpv_gl_interop;
@@ -63,6 +65,8 @@ mod video_rgba_upload;
 
 #[path = "renderer/native_video_upload.rs"]
 mod native_video_upload;
+#[path = "renderer/video_snapshot.rs"]
+mod video_snapshot;
 #[path = "renderer/video_upload.rs"]
 mod video_upload;
 mod video_zero_copy_upload;
@@ -159,7 +163,8 @@ fn yuv_uniforms_for(
         VideoTransfer::Hlg => 4.0,
     };
     let primaries = match color.primaries {
-        VideoColorPrimaries::Bt601Ntsc | VideoColorPrimaries::Bt601Pal => 0.0,
+        VideoColorPrimaries::Bt601Ntsc => 0.0,
+        VideoColorPrimaries::Bt601Pal => 5.0,
         VideoColorPrimaries::Bt709 => 1.0,
         VideoColorPrimaries::Bt2020 => 2.0,
         VideoColorPrimaries::DciP3 => 3.0,
@@ -332,6 +337,7 @@ pub struct Renderer {
     external_blit_bind_groups: std::collections::HashMap<usize, Arc<wgpu::BindGroup>>,
     blit_source_is_composition: bool, // Helps track which blit BG is currently cached
     blit_source_is_prev: bool,        // Helps track if it was prev or current
+    transition_has_rendered: bool,
     transition_rendered_this_frame: bool, // Track if transition shader ran successfully this frame
 
     // Content Type state to prevent race conditions (stale video frames overwriting images)
@@ -528,6 +534,7 @@ impl Renderer {
             external_blit_bind_groups: std::collections::HashMap::new(),
             blit_source_is_composition: false,
             blit_source_is_prev: false,
+            transition_has_rendered: false,
             transition_rendered_this_frame: false,
             valid_content_type: crate::queue::ContentType::Image,
             active_image_session_id: 0,

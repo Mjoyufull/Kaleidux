@@ -92,6 +92,7 @@ impl super::Renderer {
             self.transition_start_time = None;
             self.transition_progress = 0.0;
             self.transition_active = true;
+            self.transition_has_rendered = false;
             // P-32: Reset batch_start_time so transition timer starts fresh from
             // actual upload time, preventing decode latency from eating into duration
             self.batch_start_time = None;

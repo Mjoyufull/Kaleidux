@@ -128,7 +128,11 @@ pub fn get_video_backend_request() -> VideoBackendRequest {
 pub fn resolve_video_backend_request(request: VideoBackendRequest) -> VideoBackendRequest {
     match request {
         VideoBackendRequest::Auto => match get_video_backend_request() {
-            VideoBackendRequest::Auto if get_video_mode() != VideoMode::Auto => {
+            VideoBackendRequest::Auto
+                if get_video_mode() != VideoMode::Auto
+                    && !(get_video_mode() == VideoMode::ForceCpu
+                        && cfg!(feature = "backend-ffmpeg")) =>
+            {
                 VideoBackendRequest::ForceAppsink
             }
             VideoBackendRequest::Auto => default_video_backend_request(),

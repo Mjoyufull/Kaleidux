@@ -94,6 +94,7 @@ impl MainLoopContext {
     ) -> bool {
         self.low_power_prefetch_deferrals
             .retain(|name, _| self.monitor_manager.outputs.contains_key(name));
+        let mut deferred_outputs = Vec::new();
         for name in self.monitor_manager.due_low_power_outputs(loop_start) {
             let Some(orchestrator) = self.monitor_manager.outputs.get(&name) else {
                 continue;
@@ -131,12 +132,14 @@ impl MainLoopContext {
             );
             schedule_image_prefetch_plan(&name, generation, prefetch_plan, self.metrics.clone());
             self.low_power_prefetch_deferrals.insert(name.clone(), path);
-            self.monitor_manager
-                .defer_switch_deadline(&name, LOW_POWER_IMAGE_PREFETCH_DEFER);
-            return true;
+            deferred_outputs.push(name);
         }
 
-        false
+        for name in &deferred_outputs {
+            self.monitor_manager
+                .defer_switch_deadline(name, LOW_POWER_IMAGE_PREFETCH_DEFER);
+        }
+        !deferred_outputs.is_empty()
     }
 
     /// Process script tick.

@@ -110,6 +110,9 @@ pub fn startup_barrier_next_deadline(
     barrier: &StartupPresentBarrier,
     now: Instant,
 ) -> Option<Instant> {
+    if barrier.release_reason.is_some() {
+        return None;
+    }
     if startup_barrier_release_candidate(barrier, now).is_some() {
         return Some(now);
     }
@@ -135,6 +138,23 @@ pub fn startup_barrier_is_terminal(barrier: &StartupPresentBarrier) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_barrier_does_not_schedule_an_expired_deadline() {
+        let now = Instant::now();
+        let barrier = StartupPresentBarrier {
+            batch_id: 1,
+            blocks_present: false,
+            armed_at: now,
+            first_ready_at: None,
+            release_reason: Some("timeout"),
+            outputs: HashMap::from([("slow-output".to_owned(), StartupOutputState::pending())]),
+        };
+        assert_eq!(
+            startup_barrier_next_deadline(&barrier, now + STARTUP_BARRIER_TIMEOUT),
+            None
+        );
+    }
 
     #[test]
     fn startup_barrier_releases_after_bounded_skew() {

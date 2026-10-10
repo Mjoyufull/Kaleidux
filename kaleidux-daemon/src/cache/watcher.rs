@@ -85,6 +85,9 @@ impl DirectoryWatcher {
 
     fn emit_modified_file(&mut self, path: PathBuf, pool_events: &mut Vec<PoolEvent>) {
         if path.is_file() {
+            if self.known_files.len() >= MAX_KNOWN_FILES && !self.known_files.contains(&path) {
+                self.known_files.clear();
+            }
             self.known_files.insert(path.clone());
             pool_events.push(PoolEvent::Modified(path));
         }

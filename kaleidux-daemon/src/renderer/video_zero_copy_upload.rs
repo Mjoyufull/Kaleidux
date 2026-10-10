@@ -52,7 +52,7 @@ impl super::Renderer {
             let mut ci_lock = self.ctx.cuda_interop.lock();
             if ci_lock.is_none() {
                 match crate::cuda_interop::CudaInterop::new(&self.ctx.device) {
-                    Ok(ci) => *ci_lock = Some(ci),
+                    Ok(ci) => *ci_lock = Some(std::sync::Arc::new(ci)),
                     Err(e) => {
                         error!("[VIDEO] {}: {e}", self.name);
                         self.ctx
@@ -75,8 +75,6 @@ impl super::Renderer {
             || (uv_offset as usize) > frame_size
             || (uv_offset as usize).saturating_add(min_uv_bytes) > frame_size
             || (uv_offset as usize) < expected_uv_offset_floor
-            || (y_stride & 1) != 0
-            || (uv_stride & 1) != 0
         {
             warn!(
                 "[VIDEO] {}: Rejecting CUDA NV12 layout and falling back to CPU upload: frame={}x{} size={} y_stride={} uv_offset={} uv_stride={} min_uv_offset={}",
@@ -103,18 +101,8 @@ impl super::Renderer {
             let ci_guard = self.ctx.cuda_interop.lock();
             let ci = ci_guard.as_ref().unwrap();
 
-            // Destroy old cache
-            if let Some(mut old) = self.cuda_textures.take() {
-                if let Some(timeline) = old.timeline.take() {
-                    timeline.destroy(ci);
-                }
-                old.in_flight_frames.clear();
-                drop(old.y_view);
-                drop(old.uv_view);
-                drop(old.y_texture);
-                drop(old.uv_texture);
-                ci.free_exportable(old.y_cuda_alloc);
-                ci.free_exportable(old.uv_cuda_alloc);
+            if let Some(old) = self.cuda_textures.take() {
+                super::cuda_retirement::retire(self.ctx.clone(), old);
             }
 
             // Allocate Y plane: CUDA exports, Vulkan imports
@@ -231,23 +219,10 @@ impl super::Renderer {
             .as_ref()
             .is_some_and(|cache| cache.in_flight_frames.len() >= MAX_CUDA_IN_FLIGHT_FRAMES)
         {
-            let ci_guard = self.ctx.cuda_interop.lock();
-            let ci = ci_guard.as_ref().expect("CUDA interop was initialized");
-            if let Err(error) = ci.synchronize() {
-                error!(
-                    "[VIDEO] {}: CUDA in-flight retirement sync failed: {error}",
-                    self.name
-                );
-                self.ctx
-                    .cuda_interop_failed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return false;
-            }
-            self.cuda_textures
-                .as_mut()
-                .expect("CUDA textures are initialized")
-                .in_flight_frames
-                .clear();
+            self.ctx
+                .cuda_interop_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
 
         // The guard retains either GstCUDAMemory or the native decoder AVFrame.
@@ -314,21 +289,14 @@ impl super::Renderer {
                         "[VIDEO] {}: CUDA/Vulkan timeline handoff failed: {error}",
                         self.name
                     );
-                    if let Err(sync_error) = ci.synchronize() {
-                        error!(
-                            "[VIDEO] {}: CUDA recovery sync after handoff failure failed: {sync_error}",
-                            self.name
-                        );
-                        // CUDA may still reference the mapped source. Retain
-                        // the guard in the bounded cache and disable this path
-                        // instead of unmapping it on the error return.
-                        cache
-                            .in_flight_frames
-                            .push_back((u64::MAX, guard.take().expect("CUDA map guard is live")));
-                        self.ctx
-                            .cuda_interop_failed
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    // Pending CUDA may still reference this source. Retire it on
+                    // a worker rather than blocking commands or shutdown here.
+                    cache
+                        .in_flight_frames
+                        .push_back((u64::MAX, guard.take().expect("CUDA map guard is live")));
+                    self.ctx
+                        .cuda_interop_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }
                 cuda_sync_duration = handshake_start.elapsed().saturating_sub(cuda_copy_duration);
@@ -337,6 +305,10 @@ impl super::Renderer {
                     .push_back((ready, guard.take().expect("CUDA map guard is live")));
                 true
             } else {
+                if let Err(error) = ci.synchronize() {
+                    error!("[VIDEO] {}: CUDA producer sync failed: {error}", self.name);
+                    return false;
+                }
                 // Compatibility path for pre-timeline drivers. Both copies and
                 // cuMemcpy2D calls are synchronous; the optional context fence
                 // below is additional cross-API visibility hardening.

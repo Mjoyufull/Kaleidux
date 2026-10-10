@@ -284,7 +284,8 @@ impl CudaInterop {
             let cu_primary_release: FnCuPrimaryRelease =
                 load_fn!(lib, b"cuDevicePrimaryCtxRelease_v2\0");
             let source_events = source::SourceEventFns::load(&lib)?;
-            let cu_stream_synchronize: FnCuStreamSynchronize = load_fn!(lib, b"cuCtxSynchronize\0");
+            let cu_stream_synchronize: FnCuStreamSynchronize =
+                load_fn!(lib, b"cuStreamSynchronize\0");
             let cu_memcpy_2d: FnCuMemcpy2D = load_fn!(lib, b"cuMemcpy2D_v2\0");
             let cu_memcpy_2d_async: FnCuMemcpy2DAsync = load_fn!(lib, b"cuMemcpy2DAsync_v2\0");
             let cu_stream_create: FnCuStreamCreate = load_fn!(lib, b"cuStreamCreate\0");

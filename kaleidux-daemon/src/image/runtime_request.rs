@@ -225,8 +225,11 @@ pub(crate) async fn request_decoded_source_image(
         }
     };
     let decode_path = path.to_path_buf();
-    let Some(handle) =
-        spawn_image_blocking(work_kind, move || decode_source_image(&decode_path)).await
+    let Some(handle) = spawn_image_blocking(work_kind, move || {
+        let _permit = _permit;
+        decode_source_image(&decode_path)
+    })
+    .await
     else {
         let msg = rejected_image_work(work_kind);
         flight.publish(Err(msg.clone()));
@@ -239,16 +242,15 @@ pub(crate) async fn request_decoded_source_image(
         Err(e) => Err(format!("image source decode task panicked: {}", e)),
     };
 
+    if let Ok(source) = &result {
+        let descriptor = image_pipeline::descriptor::from_decoded_source(identity.clone(), source);
+        store_decoded_source_memory(identity, source.clone());
+        store_source_descriptor_memory(descriptor);
+    }
     flight.publish(result.clone());
 
     match result {
-        Ok(source) => {
-            let descriptor =
-                image_pipeline::descriptor::from_decoded_source(identity.clone(), &source);
-            store_decoded_source_memory(identity, source.clone());
-            store_source_descriptor_memory(descriptor);
-            Ok(source)
-        }
+        Ok(source) => Ok(source),
         Err(e) => Err(anyhow::anyhow!(e)),
     }
 }
@@ -263,7 +265,9 @@ pub(crate) async fn request_prepared_image_payload(
 ) -> anyhow::Result<DecodedImagePayload> {
     let Some(descriptor) = load_image_source_descriptor(path) else {
         let fallback_path = path.to_path_buf();
+        let permit = acquire_image_work_permit(work_kind, "prepare").await?;
         let Some(handle) = spawn_image_blocking(work_kind, move || {
+            let _permit = permit;
             prepare_image_for_output_uncached(&fallback_path, target_width, target_height)
         })
         .await
@@ -387,6 +391,7 @@ pub(crate) async fn request_prepared_image_payload(
     let source_for_prepare = source.clone();
     let cache_key = key.clone();
     let Some(handle) = spawn_image_blocking(work_kind, move || {
+        let _permit = _permit;
         let payload =
             prepare_source_image_for_output(&source_for_prepare, target_width, target_height)?;
         store_prepared_image_cache_by_key(&cache_key, &payload);

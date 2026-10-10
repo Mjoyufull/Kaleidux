@@ -27,15 +27,7 @@ impl RenderWake {
     }
 
     pub(crate) fn signal(&self) {
-        let value = 1u64;
-        // SAFETY: fd is a live nonblocking eventfd and value is readable for one u64.
-        unsafe {
-            libc::write(
-                *self.fd,
-                &value as *const u64 as *const c_void,
-                std::mem::size_of::<u64>(),
-            );
-        }
+        signal_eventfd(*self.fd);
     }
 
     /// Block until either libmpv has an update or shutdown explicitly wakes the
@@ -54,7 +46,12 @@ impl RenderWake {
             },
         ];
         // SAFETY: poll_fds contains two initialized pollfd values for live eventfds.
-        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        let ret = loop {
+            let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+            if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
         if ret <= 0 {
             return false;
         }
@@ -98,6 +95,9 @@ impl RenderWake {
                 )
             };
             if read as usize != std::mem::size_of::<u64>() {
+                if read < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
                 break;
             }
         }
@@ -116,15 +116,25 @@ pub(super) unsafe extern "C" fn render_update_callback(callback_ctx: *mut c_void
     let Some(fd) = (unsafe { (callback_ctx as *const RawFd).as_ref() }) else {
         return;
     };
+    signal_eventfd(*fd);
+}
+
+fn signal_eventfd(fd: RawFd) {
     let value = 1u64;
-    // SAFETY: fd is a live nonblocking eventfd and value is readable for one u64.
-    unsafe {
-        libc::write(
-            *fd,
-            &value as *const u64 as *const c_void,
-            std::mem::size_of::<u64>(),
-        )
-    };
+    loop {
+        // SAFETY: callers retain a live nonblocking eventfd; value is readable.
+        let written = unsafe {
+            libc::write(
+                fd,
+                &value as *const u64 as *const c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if written >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            // EAGAIN means the eventfd already contains a pending wake.
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

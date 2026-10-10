@@ -202,6 +202,9 @@ pub(crate) fn switch_wallpaper_content(
             player.session_id(),
             was_paused
         );
+        let prefetch_generation = begin_image_prefetch_generation(&name);
+        let prefetch_plan = prefetch::build_plan(monitor_manager, renderers, &name);
+        schedule_image_prefetch_plan(&name, prefetch_generation, prefetch_plan, metrics.clone());
         return;
     }
 
