@@ -672,6 +672,7 @@ pub(super) fn sample_to_video_frame(
                     strides[1],
                     caps.to_string()
                 );
+                return Err(gst::FlowError::NotNegotiated);
             }
             if is_cuda {
                 let should_log_layout =

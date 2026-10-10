@@ -691,7 +691,15 @@ async fn reconcile_monitors(
 
         info!("[X11] Adding connected output {name} at {width}x{height}@{x},{y}");
         ctx.monitor_manager.add_output(&name, "X11 Display").await;
-        let window = backend.create_wallpaper_window(&name, x, y, width, height)?;
+        let window = match backend.create_wallpaper_window(&name, x, y, width, height) {
+            Ok(window) => window,
+            Err(error) => {
+                ctx.monitor_manager.remove_output(&name);
+                retry.record_failure(&name, Instant::now());
+                tracing::warn!("[X11] {name}: window creation failed: {error}");
+                continue;
+            }
+        };
         window_to_renderer.insert(window, name.clone());
         let raw = Arc::new(crate::x11::RawX11Surface {
             window_id: window,
@@ -842,6 +850,7 @@ async fn drain_pending_x11_renderers(
             u32::from(height),
         );
         geometries.insert(name.clone(), add.geometry);
+        ctx.load_adopted_renderer_content(&name, "X11-HOTPLUG");
         info!("[X11] Hotplug renderer initialized successfully for {name}");
         initialized_any = true;
     }
@@ -894,6 +903,14 @@ fn refresh_x11_mpv_composed_target(
     ) {
         ctx.mpv_composed_targets.insert(name.to_string(), target);
         info!("[VIDEO] {name}: prepared composed libmpv XCB GL/WGPU target {width}x{height}");
+        if ctx
+            .video_players
+            .get(name)
+            .is_some_and(crate::video::VideoPlayer::uses_mpv)
+            || ctx.pending_video_switches.contains_key(name)
+        {
+            ctx.load_adopted_renderer_content(name, "X11-RESIZE");
+        }
     } else {
         error!("[VIDEO] {name}: XCB connection is unavailable for composed libmpv GL/WGPU");
     }

@@ -77,3 +77,15 @@ fn protocol_serde_inhibit_roundtrip() {
         _ => panic!("deserialized wrong response variant"),
     }
 }
+
+#[test]
+fn omitted_transition_parameters_match_named_defaults() {
+    for (tag, name) in [
+        ("stereo-viewer", "stereoviewer"),
+        ("squares-wire", "squareswire"),
+    ] {
+        let value = serde_json::json!({"type": tag});
+        let parsed: Transition = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, Transition::from_name(name));
+    }
+}

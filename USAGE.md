@@ -68,7 +68,7 @@ the tables below explain their defaults and behavior.
 # Start daemon with default configuration (/home/your-user/.config/kaleidux/config.toml)
 kaleidux-daemon
 
-# Start daemon with warning-level console and rotating file logging
+# Start daemon with warning-level console and per-launch timestamped file logging
 kaleidux-daemon --log 1
 
 # Start daemon in transition demo mode (cycles current directory with 10s intervals)
@@ -146,7 +146,7 @@ kaleidux-daemon [OPTIONS]
 
 | Option | Values | Default | Description |
 |---|---|---|---|
-| `--log` | `1`, `2`, `3`, `4`, `5` | Unset (`WARN` to stderr) | Diagnostic verbosity and file logging. Level 1 enables `WARN` plus rotating file logs under `~/.config/kaleidux/logs/`. Level 2 adds `INFO`, level 3 adds `DEBUG`, level 4 adds `TRACE`, and level 5 enables `TRACE-ALL` diagnostics (forces GStreamer trace logging and 1 ms idle polling). |
+| `--log` | `1`, `2`, `3`, `4`, `5` | Unset (`WARN` to stderr) | Diagnostic verbosity and file logging. Level 1 enables `WARN` plus per-launch timestamped file logs under `~/.config/kaleidux/logs/`. Level 2 adds `INFO`, level 3 adds `DEBUG`, level 4 adds `TRACE`, and level 5 enables `TRACE-ALL` diagnostics (forces GStreamer trace logging and 1 ms idle polling). |
 | `--demo` | Flag | `false` | Built-in transition demo. Overrides `[any].path` to current working directory, sets duration to 10 seconds, sets video ratio to 100%, sets transition duration to 1500 ms, and selects `random` transitions. |
 | `--video-mode` | `auto`, `cpu`, `cuda`, `dmabuf`, `nv12`, `rgba` | `auto` | Force the appsink memory/decode path; `cpu` also disables FFmpeg hardware decoding. Legacy aliases `cuda-strict` (maps to `cuda`) and `zero-copy` (maps to `dmabuf`) are accepted with a deprecation warning. |
 | `--video-backend` | `auto`, `ffmpeg`, `mpv`, `appsink` | `auto` | Select video decoding backend. Aliases: `gst`/`gstreamer` for `appsink`; `libmpv`/`mpv-experimental` for `mpv`; `native`/`native-experimental`/`ffmpeg-native`/`libav` for `ffmpeg`. |
@@ -156,7 +156,9 @@ kaleidux-daemon [OPTIONS]
 - `--video-backend auto` probes backends in priority order: native FFmpeg first, then libmpv, then GStreamer appsink when backend initialization fails.
 - Forcing `ffmpeg`, `mpv`, or `appsink` disables fallback: if the selected backend fails to initialize, playback fails immediately and logs the error.
 - If a forced backend was disabled at compile time (`backend-ffmpeg`, `backend-mpv`, `backend-appsink`), the daemon terminates with exit code 2 and reports the Cargo feature needed to enable it.
-- Explicit `--video-mode` settings (`cpu`, `cuda`, `dmabuf`, `nv12`, `rgba`) apply strictly to the appsink backend. Combining an explicit video mode with `--video-backend ffmpeg` or `--video-backend mpv` causes the daemon to exit with code 1.
+- `--video-mode cpu` works with FFmpeg and appsink; automatic backend selection keeps FFmpeg when available. The `cuda`, `dmabuf`, `nv12`, and `rgba` modes require appsink. Combining those modes with FFmpeg, or any explicit mode with mpv, causes startup to fail.
+
+X11 Cargo builds include the shared Wayland/EGL display stack and require Wayland development libraries. `display-x11` enables `display-wayland` as a dependency.
 
 ### Display Backend Selection
 

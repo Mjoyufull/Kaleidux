@@ -456,16 +456,20 @@ impl MonitorManager {
             if let Some(q) = &self.shared_queue {
                 return to_strings(&q.history);
             }
-            // Try to find a group queue
-            if let Some(q) = self.group_queues.values().next() {
-                return to_strings(&q.history);
+            let mut histories = Vec::new();
+            let mut groups: Vec<_> = self.group_queues.iter().collect();
+            groups.sort_by_key(|(name, _)| *name);
+            for (_, queue) in groups {
+                histories.extend(to_strings(&queue.history));
             }
-            // Try to find any independent queue
-            for orch in self.outputs.values() {
-                if let Some(q) = &orch.queue {
-                    return to_strings(&q.history);
+            let mut outputs: Vec<_> = self.outputs.iter().collect();
+            outputs.sort_by_key(|(name, _)| *name);
+            for (_, output) in outputs {
+                if let Some(queue) = &output.queue {
+                    histories.extend(to_strings(&queue.history));
                 }
             }
+            return histories;
         }
         history
     }

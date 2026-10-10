@@ -419,6 +419,7 @@ pub(crate) async fn drain_pending_renderer_adds(
         {
             ctx.mpv_composed_targets.insert(name.clone(), target);
         }
+        ctx.load_adopted_renderer_content(&name, "WAYLAND-HOTPLUG");
         info!("[WAYLAND-HOTPLUG] Renderer initialized successfully for {name}");
         initialized_any = true;
     }

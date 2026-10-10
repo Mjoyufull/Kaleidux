@@ -396,3 +396,36 @@ fn candidate_video_backends_preserves_ladder_and_forced_choice() {
         assert_eq!(forced_appsink, vec![VideoBackendRequest::ForceAppsink]);
     });
 }
+
+#[test]
+fn rotated_anamorphic_geometry_inverts_the_sample_aspect() {
+    let mut geometry = VideoGeometry::for_dimensions(720, 576);
+    geometry.sample_aspect_num = 16;
+    geometry.sample_aspect_den = 15;
+    assert!((geometry.display_aspect() - 4.0 / 3.0).abs() < 0.00001);
+    for rotation in [VideoRotation::Rotate90, VideoRotation::Rotate270] {
+        geometry.rotation = rotation;
+        assert!((geometry.display_aspect() - 3.0 / 4.0).abs() < 0.00001);
+    }
+}
+
+#[test]
+fn mastering_metadata_equality_and_hash_use_matching_float_bits() {
+    use std::hash::{Hash, Hasher};
+    let metadata = VideoMasteringMetadata {
+        primaries_xy: [[f32::NAN, -0.0]; 4],
+        min_luminance_nits: 0.0,
+        max_luminance_nits: 1000.0,
+    };
+    assert_eq!(metadata, metadata);
+    let hash = |value: &VideoMasteringMetadata| {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut state);
+        state.finish()
+    };
+    let copied = metadata;
+    assert_eq!(hash(&metadata), hash(&copied));
+    let mut different = metadata;
+    different.primaries_xy[0][1] = 0.0;
+    assert_ne!(metadata, different);
+}

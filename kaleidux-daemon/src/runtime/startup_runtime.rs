@@ -15,6 +15,25 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 impl MainLoopContext {
+    pub(crate) fn load_adopted_renderer_content(&mut self, name: &str, prefix: &'static str) {
+        let Some(path) = self
+            .monitor_manager
+            .outputs
+            .get(name)
+            .and_then(|output| output.current_path.clone())
+        else {
+            return;
+        };
+        let Some(kind) = crate::queue::SmartQueue::get_content_type(&path) else {
+            return;
+        };
+        self.load_content_changes(
+            HashMap::from([(name.to_owned(), (path, kind))]),
+            prefix,
+            false,
+        );
+    }
+
     pub fn initial_load(&mut self) {
         info!(
             "[STARTUP] Reached Initial Load section, renderers count: {}",

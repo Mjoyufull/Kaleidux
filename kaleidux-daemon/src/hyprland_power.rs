@@ -58,6 +58,10 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
         {
             ctx.pending_native_presentations.remove(name);
             ctx.monitor_manager.mark_transition_completed(name);
+            let now = Instant::now();
+            ctx.mark_startup_output_ready(name, now);
+            ctx.mark_startup_output_presented(name, now);
+            ctx.maybe_clear_startup_present_barrier();
         }
         if let Some(renderer) = ctx.renderers.get_mut(name) {
             if let Some(start) = renderer.transition_start_time.as_mut() {
@@ -111,6 +115,7 @@ pub(crate) enum PowerTransition {
 
 pub(crate) struct HyprlandPowerMonitor {
     socket_path: Option<PathBuf>,
+    live_outputs: HashSet<String>,
     powered_outputs: HashMap<String, bool>,
     next_probe: Instant,
     result_check_deadline: Option<Instant>,
@@ -150,6 +155,7 @@ impl HyprlandPowerMonitor {
         }
         Self {
             socket_path,
+            live_outputs: HashSet::new(),
             powered_outputs: HashMap::new(),
             next_probe: now,
             result_check_deadline: None,
@@ -165,6 +171,7 @@ impl HyprlandPowerMonitor {
     fn with_socket(path: PathBuf, now: Instant) -> Self {
         Self {
             socket_path: Some(path),
+            live_outputs: HashSet::new(),
             powered_outputs: HashMap::new(),
             next_probe: now,
             result_check_deadline: None,
@@ -211,6 +218,15 @@ impl HyprlandPowerMonitor {
         output_names: &[String],
         now: Instant,
     ) -> Option<PowerUpdate> {
+        let live_names: HashSet<String> = output_names.iter().cloned().collect();
+        if self.live_outputs != live_names {
+            if let Some(query) = self.in_flight.take() {
+                query.abort();
+            }
+            self.result_check_deadline = None;
+            self.next_probe = now;
+            self.live_outputs = live_names;
+        }
         let live = output_names
             .iter()
             .map(String::as_str)
@@ -306,7 +322,10 @@ impl HyprlandPowerMonitor {
                     self.query_failure_reported = false;
                 }
                 self.consecutive_failures = 0;
-                self.powered_outputs = powered_outputs;
+                self.powered_outputs = powered_outputs
+                    .into_iter()
+                    .filter(|(name, _)| output_names.contains(name))
+                    .collect();
             }
             Err(error) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);

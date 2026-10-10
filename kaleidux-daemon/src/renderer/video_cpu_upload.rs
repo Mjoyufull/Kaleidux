@@ -547,10 +547,6 @@ impl super::Renderer {
             }
         }
 
-        let y_view = self.i420_y_view.as_ref().unwrap();
-        let u_view = self.i420_u_view.as_ref().unwrap();
-        let v_view = self.i420_v_view.as_ref().unwrap();
-
         if output.is_none() {
             self.active_yuv_source = Some(super::YuvSource {
                 format: super::YuvFormat::I420,
@@ -571,30 +567,12 @@ impl super::Renderer {
                 });
 
         let bind_group = self
+            .final_i420_bind_group
+            .as_ref()
+            .expect("I420 final binding initialized");
+        let pipeline = self
             .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("I420 Convert Bind Group"),
-                layout: &self.ctx.i420_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(y_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(u_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(v_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            });
+            .get_final_i420_blit_pipeline(wgpu::TextureFormat::Rgba8UnormSrgb);
 
         let mut encoder = self
             .ctx
@@ -617,8 +595,8 @@ impl super::Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.ctx.i420_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, bind_group.as_ref(), &[]);
             pass.draw(0..3, 0..1);
         }
         self.ctx.submit(std::iter::once(encoder.finish()));

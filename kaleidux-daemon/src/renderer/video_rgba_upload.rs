@@ -6,7 +6,7 @@ impl super::Renderer {
         frame: &crate::video::GlExternalFrame,
         width: u32,
         height: u32,
-    ) {
+    ) -> bool {
         let old_frame = self.current_external_frame.take();
         if let Err(error) = frame.prepare_for_wgpu_releasing(old_frame.as_ref()) {
             error!(
@@ -14,7 +14,7 @@ impl super::Renderer {
                 self.name
             );
             self.current_external_frame = old_frame;
-            return;
+            return false;
         }
         if let Some(curr) = self.current_texture.take()
             && let Some((w, h)) = self.current_texture_size.take()
@@ -28,6 +28,7 @@ impl super::Renderer {
         self.current_texture_size = Some((width, height));
         self.transition_bind_group = None;
         self.blit_bind_group = None;
+        true
     }
 
     /// Upload an RGBA frame directly to the output texture (legacy fallback path).
@@ -37,9 +38,21 @@ impl super::Renderer {
         texture: &wgpu::Texture,
         width: u32,
         height: u32,
-    ) {
+    ) -> bool {
         let src_stride = frame.stride;
-        let expected_stride = width * 4;
+        let Some(expected_stride) = width.checked_mul(4) else {
+            return false;
+        };
+        let required_source = u64::from(height.saturating_sub(1)) * u64::from(src_stride)
+            + u64::from(expected_stride);
+        if width == 0
+            || height == 0
+            || src_stride < expected_stride
+            || required_source > frame.storage.byte_len() as u64
+        {
+            error!("[VIDEO] {}: invalid RGBA buffer extent/stride", self.name);
+            return false;
+        }
 
         if src_stride.is_multiple_of(256) && src_stride >= expected_stride {
             if let Err(error) = frame.storage.with_readable_bytes(|src_data| {
@@ -64,6 +77,7 @@ impl super::Renderer {
                 );
             }) {
                 error!("Failed to read RGBA video buffer: {}", error);
+                return false;
             }
         } else {
             let align_mask = 255u32;
@@ -95,7 +109,7 @@ impl super::Renderer {
             });
             if let Err(error) = repacked {
                 error!("Failed to read RGBA video buffer: {}", error);
-                return;
+                return false;
             }
 
             self.ctx.write_texture(
@@ -118,5 +132,6 @@ impl super::Renderer {
                 },
             );
         }
+        true
     }
 }

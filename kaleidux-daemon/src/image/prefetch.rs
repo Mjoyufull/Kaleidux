@@ -51,9 +51,6 @@ pub(crate) fn build_plan(
         candidates.into_iter().map(|(path, _reason)| path).collect();
 
     for (output_name, other_orchestrator) in &monitor_manager.outputs {
-        if requests.len() >= MAX_REQUESTS {
-            break;
-        }
         if output_name == trigger_output
             || other_orchestrator.next_content_type != Some(queue::ContentType::Image)
         {
@@ -82,8 +79,8 @@ pub(crate) fn build_plan(
         );
     }
 
-    requests.truncate(MAX_REQUESTS);
     sort_requests(&mut requests);
+    requests.truncate(MAX_REQUESTS);
     limit_plan_to_memory_budget(&mut requests);
     requests
 }

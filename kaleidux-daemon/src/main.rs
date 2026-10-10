@@ -359,6 +359,13 @@ fn init_gstreamer() -> anyhow::Result<std::time::Duration> {
 
     #[cfg(feature = "backend-appsink")]
     {
+        use kaleidux_daemon::video::VideoBackendRequest;
+        if matches!(
+            kaleidux_daemon::video::get_video_backend_request(),
+            VideoBackendRequest::ForceFfmpeg | VideoBackendRequest::ForceMpv
+        ) {
+            return Ok(std::time::Duration::ZERO);
+        }
         let gstreamer_start = Instant::now();
         gstreamer::init()?;
         if kaleidux_daemon::observability::trace_all::trace_all_enabled() {

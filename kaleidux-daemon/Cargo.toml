@@ -26,7 +26,7 @@ backend-appsink = []
 backend-mpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 backend-ffmpeg = ["dep:ffmpeg-next", "dep:libva-sys"]
 display-wayland = []
-display-x11 = ["dep:x11rb"]
+display-x11 = ["display-wayland", "dep:x11rb"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]

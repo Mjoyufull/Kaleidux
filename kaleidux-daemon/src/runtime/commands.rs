@@ -220,6 +220,9 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                     monitor_manager.update_config(new_config);
                     for (name, r) in renderers.iter_mut() {
                         if let Some(cfg) = monitor_manager.get_output_config(name) {
+                            if let Some(player) = video_players.get_mut(name) {
+                                player.set_volume(cfg.volume as f64 / 100.0);
+                            }
                             r.apply_config(cfg);
                         }
                     }

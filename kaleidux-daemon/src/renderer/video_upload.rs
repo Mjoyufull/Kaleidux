@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-use super::compute_cover_target_dimensions;
 use tracing::{debug, error, info, warn};
 
 fn trace_video_upload_enabled() -> bool {
@@ -60,12 +59,9 @@ impl super::Renderer {
         let (presentation_width, presentation_height) = match frame.format {
             crate::video::VideoFrameFormat::Rgba => (source_width, source_height),
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => (source_width, source_height),
-            _ => compute_cover_target_dimensions(
-                source_width,
-                source_height,
-                self.config.width.max(1),
-                self.config.height.max(1),
-            ),
+            // Converted transition textures already contain cover/crop/rotation
+            // in screen coordinates; avoid applying framing twice at final blit.
+            _ => (self.config.width.max(1), self.config.height.max(1)),
         };
 
         if let crate::video::VideoFrameFormat::GlExternalRgba {
@@ -84,11 +80,13 @@ impl super::Renderer {
             if is_first_frame_after_switch {
                 self.external_blit_bind_groups.clear();
             }
-            self.set_current_gl_external_rgba(
+            if !self.set_current_gl_external_rgba(
                 external_frame,
                 presentation_width,
                 presentation_height,
-            );
+            ) {
+                return;
+            }
             self.current_aspect = frame.geometry.display_aspect();
             self.finish_video_frame_upload(is_first_frame_after_switch);
             return;
@@ -100,6 +98,8 @@ impl super::Renderer {
                 | crate::video::VideoFrameFormat::P010 { .. }
                 | crate::video::VideoFrameFormat::I420 { .. }
                 | crate::video::VideoFrameFormat::CudaNv12 { .. }
+                | crate::video::VideoFrameFormat::DmaBufNv12 { .. }
+                | crate::video::VideoFrameFormat::NativeDmaBufNv12 { .. }
         ) && !self.transition_active
             && !self.has_previous_texture();
 
@@ -237,72 +237,58 @@ impl super::Renderer {
                 y_stride,
                 uv_offset,
                 uv_stride,
-            } => {
-                self.upload_frame_nv12(
-                    frame,
-                    texture.as_ref(),
-                    source_width,
-                    source_height,
-                    *y_stride,
-                    *uv_offset,
-                    *uv_stride,
-                );
-                true
-            }
+            } => self.upload_frame_nv12(
+                frame,
+                texture.as_ref(),
+                source_width,
+                source_height,
+                *y_stride,
+                *uv_offset,
+                *uv_stride,
+            ),
             crate::video::VideoFrameFormat::P010 {
                 y_stride,
                 uv_offset,
                 uv_stride,
-            } => {
-                self.upload_frame_p010(
-                    frame,
-                    texture.as_ref(),
-                    source_width,
-                    source_height,
-                    *y_stride,
-                    *uv_offset,
-                    *uv_stride,
-                );
-                true
-            }
+            } => self.upload_frame_p010(
+                frame,
+                texture.as_ref(),
+                source_width,
+                source_height,
+                *y_stride,
+                *uv_offset,
+                *uv_stride,
+            ),
             crate::video::VideoFrameFormat::I420 {
                 y_stride,
                 u_offset,
                 u_stride,
                 v_offset,
                 v_stride,
-            } => {
-                self.upload_frame_i420(
-                    frame,
-                    texture.as_ref(),
-                    source_width,
-                    source_height,
-                    *y_stride,
-                    *u_offset,
-                    *u_stride,
-                    *v_offset,
-                    *v_stride,
-                );
-                true
-            }
-            crate::video::VideoFrameFormat::Rgba => {
-                self.upload_frame_rgba(
-                    frame,
-                    texture.as_ref().expect("RGBA path allocates a texture"),
-                    source_width,
-                    source_height,
-                );
-                true
-            }
+            } => self.upload_frame_i420(
+                frame,
+                texture.as_ref(),
+                source_width,
+                source_height,
+                *y_stride,
+                *u_offset,
+                *u_stride,
+                *v_offset,
+                *v_stride,
+            ),
+            crate::video::VideoFrameFormat::Rgba => self.upload_frame_rgba(
+                frame,
+                texture.as_ref().expect("RGBA path allocates a texture"),
+                source_width,
+                source_height,
+            ),
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => {
                 unreachable!("external GL frames return before allocating an upload texture");
             }
             crate::video::VideoFrameFormat::DmaBufNv12 { frame: dmabuf } => {
                 let uploaded = self.upload_frame_native_dmabuf_nv12(
                     frame,
-                    texture
-                        .as_ref()
-                        .expect("modifier-aware DMA-BUF path primes an RGBA target"),
+                    texture.as_ref(),
                     source_width,
                     source_height,
                     dmabuf,
@@ -318,9 +304,7 @@ impl super::Renderer {
             } => {
                 let uploaded = self.upload_frame_native_dmabuf_nv12(
                     frame,
-                    texture
-                        .as_ref()
-                        .expect("native path currently primes an RGBA target"),
+                    texture.as_ref(),
                     source_width,
                     source_height,
                     native_dmabuf,
@@ -438,7 +422,13 @@ impl super::Renderer {
             self.transition_bind_group = None;
             self.blit_bind_group = None;
         }
-        self.current_aspect = frame.geometry.display_aspect();
+        self.current_aspect = if self.current_texture.is_some()
+            && !matches!(frame.format, crate::video::VideoFrameFormat::Rgba)
+        {
+            presentation_width as f32 / presentation_height.max(1) as f32
+        } else {
+            frame.geometry.display_aspect()
+        };
         self.finish_video_frame_upload(is_first_frame_after_switch);
 
         // device.poll deferred to end-of-loop to avoid redundant driver calls (P-14)
@@ -464,6 +454,7 @@ impl super::Renderer {
                 self.transition_start_time = None;
                 self.transition_progress = 0.0;
                 self.transition_active = true;
+                self.transition_has_rendered = false;
                 self.prewarm_transition_resources();
             } else {
                 info!(

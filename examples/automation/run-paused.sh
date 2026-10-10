@@ -9,10 +9,6 @@ if [ "$#" -eq 0 ]; then
 fi
 
 reason="command-$$"
-if ! kldctl inhibit "$reason"; then
-    printf '%s\n' 'Could not pause Kaleidux; starting command without an inhibitor.' >&2
-    exec "$@"
-fi
 
 child=
 cleanup() {
@@ -32,6 +28,12 @@ trap cleanup EXIT
 trap 'interrupt INT 130' INT
 trap 'interrupt TERM 143' TERM
 trap 'interrupt HUP 129' HUP
+
+if ! kldctl inhibit "$reason"; then
+    printf '%s\n' 'Could not pause Kaleidux; starting command without an inhibitor.' >&2
+    exec "$@"
+fi
+
 
 # A non-interactive shell makes asynchronous children ignore INT/QUIT.
 # Restore their defaults before exec so forwarded Ctrl-C reaches the command.

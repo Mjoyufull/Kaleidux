@@ -381,7 +381,7 @@ pub enum Transition {
         max_static_span: f32,
     },
     StereoViewer {
-        #[serde(default = "df_0_8")]
+        #[serde(default = "df_0_88")]
         zoom: f32,
         #[serde(default = "df_0_22")]
         corner_radius: f32,

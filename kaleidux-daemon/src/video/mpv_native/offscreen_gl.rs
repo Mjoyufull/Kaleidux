@@ -389,8 +389,18 @@ impl SharedGlSlot {
                 GL_HANDLE_TYPE_OPAQUE_FD_EXT,
                 exported.vulkan_to_gl_fd.into_raw_fd(),
             );
-            (gl.create_textures)(GL_TEXTURE_2D, 1, &mut gl_texture);
-            (gl.texture_storage_mem_2d)(gl_texture, 1, GL_RGBA8, width, height, memory_object, 0);
+            (gl.gen_textures)(1, &mut gl_texture);
+            (gl.bind_texture)(GL_TEXTURE_2D, gl_texture);
+            (gl.texture_storage_mem_2d)(
+                GL_TEXTURE_2D,
+                1,
+                GL_RGBA8,
+                width,
+                height,
+                memory_object,
+                0,
+            );
+            (gl.bind_texture)(GL_TEXTURE_2D, 0);
             (gl.gen_framebuffers)(1, &mut framebuffer);
             (gl.bind_framebuffer)(GL_FRAMEBUFFER, framebuffer);
             (gl.framebuffer_texture_2d)(

@@ -175,39 +175,11 @@ impl SmartQueue {
                         path
                     );
 
-                    // Spawn background full discovery to refresh the pool and metadata cache
-                    let bg_path = path.to_path_buf();
-                    let bg_blacklist = stats.blacklist.clone();
-                    let bg_cache = cache.clone();
-                    let bg_metrics = metrics.clone();
-
-                    tokio::spawn(async move {
-                        let handle = background::spawn_blocking_tracked(
-                            BackgroundWorkKind::QueueDiscovery,
-                            move || match Self::discover_content(
-                                &bg_path,
-                                &bg_blacklist,
-                                bg_cache,
-                                bg_metrics,
-                            ) {
-                                Ok((pool, _)) => {
-                                    tracing::info!(
-                                        "[QUEUE] Background pool refresh finished ({} files) for {:?}",
-                                        pool.len(),
-                                        bg_path
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!("[QUEUE] Background pool refresh failed: {}", e);
-                                }
-                            },
-                        );
-                        if handle.is_none() {
-                            tracing::debug!(
-                                "[QUEUE] Skipping speculative pool refresh: worker budget full or shutdown in progress"
-                            );
-                        }
-                    });
+                    Self::schedule_root_rescan_for(
+                        super::media_index::shared_root_index(path),
+                        path.to_path_buf(),
+                        cache.clone(),
+                    );
 
                     ct_cache_init = Some(Self::populate_content_type_cache_from_pool(
                         &cache,

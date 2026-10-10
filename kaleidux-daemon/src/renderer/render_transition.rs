@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use super::{TransitionStats, TransitionUniforms};
 
@@ -58,6 +58,7 @@ impl super::Renderer {
                     // Only set flag if transition was just completed (not already completed)
                     if self.transition_active {
                         self.transition_active = false;
+                        self.release_prev_texture("transition completed");
                         self.transition_just_completed = true;
                         self.arm_display_timer_on_present();
 
@@ -201,6 +202,7 @@ impl super::Renderer {
 
                 // Mark that transition was successfully rendered this frame
                 self.transition_rendered_this_frame = true;
+                self.transition_has_rendered = true;
 
                 // debug!("[TRANSITION] {}: Rendered transition frame ...", self.name);
             } else {
@@ -211,34 +213,6 @@ impl super::Renderer {
                     self.active_transition.name()
                 );
                 // Don't set transition_rendered_this_frame - transition didn't actually render
-            }
-
-            // CLEANUP: Return prev_texture to pool when transition is TRULY finished
-            if self.transition_progress >= 1.0
-                && (self.current_texture.is_some() || self.current_external_view_available())
-                && (self.prev_texture.is_some() || self.prev_external_view_available())
-            {
-                debug!(
-                    "[TRANSITION] {}: Transition completed, returning prev_texture to pool",
-                    self.name
-                );
-                // Return prev_texture to pool for reuse (instead of just dropping)
-                if let Some(prev_tex) = self.prev_texture.take() {
-                    if let Some((w, h)) = self.prev_texture_size.take() {
-                        self.ctx.return_texture_to_pool(prev_tex, w, h);
-                    }
-                    // If size unknown, texture is still dropped here (freed by WGPU)
-                }
-                {
-                    self.prev_external_view = None;
-                    let frame = self.prev_external_frame.take();
-                    self.drop_external_frame(frame);
-                }
-                self.prev_texture_view = None;
-                self.transition_bind_group = None;
-                self.blit_bind_group = None;
-                self.transition_start_time = None;
-                self.transition_active = false;
             }
         }
 

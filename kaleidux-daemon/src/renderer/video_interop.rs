@@ -37,12 +37,13 @@ pub(super) struct CudaVulkanTimeline {
     queue: ash::vk::Queue,
     semaphore: ash::vk::Semaphore,
     cuda: Option<crate::cuda_interop::CudaTimelineSemaphore>,
+    interop: std::sync::Arc<crate::cuda_interop::CudaInterop>,
     next_value: u64,
 }
 
 impl CudaVulkanTimeline {
     pub(super) fn new(
-        ci: &crate::cuda_interop::CudaInterop,
+        ci: &std::sync::Arc<crate::cuda_interop::CudaInterop>,
         device: &wgpu::Device,
     ) -> anyhow::Result<Self> {
         use ash::vk;
@@ -110,6 +111,7 @@ impl CudaVulkanTimeline {
             queue,
             semaphore,
             cuda: Some(cuda),
+            interop: ci.clone(),
             next_value: 1,
         })
     }
@@ -147,6 +149,15 @@ impl CudaVulkanTimeline {
         use ash::vk;
         let values = [value];
         let semaphores = [self.semaphore];
+        // Do not put an unbounded external wait on WGPU's only queue. A failed
+        // CUDA stream must time out before any rendering submission can wait on it.
+        let host_wait = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the live exported timeline belongs to this retained device.
+        unsafe { self.device.wait_semaphores(&host_wait, 100_000_000) }.map_err(|error| {
+            anyhow::anyhow!("CUDA-ready timeline timed out or failed: {error:?}")
+        })?;
         let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
         let mut timeline =
             vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
@@ -168,35 +179,18 @@ impl CudaVulkanTimeline {
             .map_err(|error| anyhow::anyhow!("querying CUDA/Vulkan timeline: {error:?}"))
     }
 
-    pub(super) fn destroy(mut self, ci: &crate::cuda_interop::CudaInterop) {
-        // Cache retirement is rare (resize/backend teardown). Ensure no queue
-        // operation still references the semaphore or shared allocations.
-        // SAFETY: this is the owning logical device.
-        if let Err(error) = unsafe { self.device.device_wait_idle() } {
-            error!("[CUDA-VK] device-idle wait during timeline teardown failed: {error:?}");
-        }
-        if let Err(error) = ci.synchronize() {
-            error!("[CUDA-VK] CUDA stream wait during timeline teardown failed: {error}");
-        }
-        if let Some(cuda) = self.cuda.take() {
-            ci.destroy_timeline_semaphore(cuda);
-        }
-        // SAFETY: the queue is idle and this object owns the semaphore.
-        unsafe { self.device.destroy_semaphore(self.semaphore, None) };
-        self.semaphore = ash::vk::Semaphore::null();
-    }
+    // Destruction is deferred with the owning texture cache until Vulkan reads
+    // and CUDA copies complete; there is no global device-idle wait.
 }
 
 impl Drop for CudaVulkanTimeline {
     fn drop(&mut self) {
-        if self.semaphore != ash::vk::Semaphore::null() {
-            // This is a last-resort cleanup path; normal renderer teardown
-            // calls destroy() so the CUDA handle is released first.
-            unsafe {
-                let _ = self.device.device_wait_idle();
-                self.device.destroy_semaphore(self.semaphore, None);
-            }
+        if let Some(cuda) = self.cuda.take() {
+            self.interop.destroy_timeline_semaphore(cuda);
         }
+        // SAFETY: the cache retirement callback covers queue and copy-stream use.
+        // Before cache installation, this timeline has no submitted operations.
+        unsafe { self.device.destroy_semaphore(self.semaphore, None) };
     }
 }
 

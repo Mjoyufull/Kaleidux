@@ -36,6 +36,11 @@ impl CudaInterop {
         let CudaMapGuard::Native(frame) = source else {
             return Ok(());
         };
+        // Native NVDEC and this bridge retain the same device's primary
+        // context. A different device requires a peer-copy implementation.
+        if frame.context == 0 || frame.context != self.ctx as usize {
+            return Err("NVDEC source does not match the renderer CUDA primary context".into());
+        }
         let _guard = self.op_lock.lock();
         let mut event = std::ptr::null_mut();
         // SAFETY: the source guard retains the frame and its CUDA device/stream.

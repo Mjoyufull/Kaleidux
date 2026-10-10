@@ -52,12 +52,24 @@ pub enum VideoChromaSiting {
     TopLeft,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct VideoMasteringMetadata {
     /// CIE 1931 xy coordinates in red, green, blue, white order.
     pub primaries_xy: [[f32; 2]; 4],
     pub min_luminance_nits: f32,
     pub max_luminance_nits: f32,
+}
+
+impl PartialEq for VideoMasteringMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.primaries_xy
+            .into_iter()
+            .flatten()
+            .zip(other.primaries_xy.into_iter().flatten())
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+            && self.min_luminance_nits.to_bits() == other.min_luminance_nits.to_bits()
+            && self.max_luminance_nits.to_bits() == other.max_luminance_nits.to_bits()
+    }
 }
 
 impl Eq for VideoMasteringMetadata {}
@@ -135,8 +147,13 @@ impl VideoGeometry {
                 (self.display_width, self.display_height)
             }
         };
-        width.max(1) as f32 * self.sample_aspect_num.max(1) as f32
-            / (height.max(1) as f32 * self.sample_aspect_den.max(1) as f32)
+        let (sar_num, sar_den) = match self.rotation {
+            VideoRotation::Rotate90 | VideoRotation::Rotate270 => {
+                (self.sample_aspect_den, self.sample_aspect_num)
+            }
+            _ => (self.sample_aspect_num, self.sample_aspect_den),
+        };
+        width.max(1) as f32 * sar_num.max(1) as f32 / (height.max(1) as f32 * sar_den.max(1) as f32)
     }
 }
 

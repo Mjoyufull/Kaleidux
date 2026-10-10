@@ -36,6 +36,7 @@ pub(super) struct NativeSubscriber {
     first_frame_sent: AtomicBool,
     active: AtomicBool,
     paused: AtomicBool,
+    started: AtomicBool,
     volume: AtomicU64,
     creation_start: Instant,
 }
@@ -91,7 +92,8 @@ impl SharedDecodeSession {
             first_frame_tx,
             first_frame_sent: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            paused: AtomicBool::new(false),
+            paused: AtomicBool::new(true),
+            started: AtomicBool::new(false),
             volume: AtomicU64::new(request.volume.clamp(0.0, 1.0).to_bits()),
             creation_start: request.creation_start,
         });
@@ -163,21 +165,31 @@ impl SharedDecodeSession {
         self.update_playback(&state);
     }
 
+    pub(super) fn start(&self, session_id: u64, paused: bool) {
+        let state = self.fanout.state.lock();
+        if let Some(subscriber) = state.subscribers.get(&session_id) {
+            subscriber.started.store(true, Ordering::Release);
+            subscriber.paused.store(paused, Ordering::Release);
+        }
+        self.update_playback(&state);
+    }
+
     fn update_playback(&self, state: &FanoutState) {
         let volume = state
             .subscribers
             .values()
-            .filter(|subscriber| !subscriber.paused.load(Ordering::Acquire))
+            .filter(|subscriber| {
+                subscriber.started.load(Ordering::Acquire)
+                    && !subscriber.paused.load(Ordering::Acquire)
+            })
             .map(|subscriber| f64::from_bits(subscriber.volume.load(Ordering::Acquire)))
             .fold(0.0f64, f64::max);
         // One audio stream per shared decode group avoids duplicate playback
         // when synchronized outputs use the same source.
         self.control.set_volume(volume);
-        if state
-            .subscribers
-            .values()
-            .all(|subscriber| subscriber.paused.load(Ordering::Acquire))
-        {
+        if state.subscribers.values().all(|subscriber| {
+            !subscriber.started.load(Ordering::Acquire) || subscriber.paused.load(Ordering::Acquire)
+        }) {
             self.control.pause();
         } else {
             self.control.play();
@@ -343,7 +355,10 @@ impl NativeDecodeFanout {
                     state
                         .subscribers
                         .values()
-                        .filter(|subscriber| !subscriber.paused.load(Ordering::Acquire))
+                        .filter(|subscriber| {
+                            !subscriber.started.load(Ordering::Acquire)
+                                || !subscriber.paused.load(Ordering::Acquire)
+                        })
                         .cloned()
                         .collect::<Vec<_>>(),
                 )
@@ -430,7 +445,9 @@ impl NativeDecodeFanout {
 
 impl NativeSubscriber {
     fn deliver(&self, frame: VideoFrame) {
-        if self.paused.load(Ordering::Acquire) || !self.active.load(Ordering::Acquire) {
+        if (self.started.load(Ordering::Acquire) && self.paused.load(Ordering::Acquire))
+            || !self.active.load(Ordering::Acquire)
+        {
             return;
         }
         let (source_id, frame) = self.prepare_delivery(frame);
@@ -482,6 +499,7 @@ mod tests {
             first_frame_sent: AtomicBool::new(false),
             active: AtomicBool::new(true),
             paused: AtomicBool::new(false),
+            started: AtomicBool::new(true),
             volume: AtomicU64::new(0.0f64.to_bits()),
             creation_start: Instant::now(),
         })
@@ -490,6 +508,7 @@ mod tests {
     #[test]
     fn peer_subscriber_detection_and_paused_queries() {
         let sub1 = subscriber(1);
+        sub1.started.store(false, Ordering::Release);
         let fanout = Arc::new(NativeDecodeFanout::new(sub1));
         let session = Arc::new(SharedDecodeSession {
             key: SharedDecodeKey {
@@ -507,6 +526,17 @@ mod tests {
         // Solo subscriber has no peers.
         assert!(!session.has_active_peer_subscribers(1));
         assert!(!session.is_paused(1));
+        // Preparing a video permits preroll without opening audible playback.
+        session.set_volume(1, 0.4);
+        assert!(!session.control.is_playing());
+        assert_eq!(session.control.volume(), 0.0);
+        session.start(1, true);
+        assert!(session.is_paused(1));
+        assert!(!session.control.is_playing());
+        assert_eq!(session.control.volume(), 0.0);
+        session.set_paused(1, false);
+        assert!(session.control.is_playing());
+        assert_eq!(session.control.volume(), 0.4);
         assert!(session.restart_if_solo(1, true));
         assert_eq!(session.control.take_seek(), Some(0));
         assert!(session.is_paused(1));

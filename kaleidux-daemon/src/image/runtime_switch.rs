@@ -40,13 +40,9 @@ pub(crate) fn annotate_shared_image_targets(pending: &mut [PendingContentSwitch]
         largest_by_path
             .entry(change.path.clone())
             .and_modify(|target| {
-                if change.target_area > target.2 {
-                    *target = (
-                        change.target_width,
-                        change.target_height,
-                        change.target_area,
-                    );
-                }
+                target.0 = target.0.max(change.target_width);
+                target.1 = target.1.max(change.target_height);
+                target.2 = u64::from(target.0) * u64::from(target.1);
             })
             .or_insert((
                 change.target_width,
@@ -91,4 +87,32 @@ where
     annotate_shared_image_targets(&mut pending);
     sort_pending_content_switches(&mut pending);
     pending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_targets_cover_landscape_and_portrait_outputs() {
+        let change = |name: &str, width, height| PendingContentSwitch {
+            name: name.to_owned(),
+            path: PathBuf::from("shared.png"),
+            content_type: queue::ContentType::Image,
+            shared_image_target: None,
+            target_width: width,
+            target_height: height,
+            target_area: u64::from(width) * u64::from(height),
+        };
+        let mut pending = [
+            change("landscape", 1920, 1080),
+            change("portrait", 1080, 1920),
+        ];
+        annotate_shared_image_targets(&mut pending);
+        assert!(
+            pending
+                .iter()
+                .all(|change| change.shared_image_target == Some((1920, 1920)))
+        );
+    }
 }

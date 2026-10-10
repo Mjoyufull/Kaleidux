@@ -85,3 +85,19 @@ fn custom_shader_cache_key_includes_sorted_parameter_values() {
         ShaderManager::transition_cache_key(&changed)
     );
 }
+
+#[test]
+fn metadata_aware_video_shaders_validate() {
+    for source in [
+        include_str!("native_nv12_blit.wgsl"),
+        include_str!("final_i420_blit.wgsl"),
+    ] {
+        let module = naga::front::wgsl::parse_str(source).expect("valid video WGSL");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validated video shader");
+    }
+}

@@ -58,7 +58,7 @@ impl NativePlayer {
         anyhow::bail!("FFmpeg backend is disabled in this build")
     }
 
-    pub fn start(&self) {}
+    pub fn start(&self, _paused: bool) {}
 
     pub fn stop(&mut self) -> anyhow::Result<()> {
         Ok(())

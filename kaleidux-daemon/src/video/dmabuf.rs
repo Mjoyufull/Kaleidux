@@ -229,7 +229,7 @@ fn validate_layout(
     anyhow::ensure!(width > 0 && height > 0, "empty DMA-BUF frame");
     anyhow::ensure!(strides[0] > 0 && strides[1] > 0, "invalid DMA-BUF strides");
     anyhow::ensure!(
-        strides[0] as u32 >= width && strides[1] as u32 >= width,
+        strides[0] as u32 >= width && strides[1] as u32 >= width.div_ceil(2).saturating_mul(2),
         "DMA-BUF pitch is smaller than the NV12 plane width"
     );
     anyhow::ensure!(buffer.n_memory() > 0, "DMA-BUF frame has no memory");

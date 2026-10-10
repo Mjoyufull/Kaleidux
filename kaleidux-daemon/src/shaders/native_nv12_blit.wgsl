@@ -80,6 +80,14 @@ fn linearize(value: f32, transfer: f32) -> f32 {
 }
 
 fn to_bt709(rgb: vec3<f32>, primaries: f32) -> vec3<f32> {
+    if (primaries > 4.5) {
+        // BT.470 PAL/EBU primaries to BT.709, D65 white.
+        return vec3<f32>(
+            dot(vec3<f32>(1.044043, -0.044043, 0.0), rgb),
+            rgb.g,
+            dot(vec3<f32>(0.0, 0.011793, 0.988207), rgb)
+        );
+    }
     if (primaries < 0.5) {
         // Linear-light SMPTE-C/BT.601 to BT.709, D65 white.
         return vec3<f32>(
@@ -110,7 +118,13 @@ fn to_bt709(rgb: vec3<f32>, primaries: f32) -> vec3<f32> {
 fn tonemap_hdr_to_sdr(rgb: vec3<f32>, transfer: f32, mastering_peak: f32, sdr_white: f32) -> vec3<f32> {
     if (transfer < 2.5) { return rgb; }
     let signal_peak = select(1000.0, 10000.0, transfer < 3.5);
-    let nits_rgb = max(rgb, vec3<f32>(0.0)) * signal_peak;
+    var display_linear = max(rgb, vec3<f32>(0.0));
+    if (transfer >= 3.5) {
+        // BT.2100 HLG reference OOTF: gamma 1.2 at the nominal 1000-nit peak.
+        let scene_luminance = max(dot(display_linear, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.000001);
+        display_linear *= pow(scene_luminance, 0.2);
+    }
+    let nits_rgb = display_linear * signal_peak;
     let luminance = max(dot(nits_rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.000001);
     let x = luminance / max(sdr_white, 1.0);
     let white = max(mastering_peak / max(sdr_white, 1.0), 1.0);
@@ -123,7 +137,7 @@ fn tonemap_hdr_to_sdr(rgb: vec3<f32>, transfer: f32, mastering_peak: f32, sdr_wh
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = source_coordinate(cover(in.uv, uniforms.geometry_and_range.x, uniforms.geometry_and_range.y));
-    let chroma_uv = uv + uniforms.sampling_geometry.yz;
+    let chroma_uv = uv - uniforms.sampling_geometry.yz;
     let y_raw = textureSample(t_y, samp, uv).r;
     let uv_raw = textureSample(t_uv, samp, chroma_uv);
     let y = (y_raw - uniforms.geometry_and_range.z) * uniforms.geometry_and_range.w;

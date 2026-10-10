@@ -32,6 +32,7 @@ pub(super) fn select_hwdec_display_resource(adapter_vendor: Option<u32>) -> Opti
         tracing::debug!("[MPV-GL] NVIDIA adapter: keeping wl_display hwdec resource (nvdec path)");
         return None;
     }
+    let adapter_vendor = Some(adapter_vendor?);
     let (fd, path) = open_matching_drm_render_node(adapter_vendor)?;
     let detected_vendor = adapter_vendor.or_else(|| {
         path.file_name()
@@ -61,7 +62,7 @@ pub(super) fn select_hwdec_display_resource(adapter_vendor: Option<u32>) -> Opti
 
 fn open_matching_drm_render_node(vendor_id: Option<u32>) -> Option<(OwnedFd, PathBuf)> {
     let mut first_available: Option<(OwnedFd, PathBuf)> = None;
-    for minor in 128..=143u32 {
+    for minor in 128..=191u32 {
         let path = PathBuf::from(format!("/dev/dri/renderD{minor}"));
         if !path.exists() {
             continue;
@@ -200,7 +201,8 @@ pub(super) struct GlApi {
         unsafe extern "system" fn(u32, u32, *const u32, u32, *const u32, *const u32),
     pub(super) signal_semaphore:
         unsafe extern "system" fn(u32, u32, *const u32, u32, *const u32, *const u32),
-    pub(super) create_textures: unsafe extern "system" fn(u32, i32, *mut u32),
+    pub(super) gen_textures: unsafe extern "system" fn(i32, *mut u32),
+    pub(super) bind_texture: unsafe extern "system" fn(u32, u32),
     pub(super) delete_textures: unsafe extern "system" fn(i32, *const u32),
     pub(super) texture_storage_mem_2d: unsafe extern "system" fn(u32, i32, u32, i32, i32, u32, u64),
     pub(super) gen_framebuffers: unsafe extern "system" fn(i32, *mut u32),
@@ -224,9 +226,10 @@ impl GlApi {
             import_semaphore_fd: load_gl(egl, "glImportSemaphoreFdEXT")?,
             wait_semaphore: load_gl(egl, "glWaitSemaphoreEXT")?,
             signal_semaphore: load_gl(egl, "glSignalSemaphoreEXT")?,
-            create_textures: load_gl(egl, "glCreateTextures")?,
+            gen_textures: load_gl(egl, "glGenTextures")?,
+            bind_texture: load_gl(egl, "glBindTexture")?,
             delete_textures: load_gl(egl, "glDeleteTextures")?,
-            texture_storage_mem_2d: load_gl(egl, "glTextureStorageMem2DEXT")?,
+            texture_storage_mem_2d: load_gl(egl, "glTexStorageMem2DEXT")?,
             gen_framebuffers: load_gl(egl, "glGenFramebuffers")?,
             delete_framebuffers: load_gl(egl, "glDeleteFramebuffers")?,
             bind_framebuffer: load_gl(egl, "glBindFramebuffer")?,
