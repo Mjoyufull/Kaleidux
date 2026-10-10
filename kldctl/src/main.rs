@@ -53,19 +53,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Jump to an image inside the slideshow directory
+    /// Jump to a wallpaper inside the slideshow directory
     Jump {
         path: std::path::PathBuf,
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Insert an image into the queue and display it now
+    /// Insert an image or video into the queue and display it now
     Set {
         path: std::path::PathBuf,
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Jump to a slideshow image, or insert an external image and display it
+    /// Display an image or video from the slideshow or an external path
     Img {
         path: std::path::PathBuf,
         #[arg(short, long)]
@@ -78,7 +78,7 @@ enum Commands {
     /// Switch to the next wallpaper in the queue
     #[command(visible_alias = "n")]
     Next {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -86,7 +86,7 @@ enum Commands {
     /// Switch to the previous wallpaper (if history exists)
     #[command(visible_alias = "p")]
     Prev {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -157,7 +157,7 @@ enum Commands {
 
     /// Clear wallpaper on output(s) - show black screen
     Clear {
-        /// Target output or omit for all
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -180,7 +180,7 @@ enum Commands {
 
     /// Show recently played wallpapers
     History {
-        /// Target output (omit for default/all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },

@@ -26,6 +26,9 @@ impl tracing_subscriber::fmt::time::FormatTime for CustomTimer {
 #[derive(Parser, Debug)]
 #[command(author, about, long_about = None)]
 struct Args {
+    /// Experimental file-backed image decoding with smaller caches and media read-ahead.
+    #[arg(long)]
+    streamed: bool,
     /// Diagnostic verbosity from 1 (warnings) through 5 (trace-all).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     log: Option<u8>,
@@ -78,9 +81,11 @@ fn configure_image_allocator() {
 
 async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
+    kaleidux_daemon::media_policy::initialize(args.streamed)?;
     let log_level = args.log;
     kaleidux_daemon::observability::trace_all::set_trace_all_enabled(log_level == Some(5));
     let _guards = init_logging(log_level)?;
+    info!("[MEDIA-POLICY] streamed={}", args.streamed);
 
     if log_level == Some(5) {
         info!(

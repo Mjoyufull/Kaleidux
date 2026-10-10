@@ -18,8 +18,8 @@ struct LinearImage {
 
 impl Drop for LinearImage {
     fn drop(&mut self) {
-        // SAFETY: the interop owner waits for device idle before dropping its
-        // cached bridges, and both handles belong to this device.
+        // SAFETY: the interop owner retains cached bridges until submitted
+        // queue work completes. Both handles belong to this device.
         unsafe {
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.memory, None);

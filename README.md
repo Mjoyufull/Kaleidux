@@ -78,7 +78,7 @@ $ paru -S kaleidux-git
 
 **Build Requirements:**
 
-- Rust 1.89+ **stable**
+- Rust 1.95+ **stable**
 - mpv/libmpv with development headers
 - GStreamer 1.24+ with development headers and plugins
 - Wayland and/or X11 development headers
@@ -153,6 +153,7 @@ Options:
       --demo              Run in demo mode (rotating built-in shaders)
       --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
       --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
+      --streamed           Experimental memory policy: smaller caches and read-ahead
       --video-backend <BACKEND>
                           Force backend: auto, ffmpeg, mpv, appsink (default: auto)
   -h, --help              Show help
@@ -192,7 +193,7 @@ kldctl love ~/wallpapers/nature.jpg
 kldctl query
 
 # Sync all monitors to the next wallpaper
-kldctl next --all
+kldctl next -o all
 ```
 
 ## Configuration
@@ -202,6 +203,7 @@ Default location: `~/.config/kaleidux/config.toml`
 ```toml
 [global]
 monitor-behavior = "independent"
+main-monitor = "auto"
 sorting = "loveit"
 video-ratio = 50
 pause-on-fullscreen = false

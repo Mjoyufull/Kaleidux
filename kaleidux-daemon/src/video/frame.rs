@@ -194,7 +194,9 @@ impl VideoFrameStorage {
         match self {
             Self::Gstreamer(buffer) => buffer.size(),
             Self::Cpu(bytes) => bytes.len(),
-            Self::Native(_) => 0,
+            Self::Native(owner) => owner
+                .downcast_ref::<NativeCudaFrame>()
+                .map_or(0, |frame| frame.byte_len),
             Self::External => 0,
         }
     }
@@ -251,6 +253,16 @@ impl VideoFrameStorage {
             Self::External => "external".hash(hasher),
         }
     }
+}
+
+/// Device addresses remain valid while `owner` retains the decoder's AVFrame.
+/// Context and stream tokens are passed only to the CUDA driver, never dereferenced.
+pub struct NativeCudaFrame {
+    pub device_ptr: u64,
+    pub byte_len: usize,
+    pub context: usize,
+    pub stream: usize,
+    pub owner: Arc<dyn Any + Send + Sync>,
 }
 
 impl From<gst::Buffer> for VideoFrameStorage {

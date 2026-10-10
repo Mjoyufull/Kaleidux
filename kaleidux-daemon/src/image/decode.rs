@@ -178,7 +178,9 @@ fn decode_source_generic(
     format: Option<image::ImageFormat>,
 ) -> anyhow::Result<DecodedSourceImage> {
     let decode_start = Instant::now();
-    let (header_width, header_height) = image::image_dimensions(path)?;
+    let (header_width, header_height) = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()?;
     validate_source_dimensions(path, header_width, header_height)?;
     let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
     let mut limits = image::Limits::default();
@@ -215,7 +217,12 @@ fn decode_source_generic(
 }
 
 pub(crate) fn decode_source_image(path: &Path) -> anyhow::Result<DecodedSourceImage> {
-    let format = image::ImageFormat::from_path(path).ok();
+    let format = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .format();
+    if crate::media_policy::streamed() {
+        return decode_source_generic(path, format);
+    }
     match format {
         Some(image::ImageFormat::Jpeg) => match decode_jpeg_source_fast(path) {
             Ok(source) => Ok(source),

@@ -390,3 +390,15 @@ fn full_layer_range(layer: &ImportedLayer) -> vk::ImageSubresourceRange {
         .base_array_layer(0)
         .layer_count(1)
 }
+
+pub(super) fn raw_texture_handle(texture: &wgpu::Texture) -> anyhow::Result<vk::Image> {
+    // SAFETY: the raw handle is borrowed only for queue work while the owning
+    // WGPU texture remains live in Renderer.
+    unsafe {
+        texture.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_texture| {
+            hal_texture
+                .map(|texture| texture.raw_handle())
+                .ok_or_else(|| anyhow::anyhow!("destination WGPU texture is not Vulkan-backed"))
+        })
+    }
+}

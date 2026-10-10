@@ -12,6 +12,7 @@ pub mod cuda_interop;
 pub(crate) mod hyprland_power;
 pub mod image;
 pub mod main_loop;
+pub mod media_policy;
 pub mod metrics;
 pub mod monitor;
 pub mod monitor_manager;

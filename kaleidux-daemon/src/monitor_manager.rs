@@ -474,3 +474,6 @@ impl MonitorManager {
 #[cfg(test)]
 #[path = "monitor_manager/tests.rs"]
 mod tests;
+
+#[path = "monitor_manager/selection.rs"]
+mod selection;

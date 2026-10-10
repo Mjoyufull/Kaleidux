@@ -11,6 +11,7 @@ impl MpvPlayer {
         let session_id = self.session_id;
         let player_event_tx = self.player_event_tx.clone();
         let stop_requested = self.stop_requested.clone();
+        let position_ns = self.position_ns.clone();
         let first_hwdec_logged = self.first_hwdec_logged.clone();
         self.event_thread = Some(
             std::thread::Builder::new()
@@ -21,6 +22,14 @@ impl MpvPlayer {
                             continue;
                         };
                         match event {
+                            Ok(events::Event::PropertyChange {
+                                name: "time-pos",
+                                change: events::PropertyData::Double(seconds),
+                                ..
+                            }) if seconds.is_finite() && seconds >= 0.0 => {
+                                position_ns
+                                    .store((seconds * 1_000_000_000.0) as u64, Ordering::Release);
+                            }
                             Ok(events::Event::EndFile(reason)) => {
                                 trace!(
                                     "[VIDEO] {}: libmpv EndFile event session={} reason={:?}",
@@ -83,7 +92,7 @@ impl MpvPlayer {
                                 }
                                 let reason = format!("libmpv event error: {error}");
                                 warn!("[VIDEO] {}: {}", source_id, reason);
-                                let _ = player_event_tx.blocking_send(PlayerEvent {
+                                let _ = player_event_tx.try_send(PlayerEvent {
                                     source_id: source_id.to_string(),
                                     session_id,
                                     backend_kind: VideoBackendKind::Mpv,

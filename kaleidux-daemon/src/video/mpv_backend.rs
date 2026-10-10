@@ -1,7 +1,7 @@
 use libmpv2::{Mpv, events};
 use libmpv2_sys as sys;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{info, trace, warn};
@@ -51,6 +51,7 @@ pub struct MpvPlayer {
     player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
     metrics: Arc<PerformanceMetrics>,
     stop_requested: Arc<AtomicBool>,
+    position_ns: Arc<AtomicU64>,
     first_frame_logged: Arc<AtomicBool>,
     first_hwdec_logged: Arc<AtomicBool>,
     capture_interval: Duration,
@@ -198,6 +199,7 @@ impl MpvPlayer {
         // On the GL paths mpv's VO cannot initialize until the render thread
         // has created the render context, and a `loadfile` issued before that
         // makes mpv drop the video track for good. Defer the load to `start`.
+        mpv.observe_property("time-pos", libmpv2::Format::Double, 1)?;
         let defers_load = use_native_gl || use_composed_gl;
         let mut player = Self {
             mpv: Arc::new(mpv),
@@ -210,6 +212,7 @@ impl MpvPlayer {
             player_event_tx,
             metrics,
             stop_requested: Arc::new(AtomicBool::new(false)),
+            position_ns: Arc::new(AtomicU64::new(u64::MAX)),
             first_frame_logged: Arc::new(AtomicBool::new(false)),
             first_hwdec_logged: Arc::new(AtomicBool::new(false)),
             capture_interval: Duration::from_nanos(1_000_000_000u64 / capture_fps as u64),
@@ -291,7 +294,7 @@ impl MpvPlayer {
             }
             self.load_file(&uri)?;
         }
-        self.mpv.set_property("pause", paused)?;
+        self.set_paused_async(paused)?;
         info!(
             "[VIDEO] {}: libmpv backend started (session={})",
             self.source_id, self.session_id
@@ -314,8 +317,14 @@ impl MpvPlayer {
         }
         self.frame_mailbox
             .clear_session(self.source_id.as_ref(), self.session_id);
-        let _ = self.mpv.command("stop", &[]);
-        let _ = self.mpv.command("quit", &[]);
+        // Wake the blocking event wait explicitly. Normal core commands must
+        // never hold the display loop while advanced-control GL needs service.
+        let mut arguments = [c"quit".as_ptr(), std::ptr::null()];
+        unsafe {
+            // SAFETY: mpv copies the terminated command array during this call.
+            sys::mpv_command_async(self.mpv.ctx.as_ptr(), 0, arguments.as_mut_ptr());
+            sys::mpv_wakeup(self.mpv.ctx.as_ptr());
+        }
         if let Some(handle) = self.frame_thread.take() {
             let _ = handle.join();
         }
@@ -326,27 +335,47 @@ impl MpvPlayer {
     }
 
     pub fn set_volume(&self, volume: f64) {
-        let _ = self
-            .mpv
-            .set_property("volume", (volume * 100.0).clamp(0.0, 100.0));
+        let mut value = (volume * 100.0).clamp(0.0, 100.0);
+        // SAFETY: mpv copies the typed property payload before returning. The
+        // asynchronous API never waits for the core from the display loop.
+        unsafe {
+            libmpv2_sys::mpv_set_property_async(
+                self.mpv.ctx.as_ptr(),
+                0,
+                c"volume".as_ptr(),
+                libmpv2_sys::mpv_format_MPV_FORMAT_DOUBLE,
+                (&mut value as *mut f64).cast(),
+            );
+        }
     }
 
     pub fn pause(&self) -> anyhow::Result<()> {
-        self.mpv.set_property("pause", true)?;
-        Ok(())
+        self.set_paused_async(true)
     }
 
     pub fn resume(&self) -> anyhow::Result<()> {
-        self.mpv.set_property("pause", false)?;
+        self.set_paused_async(false)
+    }
+
+    fn set_paused_async(&self, paused: bool) -> anyhow::Result<()> {
+        let mut value = i32::from(paused);
+        // SAFETY: the live handle copies the stack MPV_FORMAT_FLAG value.
+        let result = unsafe {
+            libmpv2_sys::mpv_set_property_async(
+                self.mpv.ctx.as_ptr(),
+                0,
+                c"pause".as_ptr(),
+                libmpv2_sys::mpv_format_MPV_FORMAT_FLAG,
+                (&mut value as *mut i32).cast(),
+            )
+        };
+        anyhow::ensure!(result >= 0, "libmpv pause request failed: {result}");
         Ok(())
     }
 
     pub fn current_position_ns(&self) -> Option<u64> {
-        self.mpv
-            .get_property::<f64>("time-pos")
-            .ok()
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .map(|seconds| (seconds * 1_000_000_000.0) as u64)
+        let position = self.position_ns.load(Ordering::Acquire);
+        (position != u64::MAX).then_some(position)
     }
 
     pub fn seek_to_position_ns(&self, position_ns: u64) -> anyhow::Result<()> {
@@ -354,8 +383,17 @@ impl MpvPlayer {
             return Ok(());
         }
         let seconds = position_ns as f64 / 1_000_000_000.0;
-        self.mpv
-            .command("seek", &[&seconds.to_string(), "absolute+exact"])?;
+        let value = std::ffi::CString::new(seconds.to_string())?;
+        let mut arguments = [
+            c"seek".as_ptr(),
+            value.as_ptr(),
+            c"absolute+exact".as_ptr(),
+            std::ptr::null(),
+        ];
+        // SAFETY: mpv copies all terminated command arguments before returning.
+        let result =
+            unsafe { sys::mpv_command_async(self.mpv.ctx.as_ptr(), 0, arguments.as_mut_ptr()) };
+        anyhow::ensure!(result >= 0, "libmpv seek request failed: {result}");
         Ok(())
     }
 

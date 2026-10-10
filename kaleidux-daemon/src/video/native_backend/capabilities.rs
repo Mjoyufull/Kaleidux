@@ -232,7 +232,7 @@ fn create_device_with_options(
                 .map(|value| value.as_ptr())
                 .unwrap_or(ptr::null()),
             options,
-            0,
+            i32::from(choice.api == NativeDecoderApi::Nvdec), // AV_CUDA_USE_PRIMARY_CONTEXT
         )
     };
     // SAFETY: FFmpeg accepts null and releases dictionary-owned strings.
@@ -403,6 +403,9 @@ fn requested_decoder_api() -> Option<NativeDecoderApi> {
 }
 
 fn hardware_decode_disabled() -> bool {
+    if crate::video::get_video_mode() == crate::video::VideoMode::ForceCpu {
+        return true;
+    }
     std::env::var("KLD_NATIVE_HWDECODER")
         .map(|value| {
             matches!(

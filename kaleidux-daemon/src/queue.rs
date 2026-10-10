@@ -112,3 +112,6 @@ mod stats;
 #[cfg(test)]
 #[path = "queue/tests.rs"]
 mod tests;
+
+#[path = "queue/media_probe.rs"]
+mod media_probe;

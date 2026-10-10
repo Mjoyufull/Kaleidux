@@ -39,8 +39,16 @@ static PREPARED_IMAGE_MEMORY_CACHE: once_cell::sync::Lazy<
     ParkingMutex<SizedLruCache<PreparedImageKey, Arc<PreparedImageEntry>>>,
 > = once_cell::sync::Lazy::new(|| {
     ParkingMutex::new(SizedLruCache::new(
-        PREPARED_IMAGE_MEMORY_CACHE_ENTRIES,
-        PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES,
+        if crate::media_policy::streamed() {
+            4
+        } else {
+            PREPARED_IMAGE_MEMORY_CACHE_ENTRIES
+        },
+        if crate::media_policy::streamed() {
+            16 * 1024 * 1024
+        } else {
+            PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES
+        },
     ))
 });
 
@@ -56,7 +64,11 @@ static SOURCE_IMAGE_MEMORY_CACHE: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(|| {
     ParkingMutex::new(SizedLruCache::new(
         SOURCE_IMAGE_MEMORY_CACHE_ENTRIES,
-        SOURCE_IMAGE_MEMORY_CACHE_MAX_BYTES,
+        if crate::media_policy::streamed() {
+            0
+        } else {
+            SOURCE_IMAGE_MEMORY_CACHE_MAX_BYTES
+        },
     ))
 });
 
@@ -281,7 +293,12 @@ pub(crate) fn load_image_source_descriptor(path: &Path) -> Option<Arc<ImageSourc
         return Some(descriptor);
     }
 
-    let (width, height) = image::image_dimensions(path).ok()?;
+    let (width, height) = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
     let descriptor = image_pipeline::descriptor::from_dimensions(identity, width, height);
     store_source_descriptor_memory(descriptor.clone());
     Some(descriptor)

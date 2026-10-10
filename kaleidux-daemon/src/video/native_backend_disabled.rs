@@ -28,6 +28,8 @@ pub(crate) fn report_native_surface_import_failure() -> bool {
     false
 }
 
+pub(crate) fn report_native_cuda_import_failure() {}
+
 pub struct NativePlayer;
 
 impl NativePlayer {

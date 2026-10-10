@@ -82,7 +82,7 @@ impl WgpuContext {
         let instance = Instance::new(wgpu::InstanceDescriptor {
             // WGPU prefers primary backends, including Vulkan, but must still
             // discover GLES when the machine has no usable Vulkan adapter.
-            backends: wgpu::Backends::all(),
+            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
             ..Default::default()
         });
         let compatible_surface = instance.create_surface(window)?;

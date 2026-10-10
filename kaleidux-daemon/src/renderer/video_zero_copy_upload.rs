@@ -250,17 +250,10 @@ impl super::Renderer {
                 .clear();
         }
 
-        // Map the GStreamer CUDA buffer to get the source device pointer
+        // The guard retains either GstCUDAMemory or the native decoder AVFrame.
         let cuda_map_start = Instant::now();
-        let Some(buffer) = frame.storage.gstreamer_buffer() else {
-            error!(
-                "[VIDEO] {}: CUDA frame did not retain its GStreamer buffer owner",
-                self.name
-            );
-            return false;
-        };
-        let mut guard = match crate::cuda_interop::map_buffer_cuda(buffer) {
-            Some(g) => Some(g),
+        let mut guard = match crate::cuda_interop::map_frame_cuda(frame) {
+            Some(mapped) => Some(mapped),
             None => return false,
         };
         let cuda_map_duration = cuda_map_start.elapsed();
@@ -269,6 +262,13 @@ impl super::Renderer {
         let (cuda_copy_duration, cuda_sync_duration, used_timeline) = {
             let ci_guard = self.ctx.cuda_interop.lock();
             let ci = ci_guard.as_ref().unwrap();
+            if let Err(error) = ci.wait_for_source(guard.as_ref().expect("CUDA guard is live")) {
+                error!(
+                    "[VIDEO] {}: CUDA producer dependency failed: {error}",
+                    self.name
+                );
+                return false;
+            }
             let cache = self.cuda_textures.as_mut().unwrap();
 
             let uv_row_bytes = (uv_width * 2) as usize;

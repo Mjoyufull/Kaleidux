@@ -8,7 +8,7 @@ use crate::video::{
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
@@ -36,6 +36,7 @@ pub(super) struct NativeSubscriber {
     first_frame_sent: AtomicBool,
     active: AtomicBool,
     paused: AtomicBool,
+    volume: AtomicU64,
     creation_start: Instant,
 }
 
@@ -72,6 +73,7 @@ pub(super) struct AcquireRequest {
     pub max_publish_fps: Option<u32>,
     pub creation_start: Instant,
     pub worker_name: String,
+    pub volume: f64,
 }
 
 impl SharedDecodeSession {
@@ -90,6 +92,7 @@ impl SharedDecodeSession {
             first_frame_sent: AtomicBool::new(false),
             active: AtomicBool::new(true),
             paused: AtomicBool::new(false),
+            volume: AtomicU64::new(request.volume.clamp(0.0, 1.0).to_bits()),
             creation_start: request.creation_start,
         });
         let key = SharedDecodeKey {
@@ -161,6 +164,15 @@ impl SharedDecodeSession {
     }
 
     fn update_playback(&self, state: &FanoutState) {
+        let volume = state
+            .subscribers
+            .values()
+            .filter(|subscriber| !subscriber.paused.load(Ordering::Acquire))
+            .map(|subscriber| f64::from_bits(subscriber.volume.load(Ordering::Acquire)))
+            .fold(0.0f64, f64::max);
+        // One audio stream per shared decode group avoids duplicate playback
+        // when synchronized outputs use the same source.
+        self.control.set_volume(volume);
         if state
             .subscribers
             .values()
@@ -170,6 +182,16 @@ impl SharedDecodeSession {
         } else {
             self.control.play();
         }
+    }
+
+    pub(super) fn set_volume(&self, session_id: u64, volume: f64) {
+        let state = self.fanout.state.lock();
+        if let Some(subscriber) = state.subscribers.get(&session_id) {
+            subscriber
+                .volume
+                .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+        }
+        self.update_playback(&state);
     }
 
     pub(super) fn release(self: &Arc<Self>, session_id: u64) -> anyhow::Result<()> {
@@ -460,6 +482,7 @@ mod tests {
             first_frame_sent: AtomicBool::new(false),
             active: AtomicBool::new(true),
             paused: AtomicBool::new(false),
+            volume: AtomicU64::new(0.0f64.to_bits()),
             creation_start: Instant::now(),
         })
     }
