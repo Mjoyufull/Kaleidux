@@ -95,6 +95,16 @@ pub(super) fn apply_fast_gpu_options(init: &MpvInitializer) {
     set_optional(init, "audio-file-auto", "no");
     set_optional(init, "demuxer-thread", false);
     set_optional(init, "cache", false);
+    // Local wallpapers do not benefit from mpv's large network-oriented
+    // forward/backward packet caches. Keep ordinary playback bounded too.
+    set_optional(init, "demuxer-max-bytes", 32i64 * 1024 * 1024);
+    set_optional(init, "demuxer-max-back-bytes", 4i64 * 1024 * 1024);
+    set_optional(init, "demuxer-readahead-secs", 1.0f64);
+    if crate::media_policy::streamed() {
+        set_optional(init, "demuxer-max-bytes", 8i64 * 1024 * 1024);
+        set_optional(init, "demuxer-max-back-bytes", 1024i64 * 1024);
+        set_optional(init, "demuxer-readahead-secs", 0.5f64);
+    }
     set_optional(init, "vd-lavc-threads", 1i64);
     set_optional(init, "vd-lavc-fast", true);
     // mpv otherwise aspect-fits into the offscreen target and permanently

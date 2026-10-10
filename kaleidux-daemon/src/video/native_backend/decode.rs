@@ -1,7 +1,7 @@
 use super::capabilities::{HardwareDecoderChoice, NativeDecoderApi, NativePathTier};
 use super::control::NativePlaybackControl;
-use super::decoder_open::DecoderInstance;
 use super::frame_copy::NativeFrameConverter;
+use super::gpu_delivery::receive_frames;
 use crate::metrics::PerformanceMetrics;
 use crate::observability::video_backend::VideoBackendMetricKind;
 use crate::video::VideoFrame;
@@ -25,18 +25,19 @@ pub struct NativeDecodeConfig {
     pub creation_start: Instant,
 }
 
-struct DecodeState {
-    converter: NativeFrameConverter,
-    surface_exporter: super::dmabuf::NativeSurfaceExporter,
-    transfer_frame: Video,
-    first_frame_decoded: bool,
-    surface_export_warning_emitted: bool,
-    timeline: PlaybackTimeline,
-    last_publish_ns: AtomicU64,
+pub(super) struct DecodeState {
+    pub(super) converter: NativeFrameConverter,
+    pub(super) surface_exporter: super::dmabuf::NativeSurfaceExporter,
+    pub(super) transfer_frame: Video,
+    pub(super) first_frame_decoded: bool,
+    pub(super) surface_export_warning_emitted: bool,
+    pub(super) surface_export_disabled: bool,
+    pub(super) timeline: PlaybackTimeline,
+    pub(super) last_publish_ns: AtomicU64,
 }
 
 #[derive(Default)]
-struct PlaybackTimeline {
+pub(super) struct PlaybackTimeline {
     epoch: u64,
     media_anchor_ns: u64,
     wall_anchor: Option<Instant>,
@@ -48,32 +49,43 @@ pub fn run(config: NativeDecodeConfig) {
         return;
     }
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Error);
+    let _audio = super::audio::AudioWorker::spawn(&config.uri, config.control.clone());
 
-    let hardware_result = run_session(&config, true);
-    if hardware_result.is_ok() || config.control.is_stopped() {
-        return;
-    }
-
-    let hardware_error = hardware_result.expect_err("checked above");
-    warn!(
-        "[NATIVE-VIDEO] {} session={} hardware path failed: {hardware_error:#}; reopening with software decode",
-        config.source_id, config.session_id
-    );
-    config
-        .metrics
-        .record_video_backend_metric(VideoBackendMetricKind::NativeDecodeError);
-    if let Err(error) = run_session(&config, false)
-        && !config.control.is_stopped()
-    {
-        report_fatal(
-            &config,
-            format!("native FFmpeg decode failed after software fallback: {error:#}"),
-        );
+    let mut rejected = Vec::new();
+    loop {
+        let mut attempted = None;
+        match run_session(&config, &rejected, &mut attempted) {
+            Ok(()) => return,
+            Err(_) if config.control.is_stopped() => return,
+            Err(error) => {
+                config
+                    .metrics
+                    .record_video_backend_metric(VideoBackendMetricKind::NativeDecodeError);
+                if let Some(api) = attempted {
+                    warn!(
+                        "[NATIVE-VIDEO] {} session={} {} failed: {error:#}; trying the next supported decoder",
+                        config.source_id,
+                        config.session_id,
+                        api.label()
+                    );
+                    rejected.push(api);
+                } else {
+                    report_fatal(&config, format!("native FFmpeg decode failed: {error:#}"));
+                    return;
+                }
+            }
+        }
     }
 }
 
-fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Result<()> {
-    let mut input = ffmpeg::format::input(&config.uri)?;
+fn run_session(
+    config: &NativeDecodeConfig,
+    rejected: &[NativeDecoderApi],
+    attempted: &mut Option<NativeDecoderApi>,
+) -> anyhow::Result<()> {
+    let stop_control = config.control.clone();
+    let mut input =
+        ffmpeg::format::input_with_interrupt(&config.uri, move || stop_control.is_stopped())?;
     let (stream_index, stream_time_base, average_rate, parameters, codec_id) = {
         let stream = input
             .streams()
@@ -91,8 +103,8 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
     };
     discard_unselected_streams(&mut input, stream_index);
 
-    let mut decoder =
-        super::decoder_open::open_decoder(parameters, stream_time_base, allow_hardware)?;
+    let mut decoder = super::decoder_open::open_decoder(parameters, stream_time_base, rejected)?;
+    *attempted = decoder.hardware.map(|choice| choice.api);
     let actual_tier = selected_tier(decoder.hardware);
     let decoder_label = decoder
         .hardware
@@ -119,6 +131,7 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
         transfer_frame: Video::empty(),
         first_frame_decoded: false,
         surface_export_warning_emitted: false,
+        surface_export_disabled: false,
         timeline: PlaybackTimeline::default(),
         last_publish_ns: AtomicU64::new(super::super::NEVER_PUBLISHED_NS),
     };
@@ -128,13 +141,13 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
     let mut packet = ffmpeg::Packet::empty();
     let mut eof_sent = false;
 
-    if !allow_hardware {
+    if !rejected.is_empty() {
         let position = config.control.position_ns();
         if position > 0
             && let Err(error) = seek_input(&mut input, &mut decoder.decoder, position)
         {
             warn!(
-                "[NATIVE-VIDEO] {}: software fallback cannot restore playback position: {error:#}; continuing from reopened input",
+                "[NATIVE-VIDEO] {}: decoder fallback cannot restore playback position: {error:#}; continuing from reopened input",
                 config.source_id
             );
         }
@@ -177,7 +190,7 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
             input.seek(0, ..)?;
             decoder.decoder.flush();
             state.timeline = PlaybackTimeline::default();
-            config.control.set_position_ns(0);
+            config.control.looped();
             eof_sent = false;
             continue;
         }
@@ -216,7 +229,10 @@ fn run_session(config: &NativeDecodeConfig, allow_hardware: bool) -> anyhow::Res
     }
 }
 
-fn discard_unselected_streams(input: &mut ffmpeg::format::context::Input, selected: usize) {
+pub(super) fn discard_unselected_streams(
+    input: &mut ffmpeg::format::context::Input,
+    selected: usize,
+) {
     // SAFETY: libavformat owns a contiguous `nb_streams` array for the live
     // input context. We only update AVStream's documented discard policy and
     // retain the selected video stream unchanged.
@@ -237,128 +253,28 @@ fn discard_unselected_streams(input: &mut ffmpeg::format::context::Input, select
     }
 }
 
-fn receive_frames(
-    config: &NativeDecodeConfig,
-    decoder: &mut DecoderInstance,
-    state: &mut DecodeState,
-    time_base: ffmpeg::Rational,
-    default_duration_ns: Option<u64>,
-) -> anyhow::Result<bool> {
-    let mut decoded = state.surface_exporter.acquire_decode_frame();
-    loop {
-        if let Err(error) = decoder.decoder.receive_frame(&mut decoded) {
-            state.surface_exporter.recycle_decode_frame(decoded);
-            return match error {
-                ffmpeg::Error::Eof => Ok(false),
-                ffmpeg::Error::Other { errno } if errno == ffmpeg::error::EAGAIN => Ok(false),
-                error => Err(error.into()),
-            };
-        }
-        let pts_ns = decoded
-            .timestamp()
-            .or_else(|| decoded.pts())
-            .and_then(|timestamp| timestamp_to_ns(timestamp, time_base));
-        let duration_ns =
-            duration_to_ns(decoded.packet().duration, time_base).or(default_duration_ns);
-
-        if state.first_frame_decoded && !pace_frame(config, &mut state.timeline, pts_ns) {
-            state.surface_exporter.recycle_decode_frame(decoded);
-            return Ok(true);
-        }
-        if config.control.is_stopped() {
-            state.surface_exporter.recycle_decode_frame(decoded);
-            return Ok(true);
-        }
-
-        let hardware_frame = decoder.hardware.is_some_and(|choice| {
-            let decoded_format: ffi::AVPixelFormat = decoded.format().into();
-            decoded_format == choice.pixel_format
-        });
-        let surface_api = decoder.hardware.map(|choice| choice.api).filter(|api| {
-            hardware_frame
-                && super::native_storage_format(&decoded) == ffmpeg::format::Pixel::NV12
-                && matches!(api, NativeDecoderApi::Vaapi)
-                && surface_export_enabled()
-        });
-        let (frame, decoded_to_recycle) = if let Some(surface_api) = surface_api {
-            match state.surface_exporter.export_hardware_nv12(
-                decoded,
-                surface_api,
-                config.session_id,
-                pts_ns,
-                duration_ns,
-            ) {
-                Ok(frame) => {
-                    config
-                        .metrics
-                        .record_video_backend_metric(VideoBackendMetricKind::NativeSurfaceExported);
-                    (frame, None)
-                }
-                Err((error, decoded)) => {
-                    if !state.surface_export_warning_emitted {
-                        warn!(
-                            "[NATIVE-PATH] {} session={} {} surface export rejected ({error:#}); degrading to hardware-transfer",
-                            config.source_id,
-                            config.session_id,
-                            surface_api.label()
-                        );
-                        state.surface_export_warning_emitted = true;
-                    }
-                    transfer_hardware_frame(&decoded, &mut state.transfer_frame, decoder.hardware)?;
-                    let frame = state.converter.convert(
-                        &state.transfer_frame,
-                        config.session_id,
-                        pts_ns,
-                        duration_ns,
-                    )?;
-                    (frame, Some(decoded))
-                }
-            }
-        } else {
-            let frame = if hardware_frame {
-                transfer_hardware_frame(&decoded, &mut state.transfer_frame, decoder.hardware)?;
-                state.converter.convert(
-                    &state.transfer_frame,
-                    config.session_id,
-                    pts_ns,
-                    duration_ns,
-                )?
-            } else {
-                state
-                    .converter
-                    .convert(&decoded, config.session_id, pts_ns, duration_ns)?
-            };
-            (frame, Some(decoded))
-        };
-        if let Some(decoded) = decoded_to_recycle {
-            state.surface_exporter.recycle_decode_frame(decoded);
-        }
-        if let Some(pts_ns) = pts_ns {
-            config.control.set_position_ns(pts_ns);
-        }
-        if publish_frame(config, state, frame) {
-            return Ok(true);
-        }
-        decoded = state.surface_exporter.acquire_decode_frame();
-    }
-}
-
-fn surface_export_enabled() -> bool {
-    super::native_surface_import_available()
-        && std::env::var("KLD_NATIVE_SURFACE_IMPORT")
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true)
+pub(super) fn surface_export_enabled(api: NativeDecoderApi) -> bool {
+    (if api == NativeDecoderApi::Nvdec {
+        super::native_cuda_import_available()
+    } else {
+        super::native_surface_import_available()
+    }) && std::env::var("KLD_NATIVE_SURFACE_IMPORT")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 pub(super) fn selected_tier(hardware: Option<HardwareDecoderChoice>) -> NativePathTier {
     match hardware {
         Some(choice)
-            if matches!(choice.api, NativeDecoderApi::Vaapi) && surface_export_enabled() =>
+            if matches!(
+                choice.api,
+                NativeDecoderApi::Vaapi | NativeDecoderApi::Nvdec | NativeDecoderApi::VulkanVideo
+            ) && surface_export_enabled(choice.api) =>
         {
             NativePathTier::SingleGpuCopy
         }
@@ -367,43 +283,11 @@ pub(super) fn selected_tier(hardware: Option<HardwareDecoderChoice>) -> NativePa
     }
 }
 
-fn transfer_hardware_frame(
-    decoded: &Video,
-    software: &mut Video,
-    hardware: Option<HardwareDecoderChoice>,
-) -> anyhow::Result<()> {
-    let choice = hardware.ok_or_else(|| anyhow::anyhow!("hardware transfer without decoder"))?;
-    let decoded_format: ffi::AVPixelFormat = decoded.format().into();
-    if decoded_format != choice.pixel_format {
-        anyhow::bail!(
-            "{} decoder returned unexpected software frame to hardware transfer path",
-            choice.api.label()
-        );
-    }
-    // SAFETY: the scratch wrapper is worker-owned. Unref releases the previous
-    // hardware-transfer buffers while retaining the reusable AVFrame object.
-    unsafe { ffi::av_frame_unref(software.as_mut_ptr()) };
-    // SAFETY: both AVFrames are valid; FFmpeg allocates the destination
-    // buffers and performs the device-to-host transfer synchronously.
-    let result =
-        unsafe { ffi::av_hwframe_transfer_data(software.as_mut_ptr(), decoded.as_ptr(), 0) };
-    if result < 0 {
-        anyhow::bail!(
-            "{} hardware frame transfer failed with FFmpeg error {}",
-            choice.api.label(),
-            result
-        );
-    }
-    // Transfer the negotiated colorimetry, timestamps, and frame metadata once
-    // so downstream YUV shaders do not silently fall back to defaults.
-    let props_result = unsafe { ffi::av_frame_copy_props(software.as_mut_ptr(), decoded.as_ptr()) };
-    if props_result < 0 {
-        anyhow::bail!("copying hardware frame properties failed with FFmpeg error {props_result}");
-    }
-    Ok(())
-}
-
-fn publish_frame(config: &NativeDecodeConfig, state: &mut DecodeState, frame: VideoFrame) -> bool {
+pub(super) fn publish_frame(
+    config: &NativeDecodeConfig,
+    state: &mut DecodeState,
+    frame: VideoFrame,
+) -> bool {
     if !state.first_frame_decoded {
         info!(
             "[VIDEO] {}: Actual native decode path={} frame={}x{} session={} color={:?} geometry={:?}",
@@ -434,7 +318,7 @@ fn publish_frame(config: &NativeDecodeConfig, state: &mut DecodeState, frame: Vi
     true
 }
 
-fn pace_frame(
+pub(super) fn pace_frame(
     config: &NativeDecodeConfig,
     timeline: &mut PlaybackTimeline,
     pts_ns: Option<u64>,
@@ -450,8 +334,14 @@ fn pace_frame(
         timeline.wall_anchor = Some(Instant::now());
         return true;
     }
-    let due = timeline.wall_anchor.expect("checked above")
-        + Duration::from_nanos(pts_ns.saturating_sub(timeline.media_anchor_ns));
+    let due = if let Some(audio_position) = config.control.audio_position_ns() {
+        // Audio output is the master while its clock is healthy. Extrapolated
+        // observations avoid a GStreamer query on every video frame.
+        Instant::now() + Duration::from_nanos(pts_ns.saturating_sub(audio_position))
+    } else {
+        timeline.wall_anchor.expect("checked above")
+            + Duration::from_nanos(pts_ns.saturating_sub(timeline.media_anchor_ns))
+    };
     while Instant::now() < due {
         if !config.control.wait_until(due) {
             return false;
@@ -483,7 +373,7 @@ fn seek_input(
     Ok(())
 }
 
-fn timestamp_to_ns(timestamp: i64, time_base: ffmpeg::Rational) -> Option<u64> {
+pub(super) fn timestamp_to_ns(timestamp: i64, time_base: ffmpeg::Rational) -> Option<u64> {
     if timestamp < 0 || time_base.denominator() <= 0 || time_base.numerator() <= 0 {
         return None;
     }
@@ -494,7 +384,7 @@ fn timestamp_to_ns(timestamp: i64, time_base: ffmpeg::Rational) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
-fn duration_to_ns(duration: i64, time_base: ffmpeg::Rational) -> Option<u64> {
+pub(super) fn duration_to_ns(duration: i64, time_base: ffmpeg::Rational) -> Option<u64> {
     (duration > 0)
         .then(|| timestamp_to_ns(duration, time_base))
         .flatten()

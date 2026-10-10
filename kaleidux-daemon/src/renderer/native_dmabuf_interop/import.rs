@@ -1,7 +1,7 @@
 use crate::video::NativeDmaBufNv12;
 use ash::vk;
 use std::hash::{Hash, Hasher};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -23,8 +23,8 @@ pub(super) struct ImportedLayer {
 
 impl Drop for ImportedLayer {
     fn drop(&mut self) {
-        // SAFETY: NativeDmaBufInterop waits for the device before its cache is
-        // dropped, and these handles were allocated from this exact device.
+        // SAFETY: NativeDmaBufInterop retains this cache until submitted queue
+        // work completes. The handles belong to this exact device.
         unsafe {
             self.device.destroy_image(self.image, None);
             for memory in self.memories.drain(..) {
@@ -398,4 +398,33 @@ pub(super) fn descriptor_key(descriptor: &NativeDmaBufNv12, width: u32, height: 
     width.hash(&mut hasher);
     height.hash(&mut hasher);
     hasher.finish()
+}
+
+pub(super) fn import_producer_fence(
+    external_semaphore_fd: &ash::khr::external_semaphore_fd::Device,
+    semaphore: vk::Semaphore,
+    fence: Option<&OwnedFd>,
+) -> anyhow::Result<bool> {
+    let Some(fence) = fence else {
+        return Ok(false);
+    };
+    // Vulkan consumes a SYNC_FD import on success, so preserve the frame's
+    // immutable descriptor by importing a CLOEXEC duplicate.
+    let imported_fd = unsafe { libc::fcntl(fence.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if imported_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(imported_fd);
+    if let Err(error) = unsafe { external_semaphore_fd.import_semaphore_fd(&info) } {
+        // Failed imports do not transfer descriptor ownership.
+        unsafe { libc::close(imported_fd) };
+        return Err(anyhow::anyhow!(
+            "importing DMA-BUF producer sync_file: {error:?}"
+        ));
+    }
+    Ok(true)
 }

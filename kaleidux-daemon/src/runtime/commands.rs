@@ -32,23 +32,73 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         mpv_native_targets,
         mpv_composed_targets,
     } = ctx;
+    let target = match &req {
+        Request::Jump { output, .. }
+        | Request::Set { output, .. }
+        | Request::Img { output, .. }
+        | Request::Next { output }
+        | Request::Prev { output }
+        | Request::Clear { output }
+        | Request::History { output } => Some(output.clone()),
+        _ => None,
+    };
+    let selected_output = if let Some(target) = target {
+        match monitor_manager.command_output(
+            target,
+            renderers
+                .iter()
+                .map(|(name, renderer)| (name, renderer.config.width, renderer.config.height)),
+        ) {
+            Ok(output) => output,
+            Err(error) => return Response::Error(error.to_string()),
+        }
+    } else {
+        None
+    };
+    let req = match req {
+        Request::Jump { path, .. } => Request::Jump {
+            path,
+            output: selected_output,
+        },
+        Request::Set { path, .. } => Request::Set {
+            path,
+            output: selected_output,
+        },
+        Request::Img { path, .. } => Request::Img {
+            path,
+            output: selected_output,
+        },
+        Request::Next { .. } => Request::Next {
+            output: selected_output,
+        },
+        Request::Prev { .. } => Request::Prev {
+            output: selected_output,
+        },
+        Request::Clear { .. } => Request::Clear {
+            output: selected_output,
+        },
+        Request::History { .. } => Request::History {
+            output: selected_output,
+        },
+        request => request,
+    };
     let req = match req {
         Request::Jump { path, output } => {
-            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, Some(true))
+            if let Err(error) = monitor_manager.prepare_media_selection(&path, &output, Some(true))
             {
                 return Response::Error(error.to_string());
             }
             Request::Next { output }
         }
         Request::Set { path, output } => {
-            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, Some(false))
+            if let Err(error) = monitor_manager.prepare_media_selection(&path, &output, Some(false))
             {
                 return Response::Error(error.to_string());
             }
             Request::Next { output }
         }
         Request::Img { path, output } => {
-            if let Err(error) = monitor_manager.prepare_image_selection(&path, &output, None) {
+            if let Err(error) = monitor_manager.prepare_media_selection(&path, &output, None) {
                 return Response::Error(error.to_string());
             }
             Request::Next { output }

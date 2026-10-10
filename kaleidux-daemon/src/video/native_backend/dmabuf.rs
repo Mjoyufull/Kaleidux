@@ -1,4 +1,5 @@
 use super::capabilities::NativeDecoderApi;
+use super::drm_mapping::map_drm_prime_layout;
 use crate::video::{
     NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane, VideoFrame, VideoFrameFormat,
     VideoFrameStorage,
@@ -28,10 +29,10 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 const DRM_FORMAT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
 
 #[derive(Clone)]
-struct CachedSurfaceLayout {
-    objects: Arc<[NativeDmaBufObject]>,
-    planes: [NativeDmaBufPlane; 2],
-    stride: u32,
+pub(super) struct CachedSurfaceLayout {
+    pub(super) objects: Arc<[NativeDmaBufObject]>,
+    pub(super) planes: [NativeDmaBufPlane; 2],
+    pub(super) stride: u32,
 }
 
 pub struct NativeSurfaceExporter {
@@ -42,7 +43,12 @@ pub struct NativeSurfaceExporter {
 
 const MAX_REUSABLE_FRAMES: usize = 16;
 
-struct RecycledNativeFrame {
+struct MappedNativeFrame {
+    _mapped: Video,
+    _decoded: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+pub(super) struct RecycledNativeFrame {
     frame: Option<Video>,
     pool: Arc<parking_lot::Mutex<Vec<Video>>>,
 }
@@ -64,6 +70,12 @@ impl Drop for RecycledNativeFrame {
 }
 
 impl NativeSurfaceExporter {
+    pub(super) fn retain_frame(&self, frame: Video) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::new(RecycledNativeFrame {
+            frame: Some(frame),
+            pool: self.frame_pool.clone(),
+        })
+    }
     pub fn new() -> Self {
         Self {
             layouts: HashMap::new(),
@@ -120,7 +132,18 @@ impl NativeSurfaceExporter {
             width,
             height,
         };
-        let layout = if let Some(layout) = self.layouts.get(&layout_key) {
+        // Vulkan mapping performs timeline waits and transfers ownership for
+        // each decode. Reusing only its fd layout would skip that handoff.
+        let mut mapped_lease = None;
+        let layout = if api == NativeDecoderApi::VulkanVideo {
+            match map_drm_prime_layout(&decoded, api) {
+                Ok((layout, mapped)) => {
+                    mapped_lease = Some(mapped);
+                    layout
+                }
+                Err(error) => return Err((error, decoded)),
+            }
+        } else if let Some(layout) = self.layouts.get(&layout_key) {
             if let Some(position) = self.layout_order.iter().position(|key| key == &layout_key) {
                 self.layout_order.remove(position);
             }
@@ -141,14 +164,26 @@ impl NativeSurfaceExporter {
             layout
         };
 
+        let acquire_fence = if api == NativeDecoderApi::VulkanVideo {
+            match crate::video::dmabuf::export_implicit_read_fence(&layout.objects) {
+                Ok(fence) => Some(Arc::new(fence)),
+                Err(error) => return Err((error, decoded)),
+            }
+        } else {
+            None
+        };
+        let retained = self.retain_frame(decoded);
+        let owner = if let Some(mapped) = mapped_lease {
+            Arc::new(MappedNativeFrame {
+                _mapped: mapped,
+                _decoded: retained,
+            }) as Arc<dyn std::any::Any + Send + Sync>
+        } else {
+            retained
+        };
         Ok(VideoFrame {
-            // Move the received AVFrame into storage instead of cloning it per
-            // frame. The owner still retains the decoder surface until the
-            // compositor release/copy fence, with no av_frame_clone allocation.
-            storage: VideoFrameStorage::Native(Arc::new(RecycledNativeFrame {
-                frame: Some(decoded),
-                pool: self.frame_pool.clone(),
-            })),
+            // Drop the map only after the renderer's copy fence releases storage.
+            storage: VideoFrameStorage::Native(owner),
             width,
             height,
             stride: layout.stride,
@@ -159,7 +194,7 @@ impl NativeSurfaceExporter {
                     planes: layout.planes,
                     // Decoder-native VA surfaces are synchronized before
                     // export. Vulkan bridge frames carry an explicit fence.
-                    acquire_fence: None,
+                    acquire_fence,
                     drm_syncobj: None,
                 },
             },
@@ -196,104 +231,7 @@ fn map_surface_layout(
             ),
         }
     }
-    map_drm_prime_layout(decoded, api)
-}
-
-fn map_drm_prime_layout(
-    decoded: &Video,
-    api: NativeDecoderApi,
-) -> anyhow::Result<CachedSurfaceLayout> {
-    let mut mapped = Video::empty();
-    // SAFETY: setting the requested destination format before av_hwframe_map is
-    // FFmpeg's documented way to request an AVDRMFrameDescriptor.
-    unsafe {
-        (*mapped.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-    }
-    // SAFETY: both frames remain live for the call. The returned mapped frame
-    // owns a reference to the decoder surface until its AVFrame is dropped.
-    let result = unsafe {
-        ffi::av_hwframe_map(
-            mapped.as_mut_ptr(),
-            decoded.as_ptr(),
-            ffi::AV_HWFRAME_MAP_READ as i32,
-        )
-    };
-    if result < 0 {
-        anyhow::bail!(
-            "{} -> DRM PRIME map failed with FFmpeg error {result}",
-            api.label()
-        );
-    }
-
-    // SAFETY: DRM_PRIME frames carry AVDRMFrameDescriptor in data[0].
-    let descriptor_ptr = unsafe { (*mapped.as_ptr()).data[0] as *const ffi::AVDRMFrameDescriptor };
-    if descriptor_ptr.is_null() {
-        anyhow::bail!("FFmpeg returned a DRM PRIME frame without a descriptor");
-    }
-    // SAFETY: the descriptor is owned by `mapped`, which is retained below.
-    let descriptor = unsafe { &*descriptor_ptr };
-    let object_count = usize::try_from(descriptor.nb_objects)
-        .ok()
-        .filter(|count| (1..=4).contains(count))
-        .ok_or_else(|| anyhow::anyhow!("invalid DRM object count {}", descriptor.nb_objects))?;
-    let layer_count = usize::try_from(descriptor.nb_layers)
-        .ok()
-        .filter(|count| (1..=4).contains(count))
-        .ok_or_else(|| anyhow::anyhow!("invalid DRM layer count {}", descriptor.nb_layers))?;
-
-    let mut objects = Vec::with_capacity(object_count);
-    for object in descriptor.objects.iter().take(object_count) {
-        // SAFETY: dup creates ownership independent of the mapped AVFrame.
-        let duplicated = unsafe { libc::dup(object.fd) };
-        if duplicated < 0 {
-            anyhow::bail!("failed to duplicate DRM PRIME object fd {}", object.fd);
-        }
-        // SAFETY: `duplicated` is a fresh descriptor owned by this function.
-        let fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
-        objects.push(NativeDmaBufObject {
-            fd,
-            size: object.size as u64,
-            modifier: object.format_modifier,
-        });
-    }
-
-    let mut planes = Vec::with_capacity(2);
-    for (layer_index, layer) in descriptor.layers.iter().take(layer_count).enumerate() {
-        let plane_count = usize::try_from(layer.nb_planes)
-            .ok()
-            .filter(|count| (1..=4).contains(count))
-            .ok_or_else(|| anyhow::anyhow!("invalid DRM plane count {}", layer.nb_planes))?;
-        for plane in layer.planes.iter().take(plane_count) {
-            let object_index = usize::try_from(plane.object_index)
-                .ok()
-                .filter(|index| *index < object_count)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("DRM plane references invalid object {}", plane.object_index)
-                })?;
-            planes.push(NativeDmaBufPlane {
-                layer_index,
-                object_index,
-                offset: u64::try_from(plane.offset)
-                    .map_err(|_| anyhow::anyhow!("negative DRM plane offset"))?,
-                pitch: u64::try_from(plane.pitch)
-                    .map_err(|_| anyhow::anyhow!("negative DRM plane pitch"))?,
-                drm_fourcc: layer.format,
-            });
-        }
-    }
-    let planes: [NativeDmaBufPlane; 2] = planes.try_into().map_err(|planes: Vec<_>| {
-        anyhow::anyhow!(
-            "NV12 DRM PRIME export returned {} planes instead of 2",
-            planes.len()
-        )
-    })?;
-    let stride = u32::try_from(planes[0].pitch)
-        .map_err(|_| anyhow::anyhow!("DRM luma pitch exceeds u32"))?;
-    Ok(CachedSurfaceLayout {
-        objects: objects.into(),
-        planes,
-        stride,
-    })
+    map_drm_prime_layout(decoded, api).map(|(layout, _mapped)| layout)
 }
 
 #[repr(C)]

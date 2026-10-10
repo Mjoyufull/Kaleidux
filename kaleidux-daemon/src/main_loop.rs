@@ -447,11 +447,29 @@ impl MainLoopContext {
         background::close_global_work();
 
         let stop_players_start = Instant::now();
-        for (_, mut player) in self.video_players.drain() {
-            let _ = player.request_stop();
+        let players: Vec<_> = self
+            .video_players
+            .drain()
+            .chain(self.pending_image_video_stops.drain())
+            .map(|(_, player)| player)
+            .collect();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mut player in players {
+                let _ = player.request_stop();
+            }
+            let _ = stopped_tx.send(());
+        });
+        // Driver/library calls cannot be cancelled after entry. Retain their
+        // owned players on a retirement thread and bound the daemon's wait.
+        let stop_deadline = Instant::now() + Duration::from_secs(1);
+        while stopped_rx.try_recv().is_err() && Instant::now() < stop_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        for (_, mut player) in self.pending_image_video_stops.drain() {
-            let _ = player.request_stop();
+        if Instant::now() >= stop_deadline {
+            warn!(
+                "[SHUTDOWN] player retirement exceeded 1s; resources remain owned by retirement thread"
+            );
         }
         let stop_players_duration = stop_players_start.elapsed();
 
@@ -470,6 +488,8 @@ impl MainLoopContext {
         self.mpv_composed_targets.clear();
         self.renderers.clear();
         if let Some(ctx) = &self.wgpu_ctx {
+            // Run nonblocking completion callbacks for retired GL semaphores.
+            ctx.device.poll(wgpu::Maintain::Poll);
             ctx.persist_pipeline_cache();
         }
         self.wgpu_ctx = None;

@@ -33,6 +33,8 @@ pub struct NativePlaybackControl {
     seek_pending: AtomicBool,
     position_ns: AtomicU64,
     play_epoch: AtomicU64,
+    volume: AtomicU64,
+    audio_clock: Mutex<Option<(u64, Instant, u64)>>,
 }
 
 impl NativePlaybackControl {
@@ -49,6 +51,8 @@ impl NativePlaybackControl {
             seek_pending: AtomicBool::new(false),
             position_ns: AtomicU64::new(0),
             play_epoch: AtomicU64::new(0),
+            volume: AtomicU64::new(0.0f64.to_bits()),
+            audio_clock: Mutex::new(None),
         }
     }
 
@@ -89,6 +93,9 @@ impl NativePlaybackControl {
         let mut state = self.state.lock();
         state.seek_ns = Some(position_ns);
         state.frame_demanded = true;
+        // Audio observes the epoch independently of the video worker. Publish
+        // the requested position before waking either decoder.
+        self.set_position_ns(position_ns);
         self.seek_pending.store(true, Ordering::Release);
         self.play_epoch.fetch_add(1, Ordering::Relaxed);
         drop(state);
@@ -178,11 +185,90 @@ impl NativePlaybackControl {
     pub fn play_epoch(&self) -> u64 {
         self.play_epoch.load(Ordering::Relaxed)
     }
+
+    pub fn volume(&self) -> f64 {
+        f64::from_bits(self.volume.load(Ordering::Acquire))
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        self.volume
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+        self.notify_audio();
+    }
+
+    pub fn notify_audio(&self) {
+        // Pair notification with the waiter's state lock to avoid lost wakes.
+        let guard = self.state.lock();
+        self.wake.notify_all();
+        drop(guard);
+    }
+
+    pub fn wait_for_audio(&self, stopped: &AtomicBool) -> bool {
+        let mut state = self.state.lock();
+        while (state.playback != PlaybackState::Playing || self.volume() == 0.0)
+            && state.playback != PlaybackState::Stopped
+            && !stopped.load(Ordering::Acquire)
+        {
+            self.wake.wait(&mut state);
+        }
+        state.playback != PlaybackState::Stopped && !stopped.load(Ordering::Acquire)
+    }
+
+    pub fn looped(&self) {
+        self.set_position_ns(0);
+        self.play_epoch.fetch_add(1, Ordering::Release);
+        self.notify_audio();
+    }
+
+    pub fn update_audio_clock(&self, position: Option<u64>) {
+        *self.audio_clock.lock() =
+            position.map(|position| (position, Instant::now(), self.play_epoch()));
+    }
+
+    pub fn audio_position_ns(&self) -> Option<u64> {
+        let clock = self.audio_clock.lock();
+        let (position, observed, epoch) = (*clock)?;
+        let age = observed.elapsed();
+        (epoch == self.play_epoch()
+            && self.is_playing()
+            && self.volume() > 0.0
+            && age < std::time::Duration::from_millis(200))
+        .then(|| position.saturating_add(age.as_nanos().min(u64::MAX as u128) as u64))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::NativePlaybackControl;
+
+    #[test]
+    fn audio_clock_is_ignored_while_muted_paused_or_after_seek() {
+        let control = NativePlaybackControl::new();
+        control.play();
+        control.update_audio_clock(Some(1_000_000_000));
+        assert!(control.audio_position_ns().is_none());
+        control.set_volume(0.5);
+        assert!(control.audio_position_ns().unwrap() >= 1_000_000_000);
+        control.seek(4_000_000_000);
+        assert_eq!(control.position_ns(), 4_000_000_000);
+        assert!(control.audio_position_ns().is_none());
+        control.update_audio_clock(Some(4_000_000_000));
+        control.pause();
+        assert!(control.audio_position_ns().is_none());
+    }
+
+    #[test]
+    fn audio_wait_ends_on_retirement_without_stopping_video() {
+        let control = std::sync::Arc::new(NativePlaybackControl::new());
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_control = control.clone();
+        let worker_stop = stopped.clone();
+        let worker = std::thread::spawn(move || worker_control.wait_for_audio(&worker_stop));
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        control.notify_audio();
+        assert!(!worker.join().unwrap());
+        assert!(!control.is_stopped());
+    }
 
     #[test]
     fn atomic_playback_cache_tracks_control_changes() {

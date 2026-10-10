@@ -24,8 +24,9 @@ impl SmartQueue {
             let position = self.current_index.min(self.pool.len());
             self.pool.insert(position, path.clone());
         }
-        self.content_type_cache
-            .insert(path.clone(), ContentType::Image);
+        if let Some(kind) = Self::get_content_type(&path) {
+            self.content_type_cache.insert(path.clone(), kind);
+        }
         self.forward_history.clear();
         self.forward_history.push_front(path);
     }

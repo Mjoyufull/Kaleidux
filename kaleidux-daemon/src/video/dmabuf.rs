@@ -158,7 +158,9 @@ const SYNC_IOC_MERGE: libc::c_ulong = ((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT)
     | ((b'>' as libc::c_ulong) << IOC_TYPESHIFT)
     | 3;
 
-fn export_implicit_read_fence(objects: &[NativeDmaBufObject]) -> anyhow::Result<OwnedFd> {
+pub(super) fn export_implicit_read_fence(
+    objects: &[NativeDmaBufObject],
+) -> anyhow::Result<OwnedFd> {
     let mut fences = Vec::with_capacity(objects.len());
     for object in objects {
         let mut request = DmaBufExportSyncFile {

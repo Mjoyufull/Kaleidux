@@ -14,6 +14,7 @@ pub(super) struct DecoderInstance {
 
 struct HardwareFormatSelection {
     pixel_format: ffi::AVPixelFormat,
+    export_attempted: bool,
 }
 
 // SAFETY: the hardware format value is immutable after decoder creation. The
@@ -25,6 +26,7 @@ impl HardwareFormatSelection {
     fn new(choice: HardwareDecoderChoice) -> Box<Self> {
         Box::new(Self {
             pixel_format: choice.pixel_format,
+            export_attempted: false,
         })
     }
 }
@@ -32,11 +34,11 @@ impl HardwareFormatSelection {
 pub(super) fn open_decoder(
     parameters: ffmpeg::codec::Parameters,
     stream_time_base: ffmpeg::Rational,
-    allow_hardware: bool,
+    rejected: &[super::capabilities::NativeDecoderApi],
 ) -> anyhow::Result<DecoderInstance> {
     let codec = ffmpeg::decoder::find(parameters.id()).ok_or(ffmpeg::Error::DecoderNotFound)?;
-    if allow_hardware {
-        for choice in codec_hardware_choices(unsafe { codec.as_ptr() }) {
+    for choice in codec_hardware_choices(unsafe { codec.as_ptr() }) {
+        if !rejected.contains(&choice.api) {
             match open_hardware_decoder(&parameters, codec, stream_time_base, choice) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => debug!(
@@ -131,11 +133,31 @@ unsafe extern "C" fn select_hardware_format(
             return format;
         }
         if format == selection.pixel_format {
+            if format == ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
+                && !selection.export_attempted
+                && super::decode::surface_export_enabled(
+                    super::capabilities::NativeDecoderApi::VulkanVideo,
+                )
+            {
+                selection.export_attempted = true;
+                // SAFETY: the C shim uses installed FFmpeg/Vulkan headers and
+                // owns its pool reference until it transfers it to this context.
+                let result = unsafe { kld_vulkan_export_frames(context) };
+                if result < 0 {
+                    tracing::debug!(
+                        "[NATIVE-PATH] Vulkan modifier pool unavailable: {result}; retaining default pool"
+                    );
+                }
+            }
             return format;
         }
         // SAFETY: the current entry was not the terminator.
         candidate = unsafe { candidate.add(1) };
     }
+}
+
+unsafe extern "C" {
+    fn kld_vulkan_export_frames(context: *mut ffi::AVCodecContext) -> i32;
 }
 
 fn software_decode_threads() -> usize {

@@ -68,14 +68,15 @@ mod frame_gl;
 #[path = "video/frame_mailbox.rs"]
 mod frame_mailbox;
 pub use frame::{
-    DrmSyncobjFrame, NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane, VideoChromaSiting,
-    VideoColorMatrix, VideoColorMetadata, VideoColorPrimaries, VideoColorRange,
+    DrmSyncobjFrame, NativeCudaFrame, NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane,
+    VideoChromaSiting, VideoColorMatrix, VideoColorMetadata, VideoColorPrimaries, VideoColorRange,
     VideoContentLightMetadata, VideoCropRect, VideoGeometry, VideoMasteringMetadata, VideoRotation,
     VideoTransfer,
 };
 pub use frame::{PlayerEvent, PlayerEventKind, VideoFrame, VideoFrameFormat, VideoFrameStorage};
 pub(crate) use frame_gl::GlExternalFrame;
 pub use frame_mailbox::LatestFrameMailbox;
+pub(crate) use native_backend::report_native_cuda_import_failure;
 pub(crate) use native_backend::report_native_surface_import_failure;
 pub use native_backend::{NativeDecoderApi, NativePathTier};
 
@@ -364,6 +365,12 @@ impl VideoPlayer {
         let audio_enabled = audio_enabled_for_volume(volume);
         pipeline.set_property_from_str("flags", playbin_flags_for_volume(volume));
         pipeline.set_property("message-forward", true);
+        if crate::media_policy::streamed() {
+            // Applies if the source enables buffering; local-file appsink
+            // frame queues already stay at one buffer in either policy.
+            pipeline.set_property("buffer-size", 4 * 1024 * 1024i32);
+            pipeline.set_property("buffer-duration", 500_000_000i64);
+        }
         if !audio_enabled {
             pipeline.set_property("mute", true);
             pipeline.set_property("volume", 0.0f64);

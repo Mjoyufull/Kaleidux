@@ -39,7 +39,10 @@ pub(crate) fn schedule_image_prefetch_plan(
     requests: Vec<ImagePrefetchRequest>,
     metrics: Arc<metrics::PerformanceMetrics>,
 ) {
-    if requests.is_empty() || !background::is_accepting_new_work() {
+    if crate::media_policy::streamed()
+        || requests.is_empty()
+        || !background::is_accepting_new_work()
+    {
         return;
     }
 

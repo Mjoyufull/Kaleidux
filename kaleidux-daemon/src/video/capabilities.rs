@@ -156,8 +156,11 @@ pub fn validate_video_mode_backend(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         mode == VideoMode::Auto
+            || (mode == VideoMode::ForceCpu
+                && backend == VideoBackendRequest::ForceFfmpeg
+                && video_backend_is_enabled(backend))
             || (backend == VideoBackendRequest::ForceAppsink && video_backend_is_enabled(backend)),
-        "--video-mode {} requires --video-backend appsink (Cargo feature backend-appsink); use --video-mode auto with FFmpeg or mpv",
+        "--video-mode {} requires --video-backend appsink (Cargo feature backend-appsink); FFmpeg supports auto/cpu and mpv supports auto",
         mode.cli_label()
     );
     Ok(())
@@ -516,7 +519,10 @@ mod tests {
             VideoMode::ForceNv12,
             VideoMode::ForceRgba,
         ] {
-            assert!(validate_video_mode_backend(mode, VideoBackendRequest::ForceFfmpeg).is_err());
+            assert_eq!(
+                validate_video_mode_backend(mode, VideoBackendRequest::ForceFfmpeg).is_ok(),
+                mode == VideoMode::ForceCpu && cfg!(feature = "backend-ffmpeg")
+            );
             assert!(validate_video_mode_backend(mode, VideoBackendRequest::ForceMpv).is_err());
             assert_eq!(
                 validate_video_mode_backend(mode, VideoBackendRequest::ForceAppsink).is_ok(),

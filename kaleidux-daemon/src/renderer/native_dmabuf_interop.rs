@@ -4,11 +4,15 @@ mod copy;
 mod import;
 #[path = "native_dmabuf_interop/linear.rs"]
 mod linear;
+#[path = "native_dmabuf_interop/retirement.rs"]
+mod retirement;
 
 use crate::video::{NativeDmaBufNv12, VideoFrameStorage};
 use ash::vk;
+use copy::raw_texture_handle;
+use import::import_producer_fence;
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -43,14 +47,14 @@ pub(super) struct NativeDmaBufInterop {
     external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    command_pool: vk::CommandPool,
+    command_pool: Arc<retirement::CommandPool>,
     drm_syncobj_device: Option<Arc<crate::video::drm_syncobj::DrmSyncobjDevice>>,
     sources: HashMap<u64, CachedSource>,
     active_session_id: Option<u64>,
 }
 
 impl NativeDmaBufInterop {
-    pub(super) fn new(ctx: &super::WgpuContext) -> anyhow::Result<Self> {
+    pub(super) fn new(ctx: &Arc<super::WgpuContext>) -> anyhow::Result<Self> {
         // SAFETY: all copied handles remain owned by the live WGPU context.
         let raw = unsafe {
             ctx.device
@@ -95,6 +99,12 @@ impl NativeDmaBufInterop {
                     None
                 }
             };
+        let command_pool = Arc::new(retirement::CommandPool {
+            handle: command_pool,
+            context: ctx.clone(),
+            device: device.clone(),
+            access: parking_lot::Mutex::new(()),
+        });
         Ok(Self {
             device,
             external_memory_fd,
@@ -164,6 +174,7 @@ impl NativeDmaBufInterop {
         // more after that submission establishes GENERAL, then reuse the same
         // executable command buffer for this decoder surface indefinitely.
         if !source.reusable_command {
+            let _pool_access = self.command_pool.access.lock();
             if source.has_submitted {
                 // SAFETY: the per-surface fence was awaited above.
                 unsafe {
@@ -277,6 +288,7 @@ impl NativeDmaBufInterop {
         source.try_reset(&self.device, asynchronous)?;
 
         if !source.reusable_command {
+            let _pool_access = self.command_pool.access.lock();
             if source.has_submitted {
                 unsafe {
                     self.device
@@ -396,8 +408,9 @@ impl NativeDmaBufInterop {
             width,
             height,
         )?;
+        let _pool_access = self.command_pool.access.lock();
         let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
+            .command_pool(self.command_pool.handle)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         // SAFETY: command_pool is live and retained by this object.
@@ -410,7 +423,7 @@ impl NativeDmaBufInterop {
             Err(error) => {
                 unsafe {
                     self.device
-                        .free_command_buffers(self.command_pool, &[command_buffer])
+                        .free_command_buffers(self.command_pool.handle, &[command_buffer])
                 };
                 return Err(anyhow::anyhow!("creating surface copy fence: {error:?}"));
             }
@@ -425,7 +438,7 @@ impl NativeDmaBufInterop {
                 unsafe {
                     self.device.destroy_fence(fence, None);
                     self.device
-                        .free_command_buffers(self.command_pool, &[command_buffer]);
+                        .free_command_buffers(self.command_pool.handle, &[command_buffer]);
                 }
                 return Err(anyhow::anyhow!(
                     "creating linear bridge acquire semaphore: {error:?}"
@@ -442,7 +455,7 @@ impl NativeDmaBufInterop {
                     self.device.destroy_semaphore(acquire_semaphore, None);
                     self.device.destroy_fence(fence, None);
                     self.device
-                        .free_command_buffers(self.command_pool, &[command_buffer]);
+                        .free_command_buffers(self.command_pool.handle, &[command_buffer]);
                 }
                 return Err(anyhow::anyhow!(
                     "creating DMA-BUF producer semaphore: {error:?}"
@@ -480,130 +493,16 @@ impl NativeDmaBufInterop {
     }
 
     fn clear_sources(&mut self) -> anyhow::Result<()> {
-        // Session changes occur only after the outgoing frame was snapshotted.
-        // Waiting once here lets us retire the old decoder's imported surfaces
-        // while retaining the device, command pool, and capability selection.
-        unsafe { self.device.device_wait_idle() }
-            .map_err(|error| anyhow::anyhow!("waiting to retire native session: {error:?}"))?;
-        for (_, mut source) in self.sources.drain() {
-            source.owner = None;
-            // SAFETY: the device is idle and the fence belongs to it.
-            unsafe { self.device.destroy_fence(source.fence, None) };
-            unsafe {
-                self.device
-                    .destroy_semaphore(source.acquire_semaphore, None)
-            };
-            unsafe {
-                self.device
-                    .destroy_semaphore(source.producer_semaphore, None)
-            };
-            drop(source);
-        }
-        Ok(())
-    }
-}
-
-impl CachedSource {
-    fn ensure_syncobj_timelines(
-        &mut self,
-        device: &Arc<crate::video::drm_syncobj::DrmSyncobjDevice>,
-    ) -> anyhow::Result<()> {
-        if self.syncobj_timelines.is_none() {
-            self.syncobj_timelines = Some((device.create_timeline()?, device.create_timeline()?));
-        }
-        Ok(())
-    }
-
-    fn select_copy_mode(&mut self, mode: CopyMode) {
-        if self.copy_mode != Some(mode) {
-            self.copy_mode = Some(mode);
-            self.reusable_command = false;
-        }
-    }
-
-    fn try_reset(&mut self, device: &ash::Device, nonblocking: bool) -> anyhow::Result<()> {
-        unsafe {
-            if self.has_submitted {
-                if nonblocking {
-                    anyhow::ensure!(
-                        device.get_fence_status(self.fence).unwrap_or(false),
-                        "previous linear bridge producer copy is still in flight"
-                    );
-                } else {
-                    device
-                        .wait_for_fences(std::slice::from_ref(&self.fence), true, u64::MAX)
-                        .map_err(|error| {
-                            anyhow::anyhow!("waiting for DMA-BUF surface: {error:?}")
-                        })?;
-                }
-            }
-            device
-                .reset_fences(std::slice::from_ref(&self.fence))
-                .map_err(|error| anyhow::anyhow!("resetting DMA-BUF copy fence: {error:?}"))?;
-        }
-        self.owner = None;
+        retirement::retire(
+            self.command_pool.clone(),
+            self.sources.drain().map(|(_, source)| source).collect(),
+        );
         Ok(())
     }
 }
 
 impl Drop for NativeDmaBufInterop {
     fn drop(&mut self) {
-        // Cache teardown is session-level, never per frame. Waiting here keeps
-        // both imported surfaces and command buffers valid through queued work.
-        // SAFETY: every object below belongs to this device.
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            for (_, mut source) in self.sources.drain() {
-                source.owner = None;
-                self.device.destroy_fence(source.fence, None);
-                self.device
-                    .destroy_semaphore(source.acquire_semaphore, None);
-                self.device
-                    .destroy_semaphore(source.producer_semaphore, None);
-                drop(source);
-            }
-            self.device.destroy_command_pool(self.command_pool, None);
-        }
-    }
-}
-
-fn import_producer_fence(
-    external_semaphore_fd: &ash::khr::external_semaphore_fd::Device,
-    semaphore: vk::Semaphore,
-    fence: Option<&OwnedFd>,
-) -> anyhow::Result<bool> {
-    let Some(fence) = fence else {
-        return Ok(false);
-    };
-    // Vulkan consumes a SYNC_FD import on success, so preserve the frame's
-    // immutable descriptor by importing a CLOEXEC duplicate.
-    let imported_fd = unsafe { libc::fcntl(fence.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if imported_fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let info = vk::ImportSemaphoreFdInfoKHR::default()
-        .semaphore(semaphore)
-        .flags(vk::SemaphoreImportFlags::TEMPORARY)
-        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-        .fd(imported_fd);
-    if let Err(error) = unsafe { external_semaphore_fd.import_semaphore_fd(&info) } {
-        // Failed imports do not transfer descriptor ownership.
-        unsafe { libc::close(imported_fd) };
-        return Err(anyhow::anyhow!(
-            "importing DMA-BUF producer sync_file: {error:?}"
-        ));
-    }
-    Ok(true)
-}
-
-fn raw_texture_handle(texture: &wgpu::Texture) -> anyhow::Result<vk::Image> {
-    // SAFETY: the raw handle is borrowed only for queue work while the owning
-    // WGPU texture remains live in Renderer.
-    unsafe {
-        texture.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_texture| {
-            hal_texture
-                .map(|texture| texture.raw_handle())
-                .ok_or_else(|| anyhow::anyhow!("destination WGPU texture is not Vulkan-backed"))
-        })
+        let _ = self.clear_sources();
     }
 }

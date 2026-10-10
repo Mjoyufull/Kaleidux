@@ -52,7 +52,7 @@ impl ScriptManager {
             let tx = cmd_tx.clone();
             engine.register_fn(name, move |path: String, output: String| {
                 let (resp_tx, _) = oneshot::channel();
-                let output = if output == "*" { None } else { Some(output) };
+                let output = Some(if output == "*" { "all".into() } else { output });
                 enqueue_script_command(&tx, request(path, output), resp_tx)
             });
         }
@@ -60,7 +60,7 @@ impl ScriptManager {
         let tx = cmd_tx.clone();
         engine.register_fn("next", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
-            let out = if output == "*" { None } else { Some(output) };
+            let out = Some(if output == "*" { "all".into() } else { output });
             enqueue_script_command(&tx, Request::Next { output: out }, resp_tx)
         });
 
@@ -73,7 +73,7 @@ impl ScriptManager {
         let tx = cmd_tx.clone();
         engine.register_fn("prev", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
-            let out = if output == "*" { None } else { Some(output) };
+            let out = Some(if output == "*" { "all".into() } else { output });
             enqueue_script_command(&tx, Request::Prev { output: out }, resp_tx)
         });
 
@@ -135,7 +135,7 @@ impl ScriptManager {
         let tx = cmd_tx.clone();
         engine.register_fn("clear", move |output: String| {
             let (resp_tx, _) = oneshot::channel();
-            let out = if output == "*" { None } else { Some(output) };
+            let out = Some(if output == "*" { "all".into() } else { output });
             enqueue_script_command(&tx, Request::Clear { output: out }, resp_tx)
         });
 
@@ -283,7 +283,7 @@ mod tests {
             matches!(rx.try_recv().unwrap().0, Request::Set { path, output: Some(output) } if path == "/b.png" && output == "DP-1")
         );
         assert!(
-            matches!(rx.try_recv().unwrap().0, Request::Img { path, output: None } if path == "/c.png")
+            matches!(rx.try_recv().unwrap().0, Request::Img { path, output: Some(output) } if path == "/c.png" && output == "all")
         );
     }
 
@@ -399,7 +399,7 @@ mod tests {
 
         // Now drain one and verify a command succeeds again
         let (req, _) = rx.try_recv().expect("drain queue");
-        assert!(matches!(req, Request::Next { output: None }));
+        assert!(matches!(req, Request::Next { output: Some(output) } if output == "all"));
 
         assert!(
             sm.eval(r#"inhibit("game");"#).is_ok(),
@@ -429,7 +429,7 @@ mod tests {
         assert!(sm.eval(r#"prev("*");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv prev all");
         match req {
-            Request::Prev { output } => assert_eq!(output, None),
+            Request::Prev { output } => assert_eq!(output, Some("all".into())),
             _ => panic!("unexpected request"),
         }
 
@@ -459,7 +459,7 @@ mod tests {
         assert!(sm.eval(r#"clear("*");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv clear all");
         match req {
-            Request::Clear { output } => assert_eq!(output, None),
+            Request::Clear { output } => assert_eq!(output, Some("all".into())),
             _ => panic!("unexpected request"),
         }
 

@@ -8,6 +8,10 @@
 # └─────────────────────────────────────────────────────────────────────────────┘
 
 [global]
+# Default command target: largest active output, then name; use -o all for all.
+main-monitor = "auto"
+# main-monitor = "HDMI-A-1"
+
 # Monitor behavior options:
 #   "independent"  - Each monitor has its own wallpaper queue (default)
 #   "synchronized" - All monitors show the same wallpaper

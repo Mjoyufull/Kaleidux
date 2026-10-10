@@ -4,6 +4,9 @@ use crate::queue::Playlist;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[path = "tests/media_selection.rs"]
+mod media_selection;
+
 fn test_output_config(duration: Duration) -> OutputConfig {
     OutputConfig {
         path: None,
@@ -124,9 +127,9 @@ fn apply_selected_path_skips_unknown_content_type_without_mutating_state() {
 
 fn write_test_image(dir: &std::path::Path, name: &str) -> PathBuf {
     let path = dir.join(name);
-    let mut bytes = vec![0u8; 16];
-    bytes[..4].copy_from_slice(&[0x89, b'P', b'N', b'G']);
-    std::fs::write(&path, bytes).expect("test image should be written");
+    image::RgbImage::new(2, 2)
+        .save(&path)
+        .expect("test image should be written");
     path
 }
 
@@ -143,26 +146,26 @@ fn image_commands_validate_then_select_internal_or_external_images() {
     let mut manager = make_test_manager("DP-1", cache, orch, config_for_output("DP-1", &cfg));
     assert!(
         manager
-            .prepare_image_selection(b.to_str().unwrap(), &None, Some(true))
+            .prepare_media_selection(b.to_str().unwrap(), &None, Some(true))
             .is_err()
     );
     assert!(
         manager
-            .prepare_image_selection(a.to_str().unwrap(), &Some("missing".into()), None)
+            .prepare_media_selection(a.to_str().unwrap(), &Some("missing".into()), None)
             .is_err()
     );
     manager
-        .prepare_image_selection(a.to_str().unwrap(), &None, Some(true))
+        .prepare_media_selection(a.to_str().unwrap(), &None, Some(true))
         .unwrap();
     assert_eq!(manager.handle_next(None)["DP-1"].0, a);
     manager
-        .prepare_image_selection(b.to_str().unwrap(), &None, None)
+        .prepare_media_selection(b.to_str().unwrap(), &None, None)
         .unwrap();
     assert_eq!(manager.handle_next(None)["DP-1"].0, b);
     assert_eq!(manager.handle_prev(None)["DP-1"].0, a);
     assert_eq!(manager.handle_next(None)["DP-1"].0, b);
     manager
-        .prepare_image_selection(a.to_str().unwrap(), &None, Some(false))
+        .prepare_media_selection(a.to_str().unwrap(), &None, Some(false))
         .unwrap();
     assert_eq!(manager.handle_next(None)["DP-1"].0, a);
     let alias = root.join("blocked-alias.png");
@@ -179,7 +182,7 @@ fn image_commands_validate_then_select_internal_or_external_images() {
         .insert(alias);
     assert!(
         manager
-            .prepare_image_selection(b.to_str().unwrap(), &None, None)
+            .prepare_media_selection(b.to_str().unwrap(), &None, None)
             .is_err()
     );
     manager.discovered_files_cache.insert(root.clone(), vec![a]);

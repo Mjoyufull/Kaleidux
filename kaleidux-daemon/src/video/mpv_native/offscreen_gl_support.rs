@@ -190,6 +190,7 @@ unsafe extern "C" fn mpv_get_proc_address(ctx: *mut c_void, name: *const c_char)
 #[derive(Clone, Copy)]
 pub(super) struct GlApi {
     pub(super) create_memory_objects: unsafe extern "system" fn(i32, *mut u32),
+    pub(super) memory_object_parameter_iv: unsafe extern "system" fn(u32, u32, *const i32),
     pub(super) delete_memory_objects: unsafe extern "system" fn(i32, *const u32),
     pub(super) import_memory_fd: unsafe extern "system" fn(u32, u64, u32, i32),
     pub(super) gen_semaphores: unsafe extern "system" fn(i32, *mut u32),
@@ -215,6 +216,7 @@ impl GlApi {
     pub(super) fn load(egl: &EglApi) -> anyhow::Result<Self> {
         Ok(Self {
             create_memory_objects: load_gl(egl, "glCreateMemoryObjectsEXT")?,
+            memory_object_parameter_iv: load_gl(egl, "glMemoryObjectParameterivEXT")?,
             delete_memory_objects: load_gl(egl, "glDeleteMemoryObjectsEXT")?,
             import_memory_fd: load_gl(egl, "glImportMemoryFdEXT")?,
             gen_semaphores: load_gl(egl, "glGenSemaphoresEXT")?,

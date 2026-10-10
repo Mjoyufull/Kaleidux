@@ -345,6 +345,10 @@ impl super::Renderer {
                     *uv_offset,
                     *uv_stride,
                 ) {
+                    if matches!(frame.storage, crate::video::VideoFrameStorage::Native(_)) {
+                        crate::video::report_native_cuda_import_failure();
+                        return;
+                    }
                     error!(
                         "[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload",
                         self.name

@@ -1,15 +1,23 @@
+#[path = "native_backend/audio.rs"]
+mod audio;
 #[path = "native_backend/capabilities.rs"]
 mod capabilities;
 #[path = "native_backend/control.rs"]
 mod control;
+#[path = "native_backend/cuda.rs"]
+mod cuda;
 #[path = "native_backend/decode.rs"]
 mod decode;
 #[path = "native_backend/decoder_open.rs"]
 mod decoder_open;
 #[path = "native_backend/dmabuf.rs"]
 mod dmabuf;
+#[path = "native_backend/drm_mapping.rs"]
+mod drm_mapping;
 #[path = "native_backend/frame_copy.rs"]
 mod frame_copy;
+#[path = "native_backend/gpu_delivery.rs"]
+mod gpu_delivery;
 #[path = "native_backend/shared_decode.rs"]
 mod shared_decode;
 
@@ -21,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::info;
 
 fn native_color_metadata(
     frame: &ffmpeg_next::util::frame::video::Video,
@@ -229,9 +237,18 @@ fn native_geometry(frame: &ffmpeg_next::util::frame::video::Video) -> crate::vid
 }
 
 static NATIVE_SURFACE_IMPORT_FAILED: AtomicBool = AtomicBool::new(false);
+static NATIVE_CUDA_IMPORT_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn native_surface_import_available() -> bool {
     !NATIVE_SURFACE_IMPORT_FAILED.load(Ordering::Acquire)
+}
+
+pub(crate) fn native_cuda_import_available() -> bool {
+    !NATIVE_CUDA_IMPORT_FAILED.load(Ordering::Acquire)
+}
+
+pub(crate) fn report_native_cuda_import_failure() {
+    NATIVE_CUDA_IMPORT_FAILED.store(true, Ordering::Release);
 }
 
 /// Permanently lower this process to the next rung after the renderer proves
@@ -250,7 +267,6 @@ pub struct NativePlayer {
     shared: Arc<shared_decode::SharedDecodeSession>,
     first_frame_rx: Option<Receiver<VideoFrame>>,
     subscribed: bool,
-    volume: f64,
 }
 
 impl NativePlayer {
@@ -280,13 +296,8 @@ impl NativePlayer {
                 max_publish_fps,
                 creation_start,
                 worker_name,
+                volume,
             })?;
-        if volume > f64::EPSILON {
-            warn!(
-                "[NATIVE-VIDEO] {} session={}: audio is not wired in the first experimental slice; video remains muted",
-                source_id, session_id
-            );
-        }
         Ok(Self {
             source_id,
             session_id,
@@ -294,7 +305,6 @@ impl NativePlayer {
             shared,
             first_frame_rx: Some(first_frame_rx),
             subscribed: true,
-            volume,
         })
     }
 
@@ -389,13 +399,7 @@ impl NativePlayer {
     }
 
     pub fn set_volume(&mut self, volume: f64) {
-        if volume > f64::EPSILON && self.volume <= f64::EPSILON {
-            warn!(
-                "[NATIVE-VIDEO] {} session={}: audio is not implemented in native-experimental",
-                self.source_id, self.session_id
-            );
-        }
-        self.volume = volume;
+        self.shared.set_volume(self.session_id, volume);
     }
 }
 

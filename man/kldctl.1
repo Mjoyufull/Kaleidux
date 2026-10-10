@@ -25,10 +25,10 @@ Print help information.
 Display an image inside the slideshow directory using the normal transition and history.
 .TP
 .B set PATH [-o OUTPUT]
-Insert an image into the current in-memory queue and advance to it immediately.
+Insert supported media into the current in-memory queue and advance to it immediately.
 .TP
 .B img PATH [-o OUTPUT]
-Select a slideshow image or insert an external image and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept images only and honor output groups; omitted output targets all outputs. Queue rebuilds can discard external entries.
+Select slideshow media or insert external media and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept supported images and videos and honor output groups; omitted output uses main-monitor. Use -o all for every output. Queue rebuilds can discard external entries.
 .TP
 .B status \fR(alias: \fBst\fR)
 Display the current status of the daemon, including active wallpapers and playback state.

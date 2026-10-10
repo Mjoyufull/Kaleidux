@@ -50,7 +50,7 @@ fn selected_image_overrides_random_and_preserves_back_forward_history() {
     let b = dir.join("b.png");
     let external = dir.join("external.png");
     for path in [&a, &b, &external] {
-        fs::write(path, b"fixture").unwrap();
+        image::RgbImage::new(2, 2).save(path).unwrap();
     }
     for strategy in [
         crate::orchestration::SortingStrategy::Random,

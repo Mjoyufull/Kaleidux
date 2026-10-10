@@ -82,7 +82,7 @@ kaleidux-daemon --demo
 kldctl query
 
 # Advance to next wallpaper on all monitors
-kldctl next
+kldctl next -o all
 
 # Advance to next wallpaper on a specific monitor
 kldctl next -o DP-1
@@ -104,7 +104,7 @@ kldctl stop
 kldctl clear -o DP-1
 
 # Clear wallpaper on all outputs
-kldctl clear
+kldctl clear -o all
 
 # Validate config.toml syntax without connecting to the daemon
 # Note: check-config parses TOML syntax only; it does not validate schema or types
@@ -148,7 +148,7 @@ kaleidux-daemon [OPTIONS]
 |---|---|---|---|
 | `--log` | `1`, `2`, `3`, `4`, `5` | Unset (`WARN` to stderr) | Diagnostic verbosity and file logging. Level 1 enables `WARN` plus rotating file logs under `~/.config/kaleidux/logs/`. Level 2 adds `INFO`, level 3 adds `DEBUG`, level 4 adds `TRACE`, and level 5 enables `TRACE-ALL` diagnostics (forces GStreamer trace logging and 1 ms idle polling). |
 | `--demo` | Flag | `false` | Built-in transition demo. Overrides `[any].path` to current working directory, sets duration to 10 seconds, sets video ratio to 100%, sets transition duration to 1500 ms, and selects `random` transitions. |
-| `--video-mode` | `auto`, `cpu`, `cuda`, `dmabuf`, `nv12`, `rgba` | `auto` | Force video memory and decode presentation path for the GStreamer appsink backend. Legacy aliases `cuda-strict` (maps to `cuda`) and `zero-copy` (maps to `dmabuf`) are accepted with a deprecation warning. |
+| `--video-mode` | `auto`, `cpu`, `cuda`, `dmabuf`, `nv12`, `rgba` | `auto` | Force the appsink memory/decode path; `cpu` also disables FFmpeg hardware decoding. Legacy aliases `cuda-strict` (maps to `cuda`) and `zero-copy` (maps to `dmabuf`) are accepted with a deprecation warning. |
 | `--video-backend` | `auto`, `ffmpeg`, `mpv`, `appsink` | `auto` | Select video decoding backend. Aliases: `gst`/`gstreamer` for `appsink`; `libmpv`/`mpv-experimental` for `mpv`; `native`/`native-experimental`/`ffmpeg-native`/`libav` for `ffmpeg`. |
 
 ### Backend Selection Rules and Constraints
@@ -205,9 +205,12 @@ HDMI-A-1   | 1920x1080  | /home/your-user/Videos/rain.mp4
 #### Queue Navigation
 
 ```sh
-# Advance wallpaper on all monitors
+# Advance wallpaper on the main monitor
 kldctl next
 kldctl n
+
+# Advance every monitor
+kldctl next -o all
 
 # Advance wallpaper on target monitor only
 kldctl next -o DP-1
@@ -237,7 +240,7 @@ kldctl stop
 kldctl clear -o DP-1
 
 # Clear wallpaper to black on all outputs
-kldctl clear
+kldctl clear -o all
 ```
 
 When `kldctl pause` runs, video decoders pause and the monitor scheduling loop suspends wallpaper switching timers. `kldctl resume` unfreezes the rotation timer, resumes video decoders, and submits a frame request credit to restart display presentation. If compositor outputs are powered down via DPMS, video resume is deferred until outputs power back on.
@@ -383,6 +386,7 @@ monitor-behavior = "independent"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `main-monitor` | String | `"auto"` | Default command output. Auto selects the largest active pixel area, then the lexically first name. A disconnected configured output falls back to auto. `-o all` explicitly targets all outputs. |
 | `monitor-behavior` | String or Table | `"independent"` | Output queue coordination: `"independent"`, `"synchronized"`, or `{ grouped = [["DP-1", "DP-2"]] }`. |
 | `video-ratio` | Integer `0..=100` | `50` | Default probability percentage of selecting video over image when both exist in the directory (0 = images only, 100 = videos only). |
 | `sorting` | String | `"loveit"` | Selection algorithm: `"loveit"`, `"random"`, `"ascending"`, or `"descending"`. |
@@ -622,23 +626,31 @@ Video backend selection is controlled via the `--video-backend` CLI flag or the 
 
 | Characteristic | FFmpeg (`ffmpeg`) | libmpv (`mpv`) | GStreamer appsink (`appsink`) |
 |---|---|---|---|
-| Audio Support | No (video decoding only) | Yes | Yes |
+| Audio Support | Yes (FFmpeg PCM + system audio output) | Yes | Yes |
 | Hardware Decoders | Vulkan Video, VA-API, NVDEC, QSV, D3D11/12 | VA-API, NVDEC (via mpv hwdec) | VA-API, NVDEC (via GStreamer plugins) |
-| Zero-Copy Presentation | DMA-BUF, Vulkan import | Composed GL interop (default) | CUDA-Vulkan interop, DMA-BUF |
+| GPU Frame Delivery | VA-API/Vulkan DMA-BUF, native CUDA/Vulkan bridge | Composed GL interop (default) | CUDA-Vulkan interop, DMA-BUF |
 | Architecture Profile | Direct libavcodec demux and decode | Offscreen GL rendering into shared texture | GStreamer pipeline graph with autoplugging |
-| Typical Workload | Silent looping wallpapers | Audio-enabled wallpapers, mpv filters | Specialized GStreamer plugins or CUDA setups |
+| Typical Workload | Hardware decoded looping video and audio | Audio-enabled wallpapers, mpv filters | Specialized GStreamer plugins or CUDA setups |
 
 Performance and resource utilization depend on hardware decode availability, driver support, and video resolution rather than backend selection alone.
 
 ### Audio Mechanics and Volume Control
 
-- Wallpaper audio requires the `mpv` or `appsink` backend. The native FFmpeg backend does not implement audio decoding.
+- All three backends support wallpaper audio. FFmpeg decodes and resamples PCM on a separate worker; a bounded GStreamer `appsrc` pipeline sends it to the system audio sink. A synchronized decode group plays one audio stream at the highest unpaused subscriber volume. Video follows the audio clock when available; pause, seek and video loop boundaries flush or restart audio accordingly. Muted playback does not open an audio decoder or sound device.
 - Audio volume is set via `volume = <0..100>` in `config.toml` (defaults to `100`).
 - Setting `volume = 0` completely disables audio decoder elements:
   - In GStreamer, pipeline flags switch to video-only, preventing the autoplugging of audio parsers and decoders.
   - In libmpv, the `audio` property is set to `no` and `ao` is set to `null`.
 - Setting a positive volume (`volume = 1..100`) enables the audio pipeline (`flags = video+audio` in appsink, `audio = yes` in mpv).
 - Before transitioning or tearing down an audio-enabled pipeline, Kaleidux fades audio volume to zero to prevent audible clicks.
+
+### Experimental streamed memory policy
+
+Start the daemon with `--streamed` to compare the experimental policy. It preserves source-rate `video-fps = "unlimited"`, transitions and hardware decoding.
+
+Images use file-backed decoding, a 16 MiB prepared-memory cache, no decoded-source cache, and no speculative prefetch. mpv packet read-ahead is limited to 8 MiB forward, 1 MiB backward and 0.5 seconds (ordinary mode uses 32/4 MiB and one second). Appsink keeps its existing one-frame queue and limits source buffering to 4 MiB/0.5 seconds if buffering is used. Native FFmpeg already reads packets from the file on demand; it benefits from the shared image policy without adding a second video input mode. Decoded reference frames, active output textures and codec working memory are still required. This policy can trade more disk reads and image decode work for lower cache residency.
+
+For FFmpeg, `KLD_NATIVE_HWDECODER=software` or `--video-mode cpu` forces CPU decoding, `nvdec` requests NVIDIA hardware decoding, and `vulkan` requests Vulkan Video. `WGPU_BACKEND=vulkan` selects rendering only. CUDA NV12 frames use a GPU copy into persistent Vulkan planes with event/timeline synchronization, avoiding host readback. Vulkan NV12 uses exportable DRM modifier surfaces when the installed FFmpeg and driver support them; unsupported formats, tilings or imports fall back to hardware readback. The initial candidate log is followed by an actual-frame path log and counters. A decoder that fails after opening is excluded before trying the next supported decoder, then software.
 
 ### Frame Rates and Occlusion Pacing
 
@@ -652,7 +664,7 @@ Performance and resource utilization depend on hardware decode availability, dri
 
 ## History, Sorting, and Content Selection
 
-### Selecting an Image by Path
+### Selecting a Wallpaper by Path
 
 ```bash
 kldctl jump ~/Pictures/wallpapers/forest.png
@@ -660,13 +672,13 @@ kldctl set ~/Downloads/new-wallpaper.png -o DP-1
 kldctl img ~/Pictures/wallpapers/forest.png
 ```
 
-`jump PATH` selects an image inside the target slideshow directory, including
-subdirectories. `set PATH` inserts an image into the current queue and immediately
-advances to it. `img PATH` accepts either: slideshow images are selected in place,
-and external images are inserted. Existing entries are not duplicated.
+`jump PATH` selects supported image or video media inside the target slideshow directory, including
+subdirectories. `set PATH` inserts media into the current queue and immediately
+advances to it. `img PATH` accepts either: slideshow media is selected in place,
+and external media is inserted. Existing entries are not duplicated.
 
 These commands use the normal transition and history: `prev` returns to the
-previous wallpaper, and `next` returns to the selected image. An explicit selection
+previous wallpaper, and `next` returns to the selected wallpaper. An explicit selection
 replaces any older forward-history branch. Subsequent automatic selection follows
 the configured sorting strategy. Insertions are in-memory only; rebuilding the
 queue by changing playlists or restarting discards external entries. The most
@@ -674,9 +686,9 @@ recent 50 explicit selections survive background directory refreshes. No files a
 copied and the configuration is unchanged.
 
 Paths are resolved from the client's working directory; quote paths containing
-spaces. Only images are accepted. Missing files, blacklisted images, unknown
+spaces. Supported images and videos are accepted; image content is sniffed instead of relying on its extension. Invalid image headers, missing files, blacklisted media, unknown
 outputs and outputs without a slideshow queue return errors. Omit `-o OUTPUT`
-to target all outputs; synchronized outputs and groups switch together, as with
+to target `main-monitor`, or use `-o all` for every output; synchronized outputs and groups switch together, as with
 `next`. A `jump` targeting multiple directories must be inside each target directory.
 
 ### History Navigation
@@ -751,15 +763,15 @@ These functions are available in addition to Rhai's standard language operations
 | `uninhibit(reason)` | Removes only that named reason. |
 | `load_playlist(name)` | Loads a saved playlist across queues; `""` or `"*"` restores directory selection. |
 | `clear(output)` | Clears wallpaper on the named output; `"*"` means all outputs. |
-| `jump(path, output)` | Selects an image inside the slideshow directory. |
-| `set(path, output)` | Inserts an image into the current queue and displays it. |
-| `img(path, output)` | Selects a slideshow image or inserts an external image and displays it. |
+| `jump(path, output)` | Selects supported media inside the slideshow directory. |
+| `set(path, output)` | Inserts supported media into the current queue and displays it. |
+| `img(path, output)` | Selects slideshow media or inserts external media and displays it. |
 
-For `jump`, `set` and `img`, omit `output` or pass `"*"` to target all outputs.
+For `jump`, `set` and `img`, omit `output` to target the main monitor or pass `"*"` for all outputs.
 Use absolute paths in scripts: relative paths use the daemon's working directory,
 not the script directory. Selection errors are handled by the daemon after enqueueing.
 
-`next()`, `prev()`, and `clear()` without an argument target all outputs.
+`next()`, `prev()`, and `clear()` without an argument target the main monitor.
 `load_playlist()` without an argument unloads the playlist. `resume()` clears
 manual pause only; named inhibitors can keep playback paused.
 
@@ -975,6 +987,10 @@ Kaleidux evaluates environment variables at startup and during playback to confi
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
+| `KLD_NATIVE_HWDECODER` | String | `auto` | Native decoder preference: `software`/`none`, `vulkan`, `vaapi`, `nvdec`, `qsv`, or another available platform API. Hardware failure falls back through supported candidates then software. |
+| `KLD_NATIVE_SURFACE_IMPORT` | Boolean | `true` | Set to `0` to compare hardware decoding with CPU readback instead of GPU frame delivery. |
+| `KLD_NATIVE_AUDIO_SINK` | String | `autoaudiosink` | GStreamer audio output element; `fakesink` permits silent timing tests. |
+| `WGPU_BACKEND` | String | automatic | WGPU rendering API, such as `vulkan` or `gl`; this does not choose the video decoder. |
 | `KLD_VIDEO_BACKEND` | String | `"auto"` | Fallback video backend request (`"auto"`, `"ffmpeg"`, `"mpv"`, `"appsink"`) when the `--video-backend` CLI flag is omitted. |
 | `KLD_VIDEO_IMMEDIATE_PRESENT` | Boolean (`1`/`true`) | Unset | When set to `1`, `true`, `yes`, or `on`, forces immediate surface commit on frame arrival without waiting for compositor frame callbacks. |
 | `KLD_VIDEO_FRAME_CALLBACK_DAMAGE` | String | `"minimal"` | Sets Wayland surface damage on steady video callbacks. Setting to `"full"`, `"surface"`, `"1"`, `"true"`, `"yes"`, or `"on"` damages the full layer surface instead of minimal damage. |
@@ -1090,7 +1106,7 @@ When video files display a black frame or fail to advance:
 
 #### Video Plays Without Audio
 
-- Confirm backend: The native FFmpeg backend decodes video streams only. For wallpaper audio, use `--video-backend mpv` or `--video-backend appsink`.
+- Confirm that `volume` is positive. FFmpeg needs GStreamer audio output plugins (`appsrc`, `audioconvert`, `audioresample`, `volume`, `autoaudiosink`) and an available system sound sink. Check `[NATIVE-AUDIO]` logs; audio output failure leaves video running.
 - Check volume configuration: If `volume = 0` in `config.toml`, audio decoding elements are omitted from the pipeline. Set `volume` to a value between 1 and 100.
 
 #### High Memory Retention on Long Runs

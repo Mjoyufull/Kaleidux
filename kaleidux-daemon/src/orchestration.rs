@@ -135,6 +135,8 @@ struct RegexOutputOverride {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalConfig {
+    /// Default command target; omitted or "auto" selects the largest active output.
+    pub main_monitor: Option<String>,
     #[serde(default)]
     pub monitor_behavior: MonitorBehavior,
     #[serde(default)]
@@ -177,6 +179,7 @@ where
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
+            main_monitor: None,
             monitor_behavior: MonitorBehavior::default(),
             _custom_transitions: false,
             video_ratio: None,

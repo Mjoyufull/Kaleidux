@@ -202,6 +202,21 @@ impl ComposedGlRenderContext {
         if update_flags & (sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
             return Ok(None);
         }
+        // Updates may race a core reconfiguration and have no queued image.
+        // Publishing a cleared offscreen FBO would flash through the wallpaper.
+        let mut frame_info = sys::mpv_render_frame_info {
+            flags: 0,
+            target_time: 0,
+        };
+        let parameter = render_param(
+            sys::mpv_render_param_type_MPV_RENDER_PARAM_NEXT_FRAME_INFO,
+            &mut frame_info,
+        );
+        // SAFETY: the render context and frame-info output live through the call.
+        let info_result = unsafe { sys::mpv_render_context_get_info(self.mpv_context, parameter) };
+        if info_result >= 0 && frame_info.flags & 1 == 0 {
+            return Ok(None);
+        }
         if !publish {
             self.skip_frame()?;
             return Ok(None);
@@ -353,6 +368,9 @@ impl SharedGlSlot {
         // SAFETY: every OpenGL function pointer was loaded from the current EGL context.
         unsafe {
             (gl.create_memory_objects)(1, &mut memory_object);
+            // Vulkan exports a dedicated image allocation. EXT_memory_object
+            // requires this property to be set before importing that handle.
+            (gl.memory_object_parameter_iv)(memory_object, 0x9581, &1);
             (gl.import_memory_fd)(
                 memory_object,
                 exported.memory_size,
