@@ -31,8 +31,10 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer1.0-dev \
             libmpv-dev \
+            libswresample-dev \
             libswscale-dev \
             libva-dev \
+            libvulkan-dev \
             libwayland-dev \
             pkg-config
       - run: cargo fmt --all -- --check
