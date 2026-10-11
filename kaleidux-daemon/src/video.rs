@@ -402,6 +402,11 @@ impl VideoPlayer {
         let capabilities = current_video_capabilities();
         let caps_ladder = caps_ladder_labels(mode, &capabilities);
         let caps = build_video_sink_caps(mode, &capabilities);
+        anyhow::ensure!(
+            !caps.is_empty(),
+            "--video-mode {} has no importable formats on the selected renderer; use auto/cpu or select a compatible Vulkan adapter",
+            mode.cli_label()
+        );
 
         let appsink = Self::configure_appsink(
             &pipeline,

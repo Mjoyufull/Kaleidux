@@ -284,15 +284,6 @@ pub(crate) fn store_source_descriptor_memory(descriptor: Arc<ImageSourceDescript
         .put(descriptor.identity.clone(), descriptor);
 }
 
-pub(crate) fn cached_source_dimensions(path: &Path) -> Option<(u32, u32)> {
-    SOURCE_IMAGE_DESCRIPTOR_CACHE
-        .lock()
-        .lru
-        .iter()
-        .find(|(identity, _)| identity.path == path)
-        .map(|(_, descriptor)| (descriptor.width, descriptor.height))
-}
-
 pub(crate) fn load_image_source_descriptor(path: &Path) -> Option<Arc<ImageSourceDescriptor>> {
     let identity = image_pipeline::descriptor::source_identity(path)?;
     if let Some(descriptor) = try_load_source_descriptor_memory(&identity) {

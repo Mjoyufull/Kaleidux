@@ -6,6 +6,8 @@ mod import;
 mod linear;
 #[path = "native_dmabuf_interop/retirement.rs"]
 mod retirement;
+#[path = "native_dmabuf_interop/source_cache.rs"]
+mod source_cache;
 
 use crate::video::{NativeDmaBufNv12, VideoFrameStorage};
 use ash::vk;
@@ -18,6 +20,7 @@ use tracing::{debug, info};
 
 struct CachedSource {
     imported: import::ImportedSource,
+    last_used: u64,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     acquire_semaphore: vk::Semaphore,
@@ -52,6 +55,7 @@ pub(super) struct NativeDmaBufInterop {
     drm_syncobj_device: Option<Arc<crate::video::drm_syncobj::DrmSyncobjDevice>>,
     sources: HashMap<u64, CachedSource>,
     active_session_id: Option<u64>,
+    source_sequence: u64,
 }
 
 impl NativeDmaBufInterop {
@@ -105,6 +109,7 @@ impl NativeDmaBufInterop {
             context: ctx.clone(),
             device: device.clone(),
             access: parking_lot::Mutex::new(()),
+            pending_sources: std::sync::atomic::AtomicUsize::new(0),
         });
         Ok(Self {
             device,
@@ -116,6 +121,7 @@ impl NativeDmaBufInterop {
             drm_syncobj_device,
             sources: HashMap::new(),
             active_session_id: None,
+            source_sequence: 0,
         })
     }
 
@@ -137,6 +143,7 @@ impl NativeDmaBufInterop {
         self.reap_completed();
         let key = import::descriptor_key(descriptor, width, height);
         let cache_hit = self.sources.contains_key(&key);
+        self.prepare_source_slot(key)?;
         if !cache_hit {
             let source = self.import_cached_source(descriptor, width, height)?;
             debug!(
@@ -249,6 +256,7 @@ impl NativeDmaBufInterop {
         self.reap_completed();
         let key = import::descriptor_key(descriptor, width, height);
         let cache_hit = self.sources.contains_key(&key);
+        self.prepare_source_slot(key)?;
         if !cache_hit {
             let source = self.import_cached_source(descriptor, width, height)?;
             self.sources.insert(key, source);
@@ -397,112 +405,6 @@ impl NativeDmaBufInterop {
             bridged.acquire_fence = acquire_fence.map(Arc::new);
         }
         Ok(Some((bridged, cache_hit)))
-    }
-
-    fn import_cached_source(
-        &self,
-        descriptor: &NativeDmaBufNv12,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<CachedSource> {
-        let imported = import::import_source(
-            &self.device,
-            &self.external_memory_fd,
-            descriptor,
-            width,
-            height,
-        )?;
-        let _pool_access = self.command_pool.access.lock();
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool.handle)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: command_pool is live and retained by this object.
-        let command_buffer = unsafe { self.device.allocate_command_buffers(&allocate_info) }
-            .map_err(|error| anyhow::anyhow!("allocating surface command buffer: {error:?}"))?[0];
-        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        // SAFETY: device is live. Free the buffer if fence allocation fails.
-        let fence = match unsafe { self.device.create_fence(&fence_info, None) } {
-            Ok(fence) => fence,
-            Err(error) => {
-                unsafe {
-                    self.device
-                        .free_command_buffers(self.command_pool.handle, &[command_buffer])
-                };
-                return Err(anyhow::anyhow!("creating surface copy fence: {error:?}"));
-            }
-        };
-        let mut export = vk::ExportSemaphoreCreateInfo::default()
-            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
-        let acquire_semaphore = match unsafe { self.device.create_semaphore(&semaphore_info, None) }
-        {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                unsafe {
-                    self.device.destroy_fence(fence, None);
-                    self.device
-                        .free_command_buffers(self.command_pool.handle, &[command_buffer]);
-                }
-                return Err(anyhow::anyhow!(
-                    "creating linear bridge acquire semaphore: {error:?}"
-                ));
-            }
-        };
-        let producer_semaphore = match unsafe {
-            self.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        } {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                unsafe {
-                    self.device.destroy_semaphore(acquire_semaphore, None);
-                    self.device.destroy_fence(fence, None);
-                    self.device
-                        .free_command_buffers(self.command_pool.handle, &[command_buffer]);
-                }
-                return Err(anyhow::anyhow!(
-                    "creating DMA-BUF producer semaphore: {error:?}"
-                ));
-            }
-        };
-        Ok(CachedSource {
-            imported,
-            command_buffer,
-            fence,
-            acquire_semaphore,
-            producer_semaphore,
-            owner: None,
-            has_submitted: false,
-            fence_in_flight: false,
-            reusable_command: false,
-            copy_mode: None,
-            linear_bridge: None,
-            syncobj_timelines: None,
-            next_sync_point: 1,
-            last_release_point: None,
-        })
-    }
-
-    fn reap_completed(&mut self) {
-        for source in self.sources.values_mut() {
-            if source.owner.is_none() {
-                continue;
-            }
-            // SAFETY: fence is live; success means the raw plane copy no longer
-            // references the decoder-owned surface retained in owner.
-            if unsafe { self.device.get_fence_status(source.fence) }.unwrap_or(false) {
-                source.owner = None;
-            }
-        }
-    }
-
-    fn clear_sources(&mut self) -> anyhow::Result<()> {
-        retirement::retire(
-            self.command_pool.clone(),
-            self.sources.drain().map(|(_, source)| source).collect(),
-        );
-        Ok(())
     }
 }
 

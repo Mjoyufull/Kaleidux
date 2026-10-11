@@ -254,7 +254,10 @@ fn p010_caps() -> gst::Caps {
 }
 
 fn dmabuf_nv12_caps() -> gst::Caps {
-    if !super::import_caps::can_import_dmabuf() {
+    if !super::import_caps::nv12_formats()
+        .iter()
+        .any(|format| format == "NV12")
+    {
         return gst::Caps::new_empty();
     }
     gst::Caps::builder("video/x-raw")
