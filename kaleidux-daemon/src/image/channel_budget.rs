@@ -1,3 +1,5 @@
+//! Bounds prepared pixels waiting for display adoption; owned permits follow channel payloads.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

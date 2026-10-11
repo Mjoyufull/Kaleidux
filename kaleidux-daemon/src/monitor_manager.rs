@@ -15,6 +15,7 @@ mod add_output;
 mod config;
 mod config_queue;
 mod deadline;
+mod manual_queue;
 mod manual_selection;
 mod output;
 mod schedule;
