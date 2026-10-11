@@ -274,7 +274,6 @@ impl NativeDmaBufInterop {
             source.linear_bridge = Some(linear::LinearBridge::create(
                 &self.device,
                 &self.external_memory_fd,
-                descriptor.surface_id,
                 width,
                 height,
             )?);

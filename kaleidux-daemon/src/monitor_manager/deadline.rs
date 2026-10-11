@@ -17,7 +17,11 @@ impl MonitorManager {
                 orch.next_change = None;
             }
         }
-        self.shared_display_start_time = Some(now);
+        self.shared_display_start_time = self
+            .outputs
+            .values()
+            .any(|output| output.current_path.is_some())
+            .then_some(now);
         for start in self.group_display_start_times.values_mut() {
             *start = now;
         }

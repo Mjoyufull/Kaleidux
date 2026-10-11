@@ -14,12 +14,7 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
         .monitor_manager
         .outputs
         .iter()
-        .map(|(name, output)| {
-            (
-                name.clone(),
-                (output.config.video_fps, output.current_path.clone()),
-            )
-        })
+        .map(|(name, output)| (name.clone(), output.config.video_fps))
         .collect();
     ctx.monitor_manager.update_config(config);
     let mut restarts = Vec::new();
@@ -27,10 +22,14 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
         if let Some(output_config) = ctx.monitor_manager.get_output_config(name) {
             if old_fps
                 .get(name)
-                .is_some_and(|(old, _)| *old != output_config.video_fps)
+                .is_some_and(|old| *old != output_config.video_fps)
                 && (renderer.valid_content_type == ContentType::Video
                     || ctx.pending_video_switches.contains_key(name))
-                && let Some(path) = old_fps.get(name).and_then(|(_, path)| path.clone())
+                && let Some(path) = ctx
+                    .monitor_manager
+                    .outputs
+                    .get(name)
+                    .and_then(|output| output.current_path.clone())
             {
                 restarts.push((name.clone(), path));
             }
@@ -45,9 +44,6 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
         // Bypass same-source native reuse, whose decoder key contains old FPS.
         if let Some(player) = ctx.video_players.remove(&name) {
             stop_video_player_in_background(name.clone(), player);
-        }
-        if let Some(output) = ctx.monitor_manager.outputs.get_mut(&name) {
-            output.current_path = Some(path.clone());
         }
         switch_wallpaper_content(
             ContentSwitchRequest {

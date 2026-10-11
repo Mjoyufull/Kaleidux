@@ -1,3 +1,5 @@
+//! Owns each linear bridge allocation and gives replacement buffers a fresh Wayland identity.
+
 use crate::video::{NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane};
 use ash::vk;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -9,6 +11,9 @@ const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 
 const DRM_FORMAT_NV12: u32 = drm_fourcc(b'N', b'V', b'1', b'2');
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+// Reserve the high-bit namespace for bridge allocations. Decoder identities
+// are VA surface IDs or userspace pointers, and must not alias this allocation.
+static NEXT_BRIDGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
 
 struct LinearImage {
     device: ash::Device,
@@ -38,7 +43,6 @@ impl LinearBridge {
     pub(super) fn create(
         device: &ash::Device,
         external_memory_fd: &ash::khr::external_memory_fd::Device,
-        surface_id: u64,
         width: u32,
         height: u32,
     ) -> anyhow::Result<Self> {
@@ -46,7 +50,7 @@ impl LinearBridge {
         let image = created.allocation.image;
         let objects: Arc<[NativeDmaBufObject]> = vec![created.object].into();
         let descriptor = NativeDmaBufNv12 {
-            surface_id,
+            surface_id: NEXT_BRIDGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             objects,
             planes: [
                 NativeDmaBufPlane {

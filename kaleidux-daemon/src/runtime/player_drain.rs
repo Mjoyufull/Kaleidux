@@ -41,6 +41,9 @@ impl MainLoopContext {
                         preroll_frame,
                     } = *success;
                     let mut player = *player;
+                    if let Some(output_config) = self.monitor_manager.get_output_config(&name) {
+                        player.set_volume(output_config.volume as f64 / 100.0);
+                    }
                     if self.monitor_manager.is_paused() {
                         let _ = player.pause();
                     }

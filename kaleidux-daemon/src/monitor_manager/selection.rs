@@ -1,5 +1,6 @@
+//! Resolves command defaults and validates external media before changing queue state.
+
 use super::MonitorManager;
-use crate::orchestration::MonitorBehavior;
 
 impl MonitorManager {
     /// Resolve command defaults without relying on HashMap iteration order.
@@ -51,60 +52,8 @@ impl MonitorManager {
         if let Some(name) = output {
             anyhow::ensure!(self.outputs.contains_key(name), "Unknown output: {name}");
         }
-        let mut queues = Vec::new();
-        match &self.config.global.monitor_behavior {
-            MonitorBehavior::Synchronized => {
-                queues.push(
-                    self.shared_queue
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("No slideshow queue"))?,
-                );
-            }
-            MonitorBehavior::Independent | MonitorBehavior::Grouped(_) => {
-                let grouped = matches!(
-                    self.config.global.monitor_behavior,
-                    MonitorBehavior::Grouped(_)
-                );
-                let mut groups = std::collections::HashSet::new();
-                for (name, orch) in &mut self.outputs {
-                    if output.as_ref().is_some_and(|target| target != name) {
-                        continue;
-                    }
-                    if grouped && let Some(gid) = self.output_groups.get(name) {
-                        groups.insert(*gid);
-                    } else {
-                        queues.push(
-                            orch.queue
-                                .as_mut()
-                                .ok_or_else(|| anyhow::anyhow!("No slideshow queue for {name}"))?,
-                        );
-                    }
-                }
-                for (gid, queue) in &mut self.group_queues {
-                    if groups.remove(gid) {
-                        queues.push(queue);
-                    }
-                }
-                anyhow::ensure!(groups.is_empty(), "Missing group slideshow queue");
-            }
-        }
-        anyhow::ensure!(!queues.is_empty(), "No slideshow outputs");
-        for queue in &queues {
-            let in_root =
-                std::fs::canonicalize(&queue.root_path).is_ok_and(|root| path.starts_with(root));
-            anyhow::ensure!(
-                jump != Some(true) || in_root,
-                "Wallpaper is outside the slideshow directory"
-            );
-            anyhow::ensure!(
-                !queue.stats.blacklist.iter().any(|blocked| blocked == &path
-                    || std::fs::canonicalize(blocked).is_ok_and(|resolved| resolved == path)),
-                "Wallpaper is blacklisted"
-            );
-        }
-        for queue in queues {
-            queue.enqueue_selected_image(path.clone());
-        }
-        Ok(())
+        let targets = self.manual_queue_targets(output)?;
+        self.validate_manual_queues(&targets, &path, jump)?;
+        self.enqueue_manual_selection(targets, &path)
     }
 }

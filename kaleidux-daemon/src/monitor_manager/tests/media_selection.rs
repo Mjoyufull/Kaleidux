@@ -124,3 +124,41 @@ fn main_monitor_defaults_are_deterministic_and_allow_explicit_all() {
         Some("HDMI-A-1")
     );
 }
+
+#[test]
+fn external_media_initializes_blank_outputs_in_every_monitor_behavior() {
+    for behavior in [
+        MonitorBehavior::Independent,
+        MonitorBehavior::Synchronized,
+        MonitorBehavior::Grouped(vec![vec!["DP-1".into()]]),
+    ] {
+        let (mut manager, _root, original) = selection_manager("blank-external");
+        manager.config.global.monitor_behavior = behavior.clone();
+        manager.outputs.get_mut("DP-1").unwrap().queue = None;
+        if matches!(behavior, MonitorBehavior::Grouped(_)) {
+            manager.output_groups.insert("DP-1".into(), 0);
+        }
+        assert!(
+            manager
+                .prepare_media_selection(original.to_str().unwrap(), &None, Some(true))
+                .is_err()
+        );
+        manager
+            .prepare_media_selection(original.to_str().unwrap(), &None, Some(false))
+            .unwrap();
+        assert_eq!(manager.handle_next(None)["DP-1"].0, original);
+    }
+}
+
+#[test]
+fn synchronized_blank_outputs_select_immediately_after_resume() {
+    let (mut manager, _root, original) = selection_manager("blank-sync-resume");
+    manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;
+    manager.shared_queue = manager.outputs.get_mut("DP-1").unwrap().queue.take();
+    manager.outputs.get_mut("DP-1").unwrap().current_path = None;
+    manager.inhibit("startup".into()).unwrap();
+    assert!(manager.tick().is_empty());
+    manager.uninhibit("startup").unwrap();
+    assert!(manager.shared_display_start_time.is_none());
+    assert_eq!(manager.tick()["DP-1"].0, original);
+}
