@@ -91,7 +91,11 @@ impl super::WgpuContext {
             let now = std::time::Instant::now();
             entries.retain(|entry| now.duration_since(entry.last_used).as_secs() < 5);
 
-            if let Some(entry) = entries.pop() {
+            if let Some(index) = entries
+                .iter()
+                .rposition(|entry| entry.texture.usage().contains(usage))
+            {
+                let entry = entries.swap_remove(index);
                 if let Some(metric) = metrics {
                     metric.record_texture_pool_hit();
                 }

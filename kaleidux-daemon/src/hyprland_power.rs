@@ -201,12 +201,6 @@ impl HyprlandPowerMonitor {
         self.suspended_since.is_some()
     }
 
-    pub(crate) fn needs_output_snapshot(&self) -> bool {
-        // Completion can race with the subsequent poll. Take the output
-        // snapshot for every in-flight query, including one still running.
-        self.in_flight.is_some()
-    }
-
     /// Drop state for outputs no longer owned by the display backend.
     ///
     /// Hyprland omits unplugged monitors from later query results, so query

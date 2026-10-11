@@ -418,6 +418,28 @@ fn touch_access_time(path: &Path) {
 }
 
 fn discard_corrupt(path: &Path) {
+    let _writer = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(_process_writer) = lock_cache_writer(dir) else {
+        return;
+    };
+    if File::open(path)
+        .and_then(|file| {
+            let (mut reader, header) = validate_file_header(file)?;
+            let mut format = vec![0; header.format_len];
+            reader.read_exact(&mut format)?;
+            std::str::from_utf8(&format)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            Ok(())
+        })
+        .is_ok()
+    {
+        return;
+    }
     let removed = std::fs::remove_file(path).is_ok();
     let mut index = CACHE_INDEX
         .lock()

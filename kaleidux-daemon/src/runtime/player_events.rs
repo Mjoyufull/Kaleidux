@@ -92,6 +92,7 @@ impl MainLoopContext {
                     if let Some(renderer) = self.renderers.get_mut(&event.source_id) {
                         if renderer.active_video_session_id == event.session_id {
                             renderer.abort_transition();
+                            renderer.active_video_session_id = 0;
                         }
                     }
 

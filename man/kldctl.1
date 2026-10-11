@@ -65,7 +65,7 @@ List all currently active pause inhibitors.
 Names are case-sensitive, at most 64 UTF-8 bytes, nonblank, and cannot contain control characters. Up to 64 names may be active. Duplicate acquisition is idempotent, not reference-counted. Reasons remain until released or the daemon exits; they do not expire when the calling process exits.
 .TP
 .B clear \fR[\fI-o OUTPUT\fR]
-Clear wallpaper on the specified output or all outputs.
+Clear wallpaper on the main monitor by default. Use -o OUTPUT to target one output, or -o all to clear every output.
 .TP
 .B query \fR(alias: \fBq\fR)
 Query connected outputs and their current content state.

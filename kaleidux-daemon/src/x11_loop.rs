@@ -205,7 +205,7 @@ pub async fn run(
     loop {
         let loop_start = Instant::now();
         if renderer_retries
-            .next_deadline()
+            .next_deadline_when(ctx.wgpu_ctx.is_some() || pending_renderer_adds.is_empty())
             .is_some_and(|deadline| loop_start >= deadline)
         {
             backend.monitors_dirty.store(true, Ordering::Release);
@@ -215,15 +215,8 @@ pub async fn run(
             break;
         }
 
-        let power_result_ready = power_monitor.needs_output_snapshot();
-        let output_names: Vec<String> = if power_result_ready {
-            ctx.renderers.keys().cloned().collect()
-        } else {
-            Vec::new()
-        };
-        if power_result_ready
-            && let Some(update) = power_monitor.retain_outputs(&output_names, loop_start)
-        {
+        let output_names: Vec<String> = ctx.renderers.keys().cloned().collect();
+        if let Some(update) = power_monitor.retain_outputs(&output_names, loop_start) {
             crate::hyprland_power::apply_update(&mut ctx, update);
         }
         let has_active_video = ctx
@@ -273,12 +266,14 @@ pub async fn run(
             );
             let idle_deadline = crate::runtime::timing::min_deadline_with_reason(
                 idle_deadline,
-                renderer_retries.next_deadline().map(|deadline| {
-                    (
-                        deadline,
-                        crate::observability::wake::DeadlineReason::X11Randr,
-                    )
-                }),
+                renderer_retries
+                    .next_deadline_when(ctx.wgpu_ctx.is_some() || pending_renderer_adds.is_empty())
+                    .map(|deadline| {
+                        (
+                            deadline,
+                            crate::observability::wake::DeadlineReason::X11Randr,
+                        )
+                    }),
             );
             let pending_renderer_poll = if pending_renderer_adds
                 .values()
@@ -501,11 +496,16 @@ pub async fn run(
 
         ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
             if !power_monitor.is_powered(name) {
-                return;
+                return false;
             }
-            if r.render(renderer::BackendContext::X11, ls).is_ok() {
+            let previous_present = r.last_present_time;
+            if r.render(renderer::BackendContext::X11, ls).is_ok()
+                && r.last_present_time > previous_present
+            {
                 present_telemetry.record_wsi_submit();
+                return true;
             }
+            false
         });
 
         // ─── X11 render loop ────────────────────────────────────────────

@@ -1,6 +1,4 @@
-pub(crate) fn chroma_plane_extent(width: u32, height: u32) -> (u32, u32) {
-    (width.div_ceil(2), height.div_ceil(2))
-}
+pub(crate) use crate::video::chroma_plane_extent;
 
 pub(crate) fn yuv420_aux_byte_size(width: u32, height: u32) -> u64 {
     let (chroma_width, chroma_height) = chroma_plane_extent(width, height);

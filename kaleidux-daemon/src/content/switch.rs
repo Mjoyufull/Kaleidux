@@ -275,17 +275,22 @@ pub(crate) fn switch_wallpaper_content(
                 let request_start = Instant::now();
                 // Reserve before preparing pixels; waiting senders must not
                 // hold uncharged decoded buffers outside the channel budget.
-                let reserved_bytes =
-                    crate::image::runtime_cache::load_image_source_descriptor(&path_clone)
-                        .map(|descriptor| {
-                            crate::image::runtime_cache::prepared_target_dimensions_from_descriptor(
-                                &descriptor,
-                                target_width,
-                                target_height,
-                            )
-                        })
-                        .map(|(width, height)| width as usize * height as usize * 4)
-                        .unwrap_or(256 * 1024 * 1024);
+                let reserved_bytes = crate::image::runtime_probe::probe_descriptor(
+                    &path_clone,
+                    BackgroundWorkKind::ImageDecode,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|descriptor| {
+                    crate::image::runtime_cache::prepared_target_dimensions_from_descriptor(
+                        &descriptor,
+                        target_width,
+                        target_height,
+                    )
+                })
+                .map(|(width, height)| width as usize * height as usize * 4)
+                .unwrap_or(256 * 1024 * 1024);
                 let byte_permit = crate::image::channel_budget::acquire(reserved_bytes).await;
                 let decode_result = if byte_permit.is_none() {
                     Err(anyhow::anyhow!(

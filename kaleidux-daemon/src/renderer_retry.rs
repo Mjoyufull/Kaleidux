@@ -47,7 +47,15 @@ impl RendererRetryBackoff {
         self.entries.remove(name);
     }
 
+    #[cfg(test)]
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline_when(true)
+    }
+
+    pub(crate) fn next_deadline_when(&self, initialization_available: bool) -> Option<Instant> {
+        if !initialization_available {
+            return None;
+        }
         self.entries
             .values()
             .filter_map(|entry| entry.not_before)
@@ -77,6 +85,18 @@ mod tests {
         assert!(retry.next_deadline().is_none());
         retry.record_success("DP-1");
         assert!(retry.can_start("DP-1", now));
+    }
+
+    #[test]
+    fn unavailable_initialization_does_not_schedule_expired_retry() {
+        let mut retry = RendererRetryBackoff::default();
+        let now = Instant::now();
+        retry.record_failure("DP-1", now);
+        assert!(retry.next_deadline_when(false).is_none());
+        assert_eq!(
+            retry.next_deadline_when(true),
+            Some(now + Duration::from_secs(1))
+        );
     }
 
     #[test]

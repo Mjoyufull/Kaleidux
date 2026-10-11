@@ -93,7 +93,7 @@ pub(super) fn apply_fast_gpu_options(init: &MpvInitializer) {
     set_optional(init, "ytdl", false);
     set_optional(init, "sub-auto", "no");
     set_optional(init, "audio-file-auto", "no");
-    set_optional(init, "demuxer-thread", false);
+    set_optional(init, "demuxer-thread", true);
     set_optional(init, "cache", false);
     // Local wallpapers do not benefit from mpv's large network-oriented
     // forward/backward packet caches. Keep ordinary playback bounded too.

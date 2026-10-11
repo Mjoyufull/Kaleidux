@@ -9,8 +9,13 @@ impl MonitorManager {
     fn reset_display_timers(&mut self) {
         let now = Instant::now();
         for orch in self.outputs.values_mut() {
-            orch.display_start_time = Some(now);
-            orch.next_change = Some(now + orch.cycle_duration());
+            if orch.current_path.is_some() {
+                orch.display_start_time = Some(now);
+                orch.next_change = Some(now + orch.cycle_duration());
+            } else {
+                orch.display_start_time = None;
+                orch.next_change = None;
+            }
         }
         self.shared_display_start_time = Some(now);
         for start in self.group_display_start_times.values_mut() {

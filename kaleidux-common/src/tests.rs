@@ -83,6 +83,7 @@ fn omitted_transition_parameters_match_named_defaults() {
     for (tag, name) in [
         ("stereo-viewer", "stereoviewer"),
         ("squares-wire", "squareswire"),
+        ("directional-warp", "directionalwarp"),
     ] {
         let value = serde_json::json!({"type": tag});
         let parsed: Transition = serde_json::from_value(value).unwrap();

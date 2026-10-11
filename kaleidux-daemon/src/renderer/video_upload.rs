@@ -353,15 +353,10 @@ impl super::Renderer {
         };
 
         if !upload_succeeded {
-            if self.active_yuv_source.is_some_and(|source| {
-                matches!(
-                    source.origin,
-                    super::YuvOrigin::DmaBuf | super::YuvOrigin::NativeDmaBuf
-                )
-            }) {
-                self.active_yuv_source = None;
-                self.final_nv12_bind_group = None;
-            }
+            self.active_yuv_source = None;
+            self.final_nv12_bind_group = None;
+            self.final_p010_bind_group = None;
+            self.final_i420_bind_group = None;
             if let Some(failed_texture) = texture.take() {
                 if needs_new_texture {
                     self.ctx.return_texture_to_pool(

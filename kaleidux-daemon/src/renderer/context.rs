@@ -100,6 +100,7 @@ impl WgpuContext {
             adapter.get_info().backend
         );
 
+        super::context_video_caps::configure(&adapter);
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
             required_features |= wgpu::Features::PIPELINE_CACHE;

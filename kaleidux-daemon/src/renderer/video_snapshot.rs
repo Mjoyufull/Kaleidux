@@ -80,7 +80,7 @@ impl super::Renderer {
         self.active_yuv_source = None;
     }
 
-    fn render_final_yuv_to_rgba(
+    pub(super) fn render_final_yuv_to_rgba(
         &self,
         output: &wgpu::Texture,
         format: super::YuvFormat,

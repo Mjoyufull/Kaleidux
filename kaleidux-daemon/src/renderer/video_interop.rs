@@ -18,8 +18,16 @@ fn wgpu_format_to_vk(format: wgpu::TextureFormat) -> Option<ash::vk::Format> {
 }
 
 /// Find the lowest-index set bit in a memory type bitmask.
-fn find_memory_type(type_bits: u32) -> Option<u32> {
-    (0..32).find(|&i| (type_bits & (1 << i)) != 0)
+fn find_memory_type(
+    type_bits: u32,
+    properties: &ash::vk::PhysicalDeviceMemoryProperties,
+) -> Option<u32> {
+    (0..properties.memory_type_count).find(|&i| {
+        type_bits & (1 << i) != 0
+            && properties.memory_types[i as usize]
+                .property_flags
+                .contains(ash::vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    })
 }
 
 /// Allocate CUDA-exportable memory, import the fd into Vulkan as a LINEAR
@@ -309,7 +317,9 @@ pub(super) fn create_cuda_backed_texture(
             };
 
             let mem_reqs = raw_device.get_image_memory_requirements(vk_image);
-            let memory_type_index = match find_memory_type(mem_reqs.memory_type_bits & mem_type_bits) {
+            let properties = hal_device.shared_instance().raw_instance()
+                .get_physical_device_memory_properties(hal_device.raw_physical_device());
+            let memory_type_index = match find_memory_type(mem_reqs.memory_type_bits & mem_type_bits, &properties) {
                 Some(idx) => idx,
                 None => {
                     error!("[CUDA-VK] No compatible memory type (image={:#x})",

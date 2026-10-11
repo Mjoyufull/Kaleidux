@@ -11,6 +11,7 @@ use wgpu::{Surface, SurfaceConfiguration};
 mod context;
 mod context_pipelines;
 mod context_queue;
+mod context_video_caps;
 #[path = "renderer/context_vulkan.rs"]
 mod context_vulkan;
 pub use context::WgpuContext;
@@ -334,7 +335,8 @@ pub struct Renderer {
     // Cached Bind Groups to avoid per-frame creation overhead
     transition_bind_group: Option<wgpu::BindGroup>,
     blit_bind_group: Option<Arc<wgpu::BindGroup>>,
-    external_blit_bind_groups: std::collections::HashMap<usize, Arc<wgpu::BindGroup>>,
+    external_blit_bind_groups:
+        std::collections::HashMap<usize, (Arc<wgpu::TextureView>, Arc<wgpu::BindGroup>)>,
     blit_source_is_composition: bool, // Helps track which blit BG is currently cached
     blit_source_is_prev: bool,        // Helps track if it was prev or current
     transition_has_rendered: bool,

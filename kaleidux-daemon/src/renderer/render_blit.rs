@@ -117,7 +117,7 @@ impl super::Renderer {
         }
 
         if let Some(key) = self.external_view_key(blit_source)
-            && let Some(bind_group) = self.external_blit_bind_groups.get(&key).cloned()
+            && let Some((_, bind_group)) = self.external_blit_bind_groups.get(&key).cloned()
         {
             self.store_blit_bind_group(bind_group, is_comp, is_prev);
             return true;
@@ -136,8 +136,15 @@ impl super::Renderer {
                     if self.external_blit_bind_groups.len() >= 12 {
                         self.external_blit_bind_groups.clear();
                     }
+                    let owner = match blit_source {
+                        BlitSource::Current => self.current_external_view.as_ref(),
+                        BlitSource::Prev => self.prev_external_view.as_ref(),
+                        BlitSource::Composition => None,
+                    }
+                    .expect("external view key has an owner")
+                    .clone();
                     self.external_blit_bind_groups
-                        .insert(key, bind_group.clone());
+                        .insert(key, (owner, bind_group.clone()));
                 }
                 self.store_blit_bind_group(bind_group, is_comp, is_prev);
                 true

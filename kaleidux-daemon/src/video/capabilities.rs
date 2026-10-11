@@ -254,6 +254,9 @@ fn p010_caps() -> gst::Caps {
 }
 
 fn dmabuf_nv12_caps() -> gst::Caps {
+    if !super::import_caps::can_import_dmabuf() {
+        return gst::Caps::new_empty();
+    }
     gst::Caps::builder("video/x-raw")
         .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
         .field("format", "NV12")
@@ -261,12 +264,17 @@ fn dmabuf_nv12_caps() -> gst::Caps {
 }
 
 fn dmabuf_dma_drm_caps() -> gst::Caps {
-    // Leave drm-format unconstrained: the exporter fixes an NV12
-    // FOURCC:modifier pair during negotiation and GstVideoInfoDmaDrm validates
-    // the concrete result before any frame reaches Vulkan.
+    // Advertise only NV12 modifiers supported by the selected rendering device.
+    if !super::import_caps::can_import_dmabuf() {
+        return gst::Caps::new_empty();
+    }
     gst::Caps::builder("video/x-raw")
         .features([gst_alloc::CAPS_FEATURE_MEMORY_DMABUF.as_str()])
         .field("format", "DMA_DRM")
+        .field(
+            "drm-format",
+            gst::List::new(super::import_caps::nv12_formats()),
+        )
         .build()
 }
 

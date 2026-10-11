@@ -2,13 +2,12 @@ use crate::background::{self, BackgroundWorkKind};
 use crate::image as image_pipeline;
 use crate::image::runtime_cache::{
     IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX, acquire_image_work_permit, decode_source_image,
-    load_image_source_descriptor, prepare_image_for_output_uncached,
-    prepare_source_image_for_output, prepared_image_key_for_identity,
-    prepared_target_dimensions_from_descriptor, select_compatible_prepared_key,
-    store_decoded_source_memory, store_prepared_image_cache_by_key, store_prepared_image_memory,
-    store_source_descriptor_memory, try_load_compatible_prepared_image_memory,
-    try_load_decoded_source_memory, try_load_prepared_image_cache_by_key,
-    try_load_prepared_image_memory,
+    prepare_image_for_output_uncached, prepare_source_image_for_output,
+    prepared_image_key_for_identity, prepared_target_dimensions_from_descriptor,
+    select_compatible_prepared_key, store_decoded_source_memory, store_prepared_image_cache_by_key,
+    store_prepared_image_memory, store_source_descriptor_memory,
+    try_load_compatible_prepared_image_memory, try_load_decoded_source_memory,
+    try_load_prepared_image_cache_by_key, try_load_prepared_image_memory,
 };
 use crate::image::runtime_shared::{publish_shared_result, wait_for_shared_result};
 use crate::image::types::{
@@ -31,7 +30,7 @@ fn rejected_image_work(work_kind: BackgroundWorkKind) -> String {
     }
 }
 
-async fn spawn_image_blocking<T, F>(
+pub(super) async fn spawn_image_blocking<T, F>(
     work_kind: BackgroundWorkKind,
     work: F,
 ) -> Option<tokio::task::JoinHandle<T>>
@@ -263,7 +262,7 @@ pub(crate) async fn request_prepared_image_payload(
     max_compatible_bytes: usize,
     metrics: &Arc<metrics::PerformanceMetrics>,
 ) -> anyhow::Result<DecodedImagePayload> {
-    let Some(descriptor) = load_image_source_descriptor(path) else {
+    let Some(descriptor) = super::runtime_probe::probe_descriptor(path, work_kind).await? else {
         let fallback_path = path.to_path_buf();
         let permit = acquire_image_work_permit(work_kind, "prepare").await?;
         let Some(handle) = spawn_image_blocking(work_kind, move || {

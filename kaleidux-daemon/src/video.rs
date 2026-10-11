@@ -9,7 +9,9 @@ use crate::metrics::PerformanceMetrics;
 
 #[path = "video/capabilities.rs"]
 mod capabilities;
-pub(super) use capabilities::chroma_plane_extent;
+#[path = "video/import_caps.rs"]
+pub(crate) mod import_caps;
+pub(crate) use capabilities::chroma_plane_extent;
 pub use capabilities::{
     VideoBackendKind, VideoBackendRequest, VideoCapabilities, VideoMode, caps_ladder_labels,
     configure_hw_decoders, current_video_capabilities, detect_video_capabilities,
@@ -351,10 +353,10 @@ impl VideoPlayer {
             }
         }
 
-        let pipeline_name = if gst::ElementFactory::find("playbin").is_some() {
-            "playbin"
-        } else if gst::ElementFactory::find("playbin3").is_some() {
+        let pipeline_name = if gst::ElementFactory::find("playbin3").is_some() {
             "playbin3"
+        } else if gst::ElementFactory::find("playbin").is_some() {
+            "playbin"
         } else {
             anyhow::bail!("Neither playbin nor playbin3 is available");
         };

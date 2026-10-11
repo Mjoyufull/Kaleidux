@@ -164,7 +164,7 @@ impl MainLoopContext {
 
     pub fn release_startup_present_barrier<F>(&mut self, loop_start: Instant, mut render_fn: F)
     where
-        F: FnMut(&mut renderer::Renderer, &str, Instant),
+        F: FnMut(&mut renderer::Renderer, &str, Instant) -> bool,
     {
         let Some(reason) = self
             .startup_present_barrier
@@ -210,8 +210,10 @@ impl MainLoopContext {
 
         for name in outputs_to_release {
             if let Some(r) = self.renderers.get_mut(&name) {
+                if !render_fn(r, &name, loop_start) {
+                    continue;
+                }
                 self.metrics.record_startup_release_present();
-                render_fn(r, &name, loop_start);
                 if !self.first_frame_recorded {
                     self.metrics.record_first_frame();
                     self.first_frame_recorded = true;

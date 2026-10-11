@@ -244,7 +244,12 @@ pub(crate) fn prepared_image_available_for_output(
             prepared_width,
             prepared_height,
         )
-        .is_some()
+        .is_some_and(|payload| {
+            payload.data.len()
+                <= (prepared_width as usize)
+                    .saturating_mul(prepared_height as usize)
+                    .saturating_mul(4)
+        })
         || probe_prepared_image_cache_by_key(&key)
 }
 
@@ -277,6 +282,15 @@ pub(crate) fn store_source_descriptor_memory(descriptor: Arc<ImageSourceDescript
     SOURCE_IMAGE_DESCRIPTOR_CACHE
         .lock()
         .put(descriptor.identity.clone(), descriptor);
+}
+
+pub(crate) fn cached_source_dimensions(path: &Path) -> Option<(u32, u32)> {
+    SOURCE_IMAGE_DESCRIPTOR_CACHE
+        .lock()
+        .lru
+        .iter()
+        .find(|(identity, _)| identity.path == path)
+        .map(|(_, descriptor)| (descriptor.width, descriptor.height))
 }
 
 pub(crate) fn load_image_source_descriptor(path: &Path) -> Option<Arc<ImageSourceDescriptor>> {

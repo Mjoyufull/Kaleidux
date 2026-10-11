@@ -116,19 +116,23 @@ pub(crate) fn process_frame_callbacks(
                 if native_surface_presented {
                     mark_presented = true;
                 } else if let Some(layer_surface) = backend.surfaces.get(&name) {
-                    let _ = r.render(
-                        renderer::BackendContext::Wayland {
-                            surface: layer_surface,
-                            qh,
-                            presentation: backend.presentation_proxy(),
-                        },
-                        loop_start,
-                    );
-                    if !ctx.first_frame_recorded {
+                    let previous_present = r.last_present_time;
+                    let succeeded = r
+                        .render(
+                            renderer::BackendContext::Wayland {
+                                surface: layer_surface,
+                                qh,
+                                presentation: backend.presentation_proxy(),
+                            },
+                            loop_start,
+                        )
+                        .is_ok()
+                        && r.last_present_time > previous_present;
+                    if succeeded && !ctx.first_frame_recorded {
                         ctx.metrics.record_first_frame();
                         ctx.first_frame_recorded = true;
                     }
-                    mark_presented = true;
+                    mark_presented = succeeded;
                 }
             }
         }
