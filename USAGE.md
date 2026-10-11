@@ -677,7 +677,9 @@ kldctl img ~/Pictures/wallpapers/forest.png
 `jump PATH` selects supported image or video media inside the target slideshow directory, including
 subdirectories. `set PATH` inserts media into the current queue and immediately
 advances to it. `img PATH` accepts either: slideshow media is selected in place,
-and external media is inserted. Existing entries are not duplicated.
+and external media is inserted. Existing entries are not duplicated. If the output
+has no slideshow queue, `set` and `img` initialize an in-memory queue with the
+selected file; `jump` requires an existing slideshow queue.
 
 These commands use the normal transition and history: `prev` returns to the
 previous wallpaper, and `next` returns to the selected wallpaper. An explicit selection
@@ -689,7 +691,7 @@ copied and the configuration is unchanged.
 
 Paths are resolved from the client's working directory; quote paths containing
 spaces. Supported images and videos are accepted; image content is sniffed instead of relying on its extension. Invalid image headers, missing files, blacklisted media, unknown
-outputs and outputs without a slideshow queue return errors. Omit `-o OUTPUT`
+outputs return errors. Omit `-o OUTPUT`
 to target `main-monitor`, or use `-o all` for every output; synchronized outputs and groups switch together, as with
 `next`. A `jump` targeting multiple directories must be inside each target directory.
 
