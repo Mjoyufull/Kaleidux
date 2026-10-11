@@ -1,3 +1,5 @@
+//! Waits on frame, worker, IPC and display readiness while retaining display-loop state.
+
 use crate::main_loop::MainLoopContext;
 use crate::observability::wake::{DeadlineReason, WakeReason};
 use crate::renderer;

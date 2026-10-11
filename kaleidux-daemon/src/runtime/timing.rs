@@ -1,3 +1,5 @@
+//! Combines display-loop wake sources and deadlines while preserving buffered worker results.
+
 use crate::content::sessions::VideoPlayerResult;
 use crate::main_loop::{CmdMsg, LoadedImage, PlayerEventMsg};
 use crate::observability::wake::{DeadlineReason, WakeReason};

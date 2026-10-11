@@ -1,3 +1,5 @@
+//! Presents renderer-owned content or a black frame using the active surface context.
+
 use crate::observability::present::RendererPresentKind;
 use tracing::{debug, error, warn};
 
@@ -58,7 +60,7 @@ impl super::Renderer {
 
     pub(super) fn present_black_frame(
         &mut self,
-        context: BackendContext,
+        _context: BackendContext,
         encoder: wgpu::CommandEncoder,
         output: wgpu::SurfaceTexture,
         view: &wgpu::TextureView,
@@ -70,11 +72,6 @@ impl super::Renderer {
             self.current_texture.is_some(),
             self.prev_texture.is_some()
         );
-
-        if !matches!(context, BackendContext::X11) {
-            self.needs_redraw = false;
-            return;
-        }
 
         let mut encoder = encoder;
         {

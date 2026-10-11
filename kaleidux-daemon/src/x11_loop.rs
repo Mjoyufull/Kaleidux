@@ -494,6 +494,7 @@ pub async fn run(
             }
         }
 
+        let mut startup_presented = Vec::new();
         ctx.release_startup_present_barrier(loop_start, |r, name, ls| {
             if !power_monitor.is_powered(name) {
                 return false;
@@ -503,10 +504,17 @@ pub async fn run(
                 && r.last_present_time > previous_present
             {
                 present_telemetry.record_wsi_submit();
+                startup_presented.push(name.to_owned());
                 return true;
             }
             false
         });
+
+        for name in startup_presented {
+            if let Some(player) = ctx.video_players.get(&name) {
+                player.request_video_frame();
+            }
+        }
 
         // ─── X11 render loop ────────────────────────────────────────────
 

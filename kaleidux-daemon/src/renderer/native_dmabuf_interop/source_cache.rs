@@ -51,6 +51,7 @@ impl NativeDmaBufInterop {
         Ok(CachedSource {
             imported,
             last_used: self.source_sequence,
+            staging_destinations: None,
             command_buffer,
             fence,
             acquire_semaphore,

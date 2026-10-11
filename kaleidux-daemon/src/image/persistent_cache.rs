@@ -1,3 +1,5 @@
+//! Stores prepared RGBA entries atomically and validates cached metadata before admission.
+
 use crate::image::types::{DecodedImagePayload, ImageLoadProfile, PreparedImageKey};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -191,7 +193,18 @@ pub(crate) fn probe_by_key(key: &PreparedImageKey) -> bool {
     let Some(cache_path) = path_for_key(key) else {
         return false;
     };
-    match File::open(&cache_path).and_then(|file| validate_file_header(file).map(|_| ())) {
+    match File::open(&cache_path).and_then(|file| {
+        let (mut reader, header) = validate_file_header(file)?;
+        let mut format = vec![0; header.format_len];
+        reader.read_exact(&mut format)?;
+        std::str::from_utf8(&format).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid cached format text",
+            )
+        })?;
+        Ok(())
+    }) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => {
@@ -712,6 +725,22 @@ mod tests {
         let key = unique_key("corrupt");
         let path = path_for_key(&key).expect("test cache path");
         std::fs::write(&path, b"not-a-valid-cache-entry").expect("write corrupt entry");
+        assert!(!probe_by_key(&key));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn availability_rejects_invalid_format_text() {
+        let key = unique_key("invalid-format");
+        let path = path_for_key(&key).expect("test cache path");
+        let mut bytes = CACHE_MAGIC.to_vec();
+        for value in [1_u32, 1, 1, 1, 1] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&4_u64.to_le_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(&[0, 0, 0, 255]);
+        std::fs::write(&path, bytes).expect("write invalid text entry");
         assert!(!probe_by_key(&key));
         assert!(!path.exists());
     }

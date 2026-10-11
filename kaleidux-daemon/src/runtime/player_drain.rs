@@ -1,3 +1,5 @@
+//! Adopts initialized video sessions and retires stale worker results outside the display loop.
+
 use crate::content::sessions::{
     VideoPlayerResult, clear_pending_video_session_if_matches, set_pending_video_session,
     stop_video_player_in_background,

@@ -1,3 +1,5 @@
+//! Commits worker results to output state and rejects stale session/channel deliveries.
+
 use crate::content::sessions::{should_accept_video_frame, stop_video_player_in_background};
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,

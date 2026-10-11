@@ -1,3 +1,5 @@
+//! Schedules metrics, cache trimming and maintenance without transferring output ownership.
+
 use crate::background;
 use crate::main_loop::MainLoopContext;
 use crate::renderer;

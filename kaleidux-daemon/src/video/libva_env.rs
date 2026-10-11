@@ -59,8 +59,10 @@ pub(crate) fn sanitize_libva_driver_env(adapter_vendor: u32, component: &str) {
     unsafe { std::env::remove_var("LIBVA_DRIVER_NAME") };
 }
 
-/// Sanitize before GStreamer scans dynamic VA-API elements. A multi-GPU host
-/// is deliberately left unchanged until WGPU identifies the selected adapter.
+/// Sanitize before GStreamer scans dynamic VA-API elements. Mixed-vendor
+/// overrides are deliberately preserved: removing an intentional driver choice
+/// would affect every adapter, and changing process environment after worker
+/// creation is unsafe. Users can unset LIBVA_DRIVER_NAME to request auto-detection.
 pub fn sanitize_libva_driver_env_for_gstreamer() {
     if let Some(adapter_vendor) = single_drm_vendor() {
         sanitize_libva_driver_env(adapter_vendor, "[GSTREAMER]");

@@ -1,3 +1,5 @@
+//! Owns the mpv software render context and publishes only actual frame updates.
+
 use libmpv2::Mpv;
 use libmpv2_sys as sys;
 use std::ffi::CString;
@@ -239,7 +241,7 @@ impl SoftwareRenderContext {
         }
         // SAFETY: self.context is the live render context owned by this wrapper.
         let update_flags = unsafe { sys::mpv_render_context_update(self.context) };
-        if !force_redraw && !has_render_update_frame(update_flags) {
+        if !has_render_update_frame(update_flags) {
             return Ok(None);
         }
         // SAFETY: every parameter points to storage that remains live through the call.

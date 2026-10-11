@@ -18,7 +18,6 @@ pub(super) struct ImportedLayer {
     pub(super) memories: Vec<vk::DeviceMemory>,
     pub(super) format: vk::Format,
     pub(super) plane_count: usize,
-    pub(super) initialized: bool,
 }
 
 impl Drop for ImportedLayer {
@@ -279,7 +278,6 @@ fn import_layer(
         memories,
         format,
         plane_count: planes.len(),
-        initialized: false,
     })
 }
 

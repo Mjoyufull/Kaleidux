@@ -50,6 +50,8 @@ mod cuda_retirement;
 #[path = "renderer/mpv_gl_interop.rs"]
 #[cfg_attr(not(feature = "backend-mpv"), allow(dead_code))]
 mod mpv_gl_interop;
+mod mpv_gl_ownership;
+mod mpv_gl_sync;
 #[path = "renderer/native_dmabuf_interop.rs"]
 mod native_dmabuf_interop;
 #[path = "renderer/native_gl_surface.rs"]

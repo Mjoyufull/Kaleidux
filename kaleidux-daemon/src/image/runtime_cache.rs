@@ -1,3 +1,5 @@
+//! Owns bounded image caches and worker admission shared by foreground and speculative requests.
+
 use crate::background::BackgroundWorkKind;
 use crate::image as image_pipeline;
 use crate::image::types::{

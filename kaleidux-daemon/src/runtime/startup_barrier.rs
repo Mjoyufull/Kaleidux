@@ -1,3 +1,5 @@
+//! Tracks readiness and release deadlines for a bounded group of initial output presentations.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

@@ -24,10 +24,10 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
     ctx.monitor_manager.update_config(config);
     let mut restarts = Vec::new();
     for (name, renderer) in ctx.renderers.iter_mut() {
-        if let Some(config) = ctx.monitor_manager.get_output_config(name) {
+        if let Some(output_config) = ctx.monitor_manager.get_output_config(name) {
             if old_fps
                 .get(name)
-                .is_some_and(|(old, _)| *old != config.video_fps)
+                .is_some_and(|(old, _)| *old != output_config.video_fps)
                 && (renderer.valid_content_type == ContentType::Video
                     || ctx.pending_video_switches.contains_key(name))
                 && let Some(path) = old_fps.get(name).and_then(|(_, path)| path.clone())
@@ -35,9 +35,9 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
                 restarts.push((name.clone(), path));
             }
             if let Some(player) = ctx.video_players.get_mut(name) {
-                player.set_volume(config.volume as f64 / 100.0);
+                player.set_volume(output_config.volume as f64 / 100.0);
             }
-            renderer.apply_config(config);
+            renderer.apply_config(output_config);
         }
     }
     let batch = rand::random::<u64>();
