@@ -1,3 +1,6 @@
+//! Selects per-frame upload paths and owns the renderer staging/binding transition.
+//! Decoder frame storage stays borrowed until its CPU upload or GPU lease is retained.
+
 use std::sync::OnceLock;
 
 use tracing::{debug, error, info, warn};
@@ -331,21 +334,22 @@ impl super::Renderer {
                 ) {
                     if matches!(frame.storage, crate::video::VideoFrameStorage::Native(_)) {
                         crate::video::report_native_cuda_import_failure();
-                        return;
+                        false
+                    } else {
+                        error!(
+                            "[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload",
+                            self.name
+                        );
+                        self.upload_frame_nv12(
+                            frame,
+                            texture.as_ref(),
+                            source_width,
+                            source_height,
+                            *y_stride,
+                            *uv_offset,
+                            *uv_stride,
+                        )
                     }
-                    error!(
-                        "[VIDEO] {}: CUDA zero-copy failed, falling back to NV12 CPU upload",
-                        self.name
-                    );
-                    self.upload_frame_nv12(
-                        frame,
-                        texture.as_ref(),
-                        source_width,
-                        source_height,
-                        *y_stride,
-                        *uv_offset,
-                        *uv_stride,
-                    )
                 } else {
                     true
                 }
@@ -354,9 +358,12 @@ impl super::Renderer {
 
         if !upload_succeeded {
             self.active_yuv_source = None;
-            self.final_nv12_bind_group = None;
-            self.final_p010_bind_group = None;
-            self.final_i420_bind_group = None;
+            // Plane extents and their bindings form one allocation state.
+            // Reset both so the next same-sized frame rebuilds valid bindings.
+            self.release_nv12_staging("failed upload");
+            self.release_p010_staging("failed upload");
+            self.release_i420_staging("failed upload");
+            self.release_cuda_cache();
             if let Some(failed_texture) = texture.take() {
                 if needs_new_texture {
                     self.ctx.return_texture_to_pool(

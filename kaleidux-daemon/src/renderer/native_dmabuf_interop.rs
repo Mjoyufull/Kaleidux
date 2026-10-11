@@ -1,3 +1,5 @@
+//! Retains imported decoder surfaces and bounded cached copy commands until queue completion.
+
 #[path = "native_dmabuf_interop/copy.rs"]
 mod copy;
 #[path = "native_dmabuf_interop/import.rs"]
@@ -21,6 +23,7 @@ use tracing::{debug, info};
 struct CachedSource {
     imported: import::ImportedSource,
     last_used: u64,
+    staging_destinations: Option<(vk::Image, vk::Image)>,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     acquire_semaphore: vk::Semaphore,
@@ -162,6 +165,11 @@ impl NativeDmaBufInterop {
             .expect("native DMA-BUF source was inserted above");
 
         source.select_copy_mode(CopyMode::WgpuStaging);
+        let destinations = (y_destination, uv_destination);
+        if source.staging_destinations != Some(destinations) {
+            source.staging_destinations = Some(destinations);
+            source.reusable_command = false;
+        }
 
         // Decoder pools normally rotate across several surfaces, so this fence
         // is already signaled by the time the same surface returns. Retaining
@@ -179,9 +187,9 @@ impl NativeDmaBufInterop {
             source.fence_in_flight = false;
         }
 
-        // The first recording imports an undefined external layout. Record once
-        // more after that submission establishes GENERAL, then reuse the same
-        // executable command buffer for this decoder surface indefinitely.
+        // Imported producer contents enter in GENERAL. The linear-copy target
+        // needs its first-write layout only once; record again after that
+        // initialization, then reuse until staging destinations change.
         if !source.reusable_command {
             let _pool_access = self.command_pool.access.lock();
             if source.has_submitted {

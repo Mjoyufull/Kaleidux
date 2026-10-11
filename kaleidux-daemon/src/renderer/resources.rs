@@ -1,3 +1,5 @@
+//! Retires renderer textures, import leases and staging bindings as complete allocation states.
+
 use super::RetainedTextureFootprint;
 use super::texture::texture_byte_size;
 use super::video_layout::yuv420_aux_byte_size;
@@ -38,6 +40,9 @@ impl super::Renderer {
         self.nv12_y_view = None;
         self.nv12_uv_view = None;
         self.nv12_staging_size = None;
+        // Cached copy commands reference these images; retirement must precede
+        // any new allocation, including a driver reusing the same raw handle.
+        self.native_dmabuf_interop = None;
         {
             self.native_nv12_bind_group = None;
             self.final_nv12_bind_group = None;
@@ -279,7 +284,9 @@ impl super::Renderer {
             }
         }
 
-        if !self.has_any_content() || self.valid_content_type != crate::queue::ContentType::Video {
+        if (!self.has_any_content() && self.native_wayland_snapshot_frame.is_none())
+            || self.valid_content_type != crate::queue::ContentType::Video
+        {
             self.release_video_backend_resources("idle trim");
         }
     }

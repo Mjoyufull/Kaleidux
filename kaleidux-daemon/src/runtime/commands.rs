@@ -1,3 +1,5 @@
+//! Applies IPC requests to the display-loop-owned monitor and playback state.
+
 use crate::content::sessions::{set_pending_video_session, stop_video_player_in_background};
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,

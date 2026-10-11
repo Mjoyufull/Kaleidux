@@ -1,3 +1,5 @@
+//! Computes idle wake deadlines without owning timers or event sources.
+
 use std::time::{Duration, Instant};
 
 pub(crate) fn next_idle_wake_deadline(

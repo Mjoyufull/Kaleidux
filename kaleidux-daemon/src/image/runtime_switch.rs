@@ -1,3 +1,5 @@
+//! Loads a prepared image for an output while preserving its content-switch generation.
+
 use crate::main_loop::PendingContentSwitch;
 use crate::queue;
 use crate::renderer;

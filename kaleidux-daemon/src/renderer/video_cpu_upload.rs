@@ -1,3 +1,5 @@
+//! Uploads borrowed CPU planes into renderer-owned textures with reusable stride scratch.
+
 use super::video_layout::chroma_plane_extent;
 use tracing::error;
 

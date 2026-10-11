@@ -1,3 +1,5 @@
+//! Coordinates display-loop-owned playback state with asynchronous workers and IPC.
+
 pub(crate) mod channel_drain;
 pub(crate) mod commands;
 mod commands_reload;

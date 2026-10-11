@@ -3,13 +3,13 @@
 use ash::vk;
 use std::ffi::CStr;
 
-pub(super) fn configure(adapter: &wgpu::Adapter) {
+pub(super) fn configure(wgpu_adapter: &wgpu::Adapter) {
     // SAFETY: the HAL adapter and instance stay borrowed throughout all queries.
     let result = unsafe {
-        adapter.as_hal::<wgpu_hal::vulkan::Api, _, _>(|adapter| {
-            let adapter = adapter?;
-            let instance = adapter.shared_instance().raw_instance();
-            let physical = adapter.raw_physical_device();
+        wgpu_adapter.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_adapter_option| {
+            let hal_adapter = hal_adapter_option?;
+            let instance = hal_adapter.shared_instance().raw_instance();
+            let physical = hal_adapter.raw_physical_device();
             let extensions = instance
                 .enumerate_device_extension_properties(physical)
                 .ok()?;
@@ -43,13 +43,13 @@ pub(super) fn configure(adapter: &wgpu::Adapter) {
 
 unsafe fn nv12_formats(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Vec<String> {
     let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    let mut initial_properties = vk::FormatProperties2::default().push_next(&mut list);
     // SAFETY: caller retains instance/physical, and list lives across the query.
     unsafe {
         instance.get_physical_device_format_properties2(
             physical,
             vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            &mut properties,
+            &mut initial_properties,
         );
     }
     let mut modifiers = vec![
@@ -58,13 +58,13 @@ unsafe fn nv12_formats(instance: &ash::Instance, physical: vk::PhysicalDevice) -
     ];
     list.p_drm_format_modifier_properties = modifiers.as_mut_ptr();
     list.drm_format_modifier_count = modifiers.len() as u32;
-    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    let mut populated_properties = vk::FormatProperties2::default().push_next(&mut list);
     // SAFETY: Vulkan writes at most the declared live array length.
     unsafe {
         instance.get_physical_device_format_properties2(
             physical,
             vk::Format::G8_B8R8_2PLANE_420_UNORM,
-            &mut properties,
+            &mut populated_properties,
         );
     }
     modifiers.truncate(list.drm_format_modifier_count as usize);

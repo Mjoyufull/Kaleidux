@@ -24,17 +24,10 @@ pub(super) fn record_copy(
         .iter()
         .map(|layer| {
             vk::ImageMemoryBarrier::default()
-                .src_access_mask(if layer.initialized {
-                    vk::AccessFlags::MEMORY_WRITE
-                } else {
-                    vk::AccessFlags::empty()
-                })
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(if layer.initialized {
-                    vk::ImageLayout::GENERAL
-                } else {
-                    vk::ImageLayout::UNDEFINED
-                })
+                // Imported decoder contents must survive their first acquire.
+                .old_layout(vk::ImageLayout::GENERAL)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
                 .dst_queue_family_index(queue_family_index)
@@ -143,9 +136,6 @@ pub(super) fn record_copy(
         device
             .end_command_buffer(command_buffer)
             .map_err(|error| anyhow::anyhow!("ending DMA-BUF copy: {error:?}"))?;
-    }
-    for layer in &mut source.layers {
-        layer.initialized = true;
     }
     Ok(())
 }
@@ -264,9 +254,6 @@ pub(super) fn record_copy_to_linear(
             .end_command_buffer(command_buffer)
             .map_err(|error| anyhow::anyhow!("ending linear bridge copy: {error:?}"))?;
     }
-    for layer in &mut source.layers {
-        layer.initialized = true;
-    }
     output.initialized = true;
     Ok(())
 }
@@ -280,17 +267,10 @@ fn source_acquire_barriers(
         .iter()
         .map(|layer| {
             vk::ImageMemoryBarrier::default()
-                .src_access_mask(if layer.initialized {
-                    vk::AccessFlags::MEMORY_WRITE
-                } else {
-                    vk::AccessFlags::empty()
-                })
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(if layer.initialized {
-                    vk::ImageLayout::GENERAL
-                } else {
-                    vk::ImageLayout::UNDEFINED
-                })
+                // Imported decoder contents must survive their first acquire.
+                .old_layout(vk::ImageLayout::GENERAL)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
                 .dst_queue_family_index(queue_family_index)

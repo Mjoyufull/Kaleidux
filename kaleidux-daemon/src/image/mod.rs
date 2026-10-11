@@ -11,5 +11,6 @@ pub(crate) mod runtime_prefetch;
 pub(crate) mod runtime_probe;
 pub(crate) mod runtime_request;
 pub(crate) mod runtime_shared;
+pub(crate) mod runtime_source;
 pub(crate) mod runtime_switch;
 pub(crate) mod types;

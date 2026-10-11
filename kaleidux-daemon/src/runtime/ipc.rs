@@ -1,3 +1,5 @@
+//! Bounds request buffering while the caller owns the connected Unix stream.
+
 use tokio::io::AsyncReadExt;
 use tracing::warn;
 

@@ -1,3 +1,5 @@
+//! Imports native video frames and retains their producer leases through GPU sampling.
+
 use super::video_layout::chroma_plane_extent;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -52,9 +54,6 @@ impl super::Renderer {
         if let Err(error) = result {
             self.native_gl_surface = None;
             self.native_gl_surface_failed = true;
-            self.record_native_import_failure(format!(
-                "native EGLImage presentation failed: {error:#}"
-            ));
             warn!(
                 "[NATIVE-GL] {}: DMA-BUF presentation failed ({error:#}); retaining Vulkan single-copy composition",
                 self.name

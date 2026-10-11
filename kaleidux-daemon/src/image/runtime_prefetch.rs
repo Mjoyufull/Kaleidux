@@ -1,3 +1,5 @@
+//! Schedules cancellable lookahead work through shared image admission and cache budgets.
+
 use crate::background::{self, BackgroundWorkKind};
 use crate::image::prefetch::ImagePrefetchRequest;
 use crate::image::runtime_cache::request_prepared_image_payload;

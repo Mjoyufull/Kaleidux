@@ -1,18 +1,19 @@
+//! Coalesces prepared-image requests and retains source admission until preparation completes.
+
+use super::runtime_source::request_decoded_source_image;
 use crate::background::{self, BackgroundWorkKind};
-use crate::image as image_pipeline;
 use crate::image::runtime_cache::{
-    IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX, acquire_image_work_permit, decode_source_image,
+    IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX, acquire_image_work_permit,
     prepare_image_for_output_uncached, prepare_source_image_for_output,
     prepared_image_key_for_identity, prepared_target_dimensions_from_descriptor,
-    select_compatible_prepared_key, store_decoded_source_memory, store_prepared_image_cache_by_key,
-    store_prepared_image_memory, store_source_descriptor_memory,
-    try_load_compatible_prepared_image_memory, try_load_decoded_source_memory,
-    try_load_prepared_image_cache_by_key, try_load_prepared_image_memory,
+    select_compatible_prepared_key, store_prepared_image_cache_by_key, store_prepared_image_memory,
+    try_load_compatible_prepared_image_memory, try_load_prepared_image_cache_by_key,
+    try_load_prepared_image_memory,
 };
 use crate::image::runtime_shared::{publish_shared_result, wait_for_shared_result};
 use crate::image::types::{
-    DecodedImagePayload, DecodedSourceImage, ImageSourceIdentity, InFlightSharedResult,
-    PreparedImageEntry, PreparedImageKey,
+    DecodedImagePayload, ImageSourceIdentity, InFlightSharedResult, PreparedImageEntry,
+    PreparedImageKey,
 };
 use crate::metrics;
 use parking_lot::Mutex as ParkingMutex;
@@ -20,9 +21,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-const MAX_SPECULATIVE_FAILURE_RETRIES: u8 = 3;
+pub(super) const MAX_SPECULATIVE_FAILURE_RETRIES: u8 = 3;
 
-fn rejected_image_work(work_kind: BackgroundWorkKind) -> String {
+pub(super) fn rejected_image_work(work_kind: BackgroundWorkKind) -> String {
     if work_kind == BackgroundWorkKind::ImagePrefetch && background::is_accepting_new_work() {
         format!("{IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX} background registry is full")
     } else {
@@ -48,44 +49,6 @@ where
 static PREPARED_IMAGE_IN_FLIGHT: once_cell::sync::Lazy<
     ParkingMutex<HashMap<PreparedImageKey, Arc<InFlightSharedResult<PreparedImageEntry>>>>,
 > = once_cell::sync::Lazy::new(|| ParkingMutex::new(HashMap::new()));
-
-static SOURCE_IMAGE_IN_FLIGHT: once_cell::sync::Lazy<
-    ParkingMutex<HashMap<ImageSourceIdentity, Arc<InFlightSharedResult<DecodedSourceImage>>>>,
-> = once_cell::sync::Lazy::new(|| ParkingMutex::new(HashMap::new()));
-
-struct SourceInFlightGuard {
-    key: ImageSourceIdentity,
-    state: Arc<InFlightSharedResult<DecodedSourceImage>>,
-    published: bool,
-}
-
-impl SourceInFlightGuard {
-    fn new(key: ImageSourceIdentity, state: Arc<InFlightSharedResult<DecodedSourceImage>>) -> Self {
-        Self {
-            key,
-            state,
-            published: false,
-        }
-    }
-
-    fn publish(&mut self, result: Result<Arc<DecodedSourceImage>, String>) {
-        remove_source_flight_if_current(&self.key, &self.state);
-        publish_shared_result(&self.state, result);
-        self.published = true;
-    }
-}
-
-impl Drop for SourceInFlightGuard {
-    fn drop(&mut self) {
-        if !self.published {
-            remove_source_flight_if_current(&self.key, &self.state);
-            publish_shared_result(
-                &self.state,
-                Err("image source leader cancelled before publishing a result".to_string()),
-            );
-        }
-    }
-}
 
 struct PreparedInFlightGuard {
     key: PreparedImageKey,
@@ -121,19 +84,6 @@ impl Drop for PreparedInFlightGuard {
     }
 }
 
-fn remove_source_flight_if_current(
-    key: &ImageSourceIdentity,
-    state: &Arc<InFlightSharedResult<DecodedSourceImage>>,
-) {
-    let mut flights = SOURCE_IMAGE_IN_FLIGHT.lock();
-    if flights
-        .get(key)
-        .is_some_and(|current| Arc::ptr_eq(current, state))
-    {
-        flights.remove(key);
-    }
-}
-
 fn remove_prepared_flight_if_current(
     key: &PreparedImageKey,
     state: &Arc<InFlightSharedResult<PreparedImageEntry>>,
@@ -164,94 +114,9 @@ pub(crate) fn find_compatible_prepared_in_flight_state(
     in_flight.get(&candidate_key).cloned()
 }
 
-fn should_retry_speculative_failure(work_kind: BackgroundWorkKind, error: &str) -> bool {
+pub(super) fn should_retry_speculative_failure(work_kind: BackgroundWorkKind, error: &str) -> bool {
     work_kind != BackgroundWorkKind::ImagePrefetch
         && error.starts_with(IMAGE_PREFETCH_CAPACITY_ERROR_PREFIX)
-}
-
-pub(crate) async fn request_decoded_source_image(
-    path: &Path,
-    identity: ImageSourceIdentity,
-    work_kind: BackgroundWorkKind,
-    metrics: &Arc<metrics::PerformanceMetrics>,
-) -> anyhow::Result<Arc<DecodedSourceImage>> {
-    if let Some(source) = try_load_decoded_source_memory(&identity) {
-        metrics.record_image_source_memory_hit();
-        return Ok(source);
-    }
-    metrics.record_image_source_decode_miss();
-
-    let mut speculative_retries = 0;
-    let (state, leader) = loop {
-        let (state, leader) = {
-            let mut in_flight = SOURCE_IMAGE_IN_FLIGHT.lock();
-            if let Some(existing) = in_flight.get(&identity) {
-                (existing.clone(), false)
-            } else {
-                let state = Arc::new(InFlightSharedResult::default());
-                in_flight.insert(identity.clone(), state.clone());
-                (state, true)
-            }
-        };
-
-        if leader {
-            break (state, true);
-        }
-
-        metrics.record_image_shared_wait();
-        match wait_for_shared_result(state).await {
-            Ok(source) => return Ok(source),
-            Err(error) if should_retry_speculative_failure(work_kind, &error) => {
-                speculative_retries += 1;
-                if speculative_retries >= MAX_SPECULATIVE_FAILURE_RETRIES {
-                    return Err(anyhow::anyhow!(error));
-                }
-                continue;
-            }
-            Err(error) => return Err(anyhow::anyhow!(error)),
-        }
-    };
-    debug_assert!(leader);
-
-    let mut flight = SourceInFlightGuard::new(identity.clone(), state.clone());
-
-    let _permit = match acquire_image_work_permit(work_kind, "decode").await {
-        Ok(permit) => permit,
-        Err(error) => {
-            let message = error.to_string();
-            flight.publish(Err(message.clone()));
-            return Err(anyhow::anyhow!(message));
-        }
-    };
-    let decode_path = path.to_path_buf();
-    let Some(handle) = spawn_image_blocking(work_kind, move || {
-        let _permit = _permit;
-        decode_source_image(&decode_path)
-    })
-    .await
-    else {
-        let msg = rejected_image_work(work_kind);
-        flight.publish(Err(msg.clone()));
-        return Err(anyhow::anyhow!(msg));
-    };
-
-    let result = match handle.await {
-        Ok(Ok(source)) => Ok(Arc::new(source)),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) => Err(format!("image source decode task panicked: {}", e)),
-    };
-
-    if let Ok(source) = &result {
-        let descriptor = image_pipeline::descriptor::from_decoded_source(identity.clone(), source);
-        store_decoded_source_memory(identity, source.clone());
-        store_source_descriptor_memory(descriptor);
-    }
-    flight.publish(result.clone());
-
-    match result {
-        Ok(source) => Ok(source),
-        Err(e) => Err(anyhow::anyhow!(e)),
-    }
 }
 
 pub(crate) async fn request_prepared_image_payload(
@@ -379,20 +244,16 @@ pub(crate) async fn request_prepared_image_payload(
                 return Err(anyhow::anyhow!(message));
             }
         };
-    let _permit = match acquire_image_work_permit(work_kind, "prepare").await {
-        Ok(permit) => permit,
-        Err(error) => {
-            let message = error.to_string();
-            flight.publish(Err(message.clone()));
-            return Err(anyhow::anyhow!(message));
-        }
-    };
-    let source_for_prepare = source.clone();
+    let source_for_prepare = source;
     let cache_key = key.clone();
     let Some(handle) = spawn_image_blocking(work_kind, move || {
-        let _permit = _permit;
-        let payload =
-            prepare_source_image_for_output(&source_for_prepare, target_width, target_height)?;
+        // The lease holds decode admission until its source buffer is no
+        // longer needed, including the wait for this tracked preparation.
+        let payload = prepare_source_image_for_output(
+            &source_for_prepare.source,
+            target_width,
+            target_height,
+        )?;
         store_prepared_image_cache_by_key(&cache_key, &payload);
         Ok::<_, anyhow::Error>(payload)
     })
@@ -433,25 +294,6 @@ mod tests {
             modified_secs: 2,
             modified_nanos: 3,
         }
-    }
-
-    #[tokio::test]
-    async fn cancelled_source_leader_notifies_waiters_and_removes_entry() {
-        let identity = test_identity("cancelled-source-leader");
-        let state = Arc::new(InFlightSharedResult::default());
-        SOURCE_IMAGE_IN_FLIGHT
-            .lock()
-            .insert(identity.clone(), state.clone());
-
-        let waiter = tokio::spawn(wait_for_shared_result(state.clone()));
-        drop(SourceInFlightGuard::new(identity.clone(), state));
-
-        let error = waiter
-            .await
-            .expect("waiter task should complete")
-            .expect_err("cancelled leader must publish an error");
-        assert!(error.contains("cancelled"));
-        assert!(!SOURCE_IMAGE_IN_FLIGHT.lock().contains_key(&identity));
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+//! Handles decoder lifecycle events only for the matching output session.
+
 use crate::content::sessions::{
     clear_pending_video_session_if_matches, stop_video_player_in_background,
 };

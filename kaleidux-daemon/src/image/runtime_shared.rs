@@ -1,3 +1,5 @@
+//! Publishes shared worker outcomes and wakes every request waiting on that result.
+
 use crate::image::types::InFlightSharedResult;
 use std::sync::Arc;
 

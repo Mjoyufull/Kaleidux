@@ -357,6 +357,20 @@ fn caps_ladder_for_mode(mode: VideoMode, capabilities: &VideoCapabilities) -> Ve
     }
 }
 
+fn dmabuf_caps_labels() -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if super::import_caps::can_import_dmabuf() {
+        labels.push("DMA_DRM NV12");
+    }
+    if super::import_caps::nv12_formats()
+        .iter()
+        .any(|format| format == "NV12")
+    {
+        labels.push("linear DMABuf NV12");
+    }
+    labels
+}
+
 pub fn caps_ladder_labels(mode: VideoMode, capabilities: &VideoCapabilities) -> Vec<&'static str> {
     match mode {
         VideoMode::ForceRgba => vec!["RGBA"],
@@ -369,15 +383,14 @@ pub fn caps_ladder_labels(mode: VideoMode, capabilities: &VideoCapabilities) -> 
             labels
         }
         VideoMode::ForceNv12 => vec!["NV12"],
-        VideoMode::ForceDmaBuf => vec!["DMA_DRM NV12", "linear DMABuf NV12"],
+        VideoMode::ForceDmaBuf => dmabuf_caps_labels(),
         VideoMode::StrictCuda => vec!["CUDAMemory NV12"],
         VideoMode::Auto => {
             let mut labels = Vec::new();
             if capabilities.has_cuda_path() {
                 labels.push("CUDAMemory NV12");
             }
-            labels.push("DMA_DRM NV12");
-            labels.push("linear DMABuf NV12");
+            labels.extend(dmabuf_caps_labels());
             if p010_may_be_negotiated() {
                 labels.push("P010");
             }

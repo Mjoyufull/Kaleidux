@@ -1,3 +1,5 @@
+//! Extracts metadata and retains GStreamer buffer ownership through frame delivery.
+
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
@@ -82,10 +84,10 @@ fn color_metadata(
         });
     let content_light = gst_video::VideoContentLightLevel::from_caps(caps)
         .map(|metadata| super::VideoContentLightMetadata {
-            max_content_light_level: Some(u32::from(metadata.max_content_light_level())),
-            max_frame_average_light_level: Some(u32::from(
-                metadata.max_frame_average_light_level(),
-            )),
+            max_content_light_level: (metadata.max_content_light_level() != 0)
+                .then(|| u32::from(metadata.max_content_light_level())),
+            max_frame_average_light_level: (metadata.max_frame_average_light_level() != 0)
+                .then(|| u32::from(metadata.max_frame_average_light_level())),
         })
         .unwrap_or_default();
     super::VideoColorMetadata {
@@ -954,6 +956,23 @@ mod tests {
         );
         assert_eq!(first.identity, second.identity);
         assert_eq!(first.video_info.format(), gst_video::VideoFormat::Nv12);
+    }
+
+    #[test]
+    fn zero_content_light_levels_are_unknown() {
+        gst::init().expect("GStreamer should initialize");
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::P01010le, 64, 64)
+            .build()
+            .expect("valid HDR video info");
+        let mut caps = info.to_caps().expect("valid caps");
+        gst_video::VideoContentLightLevel::new(0, 0).add_to_caps(caps.make_mut());
+        let unknown = color_metadata(&info, caps.as_ref()).content_light;
+        assert_eq!(unknown.max_content_light_level, None);
+        assert_eq!(unknown.max_frame_average_light_level, None);
+        gst_video::VideoContentLightLevel::new(1000, 400).add_to_caps(caps.make_mut());
+        let known = color_metadata(&info, caps.as_ref()).content_light;
+        assert_eq!(known.max_content_light_level, Some(1000));
+        assert_eq!(known.max_frame_average_light_level, Some(400));
     }
 
     #[test]

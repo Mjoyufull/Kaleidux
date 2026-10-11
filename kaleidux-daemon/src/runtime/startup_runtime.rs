@@ -1,3 +1,5 @@
+//! Applies startup barrier decisions to display-loop-owned renderers and content sessions.
+
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,
 };
