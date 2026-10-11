@@ -167,9 +167,10 @@ pub(crate) fn process_frame_callbacks(
         let pending_video = r.steady_video_uses_frame_callbacks()
             && r.valid_content_type == crate::queue::ContentType::Video
             && ctx.latest_video_frames.pending_frame_age(name).is_some();
-        let should_request = r.has_any_content()
-            && (r.needs_redraw || r.transition_active || pending_video)
-            && !barrier_blocks;
+        // A clear still needs one presentation even though no content remains.
+        // The black presentation clears needs_redraw, restoring idle waiting.
+        let should_request =
+            (r.needs_redraw || r.transition_active || pending_video) && !barrier_blocks;
         if should_request {
             if let Some(layer_surface) = backend.surfaces.get(name) {
                 *callback_flush_needed |= r.request_frame_callback(layer_surface, qh);

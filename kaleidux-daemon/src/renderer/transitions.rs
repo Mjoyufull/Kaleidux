@@ -126,8 +126,8 @@ impl super::Renderer {
 
     /// Clears the renderer to black (removes current and previous textures)
     ///
-    /// This explicitly drops all texture resources and forces WGPU to reclaim
-    /// GPU memory immediately. Useful for cleanup and preventing memory leaks.
+    /// Retires content resources while retaining the configured presentation
+    /// surface so the next frame can clear the compositor-visible buffer.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         // Explicitly drop textures to free GPU memory
@@ -167,7 +167,6 @@ impl super::Renderer {
         self.active_video_session_id = 0; // Invalidate current video session
         self.active_image_session_id = 0;
         self.valid_content_type = crate::queue::ContentType::Image;
-        self.configured = false; // Force re-config next time
         self.ctx.request_device_poll();
     }
 
