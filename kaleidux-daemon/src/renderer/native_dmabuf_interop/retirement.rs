@@ -7,6 +7,7 @@ pub(super) struct CommandPool {
     pub(super) context: Arc<crate::renderer::WgpuContext>,
     pub(super) device: ash::Device,
     pub(super) access: parking_lot::Mutex<()>,
+    pub(super) pending_sources: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for CommandPool {
@@ -23,6 +24,9 @@ pub(super) fn retire(pool: Arc<CommandPool>, sources: Vec<CachedSource>) {
     if sources.is_empty() {
         return;
     }
+    let count = sources.len();
+    pool.pending_sources
+        .fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     let context = pool.context.clone();
     context.with_raw_queue_lock(|| {
         context.queue.submit(std::iter::empty());
@@ -43,6 +47,8 @@ pub(super) fn retire(pool: Arc<CommandPool>, sources: Vec<CachedSource>) {
                 }
                 drop(source);
             }
+            pool.pending_sources
+                .fetch_sub(count, std::sync::atomic::Ordering::AcqRel);
         });
     });
     context.request_device_poll();

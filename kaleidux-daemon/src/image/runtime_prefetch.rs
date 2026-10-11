@@ -47,52 +47,89 @@ pub(crate) fn schedule_image_prefetch_plan(
     }
 
     let output_name = trigger_output.to_string();
-    tokio::spawn(async move {
-        for request in requests {
-            if !background::is_accepting_new_work() {
-                return;
-            }
-            if !image_prefetch_generation_matches(&output_name, generation) {
-                debug!(
-                    "[PREFETCH] {}: Aborting superseded prefetch plan generation {}",
-                    output_name, generation
-                );
-                return;
-            }
+    tokio::spawn(warm_plan(output_name, generation, requests, metrics));
+}
 
-            let prefetch_start = Instant::now();
-            match request_prepared_image_payload(
-                &request.path,
-                request.target_width,
-                request.target_height,
-                BackgroundWorkKind::ImagePrefetch,
-                usize::MAX,
-                &metrics,
-            )
-            .await
-            {
-                Ok(payload) => debug!(
-                    "[PREFETCH] {} -> {}: Warmed {} ({}) as {} {}x{} in {:.1}ms",
-                    output_name,
-                    request.target_output,
-                    request.path.display(),
-                    request.reason,
-                    payload.profile.format,
-                    payload.width,
-                    payload.height,
-                    prefetch_start.elapsed().as_secs_f64() * 1000.0
-                ),
-                Err(e) => debug!(
-                    "[PREFETCH] {} -> {}: Failed to warm {} ({}): {}",
-                    output_name,
-                    request.target_output,
-                    request.path.display(),
-                    request.reason,
-                    e
-                ),
-            }
+async fn warm_plan(
+    output_name: String,
+    generation: u64,
+    requests: Vec<ImagePrefetchRequest>,
+    metrics: Arc<metrics::PerformanceMetrics>,
+) {
+    // Probe cold/current descriptors off the display loop before spending
+    // speculative bytes. Cover sizing can exceed the output's dimensions.
+    let mut remaining = (super::runtime_cache::PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES / 2) as u64;
+    for request in requests {
+        if !background::is_accepting_new_work() {
+            return;
         }
-    });
+        if !image_prefetch_generation_matches(&output_name, generation) {
+            debug!(
+                "[PREFETCH] {}: Aborting superseded prefetch plan generation {}",
+                output_name, generation
+            );
+            return;
+        }
+
+        let Ok(Some(descriptor)) = super::runtime_probe::probe_descriptor(
+            &request.path,
+            BackgroundWorkKind::ImagePrefetch,
+        )
+        .await
+        else {
+            continue;
+        };
+        let (width, height) = super::runtime_cache::prepared_target_dimensions_from_descriptor(
+            &descriptor,
+            request.target_width,
+            request.target_height,
+        );
+        if !super::prefetch::admit_prepared_bytes(&mut remaining, width, height) {
+            continue;
+        }
+        if !image_prefetch_generation_matches(&output_name, generation) {
+            return;
+        }
+        warm_request(&output_name, request, &metrics).await;
+    }
+}
+
+async fn warm_request(
+    output_name: &str,
+    request: ImagePrefetchRequest,
+    metrics: &Arc<metrics::PerformanceMetrics>,
+) {
+    let prefetch_start = Instant::now();
+    match request_prepared_image_payload(
+        &request.path,
+        request.target_width,
+        request.target_height,
+        BackgroundWorkKind::ImagePrefetch,
+        usize::MAX,
+        metrics,
+    )
+    .await
+    {
+        Ok(payload) => debug!(
+            "[PREFETCH] {} -> {}: Warmed {} ({}) as {} {}x{} in {:.1}ms",
+            output_name,
+            request.target_output,
+            request.path.display(),
+            request.reason,
+            payload.profile.format,
+            payload.width,
+            payload.height,
+            prefetch_start.elapsed().as_secs_f64() * 1000.0
+        ),
+        Err(e) => debug!(
+            "[PREFETCH] {} -> {}: Failed to warm {} ({}): {}",
+            output_name,
+            request.target_output,
+            request.path.display(),
+            request.reason,
+            e
+        ),
+    }
 }
 
 #[cfg(test)]
