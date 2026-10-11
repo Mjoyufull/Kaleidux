@@ -176,7 +176,7 @@ impl Transition {
                 scale: 0.7,
             },
             "directionalwarp" => Transition::DirectionalWarp {
-                direction: [1.0, 0.0],
+                direction: [0.0, 1.0],
             },
             "directionalwipe" | "wipe" => Transition::DirectionalWipe {
                 direction: [1.0, -1.0],

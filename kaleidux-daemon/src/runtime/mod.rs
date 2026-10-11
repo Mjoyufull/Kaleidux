@@ -1,5 +1,6 @@
 pub(crate) mod channel_drain;
 pub(crate) mod commands;
+mod commands_reload;
 pub(crate) mod housekeeping;
 pub(crate) mod idle_runtime;
 pub mod idle_wait;

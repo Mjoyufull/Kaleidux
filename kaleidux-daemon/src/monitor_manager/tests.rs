@@ -276,6 +276,36 @@ fn display_power_suspend_stops_and_rearms_content_deadlines() {
 }
 
 #[test]
+fn resuming_a_blank_output_keeps_initial_selection_due() {
+    let temp = unique_test_dir("blank-resume");
+    let cache = Arc::new(FileCache::new_test(&temp.join("cache.redb")).unwrap());
+    let config = test_output_config(Duration::from_secs(300));
+    let orchestrator = OutputOrchestrator {
+        _name: "DP-1".into(),
+        description: "test".into(),
+        phase_offset: Duration::ZERO,
+        config: config.clone(),
+        queue: None,
+        current_path: None,
+        next_path: None,
+        next_content_type: None,
+        next_change: None,
+        display_start_time: None,
+    };
+    let mut manager = make_test_manager(
+        "DP-1",
+        cache,
+        orchestrator,
+        config_for_output("DP-1", &config),
+    );
+    assert!(manager.set_paused(true));
+    assert!(manager.set_paused(false));
+    assert!(manager.outputs["DP-1"].display_start_time.is_none());
+    assert!(manager.outputs["DP-1"].next_change.is_none());
+    assert!(manager.tick_due(Instant::now()));
+}
+
+#[test]
 fn independent_phase_offset_is_stable_for_same_output_name() {
     let base = Duration::from_secs(60);
     let first = independent_phase_offset("DP-2", base);

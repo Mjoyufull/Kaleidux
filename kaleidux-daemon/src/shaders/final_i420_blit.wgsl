@@ -129,7 +129,9 @@ fn tonemap_hdr_to_sdr(rgb: vec3<f32>, transfer: f32, mastering_peak: f32, sdr_wh
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = source_coordinate(cover(in.uv, uniforms.geometry_and_range.x, uniforms.geometry_and_range.y));
-    let chroma_uv = uv - uniforms.sampling_geometry.yz;
+    let luma_extent = vec2<f32>(textureDimensions(t_y));
+    let chroma_extent = vec2<f32>(textureDimensions(t_u));
+    let chroma_uv = (uv - uniforms.sampling_geometry.yz) * luma_extent / (2.0 * chroma_extent);
     let y_raw = textureSample(t_y, samp, uv).r;
     let u_raw = textureSample(t_u, samp, chroma_uv).r;
     let v_raw = textureSample(t_v, samp, chroma_uv).r;

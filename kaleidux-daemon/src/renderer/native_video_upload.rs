@@ -244,8 +244,9 @@ impl super::Renderer {
             });
         } else {
             self.active_yuv_source = None;
-            self.render_nv12_to_rgba(
+            self.render_final_yuv_to_rgba(
                 output.expect("transition target provided"),
+                super::YuvFormat::Nv12,
                 "Native DMA-BUF NV12 Convert",
             );
         }

@@ -1,4 +1,3 @@
-use gstreamer as gst;
 use libmpv2::Mpv;
 use libmpv2_sys as sys;
 use std::ffi::CString;
@@ -37,9 +36,8 @@ fn render_video_frame(
     else {
         return Ok(None);
     };
-    let buffer = gst::Buffer::from_mut_slice(data);
     Ok(Some(VideoFrame {
-        storage: buffer.into(),
+        storage: data.into(),
         width,
         height,
         stride,

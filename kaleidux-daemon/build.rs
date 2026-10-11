@@ -1,5 +1,27 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/video/native_backend/vulkan_frames.c");
+    for name in [
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "HOST_PKG_CONFIG_PATH",
+        "TARGET_PKG_CONFIG_PATH",
+        "HOST_PKG_CONFIG_LIBDIR",
+        "TARGET_PKG_CONFIG_LIBDIR",
+        "HOST_PKG_CONFIG_SYSROOT_DIR",
+        "TARGET_PKG_CONFIG_SYSROOT_DIR",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        if let Ok(target) = std::env::var("TARGET") {
+            println!("cargo:rerun-if-env-changed={name}_{target}");
+            println!(
+                "cargo:rerun-if-env-changed={name}_{}",
+                target.replace('-', "_")
+            );
+        }
+    }
     if std::env::var_os("CARGO_FEATURE_BACKEND_FFMPEG").is_none() {
         return;
     }

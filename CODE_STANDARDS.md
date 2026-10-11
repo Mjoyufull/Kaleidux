@@ -1069,7 +1069,7 @@ Example:
 
 ```toml
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 dbg_macro = "deny"
@@ -1813,7 +1813,7 @@ style_edition = "2024"
 
 ```toml
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 dbg_macro = "deny"

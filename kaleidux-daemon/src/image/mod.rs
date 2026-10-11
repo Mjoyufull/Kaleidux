@@ -8,6 +8,7 @@ pub(crate) mod runtime_cache;
 #[cfg(test)]
 pub(crate) mod runtime_cache_tests;
 pub(crate) mod runtime_prefetch;
+pub(crate) mod runtime_probe;
 pub(crate) mod runtime_request;
 pub(crate) mod runtime_shared;
 pub(crate) mod runtime_switch;

@@ -635,16 +635,36 @@ pub(super) fn sample_to_video_frame(
     let n_planes = (video_info.n_planes() as usize).min(4);
     vi_s[..n_planes].copy_from_slice(&vi_strides[..n_planes]);
     vi_o[..n_planes].copy_from_slice(&vi_offsets[..n_planes]);
-    let buffer_size = buffer.size();
 
     let is_cuda = negotiated.is_cuda;
-    let (strides, offsets) = if is_cuda && prefer_videoinfo_cuda_layout_enabled() {
+    let (strides, mut offsets) = if is_cuda && prefer_videoinfo_cuda_layout_enabled() {
         (vi_s, vi_o)
     } else if has_meta {
         (meta_strides, meta_offsets)
     } else {
         (vi_s, vi_o)
     };
+    let is_dmabuf = negotiated.drm.is_some()
+        || (buffer.n_memory() > 0
+            && buffer
+                .peek_memory(0)
+                .downcast_memory_ref::<gst_alloc::DmaBufMemory>()
+                .is_some());
+    let storage_buffer = if offsets[0] > 0 && !is_dmabuf {
+        let start = offsets[0];
+        let trimmed = buffer
+            .copy_region(gst::BufferCopyFlags::MEMORY, start..)
+            .map_err(|_| gst::FlowError::NotNegotiated)?;
+        for offset in &mut offsets[..n_planes] {
+            *offset = offset
+                .checked_sub(start)
+                .ok_or(gst::FlowError::NotNegotiated)?;
+        }
+        trimmed
+    } else {
+        buffer.clone()
+    };
+    let buffer_size = storage_buffer.size();
     let y_stride = strides[0] as u32;
 
     let format = match video_info.format() {
@@ -785,7 +805,7 @@ pub(super) fn sample_to_video_frame(
     };
 
     let frame = VideoFrame {
-        storage: buffer.clone().into(),
+        storage: storage_buffer.into(),
         width,
         height,
         stride: y_stride,
@@ -830,6 +850,49 @@ mod tests {
     use crate::video::{VideoColorPrimaries, VideoTransfer};
     use gstreamer as gst;
     use gstreamer_video as gst_video;
+
+    #[test]
+    fn padded_luma_origin_is_normalized_without_copying_pixels() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("width", 4i32)
+            .field("height", 2i32)
+            .field("framerate", gst::Fraction::new(24, 1))
+            .build();
+        let mut buffer = gst::Buffer::from_mut_slice(vec![
+            99, 99, 99, 99, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13,
+        ]);
+        gst_video::VideoMeta::add_full(
+            buffer.get_mut().unwrap(),
+            gst_video::VideoFrameFlags::empty(),
+            gst_video::VideoFormat::Nv12,
+            4,
+            2,
+            &[4, 12],
+            &[4, 4],
+        )
+        .unwrap();
+        let sample = gst::Sample::builder().buffer(&buffer).caps(&caps).build();
+        let frame = super::sample_to_video_frame(
+            "padded",
+            sample,
+            1,
+            &mut AppsinkNegotiatedState::default(),
+        )
+        .unwrap();
+        frame
+            .storage
+            .with_readable_bytes(|data| {
+                assert_eq!(data[0], 1);
+                assert_eq!(data[8], 10);
+            })
+            .unwrap();
+        assert!(matches!(
+            frame.format,
+            crate::video::VideoFrameFormat::Nv12 { uv_offset: 8, .. }
+        ));
+    }
 
     #[test]
     fn pending_refresh_accepts_env_overrides() {

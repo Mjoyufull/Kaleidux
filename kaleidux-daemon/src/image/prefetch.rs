@@ -92,10 +92,11 @@ fn limit_plan_to_memory_budget(requests: &mut Vec<ImagePrefetchRequest>) {
     // cold rather than decoded and immediately discarded.
     let mut remaining = super::runtime_cache::PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES / 2;
     requests.retain(|request| {
-        let (width, height) = super::runtime_cache::load_image_source_descriptor(&request.path)
-            .map(|source| {
-                super::runtime_cache::prepared_target_dimensions_from_descriptor(
-                    &source,
+        let (width, height) = super::runtime_cache::cached_source_dimensions(&request.path)
+            .map(|(width, height)| {
+                crate::renderer::compute_cover_target_dimensions(
+                    width,
+                    height,
                     request.target_width,
                     request.target_height,
                 )
@@ -166,6 +167,14 @@ fn push_request(
 ) {
     let request_key = (path.to_path_buf(), target_width, target_height);
     if !seen_keys.insert(request_key) {
+        if let Some(existing) = requests.iter_mut().find(|request| {
+            request.path == path
+                && request.target_width == target_width
+                && request.target_height == target_height
+        }) && request_priority(reason) < request_priority(existing.reason)
+        {
+            existing.reason = reason;
+        }
         return;
     }
 

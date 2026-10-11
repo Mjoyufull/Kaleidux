@@ -101,14 +101,10 @@ mod imp {
             std::sync::OnceLock::new();
         ALLOCATOR
             .get_or_init(|| {
-                (0..16)
-                    .map(|index| std::path::PathBuf::from(format!("/dev/dri/card{index}")))
-                    .filter(|path| path.exists())
-                    .find_map(|path| {
-                        gst_alloc::DRMDumbAllocator::with_device_path(path)
-                            .ok()
-                            .filter(gst_alloc::DRMDumbAllocator::has_prime_export)
-                    })
+                let path = crate::video::import_caps::primary_node()?;
+                gst_alloc::DRMDumbAllocator::with_device_path(path)
+                    .ok()
+                    .filter(gst_alloc::DRMDumbAllocator::has_prime_export)
             })
             .clone()
     }

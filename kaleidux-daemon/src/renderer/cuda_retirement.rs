@@ -1,3 +1,6 @@
+//! Owns queue-completion retirement of CUDA plane allocations and frame leases.
+//! Cleanup runs on a worker; failed synchronization retains allocations until exit.
+
 use super::{CudaTextureCache, WgpuContext};
 use std::sync::Arc;
 

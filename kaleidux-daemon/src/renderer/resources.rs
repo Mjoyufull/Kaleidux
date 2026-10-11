@@ -257,7 +257,7 @@ impl super::Renderer {
         &self,
         retry_after: std::time::Duration,
     ) -> Option<std::time::Instant> {
-        if self.needs_redraw && self.frame_callback_pending {
+        if (self.needs_redraw || self.transition_active) && self.frame_callback_pending {
             self.last_frame_request.map(|t| t + retry_after)
         } else {
             None

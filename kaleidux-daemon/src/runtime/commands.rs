@@ -217,15 +217,29 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
             info!("Reloading configuration...");
             match orchestration::Config::load().await {
                 Ok(new_config) => {
-                    monitor_manager.update_config(new_config);
-                    for (name, r) in renderers.iter_mut() {
-                        if let Some(cfg) = monitor_manager.get_output_config(name) {
-                            if let Some(player) = video_players.get_mut(name) {
-                                player.set_volume(cfg.volume as f64 / 100.0);
-                            }
-                            r.apply_config(cfg);
-                        }
-                    }
+                    super::commands_reload::apply(
+                        new_config,
+                        CommandContext {
+                            monitor_manager,
+                            renderers,
+                            video_players,
+                            pending_video_switches,
+                            pending_image_video_stops,
+                            pending_video_sessions,
+                            metrics,
+                            frame_mailbox,
+                            image_tx,
+                            player_tx,
+                            player_event_tx,
+                            next_session_id,
+                            loop_start,
+                            shutdown_flag,
+                            display_power_suspended,
+                            powered_off_outputs,
+                            mpv_native_targets,
+                            mpv_composed_targets,
+                        },
+                    );
                     info!("Configuration reloaded successfully");
                     Response::Ok
                 }

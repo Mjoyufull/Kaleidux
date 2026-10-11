@@ -92,7 +92,7 @@ X11 builds also require the Wayland development libraries.
 ```bash
 sudo pacman -S mpv gstreamer gst-plugins-base gst-plugins-good \
                gst-plugins-bad gst-libav ffmpeg libva wayland libx11 \
-               vulkan-devel pkgconf cmake
+               vulkan-devel pkgconf cmake clang
 ```
 
 **Build:**
@@ -155,7 +155,7 @@ Usage: kaleidux-daemon [OPTIONS]
 
 Options:
       --demo              Run in demo mode (rotating built-in shaders)
-      --log <LEVEL>       Log verbosity 1–4 (2=INFO); when set, also writes to ~/.config/kaleidux/logs/
+      --log <LEVEL>       Log verbosity 1–5 (2=INFO, 5=TRACE-ALL); when set, also writes to ~/.config/kaleidux/logs/
       --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
       --streamed           Experimental memory policy: smaller caches and read-ahead
       --video-backend <BACKEND>

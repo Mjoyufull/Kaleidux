@@ -48,7 +48,7 @@ pub(crate) fn sanitize_libva_driver_env(adapter_vendor: u32, component: &str) {
     if expected.contains(&current.trim()) {
         return;
     }
-    tracing::warn!(
+    eprintln!(
         "{component} LIBVA_DRIVER_NAME={current} mismatches adapter vendor \
          0x{adapter_vendor:04x}; unsetting it for this process so libva \
          auto-detects the right driver"

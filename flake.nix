@@ -146,14 +146,14 @@
           # drivers through /run/opengl-driver; non-NixOS NVIDIA users should
           # launch this package through nixGL.
           postInstall = ''
-            mkdir -p $out/lib/debug
+            mkdir -p $out/bin/.debug
             for binary in kaleidux-daemon kldctl; do
               if [ -x "$out/bin/$binary" ]; then
                 ${pkgs.binutils}/bin/objcopy --only-keep-debug \
-                  "$out/bin/$binary" "$out/lib/debug/$binary.debug"
+                  "$out/bin/$binary" "$out/bin/.debug/$binary.debug"
                 ${pkgs.binutils}/bin/strip --strip-unneeded "$out/bin/$binary"
                 ${pkgs.binutils}/bin/objcopy \
-                  --add-gnu-debuglink="$out/lib/debug/$binary.debug" \
+                  --add-gnu-debuglink="$out/bin/.debug/$binary.debug" \
                   "$out/bin/$binary"
               fi
             done

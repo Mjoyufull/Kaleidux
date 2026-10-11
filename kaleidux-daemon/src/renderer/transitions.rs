@@ -110,6 +110,9 @@ impl super::Renderer {
                     self.name
                 );
             }
+            if self.transition_active && self.has_current_texture() {
+                self.release_prev_texture("transition aborted");
+            }
             self.content_swap_pending = false;
             self.transition_active = false;
             self.transition_just_completed = false; // Reset flag

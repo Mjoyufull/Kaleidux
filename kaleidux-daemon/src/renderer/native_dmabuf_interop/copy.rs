@@ -11,8 +11,7 @@ pub(super) fn record_copy(
     width: u32,
     height: u32,
 ) -> anyhow::Result<()> {
-    let begin =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin = vk::CommandBufferBeginInfo::default();
     // SAFETY: command_buffer is reset, primary, and not in flight.
     unsafe {
         device
@@ -160,8 +159,7 @@ pub(super) fn record_copy_to_linear(
     width: u32,
     height: u32,
 ) -> anyhow::Result<()> {
-    let begin =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin = vk::CommandBufferBeginInfo::default();
     unsafe {
         device
             .begin_command_buffer(command_buffer, &begin)

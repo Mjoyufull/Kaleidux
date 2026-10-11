@@ -3,8 +3,8 @@ use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
 use gstreamer_video as gst_video;
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{NativeDmaBufNv12, NativeDmaBufObject, NativeDmaBufPlane, VideoFrameFormat};
 
@@ -318,10 +318,11 @@ fn build_descriptor(
         drm_fourcc: key.fourcc,
     });
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
+    // An evicted GstMemory pointer may be recycled while an import lives.
+    // A new descriptor generation always gets a process-unique surface ID.
+    static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
     Ok(NativeDmaBufNv12 {
-        surface_id: hasher.finish(),
+        surface_id: NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed),
         objects: objects.into(),
         planes,
         acquire_fence: None,
@@ -459,6 +460,43 @@ mod tests {
         assert_eq!(frame.planes[1].object_index, 1);
         assert_eq!(frame.planes[0].drm_fourcc, DRM_FORMAT_NV12);
         assert_eq!(frame.planes[1].drm_fourcc, DRM_FORMAT_NV12);
+    }
+
+    #[test]
+    fn evicted_allocation_gets_a_new_import_identity() {
+        let buffer = dmabuf_buffer(&[12_288]);
+        let mut cache = DmaBufDescriptorCache::default();
+        let first = cache
+            .frame_format(
+                &buffer,
+                64,
+                64,
+                DRM_FORMAT_NV12,
+                DRM_FORMAT_MOD_LINEAR,
+                [128, 128, 0, 0],
+                [0, 8192, 0, 0],
+            )
+            .unwrap();
+        cache.clear();
+        let second = cache
+            .frame_format(
+                &buffer,
+                64,
+                64,
+                DRM_FORMAT_NV12,
+                DRM_FORMAT_MOD_LINEAR,
+                [128, 128, 0, 0],
+                [0, 8192, 0, 0],
+            )
+            .unwrap();
+        let (
+            VideoFrameFormat::DmaBufNv12 { frame: first },
+            VideoFrameFormat::DmaBufNv12 { frame: second },
+        ) = (first, second)
+        else {
+            panic!("expected DMA-BUF frames");
+        };
+        assert_ne!(first.surface_id, second.surface_id);
     }
 
     #[test]

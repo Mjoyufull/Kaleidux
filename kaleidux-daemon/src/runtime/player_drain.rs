@@ -100,6 +100,7 @@ impl MainLoopContext {
                         if !self.powered_off_outputs.contains(&name)
                             && self.pending_native_presentations.remove(&name) == Some(session_id)
                         {
+                            self.runtime_recoveries.remove(&name);
                             self.monitor_manager.mark_transition_completed(&name);
                             self.mark_startup_output_ready(&name, loop_start);
                             self.mark_startup_output_presented(&name, loop_start);

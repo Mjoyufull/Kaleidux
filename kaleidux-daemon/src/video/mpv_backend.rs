@@ -97,7 +97,8 @@ impl MpvPlayer {
                 init.set_option("audio", "yes")?;
             } else {
                 init.set_option("audio", "no")?;
-                init.set_option("ao", "null")?;
+                // Leave the real audio output available for later unmute.
+                // Disabling track selection avoids decoding while muted.
             }
             init.set_option("loop-file", "inf")?;
             init.set_option("keep-open", "yes")?;
@@ -336,6 +337,11 @@ impl MpvPlayer {
 
     pub fn set_volume(&self, volume: f64) {
         let mut value = (volume * 100.0).clamp(0.0, 100.0);
+        let mut track = if volume > f64::EPSILON {
+            c"auto".as_ptr()
+        } else {
+            c"no".as_ptr()
+        };
         // SAFETY: mpv copies the typed property payload before returning. The
         // asynchronous API never waits for the core from the display loop.
         unsafe {
@@ -345,6 +351,13 @@ impl MpvPlayer {
                 c"volume".as_ptr(),
                 libmpv2_sys::mpv_format_MPV_FORMAT_DOUBLE,
                 (&mut value as *mut f64).cast(),
+            );
+            libmpv2_sys::mpv_set_property_async(
+                self.mpv.ctx.as_ptr(),
+                0,
+                c"aid".as_ptr(),
+                libmpv2_sys::mpv_format_MPV_FORMAT_STRING,
+                (&mut track as *mut *const std::ffi::c_char).cast(),
             );
         }
     }
