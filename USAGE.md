@@ -679,7 +679,8 @@ subdirectories. `set PATH` inserts media into the current queue and immediately
 advances to it. `img PATH` accepts either: slideshow media is selected in place,
 and external media is inserted. Existing entries are not duplicated. If the output
 has no slideshow queue, `set` and `img` initialize an in-memory queue with the
-selected file; `jump` requires an existing slideshow queue.
+selected file, using its parent directory as the queue root. `jump` requires an
+existing slideshow queue.
 
 These commands use the normal transition and history: `prev` returns to the
 previous wallpaper, and `next` returns to the selected wallpaper. An explicit selection
