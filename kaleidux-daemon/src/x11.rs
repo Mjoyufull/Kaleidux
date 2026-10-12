@@ -245,8 +245,7 @@ impl X11Backend {
         let win_id = self.conn.generate_id()?;
         let screen = &self.conn.setup().roots[self.screen_num];
 
-        // Setup window attributes
-        // REMOVED override_redirect(1) to let WM handle stacking (keeping it below apps)
+        // Setup window attributes.
         let win_aux = CreateWindowAux::new()
             .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY)
             // Xwayland is rootless and Hyprland does not treat EWMH desktop
