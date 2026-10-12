@@ -307,6 +307,21 @@ pub async fn run(
                     x11_event_batch = x11_event_batch.saturating_add(1);
                     use x11rb::protocol::Event;
                     match event {
+                        Event::MapNotify(ev) if backend.capabilities.is_xwayland => {
+                            // Rootless compositors can replace the initial
+                            // position at map time. Reapply the RandR rectangle
+                            // after mapping, including during renderer init.
+                            if let Some(name) = window_to_renderer.get(&ev.window)
+                                && let Some(geometry) =
+                                    monitor_geometries.get(name).copied().or_else(|| {
+                                        pending_renderer_adds.get(name).map(|add| add.geometry)
+                                    })
+                            {
+                                backend.configure_wallpaper_window(
+                                    ev.window, geometry.0, geometry.1, geometry.2, geometry.3,
+                                )?;
+                            }
+                        }
                         Event::ConfigureNotify(ev) => {
                             if let Some(name) = window_to_renderer.get(&ev.window) {
                                 if let Some(r) = ctx.renderers.get_mut(name) {
