@@ -15,6 +15,7 @@ mod add_output;
 mod config;
 mod config_queue;
 mod deadline;
+mod deferred_output;
 mod manual_queue;
 mod manual_selection;
 mod output;
@@ -37,11 +38,13 @@ pub struct MonitorManager {
     power_suspended: bool, // Automatic pause while every compositor output is powered off
     // In-memory cache of discovered file lists per directory path.
     // Avoids re-scanning the same directory when multiple outputs share the same path.
-    discovered_files_cache: HashMap<PathBuf, Vec<PathBuf>>,
+    discovered_files_cache: HashMap<PathBuf, Arc<Vec<PathBuf>>>,
+    pending_output_queues: deferred_output::PendingOutputQueues,
 }
 
 impl MonitorManager {
     pub fn remove_output(&mut self, name: &str) {
+        self.cancel_output_queue(name);
         self.outputs.remove(name);
         if self.outputs.is_empty() {
             self.shared_display_start_time = None;

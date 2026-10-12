@@ -1,3 +1,5 @@
+//! Retains decoder allocations and caches DMA-BUF layouts with producer fences.
+
 use anyhow::Context;
 use gstreamer as gst;
 use gstreamer_allocators as gst_alloc;
@@ -88,8 +90,14 @@ impl DmaBufDescriptorCache {
         }
 
         let descriptor = build_descriptor(buffer, &key, strides, offsets)?;
+        // Buffer::memory refs the allocation. MemoryRef::to_owned copies its
+        // pixels and can fail for decoder memory that cannot be mapped.
         let allocation_owners = (0..buffer.n_memory())
-            .map(|index| buffer.peek_memory(index).to_owned())
+            .map(|index| {
+                buffer
+                    .memory(index)
+                    .expect("validated DMA-BUF memory index")
+            })
             .collect();
         self.entries.push_back(CachedDescriptor {
             key,

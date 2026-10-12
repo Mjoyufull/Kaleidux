@@ -698,7 +698,8 @@ async fn reconcile_monitors(
         }
 
         info!("[X11] Adding connected output {name} at {width}x{height}@{x},{y}");
-        ctx.monitor_manager.add_output(&name, "X11 Display").await;
+        ctx.monitor_manager
+            .add_output_deferred(&name, "X11 Display");
         let window = match backend.create_wallpaper_window(&name, x, y, width, height) {
             Ok(window) => window,
             Err(error) => {

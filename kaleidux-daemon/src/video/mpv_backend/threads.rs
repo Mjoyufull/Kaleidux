@@ -1,3 +1,5 @@
+//! Owns mpv event/render workers and escalates repeated capture failures to runtime recovery.
+
 use super::*;
 use crate::video::VideoBackendKind;
 
@@ -126,6 +128,7 @@ impl MpvPlayer {
         let metrics = self.metrics.clone();
         let stop_requested = self.stop_requested.clone();
         let first_frame_logged = self.first_frame_logged.clone();
+        let player_event_tx = self.player_event_tx.clone();
         let interval = self.capture_interval;
         let start_time = self.start_time;
         let publish_interval_ns = publish_interval_ns(self.max_publish_fps);
@@ -138,6 +141,7 @@ impl MpvPlayer {
                 .name(format!("kld-mpv-frames-{}", source_id))
                 .spawn(move || {
                     let render_context = render_context;
+                    let mut consecutive_failures = 0_u8;
                     while !stop_requested.load(Ordering::SeqCst) {
                         let frame_start = Instant::now();
                         let elapsed_ns = start_time.elapsed().as_nanos() as u64;
@@ -153,6 +157,7 @@ impl MpvPlayer {
                                 false,
                             ) {
                                 Ok(Some(frame)) => {
+                                    consecutive_failures = 0;
                                     if !first_frame_logged.swap(true, Ordering::SeqCst) {
                                         info!(
                                             "[ASSET] {}: First libmpv frame captured in {:.3}ms",
@@ -165,7 +170,7 @@ impl MpvPlayer {
                                         VideoBackendMetricKind::MpvFramePublished,
                                     );
                                 }
-                                Ok(None) => {}
+                                Ok(None) => consecutive_failures = 0,
                                 Err(error) => {
                                     metrics.record_video_backend_metric(
                                         VideoBackendMetricKind::MpvCaptureError,
@@ -174,6 +179,23 @@ impl MpvPlayer {
                                         "[VIDEO] {}: libmpv capture skipped: {}",
                                         source_id, error
                                     );
+                                    consecutive_failures = consecutive_failures.saturating_add(1);
+                                    if consecutive_failures >= 8 {
+                                        send_capture_failure(
+                                            &player_event_tx,
+                                            &stop_requested,
+                                            PlayerEvent {
+                                                source_id: source_id.to_string(),
+                                                session_id,
+                                                backend_kind: VideoBackendKind::Mpv,
+                                                kind: PlayerEventKind::Error,
+                                                reason: format!(
+                                                    "repeated libmpv capture failure: {error}"
+                                                ),
+                                            },
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -251,5 +273,47 @@ impl MpvPlayer {
                 .map_err(|error| anyhow::anyhow!("spawning libmpv composed thread: {error}"))?,
         );
         Ok(())
+    }
+}
+
+fn send_capture_failure(
+    sender: &tokio::sync::mpsc::Sender<PlayerEvent>,
+    stop: &std::sync::atomic::AtomicBool,
+    mut event: PlayerEvent,
+) {
+    while !stop.load(Ordering::Acquire) {
+        match sender.try_send(event) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => event = returned,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_delivery_stops_with_a_full_event_channel() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let event = || PlayerEvent {
+            source_id: "test".into(),
+            session_id: 1,
+            backend_kind: VideoBackendKind::Mpv,
+            kind: PlayerEventKind::Error,
+            reason: "test render failure".into(),
+        };
+        sender.try_send(event()).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let failure = event();
+        let worker =
+            std::thread::spawn(move || send_capture_failure(&sender, &worker_stop, failure));
+        std::thread::sleep(Duration::from_millis(20));
+        stop.store(true, Ordering::Release);
+        let stopped = Instant::now();
+        worker.join().unwrap();
+        assert!(stopped.elapsed() < Duration::from_millis(100));
     }
 }

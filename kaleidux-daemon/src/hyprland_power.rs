@@ -35,7 +35,12 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
         .retain(|name| ctx.monitor_manager.outputs.contains_key(name));
     for name in &update.powered_off {
         ctx.powered_off_outputs.insert(name.clone());
-        if let Some(player) = ctx.video_players.get(name) {
+        for player in ctx
+            .video_players
+            .get(name)
+            .into_iter()
+            .chain(ctx.pending_image_video_stops.get(name))
+        {
             if let Err(error) = player.pause() {
                 warn!("[DISPLAY-POWER] Failed to pause {name}: {error}");
             }
@@ -69,13 +74,18 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
             }
             renderer.needs_redraw = true;
         }
-        if !ctx.monitor_manager.is_paused()
-            && let Some(player) = ctx.video_players.get(name)
-        {
-            if let Err(error) = player.resume() {
-                warn!("[DISPLAY-POWER] Failed to resume {name}: {error}");
-            } else {
-                player.request_video_frame();
+        if !ctx.monitor_manager.is_paused() {
+            for player in ctx
+                .video_players
+                .get(name)
+                .into_iter()
+                .chain(ctx.pending_image_video_stops.get(name))
+            {
+                if let Err(error) = player.resume() {
+                    warn!("[DISPLAY-POWER] Failed to resume {name}: {error}");
+                } else {
+                    player.request_video_frame();
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 impl MainLoopContext {
     pub async fn housekeeping(&mut self, loop_start: Instant, was_idle: bool) {
+        self.monitor_manager.poll_output_queues().await;
         // Skip recording frame time for iterations that entered idle_wait (P-26)
         if !was_idle {
             let frame_time = loop_start.elapsed();

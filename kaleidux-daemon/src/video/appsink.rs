@@ -652,6 +652,11 @@ pub(super) fn sample_to_video_frame(
                 .peek_memory(0)
                 .downcast_memory_ref::<gst_alloc::DmaBufMemory>()
                 .is_some());
+    if is_dmabuf && super::import_caps::appsink_import_failed() {
+        // Stop this incompatible pipeline through its normal bus-error path.
+        // Recovery builds fresh caps without DMA-BUF in automatic mode.
+        return Err(gst::FlowError::NotNegotiated);
+    }
     let storage_buffer = if offsets[0] > 0 && !is_dmabuf {
         let start = offsets[0];
         let trimmed = buffer

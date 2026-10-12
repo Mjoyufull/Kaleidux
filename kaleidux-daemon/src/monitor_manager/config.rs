@@ -242,6 +242,7 @@ impl MonitorManager {
             pause_reasons: std::collections::BTreeSet::new(),
             power_suspended: false,
             discovered_files_cache: HashMap::new(),
+            pending_output_queues: Default::default(),
         })
     }
 
