@@ -218,6 +218,7 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
+    let mut native_decode_group_id = batch_id;
     let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
         let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
@@ -365,6 +366,7 @@ pub(crate) fn switch_wallpaper_content(
                 .iter()
                 .find(|(output, player)| {
                     output.as_str() != name.as_str()
+                        && monitor_manager.shares_playback_with(&name, output)
                         && monitor_manager
                             .outputs
                             .get(output.as_str())
@@ -376,6 +378,7 @@ pub(crate) fn switch_wallpaper_content(
                 .map(|(output, player)| (output.clone(), player))
             {
                 broker_start_position_ns = peer_player.current_position_ns();
+                native_decode_group_id = peer_player.native_decode_group_id().or(batch_id);
                 metrics.record_shared_broker_hit();
                 debug!(
                     "[VIDEO] {}: Shared broker prototype hit via peer {} (start_position_ms={:.1})",
@@ -440,7 +443,7 @@ pub(crate) fn switch_wallpaper_content(
                 session_id,
                 volume,
                 backend_request,
-                decode_group_id: batch_id,
+                decode_group_id: native_decode_group_id,
                 start_position_ns: broker_start_position_ns,
                 max_publish_fps,
                 render_size: video_render_size,

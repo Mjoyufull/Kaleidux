@@ -1,8 +1,8 @@
 //! Adopts initialized video sessions and retires stale worker results outside the display loop.
 
 use crate::content::sessions::{
-    VideoPlayerResult, clear_pending_video_session_if_matches, set_pending_video_session,
-    stop_video_player_in_background,
+    VideoPlayerResult, VideoPrepareFailure, clear_pending_video_session_if_matches,
+    set_pending_video_session, stop_video_player_in_background,
 };
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,
@@ -92,6 +92,11 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
+                            let retry_import = player.needs_appsink_import_retry();
+                            stop_video_player_in_background(name.clone(), player);
+                            if retry_import && self.retry_appsink_import(&name) {
+                                continue;
+                            }
                             self.handle_content_failure(
                                 &name,
                                 &format!("player_start: {}", e),
@@ -154,6 +159,11 @@ impl MainLoopContext {
                             if let Some(r) = self.renderers.get_mut(&name) {
                                 r.abort_transition();
                             }
+                            let retry_import = player.needs_appsink_import_retry();
+                            stop_video_player_in_background(name.clone(), player);
+                            if retry_import && self.retry_appsink_import(&name) {
+                                continue;
+                            }
                             self.handle_content_failure(
                                 &name,
                                 &format!("player_start: {}", e),
@@ -192,7 +202,7 @@ impl MainLoopContext {
                         stop_video_player_in_background(name, player);
                     }
                 }
-                VideoPlayerResult::Failure(name, session_id) => {
+                VideoPlayerResult::Failure(name, session_id, kind) => {
                     let is_pending = self
                         .pending_video_switches
                         .get(&name)
@@ -220,7 +230,10 @@ impl MainLoopContext {
                         }
                     }
                     if !self.pending_video_switches.contains_key(&name) {
-                        self.handle_content_failure(&name, "player_prepare_failed", loop_start);
+                        if kind != VideoPrepareFailure::Import || !self.retry_appsink_import(&name)
+                        {
+                            self.handle_content_failure(&name, "player_prepare_failed", loop_start);
+                        }
                     }
                 }
             }

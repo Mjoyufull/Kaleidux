@@ -548,6 +548,7 @@ pub enum PlayerEventKind {
     Error,
     Eos,
     FatalLifecycle,
+    ImportFailure,
 }
 
 #[derive(Debug, Clone)]

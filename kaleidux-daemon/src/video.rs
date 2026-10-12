@@ -216,6 +216,7 @@ pub struct VideoPlayer {
     decode_path_logged: Arc<AtomicBool>,
     accept_samples: Arc<AtomicBool>,
     pending_start_position_ns: Option<u64>,
+    appsink_import_recovery_enabled: bool,
 }
 
 impl VideoPlayer {
@@ -408,6 +409,10 @@ impl VideoPlayer {
             mode.cli_label()
         );
 
+        let appsink_import_recovery_enabled = mode == VideoMode::Auto
+            && caps
+                .iter_with_features()
+                .any(|(_, features)| features.contains("memory:DMABuf"));
         let appsink = Self::configure_appsink(
             &pipeline,
             &source_id,
@@ -450,6 +455,7 @@ impl VideoPlayer {
             decode_path_logged,
             accept_samples,
             pending_start_position_ns: None,
+            appsink_import_recovery_enabled,
         };
         player.log_backend_snapshot("created");
         Ok(player)
@@ -504,6 +510,7 @@ impl VideoPlayer {
             decode_path_logged: Arc::new(AtomicBool::new(false)),
             accept_samples: Arc::new(AtomicBool::new(true)),
             pending_start_position_ns: None,
+            appsink_import_recovery_enabled: false,
         };
         player.log_backend_snapshot("created");
         Ok(player)
@@ -554,9 +561,25 @@ impl VideoPlayer {
             decode_path_logged: Arc::new(AtomicBool::new(false)),
             accept_samples: Arc::new(AtomicBool::new(true)),
             pending_start_position_ns: None,
+            appsink_import_recovery_enabled: false,
         };
         player.log_backend_snapshot("created");
         Ok(player)
+    }
+
+    pub(crate) fn native_decode_group_id(&self) -> Option<u64> {
+        #[cfg(feature = "backend-ffmpeg")]
+        {
+            self.native.as_ref().map(|player| player.decode_group_id())
+        }
+        #[cfg(not(feature = "backend-ffmpeg"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn needs_appsink_import_retry(&self) -> bool {
+        self.appsink_import_recovery_enabled && import_caps::appsink_import_failed()
     }
 
     pub fn is_appsink_backend(&self) -> bool {

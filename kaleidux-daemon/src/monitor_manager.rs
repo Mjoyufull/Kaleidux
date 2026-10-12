@@ -44,8 +44,8 @@ pub struct MonitorManager {
 
 impl MonitorManager {
     pub fn remove_output(&mut self, name: &str) {
-        self.cancel_output_queue(name);
         self.outputs.remove(name);
+        self.cancel_output_queue(name);
         if self.outputs.is_empty() {
             self.shared_display_start_time = None;
         }
@@ -55,6 +55,17 @@ impl MonitorManager {
         if !self.output_groups.values().any(|id| *id == group_id) {
             self.group_queues.remove(&group_id);
             self.group_display_start_times.remove(&group_id);
+        }
+    }
+
+    pub(crate) fn shares_playback_with(&self, left: &str, right: &str) -> bool {
+        match self.config.global.monitor_behavior {
+            MonitorBehavior::Synchronized => true,
+            MonitorBehavior::Grouped(_) => self
+                .output_groups
+                .get(left)
+                .is_some_and(|group| self.output_groups.get(right) == Some(group)),
+            MonitorBehavior::Independent => false,
         }
     }
 

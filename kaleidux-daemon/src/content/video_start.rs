@@ -1,6 +1,6 @@
 use crate::background::{self, BackgroundWorkKind};
 use crate::content::sessions::{
-    PendingVideoSessions, VideoPlayerResult, pending_video_session_matches,
+    PendingVideoSessions, VideoPlayerResult, VideoPrepareFailure, pending_video_session_matches,
 };
 use crate::metrics;
 use crate::runtime::timing::duration_ms;
@@ -95,6 +95,7 @@ pub(crate) fn create_and_start_video_player(
 
             let prepare_start = Instant::now();
 
+            let mut prepare_failure = VideoPrepareFailure::Media;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let candidates = video::candidate_video_backends(backend_request);
                 let num_candidates = candidates.len();
@@ -160,6 +161,7 @@ pub(crate) fn create_and_start_video_player(
                     let mut prebuffer = match vp.prebuffer(should_abort) {
                         Ok(result) => result,
                         Err(e) => {
+                            let retry_import = vp.needs_appsink_import_retry();
                             let _ = vp.stop();
                             frame_mailbox_clone.clear_session(&name_str, session_id);
                             if should_abort() {
@@ -168,6 +170,10 @@ pub(crate) fn create_and_start_video_player(
                                     name_str, session_id
                                 );
                                 return Ok(None);
+                            }
+                            if retry_import {
+                                prepare_failure = VideoPrepareFailure::Import;
+                                return Err(e);
                             }
                             if is_provisional {
                                 warn!(
@@ -199,7 +205,9 @@ pub(crate) fn create_and_start_video_player(
                         continue;
                     }
 
-                    if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0) {
+                    if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0)
+                        && !vp.has_active_peer_subscribers()
+                    {
                         vp.set_start_position_ns(position_ns);
                         prebuffer.frame = None;
                     }
@@ -298,6 +306,7 @@ pub(crate) fn create_and_start_video_player(
                     let _ = player_tx_panic.blocking_send(VideoPlayerResult::Failure(
                         name_for_panic,
                         session_id_panic,
+                        prepare_failure,
                     ));
                 }
             }

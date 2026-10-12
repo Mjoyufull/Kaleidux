@@ -1,4 +1,4 @@
-//! Applies output configuration and recreates video sessions whose cadence changed.
+//! Applies output configuration and recreates video sessions whose cadence or appsink audio topology changed.
 
 use crate::content::sessions::stop_video_player_in_background;
 use crate::content::switch::{
@@ -10,21 +10,31 @@ use crate::queue::ContentType;
 use std::collections::HashMap;
 
 pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
-    let old_fps: HashMap<_, _> = ctx
+    let old_settings: HashMap<_, _> = ctx
         .monitor_manager
         .outputs
         .iter()
-        .map(|(name, output)| (name.clone(), output.config.video_fps))
+        .map(|(name, output)| {
+            (
+                name.clone(),
+                (output.config.video_fps, output.config.volume),
+            )
+        })
         .collect();
     ctx.monitor_manager.update_config(config);
     let mut restarts = Vec::new();
     for (name, renderer) in ctx.renderers.iter_mut() {
         if let Some(output_config) = ctx.monitor_manager.get_output_config(name) {
-            if old_fps
-                .get(name)
-                .is_some_and(|old| *old != output_config.video_fps)
-                && (renderer.valid_content_type == ContentType::Video
-                    || ctx.pending_video_switches.contains_key(name))
+            if old_settings.get(name).is_some_and(|(fps, volume)| {
+                *fps != output_config.video_fps
+                    || ((*volume == 0) != (output_config.volume == 0)
+                        && (ctx.pending_video_switches.contains_key(name)
+                            || ctx
+                                .video_players
+                                .get(name)
+                                .is_some_and(|player| player.is_appsink_backend())))
+            }) && (renderer.valid_content_type == ContentType::Video
+                || ctx.pending_video_switches.contains_key(name))
                 && let Some(path) = ctx
                     .monitor_manager
                     .outputs

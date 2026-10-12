@@ -57,17 +57,20 @@ impl MonitorManager {
         }
     }
 
-    fn queue_config(&self, target: &ManualQueueTarget) -> Option<&OutputConfig> {
-        let output = match target {
-            ManualQueueTarget::Output(name) => self.outputs.get(name),
-            ManualQueueTarget::Shared => self.outputs.values().next(),
-            ManualQueueTarget::Group(group) => self
-                .output_groups
-                .iter()
-                .find(|(_, candidate)| *candidate == group)
-                .and_then(|(name, _)| self.outputs.get(name)),
-        }?;
-        Some(&output.config)
+    fn queue_owner(&self, target: &ManualQueueTarget) -> Option<&OutputOrchestrator> {
+        self.outputs
+            .values()
+            .filter(|output| {
+                output.config.path.is_some()
+                    && match target {
+                        ManualQueueTarget::Output(name) => &output._name == name,
+                        ManualQueueTarget::Shared => true,
+                        ManualQueueTarget::Group(group) => {
+                            self.output_groups.get(&output._name) == Some(group)
+                        }
+                    }
+            })
+            .min_by(|left, right| left._name.cmp(&right._name))
     }
 
     fn queue_exists(&self, target: &ManualQueueTarget) -> bool {
@@ -85,21 +88,10 @@ impl MonitorManager {
         if self.queue_exists(&target) || self.pending_output_queues.tasks.contains_key(&target) {
             return;
         }
-        let owner_name = match &target {
-            ManualQueueTarget::Output(name) => Some(name.clone()),
-            ManualQueueTarget::Shared => self.outputs.keys().min().cloned(),
-            ManualQueueTarget::Group(group) => self
-                .output_groups
-                .iter()
-                .filter(|(_, candidate)| *candidate == group)
-                .map(|(name, _)| name)
-                .min()
-                .cloned(),
-        };
-        let Some(owner_name) = owner_name else {
+        let Some(owner) = self.queue_owner(&target) else {
             return;
         };
-        let owner = self.outputs.get(&owner_name).expect("queue owner");
+        let owner_name = owner._name.clone();
         let owner_description = owner.description.clone();
         let config = owner.config.clone();
         let Some(path) = config.path.clone() else {
@@ -173,7 +165,7 @@ impl MonitorManager {
                 }
                 continue;
             }
-            if self.queue_config(&target).is_none() {
+            if self.queue_owner(&target).is_none() {
                 continue;
             }
             let current = self
@@ -226,22 +218,32 @@ impl MonitorManager {
     }
 
     pub(super) fn cancel_output_queue(&mut self, name: &str) {
-        let abandoned: Vec<_> = self
+        let targets: Vec<_> = self
             .pending_output_queues
             .tasks
-            .keys()
-            .filter(|target| match target {
-                ManualQueueTarget::Output(owner) => owner == name,
-                ManualQueueTarget::Shared => !self.outputs.keys().any(|peer| peer != name),
-                ManualQueueTarget::Group(group) => !self.output_groups.iter().any(|(peer, id)| {
-                    peer != name && id == group && self.outputs.contains_key(peer)
-                }),
-            })
-            .cloned()
+            .iter()
+            .filter(|(_, pending)| pending.owner_name == name)
+            .map(|(target, _)| target.clone())
             .collect();
-        for target in abandoned {
-            if let Some(pending) = self.pending_output_queues.tasks.remove(&target) {
+        for target in targets {
+            let mut pending = self
+                .pending_output_queues
+                .tasks
+                .remove(&target)
+                .expect("pending queue");
+            let Some(owner) = self.queue_owner(&target) else {
                 pending.task.abort();
+                continue;
+            };
+            if Self::queue_config_changed(&pending.config, &owner.config) {
+                pending.task.abort();
+                self.start_output_queue(target);
+            } else {
+                // Identical queue work survives unplug, but validation must use a live owner.
+                pending.owner_name = owner._name.clone();
+                pending.owner_description = owner.description.clone();
+                pending.config = owner.config.clone();
+                self.pending_output_queues.tasks.insert(target, pending);
             }
         }
     }
