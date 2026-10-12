@@ -630,3 +630,26 @@ fn retained_external_video_keeps_its_type_after_root_refresh() {
     assert_eq!(queue.cached_content_type(&video), Some(ContentType::Video));
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn sequential_previous_wraps_and_retraces_each_step_after_history_exhaustion() {
+    for strategy in [
+        crate::orchestration::SortingStrategy::Ascending,
+        crate::orchestration::SortingStrategy::Descending,
+    ] {
+        let paths = ["a.jpg", "b.jpg", "c.jpg"].map(PathBuf::from).to_vec();
+        let kinds = paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ContentType::Image))
+            .collect();
+        let mut queue = make_test_queue(paths.clone(), strategy, 0, kinds);
+        let first = queue.pick_next().unwrap();
+        let previous = queue.pick_prev().unwrap();
+        let oldest = queue.pick_prev().unwrap();
+        assert_ne!(previous, first);
+        assert_ne!(oldest, previous);
+        assert_eq!(queue.pick_next(), Some(previous));
+        assert_eq!(queue.pick_next(), Some(first));
+    }
+}

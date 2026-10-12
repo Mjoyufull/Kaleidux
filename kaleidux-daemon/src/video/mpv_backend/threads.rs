@@ -170,7 +170,8 @@ impl MpvPlayer {
                                         VideoBackendMetricKind::MpvFramePublished,
                                     );
                                 }
-                                Ok(None) => consecutive_failures = 0,
+                                // Empty polls do not prove that rendering recovered.
+                                Ok(None) => {}
                                 Err(error) => {
                                     metrics.record_video_backend_metric(
                                         VideoBackendMetricKind::MpvCaptureError,

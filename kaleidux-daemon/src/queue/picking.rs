@@ -217,11 +217,13 @@ impl SmartQueue {
                     crate::orchestration::SortingStrategy::Descending
                 );
                 let mut history_previous = None;
+                let mut recorded_current = false;
                 if !self.history.is_empty() {
                     if let Some(current) = self.history.pop_back()
                         && self.pool.contains(&current)
                     {
                         self.push_forward_history(current);
+                        recorded_current = true;
                     }
                     while let Some(previous) = self.history.back().cloned() {
                         if let Some(previous_index) = self
@@ -238,6 +240,11 @@ impl SmartQueue {
                 }
                 history_previous.or_else(|| {
                     let current = self.advance_index(self.current_index, !descending);
+                    if !recorded_current {
+                        if let Some(path) = self.pool.get(current).cloned() {
+                            self.push_forward_history(path);
+                        }
+                    }
                     let previous = self.advance_index(current, !descending);
                     self.current_index = current;
                     self.pool.get(previous).cloned()

@@ -641,7 +641,7 @@ Performance and resource utilization depend on hardware decode availability, dri
 - All three backends support wallpaper audio. FFmpeg decodes and resamples PCM on a separate worker; a bounded GStreamer `appsrc` pipeline sends it to the system audio sink. A synchronized decode group plays one audio stream at the highest unpaused subscriber volume. Video follows the audio clock when available; pause, seek and video loop boundaries flush or restart audio accordingly. Muted playback does not open an audio decoder or sound device.
 - Audio volume is set via `volume = <0..100>` in `config.toml` (defaults to `100`).
 - Setting `volume = 0` completely disables audio decoder elements:
-  - In GStreamer, pipeline flags switch to video-only, preventing the autoplugging of audio parsers and decoders.
+  - In GStreamer, pipeline flags switch to video-only, preventing the autoplugging of audio parsers and decoders. Reloading between zero and positive volume recreates the current appsink video with the matching audio pipeline; positive-to-positive changes adjust volume in place.
   - In libmpv, initial muted playback uses `audio = no`. Reloading a positive volume selects `aid = auto` and restores the configured system audio output; muting again selects `aid = no`.
 - Setting a positive volume (`volume = 1..100`) enables the audio pipeline (`flags = video+audio` in appsink, `audio = yes` initially or `aid = auto` on reload in mpv).
 - Before transitioning or tearing down an audio-enabled pipeline, Kaleidux fades audio volume to zero to prevent audible clicks.

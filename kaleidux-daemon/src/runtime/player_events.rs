@@ -66,7 +66,9 @@ impl MainLoopContext {
                         event.source_id, event.session_id, event.reason
                     );
                 }
-                PlayerEventKind::Error | PlayerEventKind::FatalLifecycle => {
+                PlayerEventKind::Error
+                | PlayerEventKind::FatalLifecycle
+                | PlayerEventKind::ImportFailure => {
                     error!(
                         "[VIDEO] {} session={} runtime {:?}: {}",
                         event.source_id, event.session_id, event.kind, event.reason
@@ -99,10 +101,40 @@ impl MainLoopContext {
                     }
 
                     if !self.pending_video_switches.contains_key(&event.source_id) {
-                        self.handle_content_failure(&event.source_id, &event.reason, loop_start);
+                        if event.kind != PlayerEventKind::ImportFailure
+                            || !self.retry_appsink_import(&event.source_id)
+                        {
+                            self.handle_content_failure(
+                                &event.source_id,
+                                &event.reason,
+                                loop_start,
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    pub(crate) fn retry_appsink_import(&mut self, name: &str) -> bool {
+        let Some(path) = self
+            .monitor_manager
+            .outputs
+            .get(name)
+            .and_then(|output| output.current_path.clone())
+        else {
+            return false;
+        };
+        // The failed importer is already disabled. A newly constructed appsink
+        // advertises CPU memory and cannot request this retry again.
+        self.load_content_changes(
+            std::collections::HashMap::from([(
+                name.to_owned(),
+                (path, crate::queue::ContentType::Video),
+            )]),
+            "IMPORT-RETRY",
+            false,
+        );
+        true
     }
 }

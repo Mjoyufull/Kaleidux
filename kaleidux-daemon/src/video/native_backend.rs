@@ -390,6 +390,10 @@ impl NativePlayer {
         self.shared.control.seek(position_ns);
     }
 
+    pub fn decode_group_id(&self) -> u64 {
+        self.shared.group_id()
+    }
+
     pub fn current_position_ns(&self) -> u64 {
         self.shared.control.position_ns()
     }

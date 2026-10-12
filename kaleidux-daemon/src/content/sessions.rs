@@ -12,7 +12,13 @@ pub type PendingVideoSessions = Arc<Mutex<HashMap<String, u64>>>;
 
 pub enum VideoPlayerResult {
     Success(Box<VideoPlayerSuccess>),
-    Failure(String, u64),
+    Failure(String, u64, VideoPrepareFailure),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VideoPrepareFailure {
+    Media,
+    Import,
 }
 
 pub struct VideoPlayerSuccess {

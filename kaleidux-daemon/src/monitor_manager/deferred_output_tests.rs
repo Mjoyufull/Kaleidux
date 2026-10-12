@@ -156,3 +156,79 @@ async fn shared_discovery_survives_one_unplug_and_cancels_after_the_last() {
     drop(manager);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn shared_queue_uses_a_configured_owner_after_a_pathless_output() {
+    for grouped in [false, true] {
+        let (mut manager, root, image) = fixture();
+        manager.config.any.path = None;
+        manager.config.outputs.insert(
+            "DP-2".into(),
+            crate::orchestration::PartialOutputConfig {
+                path: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        manager.config.global.monitor_behavior = if grouped {
+            MonitorBehavior::Grouped(vec![vec!["DP-1".into(), "DP-2".into()]])
+        } else {
+            MonitorBehavior::Synchronized
+        };
+        manager.add_output_deferred("DP-1", "pathless output");
+        assert!(manager.pending_output_queues.tasks.is_empty());
+        manager.add_output_deferred("DP-2", "configured output");
+        assert_eq!(manager.pending_output_queues.tasks.len(), 1);
+        finish(&mut manager).await;
+        let changes = manager.handle_next(None);
+        assert_eq!(changes["DP-1"].0, image);
+        assert_eq!(changes["DP-2"].0, image);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unplugging_owner_restarts_discovery_with_survivors_configuration() {
+    let (mut manager, root, image) = fixture();
+    let survivor_root = root.join("survivor");
+    std::fs::create_dir(&survivor_root).unwrap();
+    let survivor_image = survivor_root.join("survivor.png");
+    image::RgbaImage::new(2, 2).save(&survivor_image).unwrap();
+    manager.config.outputs.insert(
+        "DP-2".into(),
+        crate::orchestration::PartialOutputConfig {
+            path: Some(survivor_root),
+            ..Default::default()
+        },
+    );
+    manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;
+    let mut release = hold_queue(&mut manager, "DP-1", image);
+    manager.add_output_deferred("DP-2", "survivor");
+    manager.remove_output("DP-1");
+    tokio::time::timeout(Duration::from_millis(100), release.closed())
+        .await
+        .unwrap();
+    finish(&mut manager).await;
+    assert_eq!(manager.handle_next(None)["DP-2"].0, survivor_image);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn only_synchronized_or_grouped_peers_share_playback() {
+    let (mut manager, root, _) = fixture();
+    assert!(!manager.shares_playback_with("DP-1", "DP-2"));
+    manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;
+    assert!(manager.shares_playback_with("DP-1", "DP-2"));
+    manager.config.global.monitor_behavior =
+        MonitorBehavior::Grouped(vec![vec!["DP-1".into(), "DP-2".into()]]);
+    manager.add_output_deferred("DP-1", "first");
+    manager.add_output_deferred("DP-2", "second");
+    manager.add_output_deferred("DP-3", "independent");
+    assert!(manager.shares_playback_with("DP-1", "DP-2"));
+    assert!(!manager.shares_playback_with("DP-1", "DP-3"));
+    assert!(!manager.shares_playback_with("DP-3", "DP-4"));
+    finish(&mut manager).await;
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -362,6 +362,7 @@ impl VideoPlayer {
         let player_event_tx = self.player_event_tx.clone();
         let session_id = self.session_id;
         let backend_kind = self.backend_kind;
+        let import_recovery_enabled = self.appsink_import_recovery_enabled;
 
         let watch = bus.create_watch(
             Some(&format!("kaleidux-bus-{}", source_id)),
@@ -454,7 +455,11 @@ impl VideoPlayer {
                             source_id: source_id.to_string(),
                             session_id,
                             backend_kind,
-                            kind: PlayerEventKind::Error,
+                            kind: if import_recovery_enabled && super::import_caps::appsink_import_failed() {
+                                PlayerEventKind::ImportFailure
+                            } else {
+                                PlayerEventKind::Error
+                            },
                             reason: error_msg,
                         });
                         return gst::glib::ControlFlow::Break;

@@ -47,9 +47,60 @@ fn appsink_dma_import_failure_recovers_to_system_memory() {
         .buffer(&gpu_buffer)
         .caps(&caps)
         .build();
+    #[cfg(feature = "backend-appsink")]
+    let prepared_gpu_player = {
+        let (events, _) = tokio::sync::mpsc::channel(8);
+        crate::video::VideoPlayer::new(
+            path.to_str().unwrap(),
+            std::sync::Arc::new("test".into()),
+            10,
+            0.0,
+            crate::video::LatestFrameMailbox::new(),
+            events,
+            std::sync::Arc::new(crate::metrics::PerformanceMetrics::new()),
+            crate::video::VideoBackendRequest::ForceAppsink,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    #[cfg(feature = "backend-appsink")]
+    assert!(!prepared_gpu_player.needs_appsink_import_retry());
     assert!(report_appsink_import_failure());
     assert!(!report_appsink_import_failure());
     assert!(!can_import_dmabuf());
+    #[cfg(feature = "backend-appsink")]
+    {
+        assert!(prepared_gpu_player.needs_appsink_import_retry());
+        let (events, _) = tokio::sync::mpsc::channel(8);
+        let prepared_cpu_player = crate::video::VideoPlayer::new(
+            prepared_gpu_player.source_uri(),
+            std::sync::Arc::new("test".into()),
+            11,
+            0.0,
+            crate::video::LatestFrameMailbox::new(),
+            events,
+            std::sync::Arc::new(crate::metrics::PerformanceMetrics::new()),
+            crate::video::VideoBackendRequest::ForceAppsink,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_cpu_player.source_uri(),
+            prepared_gpu_player.source_uri()
+        );
+        assert!(
+            !prepared_cpu_player.needs_appsink_import_retry(),
+            "CPU recovery cannot request another import retry"
+        );
+    }
     let fallback_caps = build_video_sink_caps(VideoMode::Auto, &VideoCapabilities::default());
     assert!(!fallback_caps.to_string().contains("memory:DMABuf"));
     assert!(matches!(

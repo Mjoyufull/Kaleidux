@@ -78,6 +78,10 @@ pub(super) struct AcquireRequest {
 }
 
 impl SharedDecodeSession {
+    pub(super) fn group_id(&self) -> u64 {
+        self.key.group_id
+    }
+
     pub(super) fn acquire(
         request: AcquireRequest,
     ) -> anyhow::Result<(Arc<Self>, Receiver<VideoFrame>)> {

@@ -98,7 +98,11 @@ impl MonitorManager {
                 }
             }
             MonitorBehavior::Synchronized => {
-                if let Some(representative_name) = output_names.first() {
+                if let Some(representative_name) = output_names.iter().find(|name| {
+                    updated_configs
+                        .get(*name)
+                        .is_some_and(|config| config.path.is_some())
+                }) {
                     if let Some(representative_config) = Self::updated_config_for(
                         updated_configs,
                         representative_name,
@@ -135,10 +139,11 @@ impl MonitorManager {
                 }
 
                 for (gid, group) in groups.iter().enumerate() {
-                    let Some(representative_name) = group
-                        .iter()
-                        .find(|name| updated_configs.contains_key(*name))
-                    else {
+                    let Some(representative_name) = group.iter().find(|name| {
+                        updated_configs
+                            .get(*name)
+                            .is_some_and(|config| config.path.is_some())
+                    }) else {
                         continue;
                     };
                     let Some(representative_config) = Self::updated_config_for(
