@@ -201,9 +201,10 @@ impl super::Renderer {
             None => match super::native_dmabuf_interop::NativeDmaBufInterop::new(&self.ctx) {
                 Ok(interop) => interop,
                 Err(error) => {
-                    self.record_native_import_failure(format!(
-                        "cannot initialize DMA-BUF import: {error:#}"
-                    ));
+                    self.record_dmabuf_import_failure(
+                        origin,
+                        format!("cannot initialize DMA-BUF import: {error:#}"),
+                    );
                     return false;
                 }
             },
@@ -226,9 +227,10 @@ impl super::Renderer {
         match copy_result {
             Ok(cache_hit) => self.record_dmabuf_import(descriptor.surface_id, cache_hit, origin),
             Err(error) => {
-                self.record_native_import_failure(format!(
-                    "decoder-surface GPU copy failed: {error:#}"
-                ));
+                self.record_dmabuf_import_failure(
+                    origin,
+                    format!("decoder-surface GPU copy failed: {error:#}"),
+                );
                 return false;
             }
         }
@@ -395,6 +397,19 @@ impl super::Renderer {
                 "[GST-DMABUF] {}: cached allocation surface={} modifier-aware Vulkan import",
                 self.name, surface_id
             );
+        }
+    }
+
+    fn record_dmabuf_import_failure(&self, origin: super::YuvOrigin, detail: String) {
+        if origin == super::YuvOrigin::DmaBuf {
+            if crate::video::import_caps::report_appsink_import_failure() {
+                warn!(
+                    "[VIDEO] {}: {detail}; restarting appsink without DMA-BUF caps",
+                    self.name
+                );
+            }
+        } else {
+            self.record_native_import_failure(detail);
         }
     }
 

@@ -54,6 +54,12 @@ impl MainLoopContext {
             .monitor_manager
             .next_switch_deadline()
             .map(|deadline| (deadline, DeadlineReason::ContentSwitch));
+        deadline = min_deadline_with_reason(
+            deadline,
+            self.monitor_manager
+                .output_queue_deadline(now)
+                .map(|wake| (wake, DeadlineReason::ContentSwitch)),
+        );
         if self.script_manager.has_tick() {
             let script_deadline = (
                 self.last_script_tick + Duration::from_secs(self.script_tick_interval),

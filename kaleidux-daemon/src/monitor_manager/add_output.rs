@@ -26,7 +26,7 @@ impl MonitorManager {
                         );
                         let queue = SmartQueue::new_from_pool(
                             path,
-                            cached_files.clone(),
+                            cached_files.as_ref().clone(),
                             output_config.video_ratio,
                             output_config.sorting,
                             self.cache.clone(),
@@ -62,7 +62,7 @@ impl MonitorManager {
                         // Cache the discovered file list for subsequent outputs with the same path
                         if let Some(q) = &orch.queue {
                             self.discovered_files_cache
-                                .insert(path.clone(), q.root_pool_snapshot());
+                                .insert(path.clone(), std::sync::Arc::new(q.root_pool_snapshot()));
                         }
                         orch
                     }

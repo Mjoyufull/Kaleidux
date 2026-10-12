@@ -1,0 +1,252 @@
+//! Owns hotplug queue workers; finished queues are adopted without awaiting filesystem work.
+
+use super::manual_queue::ManualQueueTarget;
+use super::{MonitorManager, OutputOrchestrator};
+use crate::orchestration::{MonitorBehavior, OutputConfig};
+use crate::queue::SmartQueue;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+struct PendingQueue {
+    config: OutputConfig,
+    behavior: MonitorBehavior,
+    owner_name: String,
+    owner_description: String,
+    task: tokio::task::JoinHandle<anyhow::Result<(SmartQueue, Vec<PathBuf>)>>,
+}
+
+#[derive(Default)]
+pub(super) struct PendingOutputQueues {
+    tasks: HashMap<ManualQueueTarget, PendingQueue>,
+}
+
+impl Drop for PendingOutputQueues {
+    fn drop(&mut self) {
+        for pending in self.tasks.values() {
+            pending.task.abort();
+        }
+    }
+}
+
+impl MonitorManager {
+    pub(crate) fn add_output_deferred(&mut self, name: &str, description: &str) {
+        let config = self.config.get_config_for_output(name, description);
+        if let MonitorBehavior::Grouped(groups) = &self.config.global.monitor_behavior
+            && let Some(group) = groups
+                .iter()
+                .position(|members| members.iter().any(|member| member == name))
+        {
+            self.output_groups.insert(name.to_owned(), group);
+        }
+        self.outputs.insert(
+            name.to_owned(),
+            OutputOrchestrator::without_queue(name.to_owned(), description.to_owned(), config),
+        );
+        let target = self.queue_target(name);
+        self.start_output_queue(target);
+    }
+
+    fn queue_target(&self, name: &str) -> ManualQueueTarget {
+        match &self.config.global.monitor_behavior {
+            MonitorBehavior::Synchronized => ManualQueueTarget::Shared,
+            MonitorBehavior::Grouped(_) if self.output_groups.contains_key(name) => {
+                ManualQueueTarget::Group(self.output_groups[name])
+            }
+            _ => ManualQueueTarget::Output(name.to_owned()),
+        }
+    }
+
+    fn queue_config(&self, target: &ManualQueueTarget) -> Option<&OutputConfig> {
+        let output = match target {
+            ManualQueueTarget::Output(name) => self.outputs.get(name),
+            ManualQueueTarget::Shared => self.outputs.values().next(),
+            ManualQueueTarget::Group(group) => self
+                .output_groups
+                .iter()
+                .find(|(_, candidate)| *candidate == group)
+                .and_then(|(name, _)| self.outputs.get(name)),
+        }?;
+        Some(&output.config)
+    }
+
+    fn queue_exists(&self, target: &ManualQueueTarget) -> bool {
+        match target {
+            ManualQueueTarget::Output(name) => self
+                .outputs
+                .get(name)
+                .is_some_and(|output| output.queue.is_some()),
+            ManualQueueTarget::Shared => self.shared_queue.is_some(),
+            ManualQueueTarget::Group(group) => self.group_queues.contains_key(group),
+        }
+    }
+
+    fn start_output_queue(&mut self, target: ManualQueueTarget) {
+        if self.queue_exists(&target) || self.pending_output_queues.tasks.contains_key(&target) {
+            return;
+        }
+        let owner_name = match &target {
+            ManualQueueTarget::Output(name) => Some(name.clone()),
+            ManualQueueTarget::Shared => self.outputs.keys().min().cloned(),
+            ManualQueueTarget::Group(group) => self
+                .output_groups
+                .iter()
+                .filter(|(_, candidate)| *candidate == group)
+                .map(|(name, _)| name)
+                .min()
+                .cloned(),
+        };
+        let Some(owner_name) = owner_name else {
+            return;
+        };
+        let owner = self.outputs.get(&owner_name).expect("queue owner");
+        let owner_description = owner.description.clone();
+        let config = owner.config.clone();
+        let Some(path) = config.path.clone() else {
+            return;
+        };
+        let cached = self.discovered_files_cache.get(&path).cloned();
+        let cache = self.cache.clone();
+        let metrics = self.metrics.clone();
+        let task_config = config.clone();
+        let task = tokio::spawn(async move {
+            let mut queue = match cached {
+                Some(pool) => SmartQueue::new_from_pool(
+                    &path,
+                    pool.as_ref().clone(),
+                    task_config.video_ratio,
+                    task_config.sorting,
+                    cache,
+                )?,
+                None => {
+                    SmartQueue::new_with_cache(
+                        &path,
+                        task_config.video_ratio,
+                        task_config.sorting,
+                        cache,
+                        metrics,
+                    )
+                    .await?
+                }
+            };
+            if let Some(playlist) = task_config.default_playlist {
+                if let Err(error) = queue.set_playlist(Some(playlist)) {
+                    tracing::warn!(
+                        "[HOTPLUG-QUEUE] Default playlist unavailable: {error}; retaining root queue"
+                    );
+                }
+            }
+            let snapshot = queue.root_pool_snapshot();
+            Ok((queue, snapshot))
+        });
+        self.pending_output_queues.tasks.insert(
+            target,
+            PendingQueue {
+                config,
+                behavior: self.config.global.monitor_behavior.clone(),
+                owner_name,
+                owner_description,
+                task,
+            },
+        );
+    }
+
+    pub(crate) async fn poll_output_queues(&mut self) {
+        let finished: Vec<_> = self
+            .pending_output_queues
+            .tasks
+            .iter()
+            .filter(|(_, pending)| pending.task.is_finished())
+            .map(|(target, _)| target.clone())
+            .collect();
+        for target in finished {
+            let pending = self
+                .pending_output_queues
+                .tasks
+                .remove(&target)
+                .expect("finished queue task");
+            if self.config.global.monitor_behavior != pending.behavior {
+                pending.task.abort();
+                let names: Vec<_> = self.outputs.keys().cloned().collect();
+                for name in names {
+                    self.start_output_queue(self.queue_target(&name));
+                }
+                continue;
+            }
+            if self.queue_config(&target).is_none() {
+                continue;
+            }
+            let current = self
+                .config
+                .get_config_for_output(&pending.owner_name, &pending.owner_description);
+            if Self::queue_config_changed(&pending.config, &current) {
+                pending.task.abort();
+                self.start_output_queue(target);
+                continue;
+            }
+            // is_finished was observed before await; no scan is awaited here.
+            let (queue, snapshot) = match pending.task.await {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "[HOTPLUG-QUEUE] Preparing {:?} failed: {error}",
+                        pending.config.path
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[HOTPLUG-QUEUE] Preparing {:?} task failed: {error}",
+                        pending.config.path
+                    );
+                    continue;
+                }
+            };
+            if let Some(path) = pending.config.path {
+                self.discovered_files_cache
+                    .insert(path, std::sync::Arc::new(snapshot));
+            }
+            if self.queue_exists(&target) {
+                continue;
+            } // A manual command initialized it meanwhile.
+            match target {
+                ManualQueueTarget::Output(name) => {
+                    self.outputs.get_mut(&name).expect("live output").queue = Some(queue)
+                }
+                ManualQueueTarget::Shared => self.shared_queue = Some(queue),
+                ManualQueueTarget::Group(group) => {
+                    self.group_queues.insert(group, queue);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn output_queue_deadline(&self, now: Instant) -> Option<Instant> {
+        (!self.pending_output_queues.tasks.is_empty()).then(|| now + Duration::from_millis(50))
+    }
+
+    pub(super) fn cancel_output_queue(&mut self, name: &str) {
+        let abandoned: Vec<_> = self
+            .pending_output_queues
+            .tasks
+            .keys()
+            .filter(|target| match target {
+                ManualQueueTarget::Output(owner) => owner == name,
+                ManualQueueTarget::Shared => !self.outputs.keys().any(|peer| peer != name),
+                ManualQueueTarget::Group(group) => !self.output_groups.iter().any(|(peer, id)| {
+                    peer != name && id == group && self.outputs.contains_key(peer)
+                }),
+            })
+            .cloned()
+            .collect();
+        for target in abandoned {
+            if let Some(pending) = self.pending_output_queues.tasks.remove(&target) {
+                pending.task.abort();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "deferred_output_tests.rs"]
+mod tests;

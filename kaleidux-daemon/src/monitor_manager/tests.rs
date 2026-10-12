@@ -185,10 +185,12 @@ fn image_commands_validate_then_select_internal_or_external_images() {
             .prepare_media_selection(b.to_str().unwrap(), &None, None)
             .is_err()
     );
-    manager.discovered_files_cache.insert(root.clone(), vec![a]);
     manager
         .discovered_files_cache
-        .insert(outside.clone(), vec![b]);
+        .insert(root.clone(), Arc::new(vec![a]));
+    manager
+        .discovered_files_cache
+        .insert(outside.clone(), Arc::new(vec![b]));
     manager.invalidate_cache(&root.join("nested/new.png"));
     assert!(!manager.discovered_files_cache.contains_key(&root));
     assert!(manager.discovered_files_cache.contains_key(&outside));
@@ -232,6 +234,7 @@ fn make_test_manager(
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
+        pending_output_queues: Default::default(),
     }
 }
 
@@ -457,6 +460,7 @@ fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
+        pending_output_queues: Default::default(),
     };
 
     let changes = manager.tick();
@@ -523,6 +527,7 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
         discovered_files_cache: HashMap::new(),
+        pending_output_queues: Default::default(),
     };
 
     let changes = manager.handle_next(Some("DP-1".to_string()));

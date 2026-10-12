@@ -224,8 +224,7 @@ async fn add_output(
         output.size.0, output.size.1
     );
     ctx.monitor_manager
-        .add_output(name, &output.description)
-        .await;
+        .add_output_deferred(name, &output.description);
     let Some(output_config) = ctx.monitor_manager.get_output_config(name).cloned() else {
         rollback_added_output(ctx, backend, pending, name);
         return false;
