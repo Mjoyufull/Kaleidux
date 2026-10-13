@@ -836,6 +836,8 @@ control characters. At most 64 different names can be held. Repeating `inhibit`
 with the same name is idempotent, not reference-counted; releasing a missing name
 also succeeds. Use separate names for independent callers.
 
+Hotplugged synchronized/grouped FFmpeg outputs join the current decoder, including its latest paused frame. Directory discovery runs outside the display loop; unavailable or empty roots retry with backoff from 250 milliseconds up to 30 seconds. Adding supported media therefore restores cycling without replugging.
+
 Inhibitors pause decoding and automatic rotation, retaining the current image or
 video frame. Explicit `next`, `prev`, and `clear` still work. Final release starts
 a fresh rotation interval; display power state can still delay video resumption.

@@ -59,6 +59,27 @@ pub(crate) fn shared_root_index(root: &Path) -> Arc<RootMediaIndex> {
 }
 
 impl RootMediaIndex {
+    pub(super) fn local() -> Arc<Self> {
+        Arc::new(Self {
+            state: RwLock::new(RootMediaState::default()),
+            rescan: Mutex::new(RescanState::default()),
+        })
+    }
+
+    pub(crate) fn rescan_running(&self) -> bool {
+        self.rescan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .running
+    }
+
+    pub(super) fn cancel_rescan(&self) {
+        self.rescan
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .running = false;
+    }
+
     pub(crate) fn request_rescan(&self) -> Option<u64> {
         let mut state = self
             .rescan

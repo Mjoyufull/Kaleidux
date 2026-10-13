@@ -104,9 +104,11 @@ impl ContentType {
 }
 
 mod discovery;
-mod media_index;
+pub(crate) mod media_index;
 mod picking;
 mod pool_events;
+#[path = "queue/rescan.rs"]
+mod rescan;
 mod stats;
 
 #[cfg(test)]

@@ -232,3 +232,91 @@ async fn only_synchronized_or_grouped_peers_share_playback() {
     drop(manager);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn unavailable_hotplug_root_retries_and_recovers_without_replug() {
+    let (mut manager, root, image) = fixture();
+    std::fs::remove_file(&image).unwrap();
+    manager.add_output_deferred("DP-1", "empty root");
+    finish(&mut manager).await;
+    assert!(manager.outputs["DP-1"].queue.is_none());
+    assert_eq!(manager.pending_output_queues.retries.len(), 1);
+    assert!(manager.output_queue_deadline(Instant::now()).is_some());
+    image::RgbaImage::new(2, 2).save(&image).unwrap();
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    manager.poll_output_queues().await;
+    finish(&mut manager).await;
+    assert_eq!(manager.handle_next(None)["DP-1"].0, image);
+    assert!(manager.pending_output_queues.retries.is_empty());
+    assert!(manager.output_queue_deadline(Instant::now()).is_none());
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn unplug_cancels_deferred_retry() {
+    let (mut manager, root, image) = fixture();
+    std::fs::remove_file(image).unwrap();
+    manager.add_output_deferred("DP-1", "empty root");
+    finish(&mut manager).await;
+    assert!(!manager.pending_output_queues.retries.is_empty());
+    manager.remove_output("DP-1");
+    assert!(manager.pending_output_queues.retries.is_empty());
+    assert!(manager.output_queue_deadline(Instant::now()).is_none());
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn manual_selection_does_not_replace_a_later_hotplug_directory_pool() {
+    let (mut manager, root, image) = fixture();
+    manager.config.any.path = None;
+    manager.add_output_deferred("DP-1", "manual output");
+    manager
+        .prepare_media_selection(image.to_str().unwrap(), &Some("DP-1".into()), Some(false))
+        .unwrap();
+    let second = root.join("second.png");
+    image::RgbaImage::new(2, 2).save(&second).unwrap();
+    manager.config.outputs.insert(
+        "DP-2".into(),
+        crate::orchestration::PartialOutputConfig {
+            path: Some(root.clone()),
+            ..Default::default()
+        },
+    );
+    manager.add_output_deferred("DP-2", "directory output");
+    finish(&mut manager).await;
+    let pool = &manager.outputs["DP-2"].queue.as_ref().unwrap().pool;
+    assert_eq!(pool.len(), 2);
+    assert!(pool.contains(&image) && pool.contains(&second));
+    assert_eq!(
+        manager.outputs["DP-1"].queue.as_ref().unwrap().pool,
+        vec![image]
+    );
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn pending_hotplug_discovery_does_not_lose_watcher_additions() {
+    let (mut manager, root, image) = fixture();
+    let release = hold_queue(&mut manager, "DP-1", image.clone());
+    let added = root.join("added.png");
+    image::RgbaImage::new(2, 2).save(&added).unwrap();
+    manager.apply_pool_events(vec![crate::cache::PoolEvent::Added(added.clone())]);
+    let index = crate::queue::media_index::shared_root_index(&root);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while index.rescan_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    finish(&mut manager).await;
+    let pool = &manager.outputs["DP-1"].queue.as_ref().unwrap().pool;
+    assert_eq!(pool.len(), 2);
+    assert!(pool.contains(&image) && pool.contains(&added));
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}

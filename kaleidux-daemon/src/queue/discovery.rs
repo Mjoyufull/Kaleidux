@@ -76,7 +76,7 @@ impl SmartQueue {
 
         let shared_index = super::media_index::shared_root_index(path);
         let shared_snapshot = shared_index.snapshot();
-        if !shared_snapshot.entries.is_empty() {
+        if !shared_snapshot.entries.is_empty() && !shared_index.rescan_running() {
             let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
             let mut pool = Vec::with_capacity(shared_snapshot.entries.len());
             let mut content_type_cache = HashMap::with_capacity(shared_snapshot.entries.len());
@@ -244,26 +244,6 @@ impl SmartQueue {
         })
     }
 
-    /// Run full file discovery on a blocking thread
-    async fn full_discovery(
-        path: &Path,
-        blacklist: &std::collections::HashSet<PathBuf>,
-        cache: Arc<FileCache>,
-        metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
-    ) -> Result<(Vec<PathBuf>, HashMap<PathBuf, ContentType>)> {
-        let path_buf = path.to_path_buf();
-        let blacklist_clone = blacklist.clone();
-        let Some(handle) = background::spawn_blocking_tracked_wait(
-            BackgroundWorkKind::QueueDiscovery,
-            move || Self::discover_content(&path_buf, &blacklist_clone, cache, metrics),
-        )
-        .await
-        else {
-            return Ok((Vec::new(), HashMap::new()));
-        };
-        handle.await?
-    }
-
     /// Create a queue from a pre-discovered file list (avoids re-scanning the directory)
     pub fn new_from_pool(
         path: &Path,
@@ -271,6 +251,42 @@ impl SmartQueue {
         video_ratio: u8,
         strategy: crate::orchestration::SortingStrategy,
         cache: Arc<FileCache>,
+    ) -> Result<Self> {
+        Self::from_pool(
+            path,
+            pool,
+            video_ratio,
+            strategy,
+            cache,
+            super::media_index::shared_root_index(path),
+        )
+    }
+
+    /// Manual selections represent a partial pool and must not seed directory discovery.
+    pub(crate) fn new_manual_from_pool(
+        path: &Path,
+        pool: Vec<PathBuf>,
+        video_ratio: u8,
+        strategy: crate::orchestration::SortingStrategy,
+        cache: Arc<FileCache>,
+    ) -> Result<Self> {
+        Self::from_pool(
+            path,
+            pool,
+            video_ratio,
+            strategy,
+            cache,
+            super::media_index::RootMediaIndex::local(),
+        )
+    }
+
+    fn from_pool(
+        path: &Path,
+        pool: Vec<PathBuf>,
+        video_ratio: u8,
+        strategy: crate::orchestration::SortingStrategy,
+        cache: Arc<FileCache>,
+        root_index: Arc<super::media_index::RootMediaIndex>,
     ) -> Result<Self> {
         let stats = Self::load_stats_from_cache(&cache)?;
         let mut pool = pool;
@@ -283,14 +299,25 @@ impl SmartQueue {
         drop(blacklist);
         pool.sort();
 
-        let current_index = Self::fallback_current_index(strategy, pool.len());
-
-        let content_type_cache = Self::populate_content_type_cache_from_pool(&cache, &pool);
-        let (root_index, root_generation) =
-            Self::root_index_fields(path, &pool, &content_type_cache);
+        let seeded_types = Self::populate_content_type_cache_from_pool(&cache, &pool);
+        let snapshot = root_index.install_if_empty(&pool, &seeded_types);
+        // The shared root may have advanced while a cached pool was prepared.
+        // Adopt its entries together with its generation, never tag stale data
+        // with the newer generation and thereby miss later synchronization.
+        let identity = super::BlacklistIdentity::new(&stats.blacklist);
+        let content_type_cache: HashMap<_, _> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.content_type.supported() && !identity.contains(&entry.path))
+            .map(|entry| (entry.path.clone(), entry.content_type))
+            .collect();
+        let mut current_pool: Vec<_> = content_type_cache.keys().cloned().collect();
+        current_pool.sort();
+        let current_index = Self::fallback_current_index(strategy, current_pool.len());
+        let root_generation = snapshot.generation;
         Ok(Self {
             content_type_cache,
-            pool,
+            pool: current_pool,
             stats,
             video_ratio,
             strategy,

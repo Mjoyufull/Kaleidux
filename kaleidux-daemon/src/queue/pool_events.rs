@@ -254,7 +254,7 @@ impl SmartQueue {
         );
     }
 
-    pub(super) fn schedule_root_rescan_for(
+    pub(crate) fn schedule_root_rescan_for(
         index: std::sync::Arc<super::media_index::RootMediaIndex>,
         root: std::path::PathBuf,
         cache: std::sync::Arc<crate::cache::FileCache>,

@@ -16,9 +16,15 @@ struct PendingQueue {
     task: tokio::task::JoinHandle<anyhow::Result<(SmartQueue, Vec<PathBuf>)>>,
 }
 
+struct QueueRetry {
+    due: Instant,
+    delay: Duration,
+}
+
 #[derive(Default)]
 pub(super) struct PendingOutputQueues {
     tasks: HashMap<ManualQueueTarget, PendingQueue>,
+    retries: HashMap<ManualQueueTarget, QueueRetry>,
 }
 
 impl Drop for PendingOutputQueues {
@@ -58,6 +64,19 @@ impl MonitorManager {
     }
 
     fn queue_owner(&self, target: &ManualQueueTarget) -> Option<&OutputOrchestrator> {
+        if matches!(target, ManualQueueTarget::Shared)
+            && !matches!(
+                self.config.global.monitor_behavior,
+                MonitorBehavior::Synchronized
+            )
+            || matches!(target, ManualQueueTarget::Group(_))
+                && !matches!(
+                    self.config.global.monitor_behavior,
+                    MonitorBehavior::Grouped(_)
+                )
+        {
+            return None;
+        }
         self.outputs
             .values()
             .filter(|output| {
@@ -85,7 +104,17 @@ impl MonitorManager {
     }
 
     fn start_output_queue(&mut self, target: ManualQueueTarget) {
-        if self.queue_exists(&target) || self.pending_output_queues.tasks.contains_key(&target) {
+        if self.queue_exists(&target) {
+            self.pending_output_queues.retries.remove(&target);
+            return;
+        }
+        if self.pending_output_queues.tasks.contains_key(&target)
+            || self
+                .pending_output_queues
+                .retries
+                .get(&target)
+                .is_some_and(|retry| retry.due > Instant::now())
+        {
             return;
         }
         let Some(owner) = self.queue_owner(&target) else {
@@ -184,6 +213,7 @@ impl MonitorManager {
                         "[HOTPLUG-QUEUE] Preparing {:?} failed: {error}",
                         pending.config.path
                     );
+                    self.defer_queue_retry(target);
                     continue;
                 }
                 Err(error) => {
@@ -191,9 +221,11 @@ impl MonitorManager {
                         "[HOTPLUG-QUEUE] Preparing {:?} task failed: {error}",
                         pending.config.path
                     );
+                    self.defer_queue_retry(target);
                     continue;
                 }
             };
+            self.pending_output_queues.retries.remove(&target);
             if let Some(path) = pending.config.path {
                 self.discovered_files_cache
                     .insert(path, std::sync::Arc::new(snapshot));
@@ -211,10 +243,79 @@ impl MonitorManager {
                 }
             }
         }
+        let due: Vec<_> = self
+            .pending_output_queues
+            .retries
+            .iter()
+            .filter(|(_, retry)| retry.due <= Instant::now())
+            .map(|(target, _)| target.clone())
+            .collect();
+        for target in due {
+            if self.queue_owner(&target).is_none() {
+                self.pending_output_queues.retries.remove(&target);
+            } else {
+                self.start_output_queue(target);
+            }
+        }
+    }
+
+    fn defer_queue_retry(&mut self, target: ManualQueueTarget) {
+        let delay = self
+            .pending_output_queues
+            .retries
+            .get(&target)
+            .map_or(Duration::from_millis(250), |previous| {
+                (previous.delay * 2).min(Duration::from_secs(30))
+            });
+        self.pending_output_queues.retries.insert(
+            target,
+            QueueRetry {
+                due: Instant::now() + delay,
+                delay,
+            },
+        );
+    }
+
+    pub(super) fn note_output_queue_events(&self, events: &[crate::cache::PoolEvent]) {
+        let roots: std::collections::HashSet<_> = self
+            .pending_output_queues
+            .tasks
+            .values()
+            .filter_map(|pending| pending.config.path.as_ref())
+            .collect();
+        for root in roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if events.iter().any(|event| {
+                let path = match event {
+                    crate::cache::PoolEvent::Added(path)
+                    | crate::cache::PoolEvent::Removed(path)
+                    | crate::cache::PoolEvent::Modified(path)
+                    | crate::cache::PoolEvent::Rescan(path) => path,
+                };
+                path.starts_with(root)
+                    || path.starts_with(&canonical)
+                    || canonical.starts_with(path)
+            }) {
+                SmartQueue::schedule_root_rescan_for(
+                    crate::queue::media_index::shared_root_index(root),
+                    root.clone(),
+                    self.cache.clone(),
+                );
+            }
+        }
     }
 
     pub(crate) fn output_queue_deadline(&self, now: Instant) -> Option<Instant> {
-        (!self.pending_output_queues.tasks.is_empty()).then(|| now + Duration::from_millis(50))
+        let active =
+            (!self.pending_output_queues.tasks.is_empty()).then(|| now + Duration::from_millis(50));
+        let retry = self
+            .pending_output_queues
+            .retries
+            .iter()
+            .filter(|(target, _)| !self.pending_output_queues.tasks.contains_key(*target))
+            .map(|(_, retry)| retry.due)
+            .min();
+        active.into_iter().chain(retry).min()
     }
 
     pub(super) fn cancel_output_queue(&mut self, name: &str) {
@@ -225,6 +326,16 @@ impl MonitorManager {
             .filter(|(_, pending)| pending.owner_name == name)
             .map(|(target, _)| target.clone())
             .collect();
+        let abandoned: Vec<_> = self
+            .pending_output_queues
+            .retries
+            .keys()
+            .filter(|target| self.queue_owner(target).is_none())
+            .cloned()
+            .collect();
+        for target in abandoned {
+            self.pending_output_queues.retries.remove(&target);
+        }
         for target in targets {
             let mut pending = self
                 .pending_output_queues
