@@ -102,7 +102,7 @@ impl MonitorManager {
 
     pub fn next_switch_deadline(&self) -> Option<Instant> {
         if self.is_paused() || self.power_suspended {
-            return None;
+            return self.has_pending_shared_join().then(Instant::now);
         }
 
         let mut next_deadline = None;
@@ -167,7 +167,7 @@ impl MonitorManager {
 
     pub fn tick_due(&self, now: Instant) -> bool {
         if self.is_paused() || self.power_suspended {
-            return false;
+            return self.has_pending_shared_join();
         }
 
         if self

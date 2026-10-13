@@ -180,7 +180,9 @@ pub async fn run(
             // socket remains epoll-readable, creating a high-CPU readiness
             // loop and delaying async linux-dmabuf created/failed events.
             match event_queue.dispatch_pending(&mut backend) {
-                Ok(_) => {}
+                // Registry events can enqueue binds while playback is paused.
+                // Their replies must not depend on another video presentation.
+                Ok(dispatched) => callback_flush_needed |= dispatched != 0,
                 Err(error) => {
                     ctx.shutdown().await;
                     drop(ctx);
@@ -212,7 +214,9 @@ pub async fn run(
             }
 
             match event_queue.dispatch_pending(&mut backend) {
-                Ok(_) => {}
+                // Registry events can enqueue binds while playback is paused.
+                // Their replies must not depend on another video presentation.
+                Ok(dispatched) => callback_flush_needed |= dispatched != 0,
                 Err(e) => {
                     ctx.shutdown().await;
                     drop(ctx);

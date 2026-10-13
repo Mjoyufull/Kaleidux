@@ -5,12 +5,17 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 impl MonitorManager {
+    pub(super) fn has_pending_shared_join(&self) -> bool {
+        self.outputs.iter().any(|(name, output)| {
+            output.current_path.is_none()
+                && self.outputs.iter().any(|(peer_name, peer)| {
+                    peer.current_path.is_some() && self.shares_playback_with(name, peer_name)
+                })
+        })
+    }
+
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
         let mut changes = HashMap::new();
-        // Don't cycle wallpapers when paused
-        if self.is_paused() || self.power_suspended {
-            return changes;
-        }
         let now = Instant::now();
 
         // A newly connected peer joins the content already on its group;
@@ -21,16 +26,7 @@ impl MonitorManager {
             .filter(|(_, orch)| orch.current_path.is_none())
             .filter_map(|(name, _)| {
                 let peer = self.outputs.iter().find(|(peer_name, peer)| {
-                    peer.current_path.is_some()
-                        && match &self.config.global.monitor_behavior {
-                            MonitorBehavior::Synchronized => true,
-                            MonitorBehavior::Grouped(_) => {
-                                self.output_groups.contains_key(name)
-                                    && self.output_groups.get(name)
-                                        == self.output_groups.get(*peer_name)
-                            }
-                            MonitorBehavior::Independent => false,
-                        }
+                    peer.current_path.is_some() && self.shares_playback_with(name, peer_name)
                 })?;
                 Some((
                     name.clone(),
@@ -52,6 +48,10 @@ impl MonitorManager {
             }
         }
 
+        // Joining retained content does not advance the slideshow or unpause it.
+        if self.is_paused() || self.power_suspended {
+            return changes;
+        }
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for (name, orch) in &mut self.outputs {
