@@ -368,6 +368,7 @@ impl MonitorManager {
             return;
         }
 
+        self.note_output_queue_events(&events);
         // Process events to invalidate our internal cache
         for event in &events {
             match event {

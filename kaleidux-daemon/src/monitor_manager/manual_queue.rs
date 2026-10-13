@@ -110,7 +110,7 @@ impl MonitorManager {
             let root = path
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("Missing media directory"))?;
-            let queue = SmartQueue::new_from_pool(
+            let queue = SmartQueue::new_manual_from_pool(
                 root,
                 vec![path.to_path_buf()],
                 representative.config.video_ratio,

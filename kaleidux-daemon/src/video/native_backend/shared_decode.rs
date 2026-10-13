@@ -50,7 +50,6 @@ pub(super) struct NativeDecodeFanout {
     state: Mutex<FanoutState>,
     primary: Arc<NativeSubscriber>,
     subscriber_count: AtomicUsize,
-    latest_initialized: AtomicBool,
     fatal_error: Mutex<Option<String>>,
 }
 
@@ -287,7 +286,6 @@ impl NativeDecodeFanout {
             }),
             primary: first,
             subscriber_count: AtomicUsize::new(1),
-            latest_initialized: AtomicBool::new(false),
             fatal_error: Mutex::new(None),
         }
     }
@@ -329,14 +327,13 @@ impl NativeDecodeFanout {
         if self.subscriber_count.load(Ordering::Acquire) == 1
             && self.primary.active.load(Ordering::Acquire)
         {
-            if !self.latest_initialized.load(Ordering::Acquire)
-                && self
-                    .latest_initialized
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+            if self.primary.started.load(Ordering::Acquire)
+                && self.primary.paused.load(Ordering::Acquire)
             {
-                self.state.lock().latest_frame = frame.try_clone();
+                return;
             }
+            let retired = std::mem::replace(&mut self.state.lock().latest_frame, frame.try_clone());
+            drop(retired);
             let mut frame = frame;
             frame.session_id = self.primary.session_id;
             self.primary.deliver(frame);
@@ -344,13 +341,15 @@ impl NativeDecodeFanout {
         }
         let (single_subscriber, subscribers) = {
             let mut state = self.state.lock();
-            // A late subscriber only needs a valid preroll surface. Retaining
-            // the first frame avoids an AVFrame ref/unref pair on every steady
-            // frame; the next publication immediately brings it current.
-            if state.latest_frame.is_none() {
-                state.latest_frame = frame.try_clone();
-                self.latest_initialized.store(true, Ordering::Release);
+            if state.subscribers.values().all(|subscriber| {
+                subscriber.started.load(Ordering::Acquire)
+                    && subscriber.paused.load(Ordering::Acquire)
+            }) {
+                return;
             }
+            // A paused peer cannot publish another frame after a hotplug join.
+            // Keep one current surface, so its preroll matches existing outputs.
+            state.latest_frame = frame.try_clone();
             if state.subscribers.len() == 1 {
                 (state.subscribers.values().next().cloned(), Vec::new())
             } else {
@@ -595,5 +594,37 @@ mod tests {
         assert!(session.fatal_error().is_none());
         session.fanout.report_fatal("codec boom".to_string());
         assert_eq!(session.fatal_error().as_deref(), Some("codec boom"));
+    }
+    #[test]
+    fn paused_join_uses_the_latest_delivered_frame_without_advancing_peers() {
+        let primary = subscriber(1);
+        let fanout = NativeDecodeFanout::new(primary.clone());
+        let frame = |pts| VideoFrame {
+            storage: crate::video::VideoFrameStorage::Cpu(Arc::from([0_u8; 4])),
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: crate::video::VideoFrameFormat::Rgba,
+            session_id: 1,
+            pts_ns: Some(pts),
+            duration_ns: None,
+            color: Default::default(),
+            geometry: crate::video::VideoGeometry::for_dimensions(1, 1),
+        };
+        fanout.publish_frame(frame(0));
+        fanout.publish_frame(frame(99));
+        assert_eq!(
+            primary.mailbox.take_frame("output-1").unwrap().pts_ns,
+            Some(99)
+        );
+        primary.paused.store(true, Ordering::Release);
+        fanout.publish_frame(frame(100)); // An in-flight decode after pause is not presented.
+        let joining = subscriber(2);
+        joining.started.store(false, Ordering::Release);
+        fanout.add_subscriber(joining.clone());
+        let preroll = joining.mailbox.take_frame("output-2").unwrap();
+        assert_eq!(preroll.pts_ns, Some(99));
+        assert_eq!(preroll.session_id, 2);
+        assert!(primary.mailbox.take_frame("output-1").is_none());
     }
 }

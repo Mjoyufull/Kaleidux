@@ -653,3 +653,80 @@ fn sequential_previous_wraps_and_retraces_each_step_after_history_exhaustion() {
         assert_eq!(queue.pick_next(), Some(first));
     }
 }
+
+#[test]
+fn cached_queue_adopts_existing_root_entries_with_their_generation() {
+    let dir = unique_test_dir("cached-index-generation");
+    let first = dir.join("a.png");
+    let second = dir.join("b.png");
+    for path in [&first, &second] {
+        image::RgbaImage::new(2, 2).save(path).unwrap();
+    }
+    let index = media_index::shared_root_index(&dir);
+    index.replace(
+        &[first.clone(), second.clone()],
+        &HashMap::from([
+            (first.clone(), ContentType::Image),
+            (second.clone(), ContentType::Image),
+        ]),
+    );
+    let queue = SmartQueue::new_from_pool(
+        &dir,
+        vec![first.clone()],
+        0,
+        crate::orchestration::SortingStrategy::Ascending,
+        test_cache(),
+    )
+    .unwrap();
+    assert_eq!(queue.pool, vec![first, second]);
+    assert_eq!(queue.root_generation, index.snapshot().generation);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn full_discovery_waits_for_a_coalesced_scan_and_uses_its_final_snapshot() {
+    let root = unique_test_dir("discovery-coalesce");
+    let first = root.join("a.png");
+    let added = root.join("b.png");
+    for path in [&first, &added] {
+        image::RgbaImage::new(2, 2).save(path).unwrap();
+    }
+    let index = media_index::shared_root_index(&root);
+    let generation = index.request_rescan().unwrap();
+    let path = root.clone();
+    let cache = test_cache();
+    let task = tokio::spawn(async move {
+        SmartQueue::new_with_cache(
+            &path,
+            0,
+            crate::orchestration::SortingStrategy::Ascending,
+            cache,
+            None,
+        )
+        .await
+        .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!task.is_finished(), "queue must not race the existing scan");
+    index.apply_changes(&[(added.clone(), Some(ContentType::Image))]);
+    // A scan that captured candidates earlier must complete one rerun.
+    index.replace(
+        std::slice::from_ref(&first),
+        &HashMap::from([(first.clone(), ContentType::Image)]),
+    );
+    let rerun = index.finish_rescan(generation).unwrap();
+    index.replace(
+        &[first.clone(), added.clone()],
+        &HashMap::from([
+            (first.clone(), ContentType::Image),
+            (added.clone(), ContentType::Image),
+        ]),
+    );
+    assert!(index.finish_rescan(rerun).is_none());
+    let queue = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queue.pool, vec![first, added]);
+    fs::remove_dir_all(root).unwrap();
+}
