@@ -402,8 +402,32 @@ fn synchronized_hotplug_joins_current_content_before_the_deadline() {
     assert!(manager.tick_due(now));
     let changes = manager.tick();
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes["DP-2"].0, image);
+    assert_eq!(changes["DP-2"].0, image.clone());
     assert!(!changes.contains_key("DP-1"));
+    for behavior in [
+        MonitorBehavior::Synchronized,
+        MonitorBehavior::Grouped(vec![vec!["DP-1".into(), "DP-2".into()]]),
+    ] {
+        manager.remove_output("DP-2");
+        manager.config.global.monitor_behavior = behavior.clone();
+        if matches!(behavior, MonitorBehavior::Grouped(_)) {
+            manager.output_groups.insert("DP-1".into(), 0);
+            manager.output_groups.insert("DP-2".into(), 0);
+        }
+        manager.set_paused(true);
+        manager
+            .outputs
+            .insert("DP-2".into(), make_output("DP-2", None));
+        assert!(manager.tick_due(now));
+        assert!(manager.next_switch_deadline().is_some());
+        let paused_changes = manager.tick();
+        assert_eq!(paused_changes.len(), 1);
+        assert_eq!(paused_changes["DP-2"].0, image);
+        assert_eq!(manager.outputs["DP-1"].current_path.as_ref(), Some(&image));
+        assert!(manager.is_paused());
+        assert!(!manager.tick_due(now));
+        assert!(manager.next_switch_deadline().is_none());
+    }
     manager.remove_output("DP-1");
     manager.remove_output("DP-2");
     assert!(manager.shared_display_start_time.is_none());
