@@ -1,3 +1,6 @@
+//! Sniff supported image and video containers without trusting filename extensions.
+//! ISO BMFF image detection requires an AVIF codec brand, not generic HEIF branding.
+
 use super::ContentType;
 use std::path::Path;
 
@@ -34,9 +37,27 @@ pub(super) fn probe(path: &Path) -> Option<ContentType> {
     }
     // ISO BMFF container: ....ftyp (shared by MP4/MOV video and AVIF/HEIF images)
     if &buffer[4..8] == b"ftyp" {
-        // AVIF images use brands: avif, avis, mif1
-        if &buffer[8..12] == b"avif" || &buffer[8..12] == b"avis" || &buffer[8..12] == b"mif1" {
+        let major = &buffer[8..12];
+        let mut compatible = Vec::new();
+        // Bound malformed headers independently of the compressed file size.
+        let size = u32::from_be_bytes(buffer[0..4].try_into().expect("four-byte box length"));
+        let remaining = u64::from(size.saturating_sub(16)).min(64 * 1024);
+        let _ = file.take(remaining).read_to_end(&mut compatible);
+        if matches!(major, b"avif" | b"avis")
+            || compatible
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|brand| matches!(brand, b"avif" | b"avis"))
+        {
             return Some(ContentType::Image);
+        }
+        // Generic HEIF brands do not establish an available AV1 image decoder.
+        if matches!(
+            major,
+            b"mif1" | b"msf1" | b"heic" | b"heix" | b"hevc" | b"hevx"
+        ) {
+            return None;
         }
         return ContentType::Video.supported().then_some(ContentType::Video);
     }

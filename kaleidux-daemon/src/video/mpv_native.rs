@@ -399,7 +399,7 @@ pub(crate) fn run_native_render_thread(config: MpvNativeRenderThreadConfig) {
                 source_id, error
             );
             metrics.record_video_backend_metric(VideoBackendMetricKind::MpvCaptureError);
-            if !super::mpv_backend_is_explicitly_forced() {
+            if cfg!(feature = "backend-appsink") && !super::mpv_backend_is_explicitly_forced() {
                 warn!(
                     "[VIDEO] Switching automatic backend selection to appsink after native mpv GL failure"
                 );

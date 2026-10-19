@@ -110,6 +110,7 @@ pub struct WaylandBackend {
     fractional_scale_manager: Option<SimpleGlobal<WpFractionalScaleManagerV1, 1>>,
     content_type_manager: Option<SimpleGlobal<WpContentTypeManagerV1, 1>>,
     surface_viewports: std::collections::HashMap<String, WpViewport>,
+    mpv_surface_viewports: std::collections::HashMap<String, WpViewport>,
     fractional_scale_objects: std::collections::HashMap<String, WpFractionalScaleV1>,
     content_type_objects: std::collections::HashMap<String, WpContentTypeV1>,
     surface_content_types: std::collections::HashMap<String, crate::queue::ContentType>,
@@ -172,6 +173,7 @@ impl WaylandBackend {
             fractional_scale_manager,
             content_type_manager,
             surface_viewports: std::collections::HashMap::new(),
+            mpv_surface_viewports: std::collections::HashMap::new(),
             fractional_scale_objects: std::collections::HashMap::new(),
             content_type_objects: std::collections::HashMap::new(),
             surface_content_types: std::collections::HashMap::new(),
@@ -273,6 +275,9 @@ impl WaylandBackend {
         if let Some(viewport) = self.surface_viewports.get(name) {
             viewport.set_destination(logical_width as i32, logical_height as i32);
         }
+        if let Some(viewport) = self.mpv_surface_viewports.get(name) {
+            viewport.set_destination(logical_width as i32, logical_height as i32);
+        }
         let scale = self
             .preferred_fractional_scales
             .get(name)
@@ -298,6 +303,7 @@ impl WaylandBackend {
     }
 
     pub(crate) fn retire_surface_protocols(&mut self, name: &str) {
+        self.retire_mpv_surface_protocols(name);
         if let Some(object) = self.fractional_scale_objects.remove(name) {
             object.destroy();
         }
@@ -355,6 +361,15 @@ impl WaylandBackend {
     ) -> anyhow::Result<LayerSurface> {
         let layer_surface =
             self.create_layer_surface_internal(output, qh, layer, "kaleidux-mpv-video")?;
+        self.retire_mpv_surface_protocols(&name);
+        layer_surface.wl_surface().set_buffer_scale(1);
+        if let Ok(viewporter) = self.viewporter.get() {
+            let viewport = viewporter.get_viewport(layer_surface.wl_surface(), qh, ());
+            if let Some(&(width, height)) = self.logical_surface_sizes.get(&name) {
+                viewport.set_destination(width as i32, height as i32);
+            }
+            self.mpv_surface_viewports.insert(name.clone(), viewport);
+        }
 
         if let Some(_prev) = self
             .mpv_video_surfaces
@@ -364,6 +379,12 @@ impl WaylandBackend {
         }
 
         Ok(layer_surface)
+    }
+
+    fn retire_mpv_surface_protocols(&mut self, name: &str) {
+        if let Some(viewport) = self.mpv_surface_viewports.remove(name) {
+            viewport.destroy();
+        }
     }
 
     pub fn create_wallpaper_surface(
@@ -549,6 +570,8 @@ impl LayerShellHandler for WaylandBackend {
             if renderer_name.is_some() {
                 self.retire_native_dmabuf_output(&name);
                 self.retire_surface_protocols(&name);
+            } else {
+                self.retire_mpv_surface_protocols(&name);
             }
             self.closed_outputs.insert(name);
             self.outputs_changed = true;
@@ -603,6 +626,10 @@ impl LayerShellHandler for WaylandBackend {
                 _qh,
             );
             self.queue_fractional_resize(&name, width, height, serial);
+        } else if let Some(name) = mpv_name {
+            if let Some(viewport) = self.mpv_surface_viewports.get(&name) {
+                viewport.set_destination(width.max(1) as i32, height.max(1) as i32);
+            }
         }
     }
 }

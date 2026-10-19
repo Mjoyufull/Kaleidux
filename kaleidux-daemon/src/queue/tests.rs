@@ -253,6 +253,34 @@ fn discovery_handles_100k_files_with_one_root_index() {
 }
 
 #[test]
+fn bmff_images_require_an_avif_brand_and_videos_require_a_backend() {
+    let dir = unique_test_dir("bmff-brands");
+    for (name, major, compatible, expected) in [
+        ("still", *b"avif", *b"mif1", Some(ContentType::Image)),
+        ("sequence", *b"avis", *b"msf1", Some(ContentType::Image)),
+        ("compatible", *b"mif1", *b"avif", Some(ContentType::Image)),
+        ("heif", *b"mif1", *b"heic", None),
+        ("heic", *b"heic", *b"mif1", None),
+        (
+            "video",
+            *b"isom",
+            *b"mp42",
+            ContentType::Video.supported().then_some(ContentType::Video),
+        ),
+    ] {
+        let path = dir.join(format!("{name}.mp4"));
+        let mut header = Vec::from(20_u32.to_be_bytes());
+        header.extend_from_slice(b"ftyp");
+        header.extend_from_slice(&major);
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&compatible);
+        fs::write(&path, header).unwrap();
+        assert_eq!(super::media_probe::probe(&path), expected, "{name}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn new_from_pool_populates_content_type_cache_for_reused_pool() {
     let dir = unique_test_dir("content-cache");
     let image = dir.join("a.jpg");
