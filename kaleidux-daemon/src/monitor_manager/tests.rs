@@ -6,6 +6,8 @@ use std::time::Duration;
 
 #[path = "tests/media_selection.rs"]
 mod media_selection;
+#[path = "tests/power_outputs.rs"]
+mod power_outputs;
 #[path = "tests/shared_join.rs"]
 mod shared_join;
 
@@ -238,6 +240,7 @@ fn make_test_manager(
         discovered_files_cache: HashMap::new(),
         pending_output_queues: Default::default(),
         shared_join_retries: Default::default(),
+        output_power_paused: Default::default(),
     }
 }
 
@@ -489,6 +492,7 @@ fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
         discovered_files_cache: HashMap::new(),
         pending_output_queues: Default::default(),
         shared_join_retries: Default::default(),
+        output_power_paused: Default::default(),
     };
 
     let changes = manager.tick();
@@ -557,6 +561,7 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         discovered_files_cache: HashMap::new(),
         pending_output_queues: Default::default(),
         shared_join_retries: Default::default(),
+        output_power_paused: Default::default(),
     };
 
     let changes = manager.handle_next(Some("DP-1".to_string()));

@@ -170,6 +170,7 @@ pub struct MainLoopContext {
 
 impl MainLoopContext {
     pub(crate) fn retire_output_bookkeeping(&mut self, name: &str) {
+        crate::image::runtime_cache::remove_image_prefetch_generation(name);
         self.powered_off_outputs.remove(name);
         self.pending_native_presentations.remove(name);
         self.low_power_prefetch_deferrals.remove(name);

@@ -50,11 +50,15 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
         }
     }
     let batch = rand::random::<u64>();
-    for (name, path) in restarts {
-        // Bypass same-source native reuse, whose decoder key contains old FPS.
-        if let Some(player) = ctx.video_players.remove(&name) {
+    // Retire the whole batch before any replacement looks for active peers.
+    // Otherwise early replacements inherit the old cohort while the last one
+    // receives the new batch, splitting decode and audio ownership.
+    for (name, _) in &restarts {
+        if let Some(player) = ctx.video_players.remove(name) {
             stop_video_player_in_background(name.clone(), player);
         }
+    }
+    for (name, path) in restarts {
         switch_wallpaper_content(
             ContentSwitchRequest {
                 name,

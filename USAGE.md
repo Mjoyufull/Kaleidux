@@ -838,6 +838,7 @@ also succeeds. Use separate names for independent callers.
 
 Hotplugged synchronized/grouped FFmpeg outputs join the current decoder, including its latest paused frame. Directory discovery runs outside the display loop; unavailable or empty roots retry with backoff from 250 milliseconds up to 30 seconds. Adding supported media therefore restores cycling without replugging.
 If the retained file disappears before a shared join, that output retries every five seconds while preserving the group's pause state. Selecting different content allows the join immediately.
+Independently cycling monitors retain their remaining display time while powered off; powered monitors continue cycling. A shared FPS reload recreates its decoder cohort together, preserving one video/audio stream for matching settings.
 
 Inhibitors pause decoding and automatic rotation, retaining the current image or
 video frame. Explicit `next`, `prev`, and `clear` still work. Final release starts

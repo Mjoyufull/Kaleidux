@@ -19,6 +19,7 @@ mod deferred_output;
 mod manual_queue;
 mod manual_selection;
 mod output;
+mod power;
 mod schedule;
 mod shared_join;
 
@@ -42,12 +43,14 @@ pub struct MonitorManager {
     discovered_files_cache: HashMap<PathBuf, Arc<Vec<PathBuf>>>,
     pending_output_queues: deferred_output::PendingOutputQueues,
     shared_join_retries: HashMap<String, (PathBuf, Instant)>,
+    output_power_paused: HashMap<String, Instant>,
 }
 
 impl MonitorManager {
     pub fn remove_output(&mut self, name: &str) {
         self.outputs.remove(name);
         self.shared_join_retries.remove(name);
+        self.output_power_paused.remove(name);
         self.cancel_output_queue(name);
         if self.outputs.is_empty() {
             self.shared_display_start_time = None;

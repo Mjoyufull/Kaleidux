@@ -16,6 +16,9 @@ impl MonitorManager {
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
                 for (name, orch) in &mut self.outputs {
+                    if self.output_power_paused.contains_key(name) {
+                        continue;
+                    }
                     if let Some(res) = orch.tick() {
                         changes.insert(name.clone(), res);
                     }
@@ -157,7 +160,9 @@ impl MonitorManager {
 
                 // Also tick independent outputs (not in any group)
                 for (name, orch) in &mut self.outputs {
-                    if !self.output_groups.contains_key(name) {
+                    if !self.output_groups.contains_key(name)
+                        && !self.output_power_paused.contains_key(name)
+                    {
                         if let Some(res) = orch.tick() {
                             changes.insert(name.clone(), res);
                         }

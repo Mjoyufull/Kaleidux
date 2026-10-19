@@ -31,9 +31,12 @@ struct HyprlandMonitor {
 }
 
 pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: PowerUpdate) {
+    let now = Instant::now();
     ctx.powered_off_outputs
         .retain(|name| ctx.monitor_manager.outputs.contains_key(name));
     for name in &update.powered_off {
+        ctx.monitor_manager
+            .set_output_power_suspended(name, true, now);
         ctx.powered_off_outputs.insert(name.clone());
         for player in ctx
             .video_players
@@ -53,6 +56,8 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
         }
     }
     for (name, suspended_for) in &update.powered_on {
+        ctx.monitor_manager
+            .set_output_power_suspended(name, false, now);
         ctx.powered_off_outputs.remove(name);
         if let Some(session) = ctx.pending_native_presentations.get(name).copied()
             && ctx
@@ -63,7 +68,6 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
         {
             ctx.pending_native_presentations.remove(name);
             ctx.monitor_manager.mark_transition_completed(name);
-            let now = Instant::now();
             ctx.mark_startup_output_ready(name, now);
             ctx.mark_startup_output_presented(name, now);
             ctx.maybe_clear_startup_present_barrier();

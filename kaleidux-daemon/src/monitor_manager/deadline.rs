@@ -8,6 +8,9 @@ use tracing::info;
 impl MonitorManager {
     fn reset_display_timers(&mut self) {
         let now = Instant::now();
+        for start in self.output_power_paused.values_mut() {
+            *start = now;
+        }
         for orch in self.outputs.values_mut() {
             if orch.current_path.is_some() {
                 orch.display_start_time = Some(now);
@@ -109,7 +112,10 @@ impl MonitorManager {
 
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Independent => {
-                for orch in self.outputs.values() {
+                for (name, orch) in &self.outputs {
+                    if self.output_power_paused.contains_key(name) {
+                        continue;
+                    }
                     Self::earlier_deadline(&mut next_deadline, orch.next_deadline());
                 }
             }
@@ -155,7 +161,9 @@ impl MonitorManager {
                 }
 
                 for (name, orch) in &self.outputs {
-                    if !self.output_groups.contains_key(name) {
+                    if !self.output_groups.contains_key(name)
+                        && !self.output_power_paused.contains_key(name)
+                    {
                         Self::earlier_deadline(&mut next_deadline, orch.next_deadline());
                     }
                 }
@@ -177,7 +185,9 @@ impl MonitorManager {
         }
 
         if self.outputs.iter().any(|(name, orch)| {
-            orch.current_path.is_none() && !self.shared_join_is_deferred(name, now)
+            orch.current_path.is_none()
+                && !self.output_power_paused.contains_key(name)
+                && !self.shared_join_is_deferred(name, now)
         }) {
             return true;
         }
@@ -196,6 +206,9 @@ impl MonitorManager {
         self.outputs
             .iter()
             .filter_map(|(name, orch)| {
+                if self.output_power_paused.contains_key(name) {
+                    return None;
+                }
                 let low_power = orch.config.performance == PerformanceProfile::LowPower;
                 let due = orch.current_path.is_none()
                     || orch.next_deadline().is_some_and(|deadline| deadline <= now);

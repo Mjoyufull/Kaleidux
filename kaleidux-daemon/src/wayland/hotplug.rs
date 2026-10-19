@@ -172,7 +172,6 @@ fn retire_output(
     name: &str,
 ) {
     info!("[WAYLAND-HOTPLUG] Removing disconnected output {name}");
-    crate::image::runtime_cache::remove_image_prefetch_generation(name);
     ctx.latest_video_frames.clear_source(name);
     ctx.monitor_manager.remove_output(name);
     ctx.retire_output_bookkeeping(name);

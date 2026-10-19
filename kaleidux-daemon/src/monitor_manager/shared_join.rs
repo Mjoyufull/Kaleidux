@@ -31,7 +31,9 @@ impl MonitorManager {
     pub(super) fn shared_join_deadline(&self, now: Instant) -> Option<Instant> {
         self.outputs
             .iter()
-            .filter(|(_, output)| output.current_path.is_none())
+            .filter(|(name, output)| {
+                output.current_path.is_none() && !self.output_power_paused.contains_key(*name)
+            })
             .filter_map(|(name, _)| {
                 let peer = self.outputs.iter().find(|(peer_name, peer)| {
                     peer.current_path.is_some() && self.shares_playback_with(name, peer_name)
@@ -48,7 +50,9 @@ impl MonitorManager {
         let joins: Vec<_> = self
             .outputs
             .iter()
-            .filter(|(_, output)| output.current_path.is_none())
+            .filter(|(name, output)| {
+                output.current_path.is_none() && !self.output_power_paused.contains_key(*name)
+            })
             .filter_map(|(name, _)| {
                 let peer = self.outputs.iter().find(|(peer_name, peer)| {
                     peer.current_path.is_some() && self.shares_playback_with(name, peer_name)

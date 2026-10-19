@@ -31,6 +31,7 @@ fn fixture() -> (MonitorManager, PathBuf, PathBuf) {
         discovered_files_cache: HashMap::new(),
         pending_output_queues: Default::default(),
         shared_join_retries: Default::default(),
+        output_power_paused: Default::default(),
     };
     (manager, root, image)
 }
