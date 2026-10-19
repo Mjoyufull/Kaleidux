@@ -4,6 +4,9 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "rescan_tests.rs"]
+mod rescan_tests;
+
 fn empty_stats() -> LoveitData {
     LoveitData {
         files: lru::LruCache::new(NonZeroUsize::new(STATS_LRU_CAP).unwrap()),

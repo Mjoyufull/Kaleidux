@@ -5,48 +5,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 impl MonitorManager {
-    pub(super) fn has_pending_shared_join(&self) -> bool {
-        self.outputs.iter().any(|(name, output)| {
-            output.current_path.is_none()
-                && self.outputs.iter().any(|(peer_name, peer)| {
-                    peer.current_path.is_some() && self.shares_playback_with(name, peer_name)
-                })
-        })
-    }
-
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
-        let mut changes = HashMap::new();
         let now = Instant::now();
-
-        // A newly connected peer joins the content already on its group;
-        // it must neither wait for the cycle deadline nor consume queue Next.
-        let joins: Vec<_> = self
-            .outputs
-            .iter()
-            .filter(|(_, orch)| orch.current_path.is_none())
-            .filter_map(|(name, _)| {
-                let peer = self.outputs.iter().find(|(peer_name, peer)| {
-                    peer.current_path.is_some() && self.shares_playback_with(name, peer_name)
-                })?;
-                Some((
-                    name.clone(),
-                    peer.1.current_path.clone()?,
-                    peer.1.next_path.clone(),
-                    peer.1.next_content_type,
-                ))
-            })
-            .collect();
-        for (name, path, next_path, next_content_type) in joins {
-            if let Some(kind) = Self::resolve_content_type(&path, "hotplug join") {
-                let orch = self.outputs.get_mut(&name).expect("collected output");
-                orch.current_path = Some(path.clone());
-                orch.display_start_time = None;
-                orch.next_change = Some(now + content_load_timeout(orch.config.duration));
-                orch.next_path = next_path;
-                orch.next_content_type = next_content_type;
-                changes.insert(name, (path, kind));
-            }
-        }
+        let mut changes = self.join_shared_outputs(now);
 
         // Joining retained content does not advance the slideshow or unpause it.
         if self.is_paused() || self.power_suspended {

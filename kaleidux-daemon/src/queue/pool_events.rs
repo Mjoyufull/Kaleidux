@@ -266,10 +266,17 @@ impl SmartQueue {
             loop {
                 let scan_root = root.clone();
                 let scan_cache = cache.clone();
+                let scan_index = index.clone();
                 let handle = crate::background::spawn_blocking_tracked_wait(
                     crate::background::BackgroundWorkKind::QueueDiscovery,
                     move || {
-                        Self::discover_content(&scan_root, &Default::default(), scan_cache, None)
+                        Self::discover_content_into_index(
+                            &scan_root,
+                            &Default::default(),
+                            scan_cache,
+                            None,
+                            &scan_index,
+                        )
                     },
                 )
                 .await;
@@ -282,8 +289,8 @@ impl SmartQueue {
                         tracing::warn!("[QUEUE] Rescan failed for {}: {result:?}", root.display())
                     }
                 }
-                // Discovery publishes the shared snapshot. Every queue adopts
-                // it on its next pick; events during a scan request one rerun.
+                // Discovery publishes the owner's snapshot, whether shared or
+                // private. Events during a scan request one rerun.
                 let Some(next) = index.finish_rescan(generation) else {
                     break;
                 };

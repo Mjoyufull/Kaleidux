@@ -102,7 +102,7 @@ impl MonitorManager {
 
     pub fn next_switch_deadline(&self) -> Option<Instant> {
         if self.is_paused() || self.power_suspended {
-            return self.has_pending_shared_join().then(Instant::now);
+            return self.shared_join_deadline(Instant::now());
         }
 
         let mut next_deadline = None;
@@ -162,28 +162,29 @@ impl MonitorManager {
             }
         }
 
+        Self::earlier_deadline(
+            &mut next_deadline,
+            self.shared_join_deadline(Instant::now()),
+        );
         next_deadline
     }
 
     pub fn tick_due(&self, now: Instant) -> bool {
         if self.is_paused() || self.power_suspended {
-            return self.has_pending_shared_join();
+            return self
+                .shared_join_deadline(now)
+                .is_some_and(|deadline| deadline <= now);
         }
 
-        if self
-            .outputs
-            .values()
-            .any(|orch| orch.current_path.is_none())
-        {
+        if self.outputs.iter().any(|(name, orch)| {
+            orch.current_path.is_none() && !self.shared_join_is_deferred(name, now)
+        }) {
             return true;
         }
 
         match self.next_switch_deadline() {
             Some(deadline) => deadline <= now,
-            None => self
-                .outputs
-                .values()
-                .any(|orch| orch.current_path.is_none()),
+            None => false,
         }
     }
 

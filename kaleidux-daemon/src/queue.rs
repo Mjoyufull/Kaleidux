@@ -104,6 +104,7 @@ impl ContentType {
 }
 
 mod discovery;
+mod filesystem_scan;
 pub(crate) mod media_index;
 mod picking;
 mod pool_events;

@@ -248,6 +248,7 @@ impl MonitorManager {
             power_suspended: false,
             discovered_files_cache: HashMap::new(),
             pending_output_queues: Default::default(),
+            shared_join_retries: Default::default(),
         })
     }
 

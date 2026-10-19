@@ -837,6 +837,7 @@ with the same name is idempotent, not reference-counted; releasing a missing nam
 also succeeds. Use separate names for independent callers.
 
 Hotplugged synchronized/grouped FFmpeg outputs join the current decoder, including its latest paused frame. Directory discovery runs outside the display loop; unavailable or empty roots retry with backoff from 250 milliseconds up to 30 seconds. Adding supported media therefore restores cycling without replugging.
+If the retained file disappears before a shared join, that output retries every five seconds while preserving the group's pause state. Selecting different content allows the join immediately.
 
 Inhibitors pause decoding and automatic rotation, retaining the current image or
 video frame. Explicit `next`, `prev`, and `clear` still work. Final release starts
