@@ -36,6 +36,7 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
                 | Request::Prev { .. }
                 | Request::Clear { .. }
                 | Request::Reload
+                | Request::Stop
                 | Request::Playlist(_)
                 | Request::Blacklist(_)
                 | Request::Love { .. }

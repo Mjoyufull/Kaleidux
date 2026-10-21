@@ -253,7 +253,7 @@ kldctl colour '#1a1b26' -o all
 kldctl color '#112233ff'
 ```
 
-A preview pauses the previous player and freezes slideshow selection. Cancel restores its GPU frame, queue position, remaining duration and playback state, including active pause inhibitors. Apply keeps the candidate. Finish an active preview before another selection or reload; pending original loads must settle before preview begins. Applying a candidate that is still loading returns an error so it can be retried. Colours also work as `set '#1a1b26'` or a configured `path = "colour:#1a1b26"`.
+A preview pauses the previous player and freezes slideshow selection. Cancel restores its GPU frame, queue position, remaining duration and playback state, including active pause inhibitors. Apply keeps the candidate and preserves the remaining duration on untouched outputs. Finish an active preview before another selection, reload or `stop`; pending original loads must settle before preview begins. Applying a candidate that is still loading returns an error so it can be retried. Colours also work as `set '#1a1b26'` or a configured `path = "colour:#1a1b26"`.
 
 #### Playback Control
 

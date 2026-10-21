@@ -97,9 +97,15 @@
               ++ pkgs.lib.optionals withVaapi ([ pkgs.libva ] ++ vaDriverDeps)
               ++ pkgs.lib.optionals withX11 x11RuntimeDeps
               ++ pkgs.lib.optionals withAppsink appsinkRuntimeDeps
+              ++ pkgs.lib.optionals (withFfmpeg && !withAppsink) [ pkgs.gst_all_1.gst-plugins-good ]
               ++ pkgs.lib.optionals withMpv mpvRuntimeDeps
               ++ pkgs.lib.optionals withFfmpeg ffmpegRuntimeDeps;
-            packageGstPluginPath = if withAppsink then gstPluginPath else "";
+            # Native FFmpeg outputs decoded PCM through GStreamer. Its default
+            # autoaudiosink lives in plugins-good even without appsink video.
+            packageGstPluginPath = if withAppsink then gstPluginPath
+              else if withFfmpeg then pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (with pkgs.gst_all_1; [
+                gstreamer gst-plugins-base gst-plugins-good
+              ]) else "";
             packagePkgConfigPath =
               "${pkgs.lib.getDev pkgs.gst_all_1.gstreamer}/lib/pkgconfig:${pkgs.lib.getDev pkgs.gst_all_1.gst-plugins-base}/lib/pkgconfig"
               + pkgs.lib.optionalString withVaapi ":${pkgs.lib.getDev pkgs.libva}/lib/pkgconfig"
@@ -110,7 +116,7 @@
               "--prefix LIBVA_DRIVERS_PATH : \"${vaDriverPath}\" ";
             packageVaWrapperArgs = pkgs.lib.optionalString withVaapi
               "${packageVaDriverPrefix}--suffix LIBVA_DRIVERS_PATH : \"/run/opengl-driver/lib/dri\"";
-            packageGstWrapperArgs = pkgs.lib.optionalString withAppsink
+            packageGstWrapperArgs = pkgs.lib.optionalString (withAppsink || withFfmpeg)
               "--prefix GST_PLUGIN_SYSTEM_PATH_1_0 : \"${packageGstPluginPath}\"";
           in naersk-lib.buildPackage {
           inherit pname;
@@ -221,7 +227,7 @@
           featureArgs = [
             "--no-default-features"
             "--features"
-            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-appsink"
+            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-appsink,kaleidux-daemon/network-sources"
           ];
         };
         kaleiduxMpv = mkKaleidux {
@@ -232,7 +238,7 @@
           featureArgs = [
             "--no-default-features"
             "--features"
-            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-mpv"
+            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-mpv,kaleidux-daemon/network-sources"
           ];
         };
         kaleiduxFfmpeg = mkKaleidux {
@@ -243,7 +249,7 @@
           featureArgs = [
             "--no-default-features"
             "--features"
-            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-ffmpeg"
+            "kaleidux-daemon/display-wayland,kaleidux-daemon/backend-ffmpeg,kaleidux-daemon/network-sources"
           ];
         };
 

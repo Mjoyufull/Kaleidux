@@ -3,7 +3,7 @@
 
 use super::{MonitorManager, OutputOrchestrator};
 use crate::queue::SmartQueue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub(crate) struct QueueSnapshot {
@@ -14,6 +14,7 @@ pub(crate) struct QueueSnapshot {
     group_starts: HashMap<usize, Instant>,
     output_groups: HashMap<String, usize>,
     power_pauses: HashMap<String, Instant>,
+    targets: HashSet<String>,
     captured: Instant,
 }
 
@@ -21,6 +22,7 @@ impl QueueSnapshot {
     pub(crate) fn retire_output(&mut self, name: &str) {
         self.outputs.remove(name);
         self.power_pauses.remove(name);
+        self.targets.remove(name);
         if self.outputs.is_empty() {
             self.shared = None;
             self.shared_start = None;
@@ -31,6 +33,10 @@ impl QueueSnapshot {
             self.groups.remove(&group);
             self.group_starts.remove(&group);
         }
+    }
+
+    pub(crate) fn set_targets(&mut self, names: impl Iterator<Item = String>) {
+        self.targets = names.collect();
     }
 }
 
@@ -48,6 +54,7 @@ impl MonitorManager {
             group_starts: self.group_display_start_times.clone(),
             output_groups: self.output_groups.clone(),
             power_pauses: self.output_power_paused.clone(),
+            targets: HashSet::new(),
             captured,
         }
     }
@@ -60,26 +67,32 @@ impl MonitorManager {
         self.end_preview_at(snapshot, apply, Instant::now());
     }
 
-    pub(super) fn end_preview_at(&mut self, snapshot: QueueSnapshot, apply: bool, now: Instant) {
+    pub(super) fn end_preview_at(
+        &mut self,
+        mut snapshot: QueueSnapshot,
+        apply: bool,
+        now: Instant,
+    ) {
         self.preview_active = false;
-        if apply {
-            for pause in self.output_power_paused.values_mut() {
-                *pause = now;
-            }
-            for output in self.outputs.values_mut() {
-                if output.current_path.is_some() {
-                    output.display_start_time = Some(now);
-                }
-            }
-            self.shared_display_start_time = self.shared_display_start_time.map(|_| now);
-            for start in self.group_display_start_times.values_mut() {
-                *start = now;
-            }
-            return;
-        }
         let elapsed = now.saturating_duration_since(snapshot.captured);
-        for (name, mut saved) in snapshot.outputs {
+        let surviving: HashSet<_> = snapshot
+            .outputs
+            .keys()
+            .filter(|name| self.outputs.contains_key(*name))
+            .cloned()
+            .collect();
+        for (name, mut saved) in std::mem::take(&mut snapshot.outputs) {
             if let Some(output) = self.outputs.get_mut(&name) {
+                if apply && snapshot.targets.contains(&name) {
+                    if let Some(pause) = self.output_power_paused.get_mut(&name) {
+                        *pause = now;
+                    }
+                    if output.current_path.is_some() {
+                        output.display_start_time = Some(now);
+                        output.next_change = Some(now + output.cycle_duration());
+                    }
+                    continue;
+                }
                 // Credit any power pause before preview separately. Preview
                 // already covers all overlapping time; future wake adds only
                 // the off time after this restoration.
@@ -98,15 +111,55 @@ impl MonitorManager {
                 *output = saved;
             }
         }
-        if let Some(shared) = snapshot.shared {
-            self.shared_queue = Some(shared);
-            self.shared_display_start_time = snapshot.shared_start.map(|start| start + elapsed);
+        self.finish_preview_cohorts(snapshot, &surviving, apply, now);
+    }
+
+    fn finish_preview_cohorts(
+        &mut self,
+        mut snapshot: QueueSnapshot,
+        surviving: &HashSet<String>,
+        apply: bool,
+        now: Instant,
+    ) {
+        let elapsed = now.saturating_duration_since(snapshot.captured);
+        if !surviving.is_empty()
+            && matches!(
+                self.config.global.monitor_behavior,
+                crate::orchestration::MonitorBehavior::Synchronized
+            )
+        {
+            if apply && snapshot.targets.iter().any(|name| surviving.contains(name)) {
+                self.shared_display_start_time = Some(now);
+            } else {
+                // None is part of the snapshot too. Do not keep a candidate
+                // queue created while previewing a previously blank cohort.
+                self.shared_queue = snapshot.shared;
+                self.shared_display_start_time = snapshot.shared_start.map(|start| start + elapsed);
+            }
         }
-        for (group, queue) in snapshot.groups {
-            self.group_queues.insert(group, queue);
+        let groups: HashSet<_> = surviving
+            .iter()
+            .filter_map(|name| snapshot.output_groups.get(name).copied())
+            .collect();
+        for group in groups {
+            let applied = apply
+                && snapshot.targets.iter().any(|name| {
+                    surviving.contains(name) && snapshot.output_groups.get(name) == Some(&group)
+                });
+            if applied {
+                self.group_display_start_times.insert(group, now);
+                continue;
+            }
+            if let Some(queue) = snapshot.groups.remove(&group) {
+                self.group_queues.insert(group, queue);
+            } else {
+                self.group_queues.remove(&group);
+            }
             if let Some(start) = snapshot.group_starts.get(&group) {
                 self.group_display_start_times
                     .insert(group, *start + elapsed);
+            } else {
+                self.group_display_start_times.remove(&group);
             }
         }
     }

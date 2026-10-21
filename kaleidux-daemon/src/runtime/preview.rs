@@ -32,7 +32,7 @@ impl PreviewState {
         })
     }
     pub(crate) fn begin(
-        queues: crate::monitor_manager::preview::QueueSnapshot,
+        mut queues: crate::monitor_manager::preview::QueueSnapshot,
         names: impl Iterator<Item = String>,
         renderers: &mut HashMap<String, crate::renderer::Renderer>,
         players: &mut HashMap<String, crate::video::VideoPlayer>,
@@ -47,6 +47,7 @@ impl PreviewState {
                 originals.insert(name, (renderer.freeze_wallpaper(), player));
             }
         }
+        queues.set_targets(originals.keys().cloned());
         Self { queues, originals }
     }
 

@@ -8,6 +8,8 @@ use std::time::Duration;
 mod media_selection;
 #[path = "tests/power_outputs.rs"]
 mod power_outputs;
+#[path = "tests/preview_cohorts.rs"]
+mod preview_cohorts;
 #[path = "tests/shared_join.rs"]
 mod shared_join;
 

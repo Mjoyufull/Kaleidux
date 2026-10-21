@@ -23,13 +23,7 @@ impl Drop for ResolverProcess {
 }
 
 pub fn resolve(uri: &str, should_abort: impl Fn() -> bool) -> anyhow::Result<String> {
-    let host = uri
-        .split_once("://")
-        .map(|(_, rest)| rest.split('/').next().unwrap_or(""));
-    if !matches!(
-        host,
-        Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be" | "www.youtu.be")
-    ) {
+    if !is_youtube(uri) {
         return Ok(uri.to_owned());
     }
     let format = std::env::var("KLD_YTDLP_FORMAT")
@@ -109,6 +103,51 @@ pub fn resolve(uri: &str, should_abort: impl Fn() -> bool) -> anyhow::Result<Str
         "Resolver did not return a media URL"
     );
     Ok(resolved.to_owned())
+}
+
+fn is_youtube(uri: &str) -> bool {
+    let Some((_, address)) = uri.split_once("://") else {
+        return false;
+    };
+    let authority = address.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = host_port
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    [
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "youtu.be",
+        "www.youtu.be",
+    ]
+    .iter()
+    .any(|candidate| host.eq_ignore_ascii_case(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn youtube_authorities_accept_ports_without_matching_other_hosts_or_paths() {
+        for uri in [
+            "https://youtube.com:443/watch?v=x",
+            "https://WWW.YouTube.Com:443/watch?v=x",
+            "https://youtu.be/x",
+            "https://user@youtube.com.:443/watch?v=x",
+        ] {
+            assert!(super::is_youtube(uri), "{uri}");
+        }
+        for uri in [
+            "https://youtube.com.attacker.invalid/watch",
+            "https://youtube.com@attacker.invalid/watch",
+            "https://example.com/youtube.com/watch",
+            "http://[::1]:8080/video.mp4",
+        ] {
+            assert!(!super::is_youtube(uri), "{uri}");
+        }
+    }
 }
 
 fn read_available(stdout: &mut impl Read, bytes: &mut Vec<u8>) -> anyhow::Result<()> {
