@@ -56,11 +56,10 @@ impl VideoPlayer {
             seek_segment(pipeline, window)?;
         }
         self.playback_window = Some(window);
-        if self.pipeline.is_some() && self.is_running.load(std::sync::atomic::Ordering::SeqCst) {
-            // The bus handler owns the loop interval. Preparation can discover
-            // duration after the initial watch was installed; refresh its
-            // captured bounds so SegmentDone cannot restart the whole file.
-            self.install_bus_watch()?;
+        if let Some(watch) = self.bus_watch.as_ref() {
+            // Duration can arrive after playback starts. Update shared bounds
+            // without replacing a GSource that the dispatcher may still hold.
+            watch.set_playback_window(window);
         }
         Ok(())
     }

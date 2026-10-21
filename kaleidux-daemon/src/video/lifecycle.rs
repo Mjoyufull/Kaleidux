@@ -351,7 +351,7 @@ impl VideoPlayer {
         Ok(())
     }
 
-    pub(super) fn install_bus_watch(&mut self) -> anyhow::Result<()> {
+    fn install_bus_watch(&mut self) -> anyhow::Result<()> {
         self.remove_bus_watch();
         let pipeline = self
             .pipeline
@@ -367,7 +367,8 @@ impl VideoPlayer {
         let backend_kind = self.backend_kind;
         let import_recovery_enabled = self.appsink_import_recovery_enabled;
 
-        let playback_window = self.playback_window;
+        let loop_window = std::sync::Arc::new(parking_lot::Mutex::new(self.playback_window));
+        let watched_window = loop_window.clone();
         let watch = bus.create_watch(
             Some(&format!("kaleidux-bus-{}", source_id)),
             gst::glib::Priority::DEFAULT,
@@ -406,6 +407,7 @@ impl VideoPlayer {
                         );
                     }
                     MessageView::Eos(..) => {
+                        let playback_window = *watched_window.lock();
                         let _ = player_event_tx.blocking_send(PlayerEvent {
                             source_id: source_id.to_string(),
                             session_id,
@@ -428,6 +430,7 @@ impl VideoPlayer {
                         }
                     }
                     MessageView::SegmentDone(..) => {
+                        let playback_window = *watched_window.lock();
                         let source = source_id.clone();
                         let events = player_event_tx.clone();
                         // SegmentDone may arrive before the last queued frame.
@@ -473,7 +476,7 @@ impl VideoPlayer {
             },
         );
 
-        self.bus_watch = Some(attach_bus_watch(watch));
+        self.bus_watch = Some(attach_bus_watch(watch, loop_window));
         Ok(())
     }
 

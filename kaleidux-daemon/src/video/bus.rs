@@ -6,9 +6,15 @@ use tracing::{info, warn};
 pub(super) struct BusWatchHandle {
     context: gst::glib::MainContext,
     source_id: gst::glib::SourceId,
+    playback_window:
+        std::sync::Arc<parking_lot::Mutex<Option<crate::media_source::PlaybackWindow>>>,
 }
 
 impl BusWatchHandle {
+    pub(super) fn set_playback_window(&self, window: crate::media_source::PlaybackWindow) {
+        *self.playback_window.lock() = Some(window);
+    }
+
     pub(super) fn remove(self) {
         if let Some(source) = self.context.find_source_by_id(&self.source_id) {
             source.destroy();
@@ -55,11 +61,18 @@ impl BusDispatcher {
         }
     }
 
-    pub(super) fn attach(&self, source: gst::glib::Source) -> BusWatchHandle {
+    pub(super) fn attach(
+        &self,
+        source: gst::glib::Source,
+        playback_window: std::sync::Arc<
+            parking_lot::Mutex<Option<crate::media_source::PlaybackWindow>>,
+        >,
+    ) -> BusWatchHandle {
         let source_id = source.attach(Some(&self.context));
         BusWatchHandle {
             context: self.context.clone(),
             source_id,
+            playback_window,
         }
     }
 
@@ -90,8 +103,13 @@ impl BusDispatcher {
 static BUS_DISPATCHER: once_cell::sync::Lazy<BusDispatcher> =
     once_cell::sync::Lazy::new(BusDispatcher::new);
 
-pub(super) fn attach_bus_watch(source: gst::glib::Source) -> BusWatchHandle {
-    BUS_DISPATCHER.attach(source)
+pub(super) fn attach_bus_watch(
+    source: gst::glib::Source,
+    playback_window: std::sync::Arc<
+        parking_lot::Mutex<Option<crate::media_source::PlaybackWindow>>,
+    >,
+) -> BusWatchHandle {
+    BUS_DISPATCHER.attach(source, playback_window)
 }
 
 pub fn shutdown_bus_dispatcher(timeout: std::time::Duration) {
