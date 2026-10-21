@@ -16,6 +16,12 @@ pub(crate) struct PreviewState {
 }
 
 impl PreviewState {
+    pub(crate) fn retire_output(&mut self, name: &str) {
+        self.queues.retire_output(name);
+        if let Some((_wallpaper, Some(player))) = self.originals.remove(name) {
+            stop_video_player_in_background(name.to_owned(), player);
+        }
+    }
     pub(crate) fn is_loading(&self, ctx: &CommandContext<'_>) -> bool {
         self.originals.keys().any(|name| {
             ctx.pending_video_switches.contains_key(name)
@@ -71,8 +77,11 @@ impl PreviewState {
             };
             renderer.restore_wallpaper(wallpaper);
             if let Some(player) = player {
-                ctx.frame_mailbox
-                    .restore_session(&name, player.session_id());
+                ctx.frame_mailbox.restore_session(
+                    &name,
+                    player.session_id(),
+                    ctx.next_session_id.saturating_sub(1),
+                );
                 if !ctx.monitor_manager.is_paused()
                     && !ctx.display_power_suspended
                     && !ctx.powered_off_outputs.contains(&name)

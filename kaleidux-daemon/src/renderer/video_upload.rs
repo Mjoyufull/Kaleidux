@@ -64,7 +64,7 @@ impl super::Renderer {
             crate::video::VideoFrameFormat::GlExternalRgba { .. } => (source_width, source_height),
             // Converted transition textures already contain cover/crop/rotation
             // in screen coordinates; avoid applying framing twice at final blit.
-            _ => (self.config.width.max(1), self.config.height.max(1)),
+            _ => self.content_size(),
         };
 
         if let crate::video::VideoFrameFormat::GlExternalRgba {

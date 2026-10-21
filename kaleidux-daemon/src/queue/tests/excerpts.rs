@@ -51,3 +51,32 @@ fn pinned_or_disabled_sources_do_not_create_excerpt_entries() {
     queue.register_video_duration(&video, 60_000_000_000);
     assert_eq!(queue.current_window(), None);
 }
+
+#[test]
+fn history_navigation_preserves_sequential_excerpt_continuation_with_multiple_videos() {
+    use crate::orchestration::SortingStrategy;
+    for strategy in [SortingStrategy::Ascending, SortingStrategy::Descending] {
+        let paths = vec![PathBuf::from("a.mp4"), PathBuf::from("z.mp4")];
+        let mut queue = make_test_queue(
+            paths.clone(),
+            strategy,
+            100,
+            paths
+                .iter()
+                .cloned()
+                .map(|path| (path, ContentType::Video))
+                .collect(),
+        );
+        queue.configure_excerpts(std::time::Duration::from_secs(3), true);
+        let first_path = queue.pick_next().unwrap();
+        queue.register_video_duration(&first_path, 9_000_000_000);
+        assert_eq!(queue.pick_next(), Some(first_path.clone()));
+        let second = queue.current_window().unwrap();
+        queue.pick_prev();
+        assert_eq!(queue.pick_next(), Some(first_path.clone()));
+        assert_eq!(queue.current_window(), Some(second));
+        assert_eq!(queue.pick_next(), Some(first_path.clone()));
+        assert!(queue.current_window().unwrap().start_ns > second.start_ns);
+        assert_ne!(queue.pick_next(), Some(first_path));
+    }
+}

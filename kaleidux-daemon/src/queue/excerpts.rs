@@ -146,6 +146,12 @@ impl SmartQueue {
             .get(path)
             .map_or(1.0, |plan| plan.count as f64)
     }
+
+    pub(super) fn has_remaining_excerpts(&self, path: &Path) -> bool {
+        self.excerpt_plans
+            .get(path)
+            .is_some_and(|plan| plan.cursor != 0)
+    }
 }
 
 #[cfg(test)]

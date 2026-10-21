@@ -70,7 +70,12 @@ impl SmartQueue {
                     self.strategy,
                     crate::orchestration::SortingStrategy::Descending
                 );
-                self.current_index = self.advance_index(index, descending);
+                self.current_index = if entry.window.is_some() && self.has_remaining_excerpts(&path)
+                {
+                    index
+                } else {
+                    self.advance_index(index, descending)
+                };
             }
             self.record_entry(entry);
             return Some(path);

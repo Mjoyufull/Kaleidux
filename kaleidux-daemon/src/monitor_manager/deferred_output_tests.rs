@@ -144,6 +144,27 @@ async fn synchronized_hotplug_outputs_share_one_discovery_task() {
 }
 
 #[tokio::test]
+async fn final_unplug_discards_the_old_shared_root_before_reconnection() {
+    let (mut manager, root, image) = fixture();
+    manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;
+    let release = hold_queue(&mut manager, "DP-1", image.clone());
+    release.send(()).unwrap();
+    finish(&mut manager).await;
+    assert_eq!(manager.handle_next(None)["DP-1"].0, image);
+    manager.remove_output("DP-1");
+    let new_root = root.join("replacement");
+    std::fs::create_dir(&new_root).unwrap();
+    let replacement = new_root.join("new.png");
+    image::RgbaImage::new(2, 2).save(&replacement).unwrap();
+    manager.config.any.path = Some(new_root);
+    manager.add_output_deferred("DP-1", "replacement");
+    finish(&mut manager).await;
+    assert_eq!(manager.handle_next(None)["DP-1"].0, replacement);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn shared_discovery_survives_one_unplug_and_cancels_after_the_last() {
     let (mut manager, root, image) = fixture();
     manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;

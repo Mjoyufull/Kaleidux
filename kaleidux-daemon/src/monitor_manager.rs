@@ -56,6 +56,7 @@ impl MonitorManager {
         self.output_power_paused.remove(name);
         self.cancel_output_queue(name);
         if self.outputs.is_empty() {
+            self.shared_queue = None;
             self.shared_display_start_time = None;
         }
         let Some(group_id) = self.output_groups.remove(name) else {

@@ -143,8 +143,13 @@ impl LatestFrameMailbox {
             .is_none_or(|latest| session_id >= *latest)
     }
 
-    pub(crate) fn restore_session(&self, source_id: &str, session_id: u64) {
+    pub(crate) fn restore_session(&self, source_id: &str, session_id: u64, retired_through: u64) {
         let mut state = self.state.lock();
+        let latest = state
+            .latest_sessions
+            .entry(Arc::from(source_id))
+            .or_default();
+        *latest = (*latest).max(retired_through).max(session_id);
         state.frames.remove(source_id);
         state.pending_notifications.remove(source_id);
         state.pending_since.remove(source_id);
@@ -259,7 +264,7 @@ mod tests {
     fn preview_restore_accepts_original_and_rejects_cancelled_candidate_until_a_new_generation() {
         let mailbox = LatestFrameMailbox::new();
         mailbox.publish_frame("panel", test_frame(10));
-        mailbox.restore_session("panel", 7);
+        mailbox.restore_session("panel", 7, 10);
         mailbox.publish_frame("panel", test_frame(10));
         assert!(!mailbox.has_pending_frame("panel"));
         mailbox.publish_frame("panel", test_frame(7));
@@ -267,6 +272,24 @@ mod tests {
         mailbox.publish_frame("panel", test_frame(11));
         mailbox.publish_frame("panel", test_frame(7));
         assert_eq!(mailbox.take_frame("panel").unwrap().session_id, 11);
+    }
+
+    #[test]
+    fn cancellation_fences_a_candidate_that_has_not_published_yet() {
+        for batch in [false, true] {
+            let mailbox = LatestFrameMailbox::new();
+            mailbox.publish_frame("panel", test_frame(7));
+            mailbox.restore_session("panel", 7, 10);
+            if batch {
+                mailbox.publish_frame_batch(vec![(Arc::from("panel"), test_frame(10))]);
+            } else {
+                mailbox.publish_frame("panel", test_frame(10));
+            }
+            assert!(!mailbox.has_pending_frame("panel"));
+            assert!(!mailbox.accepts_session("panel", 10));
+            mailbox.publish_frame("panel", test_frame(7));
+            assert_eq!(mailbox.take_frame("panel").unwrap().session_id, 7);
+        }
     }
 
     fn test_frame(session_id: u64) -> VideoFrame {
