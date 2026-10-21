@@ -29,6 +29,18 @@ pub(super) fn receive_frames(
             .timestamp()
             .or_else(|| decoded.pts())
             .and_then(|timestamp| timestamp_to_ns(timestamp, time_base));
+        if let (Some(window), Some(position)) = (config.control.window(), pts_ns) {
+            if position < window.start_ns {
+                state.surface_exporter.recycle_decode_frame(decoded);
+                decoded = state.surface_exporter.acquire_decode_frame();
+                continue;
+            }
+            if position >= window.end_ns {
+                config.control.seek(window.start_ns);
+                state.surface_exporter.recycle_decode_frame(decoded);
+                return Ok(true);
+            }
+        }
         let duration_ns =
             duration_to_ns(decoded.packet().duration, time_base).or(default_duration_ns);
 

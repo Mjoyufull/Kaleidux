@@ -51,6 +51,10 @@ impl MainLoopContext {
                     let pending = self.pending_video_switches.get(&name).cloned();
                     if let Some(pending) = pending.filter(|p| p.session_id == session_id) {
                         self.pending_video_switches.remove(&name);
+                        if let Some(duration) = player.duration_ns() {
+                            self.monitor_manager
+                                .register_video_duration(&name, duration);
+                        }
 
                         let mut should_render = false;
                         let mut startup_ready = false;

@@ -48,7 +48,11 @@ pub fn run(config: NativeDecodeConfig) {
         report_fatal(&config, format!("FFmpeg initialization failed: {error}"));
         return;
     }
-    ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Error);
+    ffmpeg::util::log::set_level(if crate::observability::privacy::sensitive() {
+        ffmpeg::util::log::Level::Error
+    } else {
+        ffmpeg::util::log::Level::Quiet
+    });
     let _audio = super::audio::AudioWorker::spawn(&config.uri, config.control.clone());
 
     let mut rejected = Vec::new();
@@ -84,8 +88,16 @@ fn run_session(
     attempted: &mut Option<NativeDecoderApi>,
 ) -> anyhow::Result<()> {
     let stop_control = config.control.clone();
-    let mut input =
-        ffmpeg::format::input_with_interrupt(&config.uri, move || stop_control.is_stopped())?;
+    let mut options = ffmpeg::Dictionary::new();
+    if config.uri.contains("://") {
+        options.set("rw_timeout", "10000000");
+        options.set("user_agent", "Mozilla/5.0");
+    }
+    let mut input = ffmpeg::format::input_with_interrupt_and_dictionary(
+        &config.uri,
+        move || stop_control.is_stopped(),
+        options,
+    )?;
     let (stream_index, stream_time_base, average_rate, parameters, codec_id) = {
         let stream = input
             .streams()
@@ -101,7 +113,17 @@ fn run_session(
             codec_id,
         )
     };
+    config
+        .control
+        .set_duration_ns((input.duration().max(0) as u64).saturating_mul(1000));
     discard_unselected_streams(&mut input, stream_index);
+    info!(
+        "[MEDIA] kind=video container={} codec={:?} duration_ms={} bitrate={}",
+        input.format().name(),
+        codec_id,
+        input.duration().max(0) / 1000,
+        input.bit_rate()
+    );
 
     let mut decoder = super::decoder_open::open_decoder(parameters, stream_time_base, rejected)?;
     *attempted = decoder.hardware.map(|choice| choice.api);
@@ -124,6 +146,16 @@ fn run_session(
         preferred_tier
     );
 
+    debug!(
+        "[MEDIA-VIDEO] codec={:?} width={} height={} pixel_format={:?} fps={}/{} bit_rate={}",
+        codec_id,
+        decoder.decoder.width(),
+        decoder.decoder.height(),
+        decoder.decoder.format(),
+        average_rate.numerator(),
+        average_rate.denominator(),
+        decoder.decoder.bit_rate()
+    );
     let default_duration_ns = rate_duration_ns(average_rate);
     let mut state = DecodeState {
         converter: NativeFrameConverter::new(),
@@ -164,6 +196,7 @@ fn run_session(
             seek_input(&mut input, &mut decoder.decoder, seek_ns)?;
             state.timeline = PlaybackTimeline::default();
             eof_sent = false;
+            state.first_frame_decoded = false;
         }
 
         // Drain a decoder-buffered frame before reading another packet. This
@@ -187,7 +220,8 @@ fn run_session(
                 "[NATIVE-VIDEO] {} session={} looping at EOS without rebuilding decoder context",
                 config.source_id, config.session_id
             );
-            input.seek(0, ..)?;
+            let restart_ns = config.control.window().map_or(0, |window| window.start_ns);
+            seek_input(&mut input, &mut decoder.decoder, restart_ns)?;
             decoder.decoder.flush();
             state.timeline = PlaybackTimeline::default();
             config.control.looped();

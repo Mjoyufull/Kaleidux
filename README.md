@@ -32,7 +32,7 @@ Supports Wayland & X11, 50+ GLSL transitions, and FFmpeg, GStreamer, and libmpv 
 
 ## Features
 
-- **Hardware-accelerated video**: Native zero-copy decoding on NVIDIA, AMD, and Intel GPUs.
+- **Hardware-accelerated video**: Hardware decoding and GPU frame delivery where the codec, driver, and renderer support them.
 - **Hardware-accelerated rendering**: Powered by `wgpu` for low CPU overhead during rendering and transitions.
 - **Image support**: High-performance image loading and rendering.
 - **50+ Transitions**: GLSL transitions from [GL Transitions](https://gl-transitions.com/), including fade, cube, doom, wipe, and ripple.
@@ -40,6 +40,8 @@ Supports Wayland & X11, 50+ GLSL transitions, and FFmpeg, GStreamer, and libmpv 
 - **Monitor Behaviors**: `Independent`, `Synchronized`, or `Grouped` monitor support.
 - **Rhai Scripting**: Automate your wallpaper logic with Rust-like scripts.
 - **IPC Control**: Control the daemon via `kldctl` (next, prev, pause, status, etc.).
+- **Media selection**: Preview/apply/cancel, solid colours, tiled images, output margins, and long-video excerpts.
+- **Network video**: Direct HTTP/RTSP streams and YouTube resolution through an installed `yt-dlp`.
 
 ## Installation
 
@@ -154,10 +156,10 @@ The core background service handling rendering and display interop.
 Usage: kaleidux-daemon [OPTIONS]
 
 Options:
-      --demo              Run in demo mode (rotating built-in shaders)
       --log <LEVEL>       Log verbosity 1–5 (2=INFO, 5=TRACE-ALL); when set, also writes to ~/.config/kaleidux/logs/
       --video-mode <MODE> Force video decode path: auto, cpu, cuda, DMA-BUF, nv12, rgba
       --streamed           Experimental memory policy: smaller caches and read-ahead
+      --log-sensitive      Include identifying paths, URLs, and monitor names in logs
       --video-backend <BACKEND>
                           Force backend: auto, ffmpeg, mpv, appsink (default: auto)
   -h, --help              Show help
@@ -234,6 +236,16 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 
 ## Credits
 
+- [kacau](https://codeberg.org/touto/kacau) — preview and orchestration references
+- [Phonto](https://github.com/museslabs/phonto) — external yt-dlp stream resolution
+- [WayWal](https://github.com/Execorn/wwal) — performance and event-loop reference
+- [waul](https://github.com/hoppxi/waul) — wallpaper margins and styling reference
+- [gesso](https://github.com/saltnpepper97/gesso) — solid-colour command reference
+- [feh](https://feh.finalrewind.org/) — image placement and tiling reference
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — optional external hosted-video resolver
+- [FFmpeg](https://ffmpeg.org/) — native media decoding
+- [mpv](https://mpv.io/) — composed video playback
+- [WiVRn](https://github.com/WiVRn/WiVRn) — Vulkan video architecture reference
 - [gSlapper](https://github.com/Nomadcxx/gSlapper)
 - [wpaperd](https://github.com/danyspin97/wpaperd)
 - [mpvpaper](https://github.com/GhostNaN/mpvpaper)

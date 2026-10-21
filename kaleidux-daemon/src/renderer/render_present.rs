@@ -110,14 +110,14 @@ impl super::Renderer {
         // Removed the "else if self.transition_active { ... }" block because we moved ensure_composition_texture
         // to the top and we log missing resources above.
 
-        let height = self.config.height as f32;
         if !self.transition_active {
             let uniforms = TransitionUniforms {
                 progress: 1.0,
-                screen_aspect: self.config.width as f32 / height,
+                screen_aspect: self.content_size().0 as f32 / self.content_size().1 as f32,
                 prev_aspect: 1.0,
                 next_aspect: self.current_aspect,
                 params: [[0.0; 4]; 7],
+                layout: self.layout_uniform(),
             };
             self.write_uniforms_if_changed(uniforms);
         }
@@ -170,6 +170,10 @@ impl super::Renderer {
                 occlusion_query_set: None,
             });
 
+            let (x, y, width, height) =
+                super::layout::content_rect(self.config.width, self.config.height, self.margin);
+            render_pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+            render_pass.set_scissor_rect(x, y, width, height);
             if let Some(source) = final_yuv {
                 let bg = match source.format {
                     super::YuvFormat::Nv12 => self.final_nv12_bind_group.as_ref(),

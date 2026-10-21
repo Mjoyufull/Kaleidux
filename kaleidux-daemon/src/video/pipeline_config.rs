@@ -68,6 +68,17 @@ pub(super) fn configure_pipeline_element(
         configure_video_only_decodebin(source_id, factory_name.as_str(), element);
     }
 
+    if matches!(factory_name.as_str(), "queue" | "queue2" | "multiqueue") {
+        // Bound compressed and decoded staging independently of file length.
+        // Backpressure preserves frames/audio; never drop compressed packets.
+        set_if_present(element, "max-size-buffers", 8u32);
+        set_if_present(element, "max-size-bytes", 8 * 1024 * 1024u32);
+        set_if_present(element, "max-size-time", 1_000_000_000u64);
+        if factory_name == "queue2" {
+            set_if_present(element, "ring-buffer-max-size", 8 * 1024 * 1024u64);
+        }
+    }
+
     if is_nvcodec_decoder_factory(factory_name.as_str()) {
         let output_surfaces = nvdec_output_surfaces();
         set_if_present(element, "num-output-surfaces", output_surfaces);

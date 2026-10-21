@@ -287,6 +287,13 @@ pub(crate) fn store_source_descriptor_memory(descriptor: Arc<ImageSourceDescript
 }
 
 pub(crate) fn load_image_source_descriptor(path: &Path) -> Option<Arc<ImageSourceDescriptor>> {
+    if crate::media_source::parse_colour(&path.to_string_lossy()).is_some() {
+        return Some(image_pipeline::descriptor::from_dimensions(
+            image_pipeline::descriptor::source_identity(path)?,
+            1,
+            1,
+        ));
+    }
     let identity = image_pipeline::descriptor::source_identity(path)?;
     if let Some(descriptor) = try_load_source_descriptor_memory(&identity) {
         return Some(descriptor);

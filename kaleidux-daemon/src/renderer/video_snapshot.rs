@@ -7,7 +7,7 @@ impl super::Renderer {
             && let crate::video::VideoFrameFormat::NativeDmaBufNv12 { frame: descriptor } =
                 &frame.format
         {
-            let (width, height) = (self.config.width.max(1), self.config.height.max(1));
+            let (width, height) = self.content_size();
             let output = self.ctx.get_texture_from_pool(
                 width,
                 height,
@@ -47,8 +47,7 @@ impl super::Renderer {
         let Some(source) = self.active_yuv_source else {
             return;
         };
-        let width = self.config.width.max(1);
-        let height = self.config.height.max(1);
+        let (width, height) = self.content_size();
         let texture = self.ctx.get_texture_from_pool(
             width,
             height,

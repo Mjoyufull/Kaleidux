@@ -15,9 +15,6 @@ Select auto, ffmpeg, mpv, or appsink. Auto tries FFmpeg, then mpv, then appsink.
 .B \-\-video-mode \fI<MODE>\fR
 Select auto, cpu, cuda, dmabuf, nv12, or rgba. CPU mode disables hardware decoding in FFmpeg and appsink. Other explicit modes require appsink; explicit modes cannot be combined with mpv.
 .TP
-.B \-\-demo
-Start the daemon in demo mode, cycling through built-in transitions and sample content.
-.TP
 .B \-\-log \fI<LOG>\fR
 Set diagnostic verbosity from 1 (warnings) through 5 (trace-all). Level 4 includes performance diagnostics and adds monitoring overhead.
 .TP
@@ -26,10 +23,17 @@ Print help information.
 .TP
 .B \-\-streamed
 Enable the experimental memory policy with smaller media caches and read-ahead. Source cadence and hardware decoding are preserved.
+.TP
+.B \-\-log-sensitive
+Include identifying paths, URLs and monitor names in diagnostic logs. These fields are redacted by default.
 .SH CONFIGURATION
 The global main-monitor option selects the default command output. Its default, auto, chooses the largest active pixel area, then the first name in lexical order. kldctl's \-o all targets every output.
 .PP
 Set volume from 0 to 100 for audio on any video backend. Zero disables audio decoding.
+.PP
+long-video-excerpts defaults to true. Videos longer than twice the output duration receive multiple bounded slideshow excerpts when the queue has more than one source. Each excerpt loops within its interval. Set false to play whole files.
+.PP
+margin is an array of physical-pixel insets in top, left, bottom, right order. tile repeats images at their prepared pixel size. Both work on Wayland and X11.
 .SH ENVIRONMENT
 .TP
 .B KLD_NATIVE_HWDECODER

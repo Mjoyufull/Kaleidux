@@ -68,6 +68,7 @@ impl super::Renderer {
         &mut self,
         warn_if_active: bool,
     ) -> anyhow::Result<bool> {
+        let (content_width, content_height) = self.content_size();
         // Check if we need to create or recreate the composition texture
         let needs_creation =
             self.composition_texture.is_none() || self.composition_texture_view.is_none();
@@ -76,31 +77,33 @@ impl super::Renderer {
         let size_mismatch = if self.composition_texture.is_some() {
             // Texture exists, check if we can determine its size
             // We can't easily check texture size, so we'll recreate if dimensions are invalid
-            self.config.width == 0 || self.config.height == 0
+            self.composition_texture.as_ref().is_some_and(|texture| {
+                texture.width() != content_width || texture.height() != content_height
+            })
         } else {
             false
         };
 
         let created = needs_creation || size_mismatch;
         if created {
-            if self.config.width == 0 || self.config.height == 0 {
+            if content_width == 0 || content_height == 0 {
                 // Can't create texture without valid dimensions
                 return Err(anyhow::anyhow!(
                     "Cannot create composition texture: invalid dimensions ({}x{})",
-                    self.config.width,
-                    self.config.height
+                    content_width,
+                    content_height
                 ));
             }
 
             if warn_if_active && self.transition_active {
                 warn!(
                     "[TRANSITION] {}: Composition texture missing during active transition, creating now ({}x{})",
-                    self.name, self.config.width, self.config.height
+                    self.name, content_width, content_height
                 );
             } else {
                 debug!(
                     "[RENDER] {}: Creating composition texture ({}x{})",
-                    self.name, self.config.width, self.config.height
+                    self.name, content_width, content_height
                 );
             }
 
@@ -112,8 +115,8 @@ impl super::Renderer {
             let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Composition Texture"),
                 size: wgpu::Extent3d {
-                    width: self.config.width,
-                    height: self.config.height,
+                    width: content_width,
+                    height: content_height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -171,6 +174,11 @@ impl super::Renderer {
     }
 
     pub fn apply_config(&mut self, config: &crate::orchestration::OutputConfig) {
+        self.margin = config.margin;
+        self.tile = config.tile;
+        self.tiled_image =
+            config.tile && self.valid_content_type == crate::queue::ContentType::Image;
+        self.last_yuv_uniforms = None;
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
         self.pause_on_fullscreen = config.pause_on_fullscreen;

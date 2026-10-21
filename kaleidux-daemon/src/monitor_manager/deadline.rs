@@ -104,7 +104,10 @@ impl MonitorManager {
     }
 
     pub fn next_switch_deadline(&self) -> Option<Instant> {
-        if self.is_paused() || self.power_suspended {
+        if self.preview_active {
+            return None;
+        }
+        if self.is_paused() || self.power_suspended || self.preview_active {
             return self.shared_join_deadline(Instant::now());
         }
 
@@ -178,7 +181,7 @@ impl MonitorManager {
     }
 
     pub fn tick_due(&self, now: Instant) -> bool {
-        if self.is_paused() || self.power_suspended {
+        if self.is_paused() || self.power_suspended || self.preview_active {
             return self
                 .shared_join_deadline(now)
                 .is_some_and(|deadline| deadline <= now);
@@ -199,7 +202,7 @@ impl MonitorManager {
     }
 
     pub fn due_low_power_outputs(&self, now: Instant) -> Vec<String> {
-        if self.is_paused() || self.power_suspended {
+        if self.is_paused() || self.power_suspended || self.preview_active {
             return Vec::new();
         }
 

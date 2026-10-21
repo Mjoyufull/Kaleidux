@@ -191,6 +191,8 @@ fn make_test_queue(
         strategy,
         history: VecDeque::new(),
         forward_history: VecDeque::new(),
+        excerpt_length_ns: None,
+        excerpt_plans: HashMap::new(),
         selected_images: VecDeque::new(),
         root_path,
         active_playlist: None,
@@ -500,7 +502,8 @@ fn non_sequential_previous_preserves_forward_navigation() {
         let first = PathBuf::from("a.jpg");
         let second = PathBuf::from("b.jpg");
         let third = PathBuf::from("c.jpg");
-        queue.history = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+        queue.history =
+            VecDeque::from([first.clone(), second.clone(), third.clone()].map(Into::into));
 
         assert_eq!(queue.pick_prev(), Some(second.clone()));
         assert_eq!(queue.peek_next(), Some((third.clone(), ContentType::Image)));
@@ -529,7 +532,7 @@ fn forward_navigation_skips_removed_and_excluded_entries() {
         0,
         content_types,
     );
-    queue.history = VecDeque::from([first.clone(), second.clone(), third.clone()]);
+    queue.history = VecDeque::from([first.clone(), second.clone(), third.clone()].map(Into::into));
 
     assert_eq!(queue.pick_prev(), Some(second.clone()));
     assert_eq!(queue.pick_prev(), Some(first.clone()));
@@ -550,7 +553,7 @@ fn forward_peek_does_not_skip_an_unknown_first_entry() {
         0,
         HashMap::from([(image.clone(), ContentType::Image)]),
     );
-    queue.forward_history = VecDeque::from([unknown.clone(), image]);
+    queue.forward_history = VecDeque::from([unknown.clone(), image].map(Into::into));
     assert_eq!(queue.peek_next(), None);
     assert_eq!(queue.pick_next(), Some(unknown));
 }
@@ -570,7 +573,7 @@ fn sequential_previous_skips_history_entries_removed_from_the_pool() {
         0,
         content_types,
     );
-    queue.history = VecDeque::from([first.clone(), removed.clone(), current]);
+    queue.history = VecDeque::from([first.clone(), removed.clone(), current].map(Into::into));
     queue.pool.retain(|path| path != &removed);
 
     assert_eq!(queue.pick_prev(), Some(first));
@@ -761,3 +764,6 @@ async fn full_discovery_waits_for_a_coalesced_scan_and_uses_its_final_snapshot()
     assert_eq!(queue.pool, vec![first, added]);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[path = "tests/excerpts.rs"]
+mod excerpts;

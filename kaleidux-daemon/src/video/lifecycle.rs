@@ -178,6 +178,9 @@ impl VideoPlayer {
             );
         }
 
+        if let Some(window) = self.playback_window {
+            super::excerpts::seek_segment(pipeline, window)?;
+        }
         let pull_preroll_start = std::time::Instant::now();
         let preroll_budget = std::time::Duration::from_millis(250);
         let preroll_slice = std::time::Duration::from_millis(50);
@@ -348,7 +351,7 @@ impl VideoPlayer {
         Ok(())
     }
 
-    fn install_bus_watch(&mut self) -> anyhow::Result<()> {
+    pub(super) fn install_bus_watch(&mut self) -> anyhow::Result<()> {
         self.remove_bus_watch();
         let pipeline = self
             .pipeline
@@ -364,6 +367,7 @@ impl VideoPlayer {
         let backend_kind = self.backend_kind;
         let import_recovery_enabled = self.appsink_import_recovery_enabled;
 
+        let playback_window = self.playback_window;
         let watch = bus.create_watch(
             Some(&format!("kaleidux-bus-{}", source_id)),
             gst::glib::Priority::DEFAULT,
@@ -410,7 +414,7 @@ impl VideoPlayer {
                             reason: "eos".to_string(),
                         });
                         if let Err(reason) =
-                            restart_pipeline_after_eos(&pipeline, source_id.as_ref(), backend_kind)
+                            playback_window.map_or_else(|| restart_pipeline_after_eos(&pipeline, source_id.as_ref(), backend_kind), |window| super::excerpts::seek_segment(&pipeline, window).map_err(|error| error.to_string()))
                         {
                             let _ = player_event_tx.blocking_send(PlayerEvent {
                                 source_id: source_id.to_string(),
@@ -423,26 +427,24 @@ impl VideoPlayer {
                             return gst::glib::ControlFlow::Break;
                         }
                     }
-                    MessageView::SegmentDone(..)
-                        if pipeline
-                            .seek_simple(
-                                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                                gst::ClockTime::ZERO,
-                            )
-                            .is_err() =>
-                    {
-                        let reason = "failed to restart segment loop".to_string();
-                        let _ = player_event_tx.blocking_send(PlayerEvent {
-                            source_id: source_id.to_string(),
-                            session_id,
-                            backend_kind,
-                            kind: PlayerEventKind::FatalLifecycle,
-                            reason: reason.clone(),
+                    MessageView::SegmentDone(..) => {
+                        let source = source_id.clone();
+                        let events = player_event_tx.clone();
+                        // SegmentDone may arrive before the last queued frame.
+                        // A nonflushing seek preserves that tail. call_async keeps
+                        // a paused seek from blocking the shared GLib dispatcher.
+                        pipeline.call_async(move |pipeline| {
+                            let result = playback_window.map_or_else(
+                                || restart_pipeline_after_eos(pipeline, source.as_ref(), backend_kind),
+                                |window| super::excerpts::seek_segment_with_flush(pipeline, window, false).map_err(|error| error.to_string()));
+                            if let Err(reason) = result {
+                                let _ = events.try_send(PlayerEvent {
+                                    source_id: source.to_string(), session_id, backend_kind,
+                                    kind: PlayerEventKind::FatalLifecycle, reason,
+                                });
+                            }
                         });
-                        tracing::error!("[VIDEO] {}: {}", source_id, reason);
-                        return gst::glib::ControlFlow::Break;
                     }
-                    MessageView::SegmentDone(..) => {}
                     MessageView::Error(err) => {
                         let error_msg = format!(
                             "Error from {:?}: {} ({:?})",

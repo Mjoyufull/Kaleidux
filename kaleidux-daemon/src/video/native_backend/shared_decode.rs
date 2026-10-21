@@ -20,6 +20,7 @@ struct SharedDecodeKey {
     uri: String,
     group_id: u64,
     max_publish_fps: Option<u32>,
+    playback_window: Option<crate::media_source::PlaybackWindow>,
 }
 
 static SHARED_DECODERS: Lazy<Mutex<HashMap<SharedDecodeKey, Weak<SharedDecodeSession>>>> =
@@ -74,6 +75,7 @@ pub(super) struct AcquireRequest {
     pub creation_start: Instant,
     pub worker_name: String,
     pub volume: f64,
+    pub playback_window: Option<crate::media_source::PlaybackWindow>,
 }
 
 impl SharedDecodeSession {
@@ -104,6 +106,7 @@ impl SharedDecodeSession {
             uri: request.uri.clone(),
             group_id: request.group_id,
             max_publish_fps: request.max_publish_fps,
+            playback_window: request.playback_window.filter(|window| window.start_ns > 0),
         };
 
         let mut registry = SHARED_DECODERS.lock();
@@ -125,6 +128,9 @@ impl SharedDecodeSession {
         }
 
         let control = Arc::new(NativePlaybackControl::new());
+        if let Some(window) = request.playback_window {
+            control.set_window(window)?;
+        }
         let fanout = Arc::new(NativeDecodeFanout::new(subscriber));
         let finished = Arc::new(AtomicBool::new(false));
         let session = Arc::new(Self {
@@ -518,6 +524,7 @@ mod tests {
                 uri: "test".to_string(),
                 group_id: 1,
                 max_publish_fps: None,
+                playback_window: None,
             },
             control: Arc::new(NativePlaybackControl::new()),
             fanout,
@@ -583,6 +590,7 @@ mod tests {
                 uri: "test_err".to_string(),
                 group_id: 10,
                 max_publish_fps: None,
+                playback_window: None,
             },
             control: Arc::new(NativePlaybackControl::new()),
             fanout,

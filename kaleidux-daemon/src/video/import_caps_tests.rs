@@ -64,6 +64,7 @@ fn appsink_dma_import_failure_recovers_to_system_memory() {
             None,
             None,
             None,
+            None,
         )
         .unwrap()
     };
@@ -85,6 +86,7 @@ fn appsink_dma_import_failure_recovers_to_system_memory() {
             events,
             std::sync::Arc::new(crate::metrics::PerformanceMetrics::new()),
             crate::video::VideoBackendRequest::ForceAppsink,
+            None,
             None,
             None,
             None,

@@ -164,10 +164,11 @@ impl super::Renderer {
             let raw_params = self.active_transition.to_params();
             let uniforms = TransitionUniforms {
                 progress: self.transition_progress,
-                screen_aspect: self.config.width as f32 / self.config.height as f32,
+                screen_aspect: self.content_size().0 as f32 / self.content_size().1 as f32,
                 prev_aspect: self.prev_aspect,
                 next_aspect: self.current_aspect,
                 params: bytemuck::cast(raw_params),
+                layout: self.layout_uniform(),
             };
             self.write_uniforms_if_changed(uniforms);
 

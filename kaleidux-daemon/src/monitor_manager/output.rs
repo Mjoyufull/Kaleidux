@@ -38,6 +38,7 @@ pub(super) fn independent_phase_offset(name: &str, base_duration: Duration) -> D
     Duration::from_nanos(offset_nanos as u64)
 }
 
+#[derive(Clone)]
 pub struct OutputOrchestrator {
     pub _name: String,
     #[allow(dead_code)]

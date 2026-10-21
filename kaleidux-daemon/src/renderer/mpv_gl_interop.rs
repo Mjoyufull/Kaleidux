@@ -74,7 +74,7 @@ pub(crate) fn prime_shared_texture_for_gl(
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("libmpv GL Interop Prime Uniform"),
-            contents: &[0; 128],
+            contents: &[0; std::mem::size_of::<super::TransitionUniforms>()],
             usage: wgpu::BufferUsages::UNIFORM,
         });
     let sampler = ctx

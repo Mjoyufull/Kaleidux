@@ -104,6 +104,7 @@ const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct CommandContext<'a> {
+    pub(crate) preview: &'a mut Option<crate::runtime::preview::PreviewState>,
     pub(crate) monitor_manager: &'a mut monitor_manager::MonitorManager,
     pub(crate) renderers: &'a mut HashMap<String, renderer::Renderer>,
     pub(crate) video_players: &'a mut HashMap<String, video::VideoPlayer>,
@@ -126,6 +127,7 @@ pub(crate) struct CommandContext<'a> {
 
 /// Shared state for both Wayland and X11 main loops.
 pub struct MainLoopContext {
+    pub(crate) preview: Option<crate::runtime::preview::PreviewState>,
     pub metrics: Arc<metrics::PerformanceMetrics>,
     pub monitor_manager: monitor_manager::MonitorManager,
     pub renderers: HashMap<String, renderer::Renderer>,
@@ -350,6 +352,7 @@ impl MainLoopContext {
         let now = Instant::now();
 
         Ok(MainLoopContext {
+            preview: None,
             metrics,
             monitor_manager,
             renderers: HashMap::new(),

@@ -151,7 +151,15 @@ async fn decode_source_with_lease(
             source
         } else {
             metrics.record_image_source_decode_miss();
-            Arc::new(decode_source_image(&path)?)
+            let decoded = decode_source_image(&path)?;
+            tracing::debug!(
+                "[MEDIA-IMAGE] format={} width={} height={} decoded_bytes={}",
+                decoded.format,
+                decoded.width,
+                decoded.height,
+                decoded.pixels.len()
+            );
+            Arc::new(decoded)
         };
         Ok::<_, anyhow::Error>(Arc::new(LeasedSourceImage {
             source,

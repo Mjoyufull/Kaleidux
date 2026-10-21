@@ -62,6 +62,7 @@ pub(crate) use mpv_gl_interop::GlInteropSync;
 #[cfg(feature = "backend-mpv")]
 pub(crate) use mpv_gl_interop::{create_exportable_rgba_texture, prime_shared_texture_for_gl};
 
+pub(crate) mod preview;
 #[path = "renderer/video_cpu_upload.rs"]
 mod video_cpu_upload;
 mod video_rgba_upload;
@@ -79,6 +80,7 @@ mod render_blit;
 mod render_present;
 mod render_transition;
 
+mod layout;
 #[path = "renderer/lifecycle.rs"]
 mod lifecycle;
 
@@ -89,7 +91,8 @@ struct TransitionUniforms {
     screen_aspect: f32, // width / height
     prev_aspect: f32,
     next_aspect: f32,
-    params: [[f32; 4]; 7], // Total 128 bytes (aligned)
+    params: [[f32; 4]; 7],
+    layout: [f32; 4], // viewport size and previous/current image tiling flags
 }
 
 #[repr(C)]
@@ -289,6 +292,10 @@ struct YuvSource {
 }
 
 pub struct Renderer {
+    pub(crate) margin: [u32; 4],
+    pub(crate) tile: bool,
+    tiled_image: bool,
+    prev_tiled_image: bool,
     pub name: String,
     pub ctx: Arc<WgpuContext>,
     surface: Surface<'static>,
@@ -475,6 +482,10 @@ impl Renderer {
         };
 
         let r = Self {
+            margin: [0; 4],
+            tile: false,
+            tiled_image: false,
+            prev_tiled_image: false,
             name,
             default_frame_latency: desired_maximum_frame_latency,
             ctx: ctx.clone(),
@@ -604,7 +615,8 @@ impl Renderer {
         color: crate::video::VideoColorMetadata,
         geometry: crate::video::VideoGeometry,
     ) {
-        let uniforms = yuv_uniforms_for(color, geometry, self.config.width, self.config.height);
+        let (width, height) = self.content_size();
+        let uniforms = yuv_uniforms_for(color, geometry, width, height);
         if self.last_yuv_uniforms == Some(uniforms) {
             return;
         }

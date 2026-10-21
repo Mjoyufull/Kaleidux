@@ -416,17 +416,28 @@ fn hardware_decode_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn choice_priority(api: NativeDecoderApi) -> u8 {
+pub(super) fn choice_priority(api: NativeDecoderApi) -> u8 {
+    decoder_priority(api, crate::video::capabilities::renderer_vendor())
+}
+
+fn decoder_priority(api: NativeDecoderApi, vendor: u32) -> u8 {
+    // Select the proven native delivery path for the rendering GPU. Vulkan
+    // decode support alone does not establish exportable decoder surfaces.
+    if matches!((vendor, api), (0x10de, NativeDecoderApi::Nvdec))
+        || matches!((vendor, api), (0x8086 | 0x1002, NativeDecoderApi::Vaapi))
+    {
+        return 0;
+    }
     match api {
-        NativeDecoderApi::VulkanVideo => 0,
-        NativeDecoderApi::Vaapi => 1,
-        NativeDecoderApi::Nvdec => 2,
-        NativeDecoderApi::Qsv => 3,
-        NativeDecoderApi::Amf => 4,
-        NativeDecoderApi::VideoToolbox => 5,
-        NativeDecoderApi::D3d12 => 6,
-        NativeDecoderApi::D3d11 => 7,
-        NativeDecoderApi::MediaCodec => 8,
+        NativeDecoderApi::VulkanVideo => 1,
+        NativeDecoderApi::Vaapi => 2,
+        NativeDecoderApi::Nvdec => 3,
+        NativeDecoderApi::Qsv => 4,
+        NativeDecoderApi::Amf => 5,
+        NativeDecoderApi::VideoToolbox => 6,
+        NativeDecoderApi::D3d12 => 7,
+        NativeDecoderApi::D3d11 => 8,
+        NativeDecoderApi::MediaCodec => 9,
     }
 }
 
@@ -446,6 +457,25 @@ fn ffmpeg_error(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{NativeDecoderApi, NativePathTier};
+
+    #[test]
+    fn automatic_decoder_prefers_the_selected_gpu_native_api() {
+        use super::decoder_priority;
+        assert!(
+            decoder_priority(NativeDecoderApi::Nvdec, 0x10de)
+                < decoder_priority(NativeDecoderApi::VulkanVideo, 0x10de)
+        );
+        for vendor in [0x8086, 0x1002] {
+            assert!(
+                decoder_priority(NativeDecoderApi::Vaapi, vendor)
+                    < decoder_priority(NativeDecoderApi::VulkanVideo, vendor)
+            );
+        }
+        assert!(
+            decoder_priority(NativeDecoderApi::VulkanVideo, 0)
+                < decoder_priority(NativeDecoderApi::Nvdec, 0)
+        );
+    }
 
     #[test]
     fn capability_ladder_keeps_vulkan_video_first_class() {

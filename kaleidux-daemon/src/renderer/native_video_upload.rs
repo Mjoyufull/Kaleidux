@@ -73,7 +73,8 @@ impl super::Renderer {
     }
 
     pub(crate) fn can_present_native_wayland_surface(&self) -> bool {
-        !self.pause_on_fullscreen
+        self.margin == [0; 4]
+            && !self.pause_on_fullscreen
             && self.valid_content_type == crate::queue::ContentType::Video
             && !self.transition_active
             && !self.content_swap_pending

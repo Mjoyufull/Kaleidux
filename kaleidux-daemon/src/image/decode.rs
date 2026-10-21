@@ -217,6 +217,16 @@ fn decode_source_generic(
 }
 
 pub(crate) fn decode_source_image(path: &Path) -> anyhow::Result<DecodedSourceImage> {
+    if let Some(rgba) = crate::media_source::parse_colour(&path.to_string_lossy()) {
+        return Ok(DecodedSourceImage {
+            pixels: DecodedSourcePixels::Rgba(Vec::from(rgba).into()),
+            width: 1,
+            height: 1,
+            format: "solid-colour".to_owned(),
+            decode: Duration::ZERO,
+            convert: Duration::ZERO,
+        });
+    }
     let format = image::ImageReader::open(path)?
         .with_guessed_format()?
         .format();

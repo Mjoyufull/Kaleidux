@@ -14,6 +14,7 @@ impl MpvPlayer {
         let player_event_tx = self.player_event_tx.clone();
         let stop_requested = self.stop_requested.clone();
         let position_ns = self.position_ns.clone();
+        let duration_ns = self.duration_ns.clone();
         let first_hwdec_logged = self.first_hwdec_logged.clone();
         self.event_thread = Some(
             std::thread::Builder::new()
@@ -24,6 +25,13 @@ impl MpvPlayer {
                             continue;
                         };
                         match event {
+                            Ok(events::Event::PropertyChange {
+                                name: "duration",
+                                change: events::PropertyData::Double(seconds),
+                                ..
+                            }) if seconds.is_finite() && seconds > 0.0 => {
+                                duration_ns.store((seconds * 1e9) as u64, Ordering::Release);
+                            }
                             Ok(events::Event::PropertyChange {
                                 name: "time-pos",
                                 change: events::PropertyData::Double(seconds),

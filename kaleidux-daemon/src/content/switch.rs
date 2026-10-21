@@ -179,6 +179,8 @@ pub(crate) fn switch_wallpaper_content(
             player.is_native_experimental_backend()
                 && frame_mailbox.accepts_session(&name, player.session_id())
                 && std::path::Path::new(player.source_uri()) == path.as_path()
+                && monitor_manager.excerpt_request(&name).1.is_none()
+                && player.playback_window().is_none()
                 && player.restart_native_if_solo(monitor_manager.is_paused() || player.is_paused())
         })
         && let Some(renderer) = renderers.get_mut(&name)
@@ -218,7 +220,16 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
-    let mut native_decode_group_id = batch_id;
+    let mut native_decode_group_id = batch_id.map(|batch| {
+        use std::hash::{Hash, Hasher};
+        if let Some(length) = monitor_manager.excerpt_request(&name).1 {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (batch, length.as_nanos()).hash(&mut hash);
+            hash.finish()
+        } else {
+            batch
+        }
+    });
     let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
         let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
@@ -234,8 +245,8 @@ pub(crate) fn switch_wallpaper_content(
             r.active_image_session_id = session_id;
             r.active_video_session_id = 0;
             r.switch_content();
-            let output_width = r.config.width;
-            let output_height = r.config.height;
+            let (output_width, output_height) = r.content_size();
+            let tile_image = r.tile;
             let (target_width, target_height) = shared_image_target
                 .filter(|(width, height)| *width >= output_width && *height >= output_height)
                 .unwrap_or((output_width, output_height));
@@ -274,6 +285,20 @@ pub(crate) fn switch_wallpaper_content(
                 }
 
                 let request_start = Instant::now();
+                let tile_target = if tile_image {
+                    crate::image::runtime_probe::probe_descriptor(
+                        &path_clone,
+                        BackgroundWorkKind::ImageDecode,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|descriptor| (descriptor.width, descriptor.height))
+                } else {
+                    None
+                };
+                let (prepare_width, prepare_height) =
+                    tile_target.unwrap_or((target_width, target_height));
                 // Reserve before preparing pixels; waiting senders must not
                 // hold uncharged decoded buffers outside the channel budget.
                 let reserved_bytes = crate::image::runtime_probe::probe_descriptor(
@@ -286,8 +311,8 @@ pub(crate) fn switch_wallpaper_content(
                 .map(|descriptor| {
                     crate::image::runtime_cache::prepared_target_dimensions_from_descriptor(
                         &descriptor,
-                        target_width,
-                        target_height,
+                        prepare_width,
+                        prepare_height,
                     )
                 })
                 .map(|(width, height)| width as usize * height as usize * 4)
@@ -300,8 +325,8 @@ pub(crate) fn switch_wallpaper_content(
                 } else {
                     request_prepared_image_payload(
                         &path_clone,
-                        target_width,
-                        target_height,
+                        prepare_width,
+                        prepare_height,
                         BackgroundWorkKind::ImageDecode,
                         reserved_bytes,
                         &metrics,
@@ -361,7 +386,7 @@ pub(crate) fn switch_wallpaper_content(
             });
         } else {
             backend_request = video::VideoBackendRequest::Auto;
-            video_render_size = Some((r.config.width.max(1), r.config.height.max(1)));
+            video_render_size = Some(r.content_size());
             if let Some((peer_name, peer_player)) = video_players
                 .iter()
                 .find(|(output, player)| {
@@ -373,6 +398,7 @@ pub(crate) fn switch_wallpaper_content(
                             .and_then(|o| o.current_path.as_deref())
                             .is_some_and(|p| p == path.as_path())
                         && std::path::Path::new(player.source_uri()) == path.as_path()
+                        && player.playback_window() == monitor_manager.excerpt_request(&name).0
                         && player.current_position_ns().is_some()
                 })
                 .map(|(output, player)| (output.clone(), player))
@@ -434,8 +460,15 @@ pub(crate) fn switch_wallpaper_content(
             .get(&name)
             .and_then(|output| configured_max_publish_fps(output.config.video_fps));
         let mpv_native_target = mpv_native_targets.and_then(|targets| targets.get(&name).cloned());
-        let mpv_composed_target =
-            mpv_composed_targets.and_then(|targets| targets.get(&name).cloned());
+        let mpv_composed_target = mpv_composed_targets
+            .and_then(|targets| targets.get(&name).cloned())
+            .map(|target| {
+                if let Some((width, height)) = video_render_size {
+                    target.resized(width, height)
+                } else {
+                    target
+                }
+            });
         create_and_start_video_player(
             VideoPlayerStartRequest {
                 path: path.clone(),
@@ -445,6 +478,8 @@ pub(crate) fn switch_wallpaper_content(
                 backend_request,
                 decode_group_id: native_decode_group_id,
                 start_position_ns: broker_start_position_ns,
+                playback_window: monitor_manager.excerpt_request(&name).0,
+                excerpt_length: monitor_manager.excerpt_request(&name).1,
                 max_publish_fps,
                 render_size: video_render_size,
                 mpv_native_target,

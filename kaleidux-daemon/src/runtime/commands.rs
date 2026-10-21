@@ -13,8 +13,46 @@ use std::sync::atomic::Ordering;
 use tracing::{error, info};
 
 /// Handle an IPC command request.
-pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Response {
+pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) -> Response {
+    if let Request::PreviewEnd { apply } = req {
+        let Some(state) = ctx.preview.take() else {
+            return Response::Error("No preview is active".into());
+        };
+        if apply && state.is_loading(&ctx) {
+            *ctx.preview = Some(state);
+            return Response::Error("Preview is still loading".into());
+        }
+        state.finish(apply, &mut ctx);
+        return Response::Ok;
+    }
+    if ctx.preview.is_some()
+        && matches!(
+            &req,
+            Request::Preview { .. }
+                | Request::Jump { .. }
+                | Request::Set { .. }
+                | Request::Img { .. }
+                | Request::Next { .. }
+                | Request::Prev { .. }
+                | Request::Clear { .. }
+                | Request::Reload
+                | Request::Playlist(_)
+                | Request::Blacklist(_)
+                | Request::Love { .. }
+                | Request::Unlove { .. }
+        )
+    {
+        return Response::Error(
+            "End the current preview first (preview-end or preview-end --apply)".into(),
+        );
+    }
+    if matches!(&req, Request::Kill)
+        && let Some(state) = ctx.preview.take()
+    {
+        state.finish(true, &mut ctx);
+    }
     let CommandContext {
+        preview,
         monitor_manager,
         renderers,
         video_players,
@@ -35,7 +73,8 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         mpv_composed_targets,
     } = ctx;
     let target = match &req {
-        Request::Jump { output, .. }
+        Request::Preview { output, .. }
+        | Request::Jump { output, .. }
         | Request::Set { output, .. }
         | Request::Img { output, .. }
         | Request::Next { output }
@@ -58,6 +97,10 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         None
     };
     let req = match req {
+        Request::Preview { path, .. } => Request::Preview {
+            path,
+            output: selected_output,
+        },
         Request::Jump { path, .. } => Request::Jump {
             path,
             output: selected_output,
@@ -84,7 +127,26 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         },
         request => request,
     };
+    let mut starting_preview = None;
     let req = match req {
+        Request::Preview { path, output } => {
+            if !pending_video_switches.is_empty()
+                || renderers
+                    .values()
+                    .any(|renderer| renderer.transition_active || renderer.content_is_loading())
+            {
+                return Response::Error("Wait for the current wallpaper to finish loading".into());
+            }
+            let snapshot = monitor_manager.snapshot_queues();
+            if let Err(error) = monitor_manager.prepare_media_selection(&path, &output, Some(false))
+            {
+                monitor_manager.end_preview(snapshot, false);
+                return Response::Error(error.to_string());
+            }
+            starting_preview = Some(snapshot);
+            Request::Next { output }
+        }
+
         Request::Jump { path, output } => {
             if let Err(error) = monitor_manager.prepare_media_selection(&path, &output, Some(true))
             {
@@ -108,7 +170,11 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         request => request,
     };
     match req {
-        Request::Jump { .. } | Request::Set { .. } | Request::Img { .. } => {
+        Request::Preview { .. }
+        | Request::PreviewEnd { .. }
+        | Request::Jump { .. }
+        | Request::Set { .. }
+        | Request::Img { .. } => {
             unreachable!("normalized image selection")
         }
         Request::PerfSnapshot => Response::PerfSnapshot(metrics.perf_snapshot()),
@@ -129,6 +195,15 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
         }
         Request::Next { output } => {
             let changes = monitor_manager.handle_next(output);
+            if let Some(snapshot) = starting_preview {
+                *preview = Some(super::preview::PreviewState::begin(
+                    snapshot,
+                    changes.keys().cloned(),
+                    renderers,
+                    video_players,
+                ));
+                monitor_manager.begin_preview();
+            }
             let batch = rand::random::<u64>();
             let ordered_changes = ordered_pending_content_switches(renderers, changes);
             for change in ordered_changes {
@@ -222,6 +297,7 @@ pub(crate) async fn handle_command(req: Request, ctx: CommandContext<'_>) -> Res
                     super::commands_reload::apply(
                         new_config,
                         CommandContext {
+                            preview,
                             monitor_manager,
                             renderers,
                             video_players,

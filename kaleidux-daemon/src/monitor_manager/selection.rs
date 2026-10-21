@@ -40,11 +40,20 @@ impl MonitorManager {
         output: &Option<String>,
         jump: Option<bool>,
     ) -> anyhow::Result<()> {
-        let path = std::fs::canonicalize(path)?;
-        anyhow::ensure!(path.is_file(), "Wallpaper path is not a file");
+        let source = crate::media_source::MediaSource::parse(path)?;
+        let path = match source {
+            crate::media_source::MediaSource::File(local) => {
+                let canonical = std::fs::canonicalize(local)?;
+                anyhow::ensure!(canonical.is_file(), "Wallpaper path is not a file");
+                canonical
+            }
+            virtual_source => virtual_source.locator(),
+        };
         let content_type = Self::resolve_content_type(&path, "manual selection")
             .ok_or_else(|| anyhow::anyhow!("Path is not supported media"))?;
-        if content_type == crate::queue::ContentType::Image {
+        if content_type == crate::queue::ContentType::Image
+            && !crate::media_source::MediaSource::is_virtual(&path)
+        {
             image::ImageReader::open(&path)?
                 .with_guessed_format()?
                 .into_dimensions()?;

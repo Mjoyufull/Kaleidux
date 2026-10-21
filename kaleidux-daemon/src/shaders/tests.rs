@@ -89,6 +89,7 @@ fn custom_shader_cache_key_includes_sorted_parameter_values() {
 #[test]
 fn metadata_aware_video_shaders_validate() {
     for source in [
+        include_str!("quad.wgsl"),
         include_str!("native_nv12_blit.wgsl"),
         include_str!("final_i420_blit.wgsl"),
     ] {

@@ -53,6 +53,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show a candidate while preserving the current wallpaper and queue
+    Preview {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Restore the original wallpaper, or keep the preview with --apply
+    PreviewEnd {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Set a solid wallpaper colour (#RRGGBB or #RRGGBBAA)
+    #[command(name = "colour", alias = "color")]
+    Colour {
+        colour: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Jump to a wallpaper inside the slideshow directory
     Jump {
         path: std::path::PathBuf,
@@ -249,27 +267,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let request = match cli.command {
+        Commands::Preview { path, output } => Request::Preview {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::PreviewEnd { apply } => Request::PreviewEnd { apply },
+        Commands::Colour { colour, output } => Request::Set {
+            path: format!("colour:{colour}"),
+            output,
+        },
         Commands::Status => Request::QueryOutputs,
         Commands::Next { output } => Request::Next { output },
         Commands::Jump { path, output } => Request::Jump {
-            path: std::fs::canonicalize(path)?
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
-                .to_owned(),
+            path: media_locator(path)?,
             output,
         },
         Commands::Set { path, output } => Request::Set {
-            path: std::fs::canonicalize(path)?
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
-                .to_owned(),
+            path: media_locator(path)?,
             output,
         },
         Commands::Img { path, output } => Request::Img {
-            path: std::fs::canonicalize(path)?
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Image path must be UTF-8"))?
-                .to_owned(),
+            path: media_locator(path)?,
             output,
         },
         Commands::Prev { output } => Request::Prev { output },
@@ -409,6 +427,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn media_locator(path: std::path::PathBuf) -> anyhow::Result<String> {
+    let input = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Media source must be UTF-8"))?;
+    if input.contains("://")
+        || input.starts_with('#')
+        || input.starts_with("colour:")
+        || input.starts_with("color:")
+        || [
+            "youtube.com/",
+            "www.youtube.com/",
+            "m.youtube.com/",
+            "youtu.be/",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+    {
+        return Ok(input.to_owned());
+    }
+    Ok(std::fs::canonicalize(path)?.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

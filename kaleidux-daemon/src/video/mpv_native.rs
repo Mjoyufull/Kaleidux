@@ -97,6 +97,11 @@ impl std::fmt::Debug for MpvComposedVideoTarget {
 }
 
 impl MpvComposedVideoTarget {
+    pub(crate) fn resized(mut self, width: u32, height: u32) -> Self {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self
+    }
     pub(crate) fn new(
         display_ptr: *mut c_void,
         wgpu_ctx: Arc<crate::renderer::WgpuContext>,

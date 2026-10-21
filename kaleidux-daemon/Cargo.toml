@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = ["full"]
 full = [
+    "network-sources",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -16,12 +17,14 @@ full = [
     "display-x11",
 ]
 wayland-only = [
+    "network-sources",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
     "display-wayland",
 ]
 minimal-static = ["display-wayland"]
+network-sources = []
 backend-appsink = []
 backend-mpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 backend-ffmpeg = ["dep:ffmpeg-next", "dep:libva-sys"]

@@ -243,6 +243,7 @@ impl MonitorManager {
             group_display_start_times: HashMap::new(),
             cache,
             metrics,
+            preview_active: false,
             manual_paused: false,
             pause_reasons: std::collections::BTreeSet::new(),
             power_suspended: false,

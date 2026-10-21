@@ -33,6 +33,7 @@ fn native_async_open_failure_is_reported_during_prebuffer() {
         None,
         None,
         std::time::Instant::now(),
+        None,
     )
     .expect("worker creation precedes opening the input");
     let error = player

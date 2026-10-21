@@ -164,6 +164,7 @@ impl MainLoopContext {
             let response = handle_command(
                 req,
                 CommandContext {
+                    preview: &mut self.preview,
                     monitor_manager: &mut self.monitor_manager,
                     renderers: &mut self.renderers,
                     video_players: &mut self.video_players,

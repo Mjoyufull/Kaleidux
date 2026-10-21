@@ -72,6 +72,7 @@ pub(crate) async fn initialize_outputs_and_renderers(
             })
             .map(|(width, height)| (width.max(1) as u32, height.max(1) as u32))
             .unwrap_or((1920, 1080));
+        crate::observability::privacy::register_output(&name, &description);
         info!("Found output: {} ({})", name, description);
         output_infos.push((name, description, output, output_size));
     }

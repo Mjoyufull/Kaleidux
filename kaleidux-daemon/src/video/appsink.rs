@@ -188,6 +188,14 @@ impl AppsinkNegotiatedState {
         let is_dmabuf = features.is_some_and(|value| value.contains("memory:DMABuf"));
         let raw_info =
             gst_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::NotNegotiated)?;
+        tracing::debug!(
+            "[MEDIA-VIDEO] format={:?} width={} height={} fps={} color={:?}",
+            raw_info.format(),
+            raw_info.width(),
+            raw_info.height(),
+            raw_info.fps(),
+            raw_info.colorimetry()
+        );
         let (video_info, drm) = if is_dmabuf && raw_info.format() == gst_video::VideoFormat::DmaDrm
         {
             let drm_info = gst_video::VideoInfoDmaDrm::from_caps(caps)
@@ -303,6 +311,14 @@ fn propose_appsink_allocation(
         query.add_allocation_meta::<gst_video::VideoMeta>(None);
     }
 
+    let is_cuda = caps
+        .features(0)
+        .is_some_and(|features| features.contains("memory:CUDAMemory"));
+    if is_cuda {
+        // A system-memory VideoBufferPool cannot satisfy CUDA caps. Keep the
+        // decoder-owned pool instead of asking it to allocate host buffers.
+        return true;
+    }
     let is_dmabuf = caps
         .features(0)
         .is_some_and(|features| features.contains("memory:DMABuf"));
@@ -600,8 +616,8 @@ pub(super) fn sample_to_video_frame(
     session_id: u64,
     negotiated_state: &mut AppsinkNegotiatedState,
 ) -> Result<VideoFrame, gst::FlowError> {
-    let buffer = match sample.buffer() {
-        Some(b) => b.to_owned(),
+    let buffer = match sample.buffer_owned() {
+        Some(buffer) => buffer,
         None => return Err(gst::FlowError::Error),
     };
 
@@ -857,6 +873,26 @@ mod tests {
     use crate::video::{VideoColorPrimaries, VideoTransfer};
     use gstreamer as gst;
     use gstreamer_video as gst_video;
+
+    #[test]
+    fn admitted_samples_retain_the_original_buffer_without_copying() {
+        gst::init().unwrap();
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 4, 2)
+            .build()
+            .unwrap();
+        let buffer = gst::Buffer::from_mut_slice(vec![0u8; info.size()]);
+        let caps = info.to_caps().unwrap();
+        let sample = gst::Sample::builder().buffer(&buffer).caps(&caps).build();
+        let frame = super::sample_to_video_frame(
+            "retention",
+            sample,
+            1,
+            &mut AppsinkNegotiatedState::default(),
+        )
+        .unwrap();
+        let retained = frame.storage.gstreamer_buffer().unwrap();
+        assert_eq!(retained.as_ptr(), buffer.as_ptr());
+    }
 
     #[test]
     fn padded_luma_origin_is_normalized_without_copying_pixels() {

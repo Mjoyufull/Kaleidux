@@ -51,7 +51,14 @@ impl MainLoopContext {
             let idle_delta = loop_counts.0.saturating_sub(self.last_loop_rate_counts.0);
             let hot_delta = loop_counts.1.saturating_sub(self.last_loop_rate_counts.1);
             let loop_rate = idle_delta.saturating_add(hot_delta) as f64 / log_window.as_secs_f64();
-            if loop_rate > 10.0 {
+            if loop_rate > 10.0
+                && self.video_players.is_empty()
+                && self.pending_video_switches.is_empty()
+                && !self
+                    .renderers
+                    .values()
+                    .any(|renderer| renderer.transition_active)
+            {
                 warn!(
                     "[WAKE] high_loop_rate={:.1}/s idle_delta={} hot_delta={} window_ms={:.1}",
                     loop_rate,

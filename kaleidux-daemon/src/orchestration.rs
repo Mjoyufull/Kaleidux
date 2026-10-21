@@ -71,6 +71,12 @@ pub struct OutputConfig {
     /// occluded background naturally holds its current frame.
     #[serde(default)]
     pub pause_on_fullscreen: bool,
+    #[serde(default = "default_true")]
+    pub long_video_excerpts: bool,
+    #[serde(default)]
+    pub margin: [u32; 4],
+    #[serde(default)]
+    pub tile: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -92,6 +98,10 @@ impl From<Layer> for smithay_client_toolkit::shell::wlr_layer::Layer {
             Layer::Overlay => smithay_client_toolkit::shell::wlr_layer::Layer::Overlay,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_layer() -> Layer {
@@ -157,6 +167,9 @@ pub struct GlobalConfig {
     pub video_fps: Option<VideoFpsProfile>,
     pub frame_latency: Option<u32>,
     pub pause_on_fullscreen: Option<bool>,
+    pub long_video_excerpts: Option<bool>,
+    pub margin: Option<[u32; 4]>,
+    pub tile: Option<bool>,
 }
 
 fn default_script_tick_interval() -> u64 {
@@ -193,6 +206,9 @@ impl Default for GlobalConfig {
             video_fps: None,
             frame_latency: None,
             pause_on_fullscreen: None,
+            long_video_excerpts: None,
+            margin: None,
+            tile: None,
         }
     }
 }
@@ -218,6 +234,9 @@ pub struct PartialOutputConfig {
     pub video_fps: Option<VideoFpsProfile>,
     pub frame_latency: Option<u32>,
     pub pause_on_fullscreen: Option<bool>,
+    pub long_video_excerpts: Option<bool>,
+    pub margin: Option<[u32; 4]>,
+    pub tile: Option<bool>,
 }
 
 impl Config {
@@ -365,6 +384,9 @@ impl Config {
             video_fps: self.global.video_fps,
             frame_latency: self.global.frame_latency,
             pause_on_fullscreen: self.global.pause_on_fullscreen,
+            long_video_excerpts: self.global.long_video_excerpts,
+            margin: self.global.margin,
+            tile: self.global.tile,
         };
 
         // 2. Merge [any] fallback
@@ -387,6 +409,15 @@ impl Config {
 
 impl PartialOutputConfig {
     fn merge(&mut self, other: &Self) {
+        if other.margin.is_some() {
+            self.margin = other.margin;
+        }
+        if other.tile.is_some() {
+            self.tile = other.tile;
+        }
+        if other.long_video_excerpts.is_some() {
+            self.long_video_excerpts = other.long_video_excerpts;
+        }
         if other.path.is_some() {
             self.path = other.path.clone();
         }
@@ -453,6 +484,9 @@ impl PartialOutputConfig {
                 PerformanceProfile::Balanced | PerformanceProfile::Debug => None,
             }),
             pause_on_fullscreen: self.pause_on_fullscreen.unwrap_or(false),
+            long_video_excerpts: self.long_video_excerpts.unwrap_or(true),
+            margin: self.margin.unwrap_or_default(),
+            tile: self.tile.unwrap_or(false),
         }
     }
 }

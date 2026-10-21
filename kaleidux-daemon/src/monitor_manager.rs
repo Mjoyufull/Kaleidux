@@ -16,10 +16,12 @@ mod config;
 mod config_queue;
 mod deadline;
 mod deferred_output;
+mod excerpts;
 mod manual_queue;
 mod manual_selection;
 mod output;
 mod power;
+pub(crate) mod preview;
 mod schedule;
 mod shared_join;
 
@@ -35,9 +37,10 @@ pub struct MonitorManager {
     group_display_start_times: HashMap<usize, Instant>, // For grouped outputs - per-group display start time
     cache: Arc<FileCache>,                              // Shared cache instance for all queues
     metrics: Option<Arc<PerformanceMetrics>>,           // Shared metrics instance
-    manual_paused: bool,                                // Global manual pause state
-    pause_reasons: BTreeSet<String>,                    // Named pause reasons (inhibitors)
-    power_suspended: bool, // Automatic pause while every compositor output is powered off
+    preview_active: bool,
+    manual_paused: bool,             // Global manual pause state
+    pause_reasons: BTreeSet<String>, // Named pause reasons (inhibitors)
+    power_suspended: bool,           // Automatic pause while every compositor output is powered off
     // In-memory cache of discovered file lists per directory path.
     // Avoids re-scanning the same directory when multiple outputs share the same path.
     discovered_files_cache: HashMap<PathBuf, Arc<Vec<PathBuf>>>,
@@ -305,7 +308,7 @@ impl MonitorManager {
                         .stats
                         .blacklist
                         .iter()
-                        .map(|p| p.to_string_lossy().to_string())
+                        .map(|path| path.to_string_lossy().to_string())
                         .collect();
                     Response::Blacklist(paths)
                 } else {
@@ -448,12 +451,21 @@ impl MonitorManager {
 
     pub fn get_history(&self, output_name: Option<String>) -> Vec<String> {
         let history = Vec::new();
-        let to_strings = |paths: &std::collections::VecDeque<PathBuf>| -> Vec<String> {
-            paths
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect()
-        };
+        let to_strings =
+            |paths: &std::collections::VecDeque<crate::queue::QueueEntry>| -> Vec<String> {
+                paths
+                    .iter()
+                    .map(|entry| match entry.window {
+                        Some(window) => format!(
+                            "{} [{:.3}..{:.3}s]",
+                            entry.path.display(),
+                            window.start_ns as f64 / 1e9,
+                            window.end_ns as f64 / 1e9
+                        ),
+                        None => entry.path.to_string_lossy().to_string(),
+                    })
+                    .collect()
+            };
 
         if let Some(name) = output_name {
             // Specific output requested

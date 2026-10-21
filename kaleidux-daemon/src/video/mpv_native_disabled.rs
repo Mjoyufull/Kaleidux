@@ -55,6 +55,9 @@ impl MpvNativeVideoTarget {
 pub struct MpvComposedVideoTarget;
 
 impl MpvComposedVideoTarget {
+    pub(crate) fn resized(self, _width: u32, _height: u32) -> Self {
+        self
+    }
     pub(crate) fn new(
         _display_ptr: *mut c_void,
         _wgpu_ctx: Arc<crate::renderer::WgpuContext>,

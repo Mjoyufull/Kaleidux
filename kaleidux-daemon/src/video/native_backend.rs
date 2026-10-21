@@ -282,6 +282,7 @@ impl NativePlayer {
         decode_group_id: Option<u64>,
         max_publish_fps: Option<u32>,
         creation_start: Instant,
+        playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         let worker_name = native_thread_name(source_id.as_ref(), session_id);
         let (shared, first_frame_rx) =
@@ -297,6 +298,7 @@ impl NativePlayer {
                 creation_start,
                 worker_name,
                 volume,
+                playback_window,
             })?;
         Ok(Self {
             source_id,
@@ -392,6 +394,17 @@ impl NativePlayer {
 
     pub fn decode_group_id(&self) -> u64 {
         self.shared.group_id()
+    }
+
+    pub fn duration_ns(&self) -> Option<u64> {
+        self.shared.control.duration_ns()
+    }
+
+    pub fn set_playback_window(
+        &self,
+        window: crate::media_source::PlaybackWindow,
+    ) -> anyhow::Result<()> {
+        self.shared.control.set_window(window)
     }
 
     pub fn current_position_ns(&self) -> u64 {

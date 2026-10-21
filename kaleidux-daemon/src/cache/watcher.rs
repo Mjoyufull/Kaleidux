@@ -54,6 +54,9 @@ impl DirectoryWatcher {
 
     /// Watch a directory for changes
     pub fn watch(&mut self, path: &Path) -> Result<()> {
+        if crate::media_source::MediaSource::is_virtual(path) {
+            return Ok(());
+        }
         if path.exists() && path.is_dir() {
             self.watcher.watch(path, RecursiveMode::Recursive)?;
             self.watched_dirs.push(path.to_path_buf());

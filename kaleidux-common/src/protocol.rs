@@ -19,6 +19,13 @@ pub enum Request {
         path: String,
         output: Option<String>,
     },
+    #[serde(rename = "preview")]
+    Preview {
+        path: String,
+        output: Option<String>,
+    },
+    #[serde(rename = "preview_end")]
+    PreviewEnd { apply: bool },
     #[serde(rename = "set")]
     Set {
         path: String,

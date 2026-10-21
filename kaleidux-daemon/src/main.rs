@@ -1,6 +1,5 @@
 use chrono::Local;
 use clap::Parser;
-use kaleidux_common::Transition;
 #[cfg(feature = "backend-appsink")]
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -32,9 +31,9 @@ struct Args {
     /// Diagnostic verbosity from 1 (warnings) through 5 (trace-all).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     log: Option<u8>,
-    /// Run the built-in transition demo.
+    /// Include identifying paths, URLs and output names in diagnostic logs.
     #[arg(long)]
-    demo: bool,
+    log_sensitive: bool,
     /// Force video memory/decode mode: auto, cpu, cuda, dmabuf, nv12, or rgba.
     #[arg(long)]
     video_mode: Option<String>,
@@ -54,7 +53,15 @@ fn main() -> anyhow::Result<()> {
         .max_blocking_threads(16)
         .thread_name("kaleidux-main")
         .build()?;
-    let result = runtime.block_on(async_main());
+    let result = runtime.block_on(async_main()).map_err(|error| {
+        if kaleidux_daemon::observability::privacy::sensitive() {
+            error
+        } else {
+            anyhow::anyhow!(kaleidux_daemon::observability::privacy::redact(&format!(
+                "{error:#}"
+            )))
+        }
+    });
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     result
 }
@@ -84,7 +91,8 @@ async fn async_main() -> anyhow::Result<()> {
     kaleidux_daemon::media_policy::initialize(args.streamed)?;
     let log_level = args.log;
     kaleidux_daemon::observability::trace_all::set_trace_all_enabled(log_level == Some(5));
-    let _guards = init_logging(log_level)?;
+    kaleidux_daemon::observability::privacy::set_sensitive(args.log_sensitive);
+    let _guards = init_logging(log_level, args.log_sensitive)?;
     info!("[MEDIA-POLICY] streamed={}", args.streamed);
 
     if log_level == Some(5) {
@@ -105,7 +113,7 @@ async fn async_main() -> anyhow::Result<()> {
             kaleidux_daemon::video::get_video_backend_request(),
         ),
     )?;
-    let config = load_config(args.demo).await?;
+    let config = load_config().await?;
     let gstreamer_duration = init_gstreamer()?;
 
     if selected_display_is_x11()? {
@@ -124,6 +132,7 @@ async fn async_main() -> anyhow::Result<()> {
 
 fn init_logging(
     log_level: Option<u8>,
+    sensitive: bool,
 ) -> anyhow::Result<(
     Option<tracing_appender::non_blocking::WorkerGuard>,
     Option<tracing_appender::non_blocking::WorkerGuard>,
@@ -155,9 +164,12 @@ fn init_logging(
         );
 
     if let Some(level) = log_level {
-        init_file_logging(level, env_filter)
+        init_file_logging(level, env_filter, sensitive)
     } else {
         let stderr_layer = subscriber_fmt::layer()
+            .fmt_fields(kaleidux_daemon::observability::privacy::PrivateFields::new(
+                sensitive,
+            ))
             .with_writer(std::io::stderr)
             .with_timer(CustomTimer);
         Registry::default()
@@ -171,6 +183,7 @@ fn init_logging(
 fn init_file_logging(
     level: u8,
     env_filter: EnvFilter,
+    sensitive: bool,
 ) -> anyhow::Result<(
     Option<tracing_appender::non_blocking::WorkerGuard>,
     Option<tracing_appender::non_blocking::WorkerGuard>,
@@ -205,15 +218,25 @@ fn init_file_logging(
         })
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("could not allocate a unique daemon log filename"))?;
-    println!("Logging to file: {}", log_path.display());
+    if sensitive {
+        println!("Logging to file: {}", log_path.display());
+    } else {
+        println!("Logging enabled; identifying fields are redacted");
+    }
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file);
 
     let file_layer = subscriber_fmt::layer()
+        .fmt_fields(kaleidux_daemon::observability::privacy::PrivateFields::new(
+            sensitive,
+        ))
         .with_writer(non_blocking_file)
         .with_ansi(false)
         .with_timer(CustomTimer);
     let (non_blocking_stdout, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
     let stdout_layer = subscriber_fmt::layer()
+        .fmt_fields(kaleidux_daemon::observability::privacy::PrivateFields::new(
+            sensitive,
+        ))
         .with_writer(non_blocking_stdout)
         .with_timer(CustomTimer);
 
@@ -332,20 +355,10 @@ fn apply_video_backend(video_backend: Option<&str>) {
     kaleidux_daemon::video::set_video_backend_request(request);
 }
 
-async fn load_config(demo: bool) -> anyhow::Result<kaleidux_daemon::orchestration::Config> {
-    let mut config = kaleidux_daemon::orchestration::Config::load()
+async fn load_config() -> anyhow::Result<kaleidux_daemon::orchestration::Config> {
+    let config = kaleidux_daemon::orchestration::Config::load()
         .await
         .map_err(|error| anyhow::anyhow!("Failed to load configuration: {error:#}"))?;
-
-    if demo {
-        info!("Demo mode enabled! Overriding configuration to use current directory...");
-        let current_dir = std::env::current_dir()?;
-        config.any.path = Some(current_dir);
-        config.any.duration = Some(std::time::Duration::from_secs(10));
-        config.global.video_ratio = Some(100);
-        config.any.transition_time = Some(1500);
-        config.any.transition = Some(Transition::Random);
-    }
 
     Ok(config)
 }

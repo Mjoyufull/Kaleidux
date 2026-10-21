@@ -26,6 +26,9 @@ fn test_output_config(duration: Duration) -> OutputConfig {
         video_fps: crate::orchestration::VideoFpsProfile::Unlimited,
         frame_latency: None,
         pause_on_fullscreen: false,
+        long_video_excerpts: true,
+        margin: [0; 4],
+        tile: false,
     }
 }
 
@@ -44,6 +47,9 @@ fn output_partial(config: &OutputConfig) -> PartialOutputConfig {
         video_fps: Some(config.video_fps),
         frame_latency: config.frame_latency,
         pause_on_fullscreen: Some(config.pause_on_fullscreen),
+        long_video_excerpts: Some(config.long_video_excerpts),
+        margin: Some(config.margin),
+        tile: Some(config.tile),
     }
 }
 
@@ -234,6 +240,7 @@ fn make_test_manager(
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
+        preview_active: false,
         manual_paused: false,
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
@@ -486,6 +493,7 @@ fn synchronized_tick_skips_unknown_content_type_without_mutating_outputs() {
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
+        preview_active: false,
         manual_paused: false,
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
@@ -555,6 +563,7 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         group_display_start_times: HashMap::new(),
         cache,
         metrics: None,
+        preview_active: false,
         manual_paused: false,
         pause_reasons: std::collections::BTreeSet::new(),
         power_suspended: false,
@@ -585,3 +594,6 @@ fn grouped_handle_next_skips_unknown_content_type_without_mutating_group() {
         assert!(orch.next_change.is_some());
     }
 }
+
+#[path = "tests/preview.rs"]
+mod preview;

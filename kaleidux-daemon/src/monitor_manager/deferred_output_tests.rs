@@ -25,6 +25,7 @@ fn fixture() -> (MonitorManager, PathBuf, PathBuf) {
         shared_display_start_time: None,
         group_display_start_times: HashMap::new(),
         metrics: None,
+        preview_active: false,
         manual_paused: false,
         pause_reasons: Default::default(),
         power_suspended: false,

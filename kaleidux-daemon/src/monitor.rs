@@ -28,6 +28,13 @@ impl SystemMonitor {
         let mut sys = System::new();
         sys.refresh_cpu_all();
         sys.refresh_memory();
+        if let Ok(pid) = sysinfo::get_current_pid() {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            );
+        }
 
         // Initialize NVML for NVIDIA GPU monitoring (loads libnvidia-ml.so at runtime)
         let nvml = match nvml_wrapper::Nvml::init() {
@@ -175,7 +182,7 @@ impl SystemMonitor {
                 log_msg.push_str(&format!(" | GPU: {:.1}%", gl));
             }
             if let (Some(vu), Some(vt)) = (vram_used, vram_total) {
-                log_msg.push_str(&format!(" | VRAM: {:.2}GB / {:.2}GB", vu, vt));
+                log_msg.push_str(&format!(" | GPU total VRAM: {:.2}GB / {:.2}GB", vu, vt));
             }
 
             let logging_start = Instant::now();

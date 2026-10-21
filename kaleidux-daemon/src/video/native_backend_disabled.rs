@@ -45,6 +45,7 @@ impl NativePlayer {
         _decode_group_id: Option<u64>,
         _max_publish_fps: Option<u32>,
         _creation_start: Instant,
+        _playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
             "FFmpeg backend is disabled in this build; rebuild with --features backend-ffmpeg"
@@ -67,6 +68,15 @@ impl NativePlayer {
     pub fn pause(&self) {}
     pub fn resume(&self) {}
     pub fn seek_to_position_ns(&self, _position_ns: u64) {}
+    pub fn duration_ns(&self) -> Option<u64> {
+        None
+    }
+    pub fn set_playback_window(
+        &self,
+        _window: crate::media_source::PlaybackWindow,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     pub fn current_position_ns(&self) -> u64 {
         0
     }

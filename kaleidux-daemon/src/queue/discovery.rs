@@ -67,6 +67,16 @@ impl SmartQueue {
         cache: Arc<FileCache>,
         metrics: Option<Arc<crate::metrics::PerformanceMetrics>>,
     ) -> Result<Self> {
+        let source = crate::media_source::MediaSource::parse(&path.to_string_lossy())?;
+        if !matches!(source, crate::media_source::MediaSource::File(_)) {
+            return Self::new_manual_from_pool(
+                path,
+                vec![path.to_path_buf()],
+                video_ratio,
+                strategy,
+                cache,
+            );
+        }
         tracing::info!("[QUEUE] new_with_cache called for path: {:?}", path);
         let stats = Self::load_stats_from_cache(&cache)?;
         tracing::info!(
@@ -104,6 +114,8 @@ impl SmartQueue {
                 planned_sequential_type: None,
                 history: VecDeque::new(),
                 forward_history: VecDeque::new(),
+                excerpt_length_ns: None,
+                excerpt_plans: HashMap::new(),
                 selected_images: VecDeque::new(),
                 root_path: path.to_path_buf(),
                 active_playlist: None,
@@ -155,6 +167,8 @@ impl SmartQueue {
                             planned_sequential_type: None,
                             history: VecDeque::new(),
                             forward_history: VecDeque::new(),
+                            excerpt_length_ns: None,
+                            excerpt_plans: HashMap::new(),
                             selected_images: VecDeque::new(),
                             root_path: path.to_path_buf(),
                             active_playlist: None,
@@ -233,6 +247,8 @@ impl SmartQueue {
             planned_sequential_type: None,
             history: VecDeque::new(),
             forward_history: VecDeque::new(),
+            excerpt_length_ns: None,
+            excerpt_plans: HashMap::new(),
             selected_images: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
@@ -325,6 +341,8 @@ impl SmartQueue {
             planned_sequential_type: None,
             history: VecDeque::new(),
             forward_history: VecDeque::new(),
+            excerpt_length_ns: None,
+            excerpt_plans: HashMap::new(),
             selected_images: VecDeque::new(),
             root_path: path.to_path_buf(),
             active_playlist: None,
@@ -337,6 +355,13 @@ impl SmartQueue {
 
     #[inline]
     pub fn get_content_type(path: &Path) -> Option<ContentType> {
+        match crate::media_source::MediaSource::parse(&path.to_string_lossy()).ok()? {
+            crate::media_source::MediaSource::Network(_) => {
+                return ContentType::Video.supported().then_some(ContentType::Video);
+            }
+            crate::media_source::MediaSource::Colour(_) => return Some(ContentType::Image),
+            crate::media_source::MediaSource::File(_) => {}
+        }
         super::media_probe::probe(path)
     }
 }

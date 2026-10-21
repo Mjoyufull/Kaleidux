@@ -32,6 +32,9 @@ pub struct NativePlaybackControl {
     playback: AtomicU8,
     seek_pending: AtomicBool,
     position_ns: AtomicU64,
+    duration_ns: AtomicU64,
+    window_start_ns: AtomicU64,
+    window_end_ns: AtomicU64,
     play_epoch: AtomicU64,
     volume: AtomicU64,
     audio_clock: Mutex<Option<(u64, Instant, u64)>>,
@@ -50,10 +53,53 @@ impl NativePlaybackControl {
             playback: AtomicU8::new(PlaybackState::Paused.as_u8()),
             seek_pending: AtomicBool::new(false),
             position_ns: AtomicU64::new(0),
+            duration_ns: AtomicU64::new(0),
+            window_start_ns: AtomicU64::new(0),
+            window_end_ns: AtomicU64::new(0),
             play_epoch: AtomicU64::new(0),
             volume: AtomicU64::new(0.0f64.to_bits()),
             audio_clock: Mutex::new(None),
         }
+    }
+
+    pub fn set_duration_ns(&self, duration: u64) {
+        self.duration_ns.store(duration, Ordering::Release);
+    }
+    pub fn duration_ns(&self) -> Option<u64> {
+        let duration = self.duration_ns.load(Ordering::Acquire);
+        (duration > 0).then_some(duration)
+    }
+    pub fn set_window(&self, window: crate::media_source::PlaybackWindow) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            window.end_ns > window.start_ns,
+            "Invalid native playback interval"
+        );
+        let mut state = self.state.lock();
+        if let Some(existing) = self.window() {
+            anyhow::ensure!(
+                existing == window,
+                "Shared decoder interval does not match requested excerpt"
+            );
+            return Ok(());
+        }
+        self.window_start_ns
+            .store(window.start_ns, Ordering::Relaxed);
+        self.window_end_ns.store(window.end_ns, Ordering::Release);
+        state.seek_ns = Some(window.start_ns);
+        state.frame_demanded = true;
+        self.set_position_ns(window.start_ns);
+        self.seek_pending.store(true, Ordering::Release);
+        self.play_epoch.fetch_add(1, Ordering::Relaxed);
+        drop(state);
+        self.wake.notify_all();
+        Ok(())
+    }
+    pub fn window(&self) -> Option<crate::media_source::PlaybackWindow> {
+        let end_ns = self.window_end_ns.load(Ordering::Acquire);
+        (end_ns > 0).then(|| crate::media_source::PlaybackWindow {
+            start_ns: self.window_start_ns.load(Ordering::Relaxed),
+            end_ns,
+        })
     }
 
     pub fn play(&self) {
@@ -215,7 +261,7 @@ impl NativePlaybackControl {
     }
 
     pub fn looped(&self) {
-        self.set_position_ns(0);
+        self.set_position_ns(self.window().map_or(0, |window| window.start_ns));
         self.play_epoch.fetch_add(1, Ordering::Release);
         self.notify_audio();
     }
@@ -240,6 +286,29 @@ impl NativePlaybackControl {
 #[cfg(test)]
 mod tests {
     use super::NativePlaybackControl;
+
+    #[test]
+    fn shared_window_is_initialized_once_and_identical_joins_do_not_seek() {
+        let control = NativePlaybackControl::new();
+        let window = crate::media_source::PlaybackWindow {
+            start_ns: 0,
+            end_ns: 3_000_000_000,
+        };
+        control.set_window(window).unwrap();
+        assert_eq!(control.take_seek(), Some(0));
+        let epoch = control.play_epoch();
+        control.set_window(window).unwrap();
+        assert_eq!(control.take_seek(), None);
+        assert_eq!(control.play_epoch(), epoch);
+        assert!(
+            control
+                .set_window(crate::media_source::PlaybackWindow {
+                    start_ns: 0,
+                    end_ns: 5_000_000_000
+                })
+                .is_err()
+        );
+    }
 
     #[test]
     fn audio_clock_is_ignored_while_muted_paused_or_after_seek() {

@@ -21,6 +21,15 @@ Show version information.
 Print help information.
 .SH COMMANDS
 .TP
+.B preview PATH [-o OUTPUT]
+Display a candidate while retaining the original wallpaper, queue and slideshow timer. Accepts local media, supported URLs and colours. Wait for pending wallpaper loads to complete before previewing.
+.TP
+.B preview-end [--apply]
+Restore the original wallpaper and remaining display time. With --apply, retain the candidate and start its display duration. End a preview before issuing another selection command.
+.TP
+.B colour "#RRGGBB" [-o OUTPUT]
+Set a solid colour. Also accepts #RRGGBBAA and the alias color.
+.TP
 .B jump PATH [-o OUTPUT]
 Display an image inside the slideshow directory using the normal transition and history.
 .TP

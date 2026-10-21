@@ -11,6 +11,7 @@ layout(set = 0, binding = 0) uniform TransitionUniforms {
     float prev_aspect;
     float next_aspect;
     vec4 params[7];
+    vec4 placement;
 };
 
 #define ratio screen_aspect
@@ -40,12 +41,16 @@ vec2 cover(vec2 uv, float screen_ratio, float content_ratio) {
 }
 
 vec4 getFromColor(vec2 uv) {
-    vec2 uv_c = cover(uv, screen_aspect, prev_aspect);
+    vec2 uv_c = placement.z > 0.5
+        ? fract(uv * placement.xy / vec2(textureSize(sampler2D(t_prev, s_linear), 0)))
+        : cover(uv, screen_aspect, prev_aspect);
     return texture(sampler2D(t_prev, s_linear), uv_c);
 }
 
 vec4 getToColor(vec2 uv) {
-    vec2 uv_c = cover(uv, screen_aspect, next_aspect);
+    vec2 uv_c = placement.w > 0.5
+        ? fract(uv * placement.xy / vec2(textureSize(sampler2D(t_next, s_linear), 0)))
+        : cover(uv, screen_aspect, next_aspect);
     return texture(sampler2D(t_next, s_linear), uv_c);
 }
 "#;

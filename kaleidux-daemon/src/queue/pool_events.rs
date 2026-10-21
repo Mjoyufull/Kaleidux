@@ -42,8 +42,10 @@ impl SmartQueue {
             .map(|entry| (entry.path.clone(), entry.content_type))
             .collect();
         self.root_generation = snapshot.generation;
-        self.selected_images
-            .retain(|path| path.is_file() && !blacklist.contains(path));
+        self.selected_images.retain(|path| {
+            (path.is_file() || crate::media_source::MediaSource::is_virtual(path))
+                && !blacklist.contains(path)
+        });
         for path in &self.selected_images {
             if !self.pool.contains(path) {
                 self.pool.push(path.clone());
@@ -134,6 +136,7 @@ impl SmartQueue {
                     }
                 }
                 PoolEvent::Removed(path) => {
+                    self.excerpt_plans.remove(&path);
                     self.selected_images.retain(|selected| selected != &path);
                     if !path.starts_with(&self.root_path) {
                         continue;
@@ -151,6 +154,7 @@ impl SmartQueue {
                     }
                 }
                 PoolEvent::Modified(path) => {
+                    self.excerpt_plans.remove(&path);
                     if !path.starts_with(&self.root_path) {
                         continue;
                     }

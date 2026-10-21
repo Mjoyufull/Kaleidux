@@ -37,9 +37,9 @@ pub(super) fn open_decoder(
     rejected: &[super::capabilities::NativeDecoderApi],
 ) -> anyhow::Result<DecoderInstance> {
     let codec = ffmpeg::decoder::find(parameters.id()).ok_or(ffmpeg::Error::DecoderNotFound)?;
-    for choice in codec_hardware_choices(unsafe { codec.as_ptr() }) {
+    for (hardware_codec, choice) in hardware_decoder_choices(parameters.id()) {
         if !rejected.contains(&choice.api) {
-            match open_hardware_decoder(&parameters, codec, stream_time_base, choice) {
+            match open_hardware_decoder(&parameters, hardware_codec, stream_time_base, choice) {
                 Ok(decoder) => return Ok(decoder),
                 Err(error) => debug!(
                     "[NATIVE-CAPS] candidate={} preferred={} rejected={error:#}",
@@ -62,6 +62,29 @@ pub(super) fn open_decoder(
         hardware: None,
         _format_selection: None,
     })
+}
+
+fn hardware_decoder_choices(id: ffmpeg::codec::Id) -> Vec<(ffmpeg::Codec, HardwareDecoderChoice)> {
+    let mut opaque = ptr::null_mut();
+    let mut candidates = Vec::new();
+    loop {
+        // SAFETY: FFmpeg owns the immutable registry; the iteration cursor is
+        // local, and returned codec descriptors have process lifetime.
+        let pointer = unsafe { ffi::av_codec_iterate(&mut opaque) };
+        if pointer.is_null() {
+            break;
+        }
+        // SAFETY: the non-null static descriptor came from av_codec_iterate.
+        let candidate = unsafe { ffmpeg::Codec::wrap(pointer) };
+        if candidate.id() != id || unsafe { ffi::av_codec_is_decoder(pointer) } == 0 {
+            continue;
+        }
+        for choice in codec_hardware_choices(pointer) {
+            candidates.push((candidate, choice));
+        }
+    }
+    candidates.sort_by_key(|(_, choice)| super::capabilities::choice_priority(choice.api));
+    candidates
 }
 
 fn open_hardware_decoder(
@@ -165,5 +188,27 @@ fn software_decode_threads() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| *count > 0)
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |count| count.get().min(4))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn av1_hardware_registry_is_not_hidden_by_default_software_decoder() {
+        ffmpeg_next::init().unwrap();
+        let Some(codec) = ffmpeg_next::decoder::find_by_name("av1") else {
+            return;
+        };
+        let choices = super::super::capabilities::codec_hardware_choices(unsafe { codec.as_ptr() });
+        let candidates = super::hardware_decoder_choices(ffmpeg_next::codec::Id::AV1);
+        for choice in choices {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(_, candidate)| candidate.api == choice.api)
+            );
+        }
+    }
 }

@@ -33,7 +33,7 @@ impl<'a> BlacklistIdentity<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoveitData {
     pub files: lru::LruCache<PathBuf, FileStats>,
     pub playlists: HashMap<String, Playlist>,
@@ -59,6 +59,7 @@ pub struct FileStats {
     pub love_multiplier: f32, // 1.0 = normal, 2.0 = double chance, etc.
 }
 
+#[derive(Clone)]
 pub struct SmartQueue {
     pub pool: Vec<PathBuf>,
     pub stats: LoveitData,
@@ -66,8 +67,10 @@ pub struct SmartQueue {
     pub strategy: crate::orchestration::SortingStrategy,
     pub current_index: usize,
     planned_sequential_type: Option<ContentType>,
-    pub history: VecDeque<PathBuf>,
-    forward_history: VecDeque<PathBuf>,
+    pub history: VecDeque<QueueEntry>,
+    forward_history: VecDeque<QueueEntry>,
+    excerpt_length_ns: Option<u64>,
+    excerpt_plans: HashMap<PathBuf, excerpts::ExcerptPlan>,
     selected_images: VecDeque<PathBuf>,
     pub root_path: PathBuf,
     pub active_playlist: Option<String>,
@@ -104,6 +107,8 @@ impl ContentType {
 }
 
 mod discovery;
+mod excerpts;
+pub use excerpts::QueueEntry;
 mod filesystem_scan;
 pub(crate) mod media_index;
 mod picking;

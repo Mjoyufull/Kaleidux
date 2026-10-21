@@ -16,6 +16,16 @@ pub enum VideoMode {
 
 static VIDEO_MODE: AtomicU8 = AtomicU8::new(0);
 static VIDEO_BACKEND_REQUEST: AtomicU8 = AtomicU8::new(0);
+static RENDERER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn set_renderer_vendor(vendor: u32) {
+    RENDERER_VENDOR.store(vendor, Ordering::Release);
+}
+
+#[cfg(feature = "backend-ffmpeg")]
+pub(super) fn renderer_vendor() -> u32 {
+    RENDERER_VENDOR.load(Ordering::Acquire)
+}
 // 0 = renderer has not selected an adapter yet, 1 = supported, 2 = unsupported.
 // Capability logging happens before WGPU initialization, so unknown remains
 // optimistic; sink caps are built only after the renderer has resolved it.

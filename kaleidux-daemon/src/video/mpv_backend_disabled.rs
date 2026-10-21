@@ -22,6 +22,7 @@ impl MpvPlayer {
         _native_target: Option<MpvNativeVideoTarget>,
         _composed_target: Option<MpvComposedVideoTarget>,
         _start_time: Instant,
+        _playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("mpv backend is disabled in this build; rebuild with --features backend-mpv")
     }
@@ -55,6 +56,15 @@ impl MpvPlayer {
         Ok(())
     }
 
+    pub fn duration_ns(&self) -> Option<u64> {
+        None
+    }
+    pub fn set_playback_window(
+        &self,
+        _window: crate::media_source::PlaybackWindow,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     pub fn current_position_ns(&self) -> Option<u64> {
         None
     }

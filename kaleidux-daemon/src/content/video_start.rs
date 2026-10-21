@@ -19,6 +19,8 @@ pub(crate) struct VideoPlayerStartRequest {
     pub(crate) backend_request: video::VideoBackendRequest,
     pub(crate) decode_group_id: Option<u64>,
     pub(crate) start_position_ns: Option<u64>,
+    pub(crate) playback_window: Option<crate::media_source::PlaybackWindow>,
+    pub(crate) excerpt_length: Option<std::time::Duration>,
     pub(crate) max_publish_fps: Option<u32>,
     pub(crate) render_size: Option<(u32, u32)>,
     pub(crate) mpv_native_target: Option<video::MpvNativeVideoTarget>,
@@ -46,6 +48,8 @@ pub(crate) fn create_and_start_video_player(
         backend_request,
         decode_group_id,
         start_position_ns,
+        playback_window,
+        excerpt_length,
         max_publish_fps,
         render_size,
         mpv_native_target,
@@ -97,6 +101,7 @@ pub(crate) fn create_and_start_video_player(
 
             let mut prepare_failure = VideoPrepareFailure::Media;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let resolved_source = crate::media_source::resolve_for_playback(&path_str, should_abort)?;
                 let candidates = video::candidate_video_backends(backend_request);
                 let num_candidates = candidates.len();
                 let backend_is_explicitly_forced = video::backend_is_explicitly_forced(backend_request);
@@ -115,7 +120,7 @@ pub(crate) fn create_and_start_video_player(
 
                     let create_start = Instant::now();
                     let mut vp = match video::VideoPlayer::new(
-                        &path_str,
+                        &resolved_source,
                         name_arc.clone(),
                         session_id,
                         volume,
@@ -128,6 +133,7 @@ pub(crate) fn create_and_start_video_player(
                         render_size,
                         mpv_native_target.clone(),
                         mpv_composed_target.clone(),
+                        playback_window,
                     ) {
                         Ok(player) => player,
                         Err(e) => {
@@ -192,7 +198,6 @@ pub(crate) fn create_and_start_video_player(
                         }
                     };
                     let prebuffer_duration = prebuffer_start.elapsed();
-
                     if is_provisional && vp.is_native_experimental_backend() && prebuffer.frame.is_none() {
                         // Auto must not commit an unproven decoder and lose its
                         // fallback chain; forced FFmpeg can keep loading instead.
@@ -247,6 +252,24 @@ pub(crate) fn create_and_start_video_player(
                         }
                         return Err(error);
                     }
+
+                    if vp.uses_mpv() && excerpt_length.is_some() {
+                        let duration_wait = Instant::now();
+                        while vp.duration_ns().is_none() && duration_wait.elapsed() < std::time::Duration::from_millis(750) {
+                            if should_abort() { let _ = vp.stop(); return Ok(None); }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                    if playback_window.is_none()
+                        && let Some(length) = excerpt_length
+                        && let Some(duration) = vp.duration_ns()
+                        && duration > (length.as_nanos().min(u128::from(u64::MAX)) as u64).saturating_mul(2)
+                    {
+                        vp.set_playback_window(crate::media_source::PlaybackWindow {
+                            start_ns: 0, end_ns: length.as_nanos().min(u128::from(u64::MAX)) as u64,
+                        })?;
+                    }
+
 
                     if let Some(mut rx) = attempt_event_rx {
                         let forward_target = player_event_tx_clone.clone();

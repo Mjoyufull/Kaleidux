@@ -28,7 +28,7 @@ impl SmartQueue {
             self.content_type_cache.insert(path.clone(), kind);
         }
         self.forward_history.clear();
-        self.forward_history.push_front(path);
+        self.forward_history.push_front(path.into());
     }
 
     #[inline]
@@ -42,18 +42,20 @@ impl SmartQueue {
             return None;
         }
 
-        self.forward_history.retain(|path| self.pool.contains(path));
+        self.forward_history
+            .retain(|entry| self.pool.contains(&entry.path));
         // Cross-output exclusions are temporary; don't destroy browser-style
         // forward history merely because another output is showing an entry.
         if let Some(position) = self
             .forward_history
             .iter()
-            .position(|path| !excluded.contains(path))
+            .position(|entry| !excluded.contains(&entry.path))
         {
-            let path = self
+            let entry = self
                 .forward_history
                 .remove(position)
                 .expect("position exists");
+            let path = entry.path.clone();
             let index = self
                 .pool
                 .iter()
@@ -70,7 +72,7 @@ impl SmartQueue {
                 );
                 self.current_index = self.advance_index(index, descending);
             }
-            self.record_pick(&path);
+            self.record_entry(entry);
             return Some(path);
         }
 
@@ -97,11 +99,11 @@ impl SmartQueue {
         if let Some(path) = self
             .forward_history
             .iter()
-            .find(|path| self.pool.contains(path))
+            .find(|entry| self.pool.contains(&entry.path))
         {
             return self
-                .cached_content_type(path)
-                .map(|kind| (path.clone(), kind));
+                .cached_content_type(&path.path)
+                .map(|kind| (path.path.clone(), kind));
         }
 
         // For sequential strategies, we can peek at the next index
@@ -150,11 +152,11 @@ impl SmartQueue {
             .forward_history
             .iter()
             .filter(|path| {
-                self.pool.contains(path)
-                    && self.cached_content_type(path) == Some(ContentType::Image)
+                self.pool.contains(&path.path)
+                    && self.cached_content_type(&path.path) == Some(ContentType::Image)
             })
             .take(limit)
-            .cloned()
+            .map(|entry| entry.path.clone())
             .collect();
         let candidates = match self.strategy {
             crate::orchestration::SortingStrategy::Ascending
@@ -220,7 +222,7 @@ impl SmartQueue {
                 let mut recorded_current = false;
                 if !self.history.is_empty() {
                     if let Some(current) = self.history.pop_back()
-                        && self.pool.contains(&current)
+                        && self.pool.contains(&current.path)
                     {
                         self.push_forward_history(current);
                         recorded_current = true;
@@ -229,10 +231,10 @@ impl SmartQueue {
                         if let Some(previous_index) = self
                             .pool
                             .iter()
-                            .position(|candidate| candidate == &previous)
+                            .position(|candidate| candidate == &previous.path)
                         {
                             self.current_index = self.advance_index(previous_index, descending);
-                            history_previous = Some(previous);
+                            history_previous = Some(previous.path);
                             break;
                         }
                         self.history.pop_back();
@@ -242,7 +244,7 @@ impl SmartQueue {
                     let current = self.advance_index(self.current_index, !descending);
                     if !recorded_current {
                         if let Some(path) = self.pool.get(current).cloned() {
-                            self.push_forward_history(path);
+                            self.push_forward_history(path.into());
                         }
                     }
                     let previous = self.advance_index(current, !descending);
@@ -256,7 +258,7 @@ impl SmartQueue {
                     if let Some(current) = self.history.pop_back() {
                         self.push_forward_history(current);
                     }
-                    self.history.back().cloned()
+                    self.history.back().map(|entry| entry.path.clone())
                 } else {
                     None
                 }
@@ -270,19 +272,24 @@ impl SmartQueue {
         picked
     }
 
-    fn record_pick(&mut self, path: &PathBuf) {
-        self.update_stats(path);
-        if self.history.back() != Some(path) {
-            self.history.push_back(path.clone());
+    fn record_pick(&mut self, path: &std::path::Path) {
+        let entry = self.next_entry(path);
+        self.record_entry(entry);
+    }
+
+    fn record_entry(&mut self, entry: super::QueueEntry) {
+        self.update_stats(&entry.path);
+        if self.history.back() != Some(&entry) {
+            self.history.push_back(entry);
             if self.history.len() > 50 {
                 self.history.pop_front();
             }
         }
     }
 
-    fn push_forward_history(&mut self, path: PathBuf) {
-        if self.forward_history.front() != Some(&path) {
-            self.forward_history.push_front(path);
+    fn push_forward_history(&mut self, entry: super::QueueEntry) {
+        if self.forward_history.front() != Some(&entry) {
+            self.forward_history.push_front(entry);
             if self.forward_history.len() > 50 {
                 self.forward_history.pop_back();
             }
@@ -346,8 +353,9 @@ impl SmartQueue {
             {
                 continue;
             }
-            eligible += 1;
-            if rng.gen_range(0..eligible) == 0 {
+            let weight = self.excerpt_weight(path) as u64;
+            eligible += weight;
+            if rng.gen_range(0..eligible) < weight {
                 selected = Some(path.clone());
             }
         }
@@ -369,7 +377,9 @@ impl SmartQueue {
             {
                 continue;
             }
-            let weight = f64::from(self.loveit_weight_for_path(path, now)).max(f64::EPSILON);
+            let weight = (f64::from(self.loveit_weight_for_path(path, now))
+                * self.excerpt_weight(path))
+            .max(f64::EPSILON);
             total_weight += weight;
             if rng.gen_range(0.0..total_weight) < weight {
                 selected = Some(path.clone());

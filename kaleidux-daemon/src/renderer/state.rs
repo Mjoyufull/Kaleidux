@@ -15,6 +15,8 @@ impl super::Renderer {
         if content_type != crate::queue::ContentType::Video {
             self.presented_video_session_id = 0;
         }
+        self.prev_tiled_image = self.tiled_image;
+        self.tiled_image = self.tile && content_type == crate::queue::ContentType::Image;
         self.valid_content_type = content_type;
     }
 

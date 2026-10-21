@@ -5,6 +5,7 @@ use tracing::info;
 
 impl MonitorManager {
     pub async fn add_output(&mut self, name: &str, description: &str) {
+        crate::observability::privacy::register_output(name, description);
         let output_config = self.config.get_config_for_output(name, description);
         info!(
             "[ADD_OUTPUT] {}: path={:?}, behavior={:?}",

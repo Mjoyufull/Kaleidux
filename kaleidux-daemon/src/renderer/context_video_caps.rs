@@ -4,6 +4,7 @@ use ash::vk;
 use std::ffi::CStr;
 
 pub(super) fn configure(wgpu_adapter: &wgpu::Adapter) {
+    crate::video::set_renderer_vendor(wgpu_adapter.get_info().vendor);
     // SAFETY: the HAL adapter and instance stay borrowed throughout all queries.
     let result = unsafe {
         wgpu_adapter.as_hal::<wgpu_hal::vulkan::Api, _, _>(|hal_adapter_option| {

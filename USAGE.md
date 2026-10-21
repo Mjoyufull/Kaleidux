@@ -71,8 +71,6 @@ kaleidux-daemon
 # Start daemon with warning-level console and per-launch timestamped file logging
 kaleidux-daemon --log 1
 
-# Start daemon in transition demo mode (cycles current directory with 10s intervals)
-kaleidux-daemon --demo
 ```
 
 ### Basic Control
@@ -147,9 +145,27 @@ kaleidux-daemon [OPTIONS]
 | Option | Values | Default | Description |
 |---|---|---|---|
 | `--log` | `1`, `2`, `3`, `4`, `5` | Unset (`WARN` to stderr) | Diagnostic verbosity and file logging. Level 1 enables `WARN` plus per-launch timestamped file logs under `~/.config/kaleidux/logs/`. Level 2 adds `INFO`, level 3 adds `DEBUG`, level 4 adds `TRACE`, and level 5 enables `TRACE-ALL` diagnostics (forces GStreamer trace logging and 1 ms idle polling). |
-| `--demo` | Flag | `false` | Built-in transition demo. Overrides `[any].path` to current working directory, sets duration to 10 seconds, sets video ratio to 100%, sets transition duration to 1500 ms, and selects `random` transitions. |
 | `--video-mode` | `auto`, `cpu`, `cuda`, `dmabuf`, `nv12`, `rgba` | `auto` | Force the appsink memory/decode path; `cpu` also disables FFmpeg hardware decoding. Legacy aliases `cuda-strict` (maps to `cuda`) and `zero-copy` (maps to `dmabuf`) are accepted with a deprecation warning. |
 | `--video-backend` | `auto`, `ffmpeg`, `mpv`, `appsink` | `auto` | Select video decoding backend. Aliases: `gst`/`gstreamer` for `appsink`; `libmpv`/`mpv-experimental` for `mpv`; `native`/`native-experimental`/`ffmpeg-native`/`libav` for `ffmpeg`. |
+
+`--streamed` enables the experimental memory policy: smaller caches and read-ahead. It is separate from network playback. `--log-sensitive` includes paths, URLs and monitor names; identifying fields are redacted by default in daemon logs. Debug logs include technical format, dimensions, cadence and decode information, without dumping image tags or EXIF. External library diagnostics such as `GST_DEBUG` and trace-all can contain raw data.
+
+### Network Media
+
+```sh
+kldctl set 'https://example.com/wallpaper.mp4'
+kldctl set 'https://example.com/live.m3u8' -o DP-1
+kldctl set 'rtsp://camera.local/stream'
+kldctl set 'youtu.be/VIDEO_ID'
+```
+
+The normal decoder opens direct HTTP(S) and RTSP(S) media URLs. YouTube addresses are resolved by an installed `yt-dlp`; Kaleidux does not download a full video first. Resolution runs outside the display loop with bounded output, retries and runtime, and cancels when a newer selection supersedes it. Availability, authentication, seekability and codec support depend on the source and decoder. Live streams with no duration use normal playback rather than excerpts. Seeking and looping remote files require a seekable source (normally HTTP range support); MP4 files served without ranges need their index at the start for sequential playback.
+
+`KLD_YTDLP_FORMAT` selects one combined or video-only format. Its default is `best[height<=2160]/bestvideo[height<=2160]`, preferring a combined stream for audio. Separate video/audio URL pairs are rejected. `KLD_YTDLP_COOKIES_FROM_BROWSER=firefox` passes browser-cookie selection to yt-dlp. Resolution ignores the user's yt-dlp config so a download or playlist setting cannot change daemon behavior. No shell argument string is evaluated.
+
+Network support is included by default and adds no Rust dependency. To omit it, build with `--no-default-features` and select the desired display and backend features explicitly, for example `--features display-wayland,backend-ffmpeg`. The `full` and `wayland-only` bundles include `network-sources`.
+
+For Wallhaven, Reddit, Danbooru or other collections, use external download/sync tools to populate a watched wallpaper directory. Rhai can select a finished local file with `set(path)` or `set(path, output)`, and can select a supported URL through the same API. Kaleidux does not implement cloud provider APIs or run blocking download commands inside scripts.
 
 ### Backend Selection Rules and Constraints
 
@@ -225,6 +241,19 @@ kldctl prev -o DP-1
 ```
 
 `kldctl next` follows forward history if you previously stepped back using `kldctl prev` before picking new content from the pool.
+
+#### Preview and Solid Colours
+
+```sh
+kldctl preview /path/to/candidate.png -o DP-1
+kldctl preview 'https://example.com/video.mp4'
+kldctl preview-end                 # restore the original
+kldctl preview-end --apply         # keep the candidate
+kldctl colour '#1a1b26' -o all
+kldctl color '#112233ff'
+```
+
+A preview pauses the previous player and freezes slideshow selection. Cancel restores its GPU frame, queue position, remaining duration and playback state, including active pause inhibitors. Apply keeps the candidate. Finish an active preview before another selection or reload; pending original loads must settle before preview begins. Applying a candidate that is still loading returns an error so it can be retried. Colours also work as `set '#1a1b26'` or a configured `path = "colour:#1a1b26"`.
 
 #### Playback Control
 
@@ -400,6 +429,9 @@ monitor-behavior = "independent"
 | `performance` | String | `"balanced"` | Base profile: `"balanced"`, `"quality"`, `"low-power"`, or `"debug"`. |
 | `video-fps` | String | `"unlimited"` | Video frame publication cap: `"low"` (12 FPS), `"medium"` (24 FPS), `"high"` (48 FPS), or `"unlimited"`. Under `low-power` profile, defaults to `"low"`. |
 | `frame-latency` | Integer | None | Surface presentation frame latency. Defaults to 1 under `low-power`, 2 under `quality`. |
+| `long-video-excerpts` | Boolean | `true` | Give long videos multiple bounded slideshow excerpts. Applies only with more than one source. |
+| `margin` | Four nonnegative integers | `[0, 0, 0, 0]` | Physical-pixel insets: top, left, bottom, right. Unused space is black. |
+| `tile` | Boolean | `false` | Repeat images at their prepared pixel size rather than scaling to cover. Videos retain cover placement. |
 | `pause-on-fullscreen` | Boolean | `false` | Wayland-only occlusion heuristic. When `true`, steady video waits for compositor frame callbacks and freezes while occluded by a fullscreen window. Has no effect on X11. Default is `false`. |
 
 ### Output Settings Reference
@@ -408,7 +440,7 @@ Applicable within `[any]`, `[<output>]`, and `["re:<pattern>"]`:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `path` | String (Path) | None | Absolute path to directory containing wallpaper images and videos. Tilde expansion is not performed. |
+| `path` | String | None | Local media file or directory, supported media URL, or `colour:#RRGGBB`. Tilde expansion is not performed. |
 | `duration` | String (humantime) | `"5m"` | Display duration before switching (e.g., `"30s"`, `"5m"`, `"1h"`, `"2h30m"`). |
 | `video-ratio` | Integer `0..=100` | Inherited (`50`) | Probability percentage of selecting video over image. |
 | `transition` | String or Table | `{ type = "fade" }` | Transition effect and parameters. |
@@ -420,7 +452,29 @@ Applicable within `[any]`, `[<output>]`, and `["re:<pattern>"]`:
 | `performance` | String | Inherited (`"balanced"`) | Output performance profile override. |
 | `video-fps` | String | Inherited | Output video FPS profile override. |
 | `frame-latency` | Integer | Inherited | Output frame latency override. |
+| `long-video-excerpts` | Boolean | Inherited (`true`) | Enable or disable excerpt scheduling for this output. |
+| `margin` | Four nonnegative integers | Inherited | Insets in top, left, bottom, right order; applies to images and videos. |
+| `tile` | Boolean | Inherited (`false`) | Image tiling for this output. |
 | `pause-on-fullscreen` | Boolean | Inherited (`false`) | Output fullscreen pause override. |
+
+### Long Videos and Placement
+
+With a three-minute `duration`, a nine-minute video contributes three excerpt entries. A remaining partial interval rounds the entry count up; every excerpt still has the full configured length. The first starts at zero. Later entries cover later parts, with bounded random offsets up to one quarter of the excerpt length or 45 seconds, whichever is smaller. Offsets change on later slideshow cycles. Each excerpt lasts three minutes in source time and loops within its bounds. `prev` and forward history retain the exact interval; history labels show its start and end. Random and Loveit selection weight the source by its excerpt count. Plans stay compact even for very long files.
+
+This defaults on only when a video's known duration exceeds twice the configured wallpaper duration and the queue has multiple sources. Set `long-video-excerpts = false` to disable it. A pinned source or a queue containing one file plays normally. Excerpts limit the playback interval; they do not remove codec reference buffers or imply that an entire compressed file was previously decoded into VRAM.
+
+```toml
+[any]
+path = "/home/user/Pictures/Wallpapers"
+duration = "3m"
+long-video-excerpts = true
+margin = [40, 20, 20, 20] # top, left, bottom, right
+
+[DP-1]
+tile = true
+```
+
+Margins use the shared renderer on Wayland and X11. Image tiling preserves the source pixel size within the existing 8192-pixel upload safety limit. Margins shrink the content rectangle and leave a black surround. Rounded corners, borders and transparent gaps are not part of `margin`.
 
 ### Complete Configuration Example
 

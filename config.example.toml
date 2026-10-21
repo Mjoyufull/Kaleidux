@@ -34,6 +34,15 @@ video-ratio = 50
 # KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full only for compositor damage debugging.
 video-fps = "unlimited"
 
+# Split videos longer than twice the output duration into slideshow excerpts.
+# Each excerpt loops within its bounds; a queue with one file is left whole.
+long-video-excerpts = true
+
+# Insets in physical pixels: top, left, bottom, right. Unused space is black.
+margin = [0, 0, 0, 0]
+# Repeat images at their prepared pixel size instead of scaling them to cover.
+tile = false
+
 # Wayland-only power-saving heuristic. When true, steady video waits for
 # compositor frame callbacks and holds its current frame while a fullscreen
 # window occludes the wallpaper. Disabled by default so video always advances.

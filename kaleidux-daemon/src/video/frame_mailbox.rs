@@ -12,6 +12,9 @@ struct MailboxState {
     // Keep the watermark after consumption/clear: a retiring producer may
     // already be inside its callback when the replacement publishes.
     latest_sessions: HashMap<Arc<str>, u64>,
+    // A preview cancellation may explicitly restore an older live producer.
+    // Keep the high watermark so the cancelled candidate stays rejected.
+    restored_sessions: HashMap<Arc<str>, u64>,
     pending_notifications: HashSet<Arc<str>>,
     pending_since: HashMap<Arc<str>, Instant>,
 }
@@ -126,11 +129,28 @@ impl LatestFrameMailbox {
     }
 
     pub(crate) fn accepts_session(&self, source_id: &str, session_id: u64) -> bool {
-        self.state
-            .lock()
+        let state = self.state.lock();
+        if let Some(restored) = state.restored_sessions.get(source_id) {
+            return session_id == *restored
+                || state
+                    .latest_sessions
+                    .get(source_id)
+                    .is_none_or(|latest| session_id > *latest);
+        }
+        state
             .latest_sessions
             .get(source_id)
             .is_none_or(|latest| session_id >= *latest)
+    }
+
+    pub(crate) fn restore_session(&self, source_id: &str, session_id: u64) {
+        let mut state = self.state.lock();
+        state.frames.remove(source_id);
+        state.pending_notifications.remove(source_id);
+        state.pending_since.remove(source_id);
+        state
+            .restored_sessions
+            .insert(Arc::from(source_id), session_id);
     }
 
     /// Retiring a player must not discard a replacement player's pending frame.
@@ -206,6 +226,19 @@ impl LatestFrameMailbox {
 
 impl MailboxState {
     fn accept_session(&mut self, source: &Arc<str>, session: u64) -> bool {
+        if let Some(restored) = self.restored_sessions.get(source) {
+            if session == *restored {
+                return true;
+            }
+            if self
+                .latest_sessions
+                .get(source)
+                .is_some_and(|latest| session <= *latest)
+            {
+                return false;
+            }
+            self.restored_sessions.remove(source);
+        }
         let latest = self
             .latest_sessions
             .entry(source.clone())
@@ -221,6 +254,20 @@ impl MailboxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_restore_accepts_original_and_rejects_cancelled_candidate_until_a_new_generation() {
+        let mailbox = LatestFrameMailbox::new();
+        mailbox.publish_frame("panel", test_frame(10));
+        mailbox.restore_session("panel", 7);
+        mailbox.publish_frame("panel", test_frame(10));
+        assert!(!mailbox.has_pending_frame("panel"));
+        mailbox.publish_frame("panel", test_frame(7));
+        assert_eq!(mailbox.take_frame("panel").unwrap().session_id, 7);
+        mailbox.publish_frame("panel", test_frame(11));
+        mailbox.publish_frame("panel", test_frame(7));
+        assert_eq!(mailbox.take_frame("panel").unwrap().session_id, 11);
+    }
 
     fn test_frame(session_id: u64) -> VideoFrame {
         let _ = gstreamer::init();

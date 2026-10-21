@@ -77,9 +77,16 @@ fn run(
 ) -> anyhow::Result<()> {
     let interrupt_control = control.clone();
     let interrupt_stop = stopped.clone();
-    let mut input = ffmpeg::format::input_with_interrupt(uri, move || {
-        interrupt_control.is_stopped() || interrupt_stop.load(Ordering::Acquire)
-    })?;
+    let mut options = ffmpeg::Dictionary::new();
+    if uri.contains("://") {
+        options.set("rw_timeout", "10000000");
+        options.set("user_agent", "Mozilla/5.0");
+    }
+    let mut input = ffmpeg::format::input_with_interrupt_and_dictionary(
+        uri,
+        move || interrupt_control.is_stopped() || interrupt_stop.load(Ordering::Acquire),
+        options,
+    )?;
     let Some(stream) = input.streams().best(ffmpeg::media::Type::Audio) else {
         return Ok(());
     };
@@ -117,6 +124,14 @@ fn run(
         }
         if session.epoch != control.play_epoch() {
             session.restart(control)?;
+        }
+        if control.window().is_some_and(|window| {
+            session.seek_ns.saturating_add(session.cursor_ns) >= window.end_ns
+        }) {
+            // Video owns the loop epoch. Do not decode or queue audio from
+            // the following excerpt while waiting for that boundary.
+            control.wait_until(Instant::now() + Duration::from_millis(20));
+            continue;
         }
         if session.receive(control, stopped)? {
             continue;
@@ -222,11 +237,24 @@ impl AudioSession {
 
     fn push_pcm(
         &mut self,
-        converted: Vec<u8>,
+        mut converted: Vec<u8>,
         relative_pts: u64,
         control: &NativePlaybackControl,
         stopped: &AtomicBool,
     ) -> anyhow::Result<bool> {
+        if let Some(window) = control.window() {
+            let position = self.seek_ns.saturating_add(relative_pts);
+            let samples = window
+                .end_ns
+                .saturating_sub(position)
+                .saturating_mul(48_000)
+                / 1_000_000_000;
+            converted.truncate((samples as usize).saturating_mul(4));
+            if converted.is_empty() {
+                self.cursor_ns = window.end_ns.saturating_sub(self.seek_ns);
+                return Ok(true);
+            }
+        }
         // Limit decode-ahead to 50ms. Appsrc is also bounded and never blocks a
         // worker on an unresponsive sound server. Control changes interrupt pacing.
         let due = self.wall_anchor + Duration::from_nanos(relative_pts.saturating_sub(50_000_000));

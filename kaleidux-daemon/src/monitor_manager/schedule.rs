@@ -6,11 +6,14 @@ use std::time::Instant;
 
 impl MonitorManager {
     pub fn tick(&mut self) -> HashMap<String, (PathBuf, crate::queue::ContentType)> {
+        if self.preview_active {
+            return HashMap::new();
+        }
         let now = Instant::now();
         let mut changes = self.join_shared_outputs(now);
 
         // Joining retained content does not advance the slideshow or unpause it.
-        if self.is_paused() || self.power_suspended {
+        if self.is_paused() || self.power_suspended || self.preview_active {
             return changes;
         }
         match &self.config.global.monitor_behavior {

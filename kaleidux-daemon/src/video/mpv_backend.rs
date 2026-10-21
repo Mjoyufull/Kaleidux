@@ -52,6 +52,7 @@ pub struct MpvPlayer {
     metrics: Arc<PerformanceMetrics>,
     stop_requested: Arc<AtomicBool>,
     position_ns: Arc<AtomicU64>,
+    duration_ns: Arc<AtomicU64>,
     first_frame_logged: Arc<AtomicBool>,
     first_hwdec_logged: Arc<AtomicBool>,
     capture_interval: Duration,
@@ -81,6 +82,7 @@ impl MpvPlayer {
         native_target: Option<MpvNativeVideoTarget>,
         composed_target: Option<MpvComposedVideoTarget>,
         start_time: Instant,
+        playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         if MpvRenderApiRequest::from_env().enables_composed_gl() && composed_target.is_none() {
             anyhow::bail!(
@@ -101,6 +103,11 @@ impl MpvPlayer {
                 // Disabling track selection avoids decoding while muted.
             }
             init.set_option("loop-file", "inf")?;
+            if let Some(window) = playback_window {
+                init.set_option("start", (window.start_ns as f64 / 1e9).to_string())?;
+                init.set_option("ab-loop-a", (window.start_ns as f64 / 1e9).to_string())?;
+                init.set_option("ab-loop-b", (window.end_ns as f64 / 1e9).to_string())?;
+            }
             init.set_option("keep-open", "yes")?;
             init.set_option("idle", true)?;
             init.set_option("pause", true)?;
@@ -201,6 +208,7 @@ impl MpvPlayer {
         // has created the render context, and a `loadfile` issued before that
         // makes mpv drop the video track for good. Defer the load to `start`.
         mpv.observe_property("time-pos", libmpv2::Format::Double, 1)?;
+        mpv.observe_property("duration", libmpv2::Format::Double, 2)?;
         let defers_load = use_native_gl || use_composed_gl;
         let mut player = Self {
             mpv: Arc::new(mpv),
@@ -214,6 +222,7 @@ impl MpvPlayer {
             metrics,
             stop_requested: Arc::new(AtomicBool::new(false)),
             position_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            duration_ns: Arc::new(AtomicU64::new(0)),
             first_frame_logged: Arc::new(AtomicBool::new(false)),
             first_hwdec_logged: Arc::new(AtomicBool::new(false)),
             capture_interval: Duration::from_nanos(1_000_000_000u64 / capture_fps as u64),
@@ -383,6 +392,40 @@ impl MpvPlayer {
             )
         };
         anyhow::ensure!(result >= 0, "libmpv pause request failed: {result}");
+        Ok(())
+    }
+
+    pub fn duration_ns(&self) -> Option<u64> {
+        let duration = self.duration_ns.load(Ordering::Acquire);
+        (duration > 0).then_some(duration)
+    }
+
+    pub fn set_playback_window(
+        &self,
+        window: crate::media_source::PlaybackWindow,
+    ) -> anyhow::Result<()> {
+        for (name, nanoseconds) in [
+            (c"ab-loop-a", window.start_ns),
+            (c"ab-loop-b", window.end_ns),
+            (c"start", window.start_ns),
+        ] {
+            let value = std::ffi::CString::new((nanoseconds as f64 / 1e9).to_string())?;
+            let mut pointer = value.as_ptr();
+            // SAFETY: mpv copies the string value during this call. Async
+            // properties avoid waiting for core/render coordination while a
+            // prepared GL player is not yet installed in the display loop.
+            let result = unsafe {
+                sys::mpv_set_property_async(
+                    self.mpv.ctx.as_ptr(),
+                    0,
+                    name.as_ptr(),
+                    sys::mpv_format_MPV_FORMAT_STRING,
+                    (&mut pointer as *mut *const libc::c_char).cast(),
+                )
+            };
+            anyhow::ensure!(result >= 0, "libmpv loop property request failed: {result}");
+        }
+        self.seek_to_position_ns(window.start_ns)?;
         Ok(())
     }
 

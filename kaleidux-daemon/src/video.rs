@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::metrics::PerformanceMetrics;
+pub(crate) use capabilities::set_renderer_vendor;
 
 #[path = "video/capabilities.rs"]
 mod capabilities;
@@ -56,6 +57,9 @@ mod native_backend;
 pub use appsink::frame_decode_path_label;
 pub(crate) use mpv_native::MpvRenderApiRequest;
 pub use mpv_native::{MpvComposedVideoTarget, MpvNativeVideoTarget};
+#[path = "video/excerpts.rs"]
+mod excerpts;
+
 #[path = "video/lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::{AppsinkQueueLevels, VideoPrebufferProfile, VideoPrebufferResult};
@@ -216,6 +220,7 @@ pub struct VideoPlayer {
     decode_path_logged: Arc<AtomicBool>,
     accept_samples: Arc<AtomicBool>,
     pending_start_position_ns: Option<u64>,
+    playback_window: Option<crate::media_source::PlaybackWindow>,
     appsink_import_recovery_enabled: bool,
 }
 
@@ -268,6 +273,7 @@ impl VideoPlayer {
         render_size: Option<(u32, u32)>,
         mpv_native_target: Option<MpvNativeVideoTarget>,
         mpv_composed_target: Option<MpvComposedVideoTarget>,
+        playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         let creation_start = std::time::Instant::now();
         let mut resolved_backend_request = resolve_video_backend_request(backend_request);
@@ -298,6 +304,7 @@ impl VideoPlayer {
                 decode_group_id,
                 max_publish_fps,
                 creation_start,
+                playback_window,
             );
             match native_result {
                 // Asynchronous initialization is checked by prebuffer before
@@ -337,6 +344,7 @@ impl VideoPlayer {
                 mpv_native_target.clone(),
                 mpv_composed_target.clone(),
                 creation_start,
+                playback_window,
             );
             match mpv_result {
                 Ok(player) => return Ok(player),
@@ -368,6 +376,20 @@ impl VideoPlayer {
         let audio_enabled = audio_enabled_for_volume(volume);
         pipeline.set_property_from_str("flags", playbin_flags_for_volume(volume));
         pipeline.set_property("message-forward", true);
+        pipeline.connect("source-setup", false, |values| {
+            if let Ok(source) = values[1].get::<gst::Element>() {
+                if source.find_property("user-agent").is_some() {
+                    source.set_property("user-agent", "Mozilla/5.0");
+                }
+                if source
+                    .find_property("timeout")
+                    .is_some_and(|property| property.value_type() == u32::static_type())
+                {
+                    source.set_property("timeout", 10u32);
+                }
+            }
+            None
+        });
         if crate::media_policy::streamed() {
             // Applies if the source enables buffering; local-file appsink
             // frame queues already stay at one buffer in either policy.
@@ -455,6 +477,7 @@ impl VideoPlayer {
             decode_path_logged,
             accept_samples,
             pending_start_position_ns: None,
+            playback_window,
             appsink_import_recovery_enabled,
         };
         player.log_backend_snapshot("created");
@@ -475,6 +498,7 @@ impl VideoPlayer {
         mpv_native_target: Option<MpvNativeVideoTarget>,
         mpv_composed_target: Option<MpvComposedVideoTarget>,
         creation_start: std::time::Instant,
+        playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         let mpv = mpv_backend::MpvPlayer::new(
             uri,
@@ -489,6 +513,7 @@ impl VideoPlayer {
             mpv_native_target,
             mpv_composed_target,
             creation_start,
+            playback_window,
         )?;
         let backend_kind = VideoBackendKind::Mpv;
         metrics.record_video_backend_session(backend_kind);
@@ -510,6 +535,7 @@ impl VideoPlayer {
             decode_path_logged: Arc::new(AtomicBool::new(false)),
             accept_samples: Arc::new(AtomicBool::new(true)),
             pending_start_position_ns: None,
+            playback_window,
             appsink_import_recovery_enabled: false,
         };
         player.log_backend_snapshot("created");
@@ -528,6 +554,7 @@ impl VideoPlayer {
         decode_group_id: Option<u64>,
         max_publish_fps: Option<u32>,
         creation_start: std::time::Instant,
+        playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
         let native = native_backend::NativePlayer::new(
             uri,
@@ -540,6 +567,7 @@ impl VideoPlayer {
             decode_group_id,
             max_publish_fps,
             creation_start,
+            playback_window,
         )?;
         let backend_kind = VideoBackendKind::Ffmpeg;
         metrics.record_video_backend_session(backend_kind);
@@ -561,6 +589,7 @@ impl VideoPlayer {
             decode_path_logged: Arc::new(AtomicBool::new(false)),
             accept_samples: Arc::new(AtomicBool::new(true)),
             pending_start_position_ns: None,
+            playback_window,
             appsink_import_recovery_enabled: false,
         };
         player.log_backend_snapshot("created");
