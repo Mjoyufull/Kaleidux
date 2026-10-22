@@ -239,6 +239,43 @@ async fn unplugging_owner_restarts_discovery_with_survivors_configuration() {
 }
 
 #[tokio::test]
+async fn cancelling_preview_starts_discovery_for_a_new_configured_peer() {
+    for grouped in [false, true] {
+        let (mut manager, root, image) = fixture();
+        manager.config.any.path = None;
+        manager.config.outputs.insert(
+            "DP-2".into(),
+            crate::orchestration::PartialOutputConfig {
+                path: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        manager.config.global.monitor_behavior = if grouped {
+            MonitorBehavior::Grouped(vec![vec!["DP-1".into(), "DP-2".into()]])
+        } else {
+            MonitorBehavior::Synchronized
+        };
+        manager.add_output_deferred("DP-1", "pathless output");
+        let snapshot = manager.snapshot_queues();
+        manager.begin_preview();
+        manager
+            .prepare_media_selection("#112233", &Some("DP-1".into()), Some(false))
+            .unwrap();
+        assert!(!manager.handle_next(Some("DP-1".into())).is_empty());
+        manager.add_output_deferred("DP-2", "configured output");
+        assert!(manager.pending_output_queues.tasks.is_empty());
+        manager.end_preview(snapshot, false);
+        assert_eq!(manager.pending_output_queues.tasks.len(), 1);
+        finish(&mut manager).await;
+        let changes = manager.handle_next(None);
+        assert_eq!(changes["DP-1"].0, image);
+        assert_eq!(changes["DP-2"].0, image);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn only_synchronized_or_grouped_peers_share_playback() {
     let (mut manager, root, _) = fixture();
     assert!(!manager.shares_playback_with("DP-1", "DP-2"));

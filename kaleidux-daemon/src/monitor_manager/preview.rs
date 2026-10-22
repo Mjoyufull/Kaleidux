@@ -112,6 +112,9 @@ impl MonitorManager {
             }
         }
         self.finish_preview_cohorts(snapshot, &surviving, apply, now);
+        // A temporary preview queue may have suppressed discovery when a new
+        // peer connected. Restoring queue absence must admit that work again.
+        self.start_missing_output_queues();
     }
 
     fn finish_preview_cohorts(

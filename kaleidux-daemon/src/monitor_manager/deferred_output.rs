@@ -63,6 +63,17 @@ impl MonitorManager {
         }
     }
 
+    pub(super) fn start_missing_output_queues(&mut self) {
+        let targets: std::collections::HashSet<_> = self
+            .outputs
+            .keys()
+            .map(|name| self.queue_target(name))
+            .collect();
+        for target in targets {
+            self.start_output_queue(target);
+        }
+    }
+
     fn queue_owner(&self, target: &ManualQueueTarget) -> Option<&OutputOrchestrator> {
         if matches!(target, ManualQueueTarget::Shared)
             && !matches!(

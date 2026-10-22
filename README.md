@@ -236,16 +236,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 
 ## Credits
 
-- [kacau](https://codeberg.org/touto/kacau) — preview and orchestration references
-- [Phonto](https://github.com/museslabs/phonto) — external yt-dlp stream resolution
-- [WayWal](https://github.com/Execorn/wwal) — performance and event-loop reference
-- [waul](https://github.com/hoppxi/waul) — wallpaper margins and styling reference
-- [gesso](https://github.com/saltnpepper97/gesso) — solid-colour command reference
-- [feh](https://feh.finalrewind.org/) — image placement and tiling reference
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — optional external hosted-video resolver
-- [FFmpeg](https://ffmpeg.org/) — native media decoding
-- [mpv](https://mpv.io/) — composed video playback
-- [WiVRn](https://github.com/WiVRn/WiVRn) — Vulkan video architecture reference
 - [gSlapper](https://github.com/Nomadcxx/gSlapper)
 - [wpaperd](https://github.com/danyspin97/wpaperd)
 - [mpvpaper](https://github.com/GhostNaN/mpvpaper)
@@ -253,6 +243,16 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [Clapper](https://github.com/Rafostar/clapper)
 - [swww](https://github.com/Horus645/swww)
 - [Yin](https://github.com/saverinonrails/yin), a useful modern comparison
+- [kacau](https://codeberg.org/touto/kacau)
+- [Phonto](https://github.com/museslabs/phonto), for YouTube support
+- [WayWal](https://github.com/Execorn/wwal)
+- [waul](https://github.com/hoppxi/waul)
+- [gesso](https://github.com/saltnpepper97/gesso)
+- [feh](https://feh.finalrewind.org/)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [FFmpeg](https://ffmpeg.org/)
+- [mpv](https://mpv.io/)
+- [WiVRn](https://github.com/WiVRn/WiVRn)
 
 ## License
 
