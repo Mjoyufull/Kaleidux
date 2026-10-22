@@ -53,6 +53,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show a candidate while preserving the current wallpaper and queue
+    Preview {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Restore the original wallpaper, or keep the preview with --apply
+    PreviewEnd {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Set a solid wallpaper colour (#RRGGBB or #RRGGBBAA)
+    #[command(name = "colour", alias = "color")]
+    Colour {
+        colour: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Jump to a wallpaper inside the slideshow directory
+    Jump {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Insert an image or video into the queue and display it now
+    Set {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Display an image or video from the slideshow or an external path
+    Img {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Show current daemon status and playback state
     #[command(visible_alias = "st")]
     Status,
@@ -60,7 +96,7 @@ enum Commands {
     /// Switch to the next wallpaper in the queue
     #[command(visible_alias = "n")]
     Next {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -68,7 +104,7 @@ enum Commands {
     /// Switch to the previous wallpaper (if history exists)
     #[command(visible_alias = "p")]
     Prev {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -96,11 +132,29 @@ enum Commands {
     #[command(visible_alias = "ll")]
     Lovelist,
 
-    /// Pause video playback (images unaffected)
+    /// Pause video playback and automatic wallpaper rotation
     Pause,
 
-    /// Resume video playback
+    /// Clear manual pause (named inhibitors still apply)
     Resume,
+
+    /// Inhibit wallpaper playback with a named reason
+    Inhibit {
+        /// Reason for inhibiting playback
+        reason: String,
+    },
+
+    /// Uninhibit wallpaper playback for a named reason
+    Uninhibit {
+        /// Reason to remove
+        reason: String,
+    },
+
+    /// List active pause inhibitors
+    Inhibitors {
+        #[command(subcommand)]
+        command: Option<InhibitorSubcommand>,
+    },
 
     /// Stop the current wallpaper
     Stop,
@@ -121,7 +175,7 @@ enum Commands {
 
     /// Clear wallpaper on output(s) - show black screen
     Clear {
-        /// Target output or omit for all
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -138,9 +192,13 @@ enum Commands {
         command: BlacklistSubcommand,
     },
 
+    /// Dump current performance counters from the daemon
+    #[command(name = "perf-snapshot")]
+    PerfSnapshot,
+
     /// Show recently played wallpapers
     History {
-        /// Target output (omit for default/all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -169,6 +227,12 @@ enum BlacklistSubcommand {
     /// Remove a file from the blacklist
     Remove { path: String },
     /// List blacklisted files
+    List,
+}
+
+#[derive(Subcommand)]
+enum InhibitorSubcommand {
+    /// List active pause inhibitors
     List,
 }
 
@@ -203,14 +267,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let request = match cli.command {
+        Commands::Preview { path, output } => Request::Preview {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::PreviewEnd { apply } => Request::PreviewEnd { apply },
+        Commands::Colour { colour, output } => Request::Set {
+            path: format!("colour:{colour}"),
+            output,
+        },
         Commands::Status => Request::QueryOutputs,
         Commands::Next { output } => Request::Next { output },
+        Commands::Jump { path, output } => Request::Jump {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::Set { path, output } => Request::Set {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::Img { path, output } => Request::Img {
+            path: media_locator(path)?,
+            output,
+        },
         Commands::Prev { output } => Request::Prev { output },
         Commands::Love { path, multiplier } => Request::Love { path, multiplier },
         Commands::Unlove { path } => Request::Unlove { path },
         Commands::Lovelist => Request::LoveitList,
         Commands::Pause => Request::Pause,
         Commands::Resume => Request::Resume,
+        Commands::Inhibit { reason } => Request::Inhibit { reason },
+        Commands::Uninhibit { reason } => Request::Uninhibit { reason },
+        Commands::Inhibitors { .. } => Request::Inhibitors,
         Commands::Stop => Request::Stop,
         Commands::Query => Request::QueryOutputs,
         Commands::Reload => Request::Reload,
@@ -242,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
             BlacklistSubcommand::List => kaleidux_common::BlacklistCommand::List,
         }),
         Commands::History { output } => Request::History { output },
+        Commands::PerfSnapshot => Request::PerfSnapshot,
     };
 
     // Determine socket path (use provided or default)
@@ -295,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             }
                         }
-                        Response::Error(e) => eprintln!("Error: {}", e),
+                        Response::Error(e) => anyhow::bail!("{e}"),
                         Response::Ok => println!("OK"),
                         Response::Playlists(names) => {
                             println!("Playlists:");
@@ -315,6 +404,13 @@ async fn main() -> anyhow::Result<()> {
                                 println!(" {:>2}. {}", i + 1, path);
                             }
                         }
+                        Response::PerfSnapshot(snapshot) => println!("{}", snapshot),
+                        Response::Inhibitors(reasons) => {
+                            println!("Inhibitors:");
+                            for reason in reasons {
+                                println!(" - {}", reason);
+                            }
+                        }
                     }
                 } else {
                     println!("{}", response);
@@ -331,4 +427,67 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn media_locator(path: std::path::PathBuf) -> anyhow::Result<String> {
+    let input = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Media source must be UTF-8"))?;
+    if input.contains("://")
+        || input.starts_with('#')
+        || input.starts_with("colour:")
+        || input.starts_with("color:")
+        || [
+            "youtube.com/",
+            "www.youtube.com/",
+            "m.youtube.com/",
+            "youtu.be/",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+    {
+        return Ok(input.to_owned());
+    }
+    Ok(std::fs::canonicalize(path)?.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_inhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibit", "game"]).expect("parse inhibit");
+        match cli.command {
+            Commands::Inhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_uninhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "uninhibit", "game"]).expect("parse uninhibit");
+        match cli.command {
+            Commands::Uninhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_inhibitors_command_default_and_list() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibitors"]).expect("parse inhibitors");
+        match cli.command {
+            Commands::Inhibitors { command } => assert!(command.is_none()),
+            _ => panic!("wrong command parsed"),
+        }
+
+        let cli_list =
+            Cli::try_parse_from(["kldctl", "inhibitors", "list"]).expect("parse inhibitors list");
+        match cli_list.command {
+            Commands::Inhibitors { command } => {
+                assert!(matches!(command, Some(InhibitorSubcommand::List)))
+            }
+            _ => panic!("wrong command parsed"),
+        }
+    }
 }

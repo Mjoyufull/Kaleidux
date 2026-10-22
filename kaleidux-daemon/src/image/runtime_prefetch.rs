@@ -1,0 +1,154 @@
+//! Schedules cancellable lookahead work through shared image admission and cache budgets.
+
+use crate::background::{self, BackgroundWorkKind};
+use crate::image::prefetch::ImagePrefetchRequest;
+use crate::image::runtime_cache::request_prepared_image_payload;
+use crate::metrics;
+use parking_lot::Mutex as ParkingMutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tracing::debug;
+
+static IMAGE_PREFETCH_GENERATIONS: once_cell::sync::Lazy<ParkingMutex<HashMap<String, u64>>> =
+    once_cell::sync::Lazy::new(|| ParkingMutex::new(HashMap::new()));
+static NEXT_IMAGE_PREFETCH_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn begin_image_prefetch_generation(name: &str) -> u64 {
+    let mut generations = IMAGE_PREFETCH_GENERATIONS.lock();
+    let next_generation = NEXT_IMAGE_PREFETCH_GENERATION.fetch_add(1, Ordering::Relaxed);
+    generations.insert(name.to_string(), next_generation);
+    next_generation
+}
+
+pub(crate) fn image_prefetch_generation_matches(name: &str, generation: u64) -> bool {
+    IMAGE_PREFETCH_GENERATIONS
+        .lock()
+        .get(name)
+        .copied()
+        .unwrap_or(0)
+        == generation
+}
+
+pub(crate) fn remove_image_prefetch_generation(name: &str) {
+    IMAGE_PREFETCH_GENERATIONS.lock().remove(name);
+}
+
+pub(crate) fn schedule_image_prefetch_plan(
+    trigger_output: &str,
+    generation: u64,
+    requests: Vec<ImagePrefetchRequest>,
+    metrics: Arc<metrics::PerformanceMetrics>,
+) {
+    if crate::media_policy::streamed()
+        || requests.is_empty()
+        || !background::is_accepting_new_work()
+    {
+        return;
+    }
+
+    let output_name = trigger_output.to_string();
+    tokio::spawn(warm_plan(output_name, generation, requests, metrics));
+}
+
+async fn warm_plan(
+    output_name: String,
+    generation: u64,
+    requests: Vec<ImagePrefetchRequest>,
+    metrics: Arc<metrics::PerformanceMetrics>,
+) {
+    // Probe cold/current descriptors off the display loop before spending
+    // speculative bytes. Cover sizing can exceed the output's dimensions.
+    let mut remaining = (super::runtime_cache::PREPARED_IMAGE_MEMORY_CACHE_MAX_BYTES / 2) as u64;
+    for request in requests {
+        if !background::is_accepting_new_work() {
+            return;
+        }
+        if !image_prefetch_generation_matches(&output_name, generation) {
+            debug!(
+                "[PREFETCH] {}: Aborting superseded prefetch plan generation {}",
+                output_name, generation
+            );
+            return;
+        }
+
+        let Ok(Some(descriptor)) = super::runtime_probe::probe_descriptor(
+            &request.path,
+            BackgroundWorkKind::ImagePrefetch,
+        )
+        .await
+        else {
+            continue;
+        };
+        let (width, height) = super::runtime_cache::prepared_target_dimensions_from_descriptor(
+            &descriptor,
+            request.target_width,
+            request.target_height,
+        );
+        if !super::prefetch::admit_prepared_bytes(&mut remaining, width, height) {
+            continue;
+        }
+        if !image_prefetch_generation_matches(&output_name, generation) {
+            return;
+        }
+        warm_request(&output_name, request, &metrics).await;
+    }
+}
+
+async fn warm_request(
+    output_name: &str,
+    request: ImagePrefetchRequest,
+    metrics: &Arc<metrics::PerformanceMetrics>,
+) {
+    let prefetch_start = Instant::now();
+    match request_prepared_image_payload(
+        &request.path,
+        request.target_width,
+        request.target_height,
+        BackgroundWorkKind::ImagePrefetch,
+        usize::MAX,
+        metrics,
+    )
+    .await
+    {
+        Ok(payload) => debug!(
+            "[PREFETCH] {} -> {}: Warmed {} ({}) as {} {}x{} in {:.1}ms",
+            output_name,
+            request.target_output,
+            request.path.display(),
+            request.reason,
+            payload.profile.format,
+            payload.width,
+            payload.height,
+            prefetch_start.elapsed().as_secs_f64() * 1000.0
+        ),
+        Err(e) => debug!(
+            "[PREFETCH] {} -> {}: Failed to warm {} ({}): {}",
+            output_name,
+            request.target_output,
+            request.path.display(),
+            request.reason,
+            e
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_teardown_removes_prefetch_generation() {
+        let output = "KLD-PREFETCH-TEARDOWN-TEST";
+        let generation = begin_image_prefetch_generation(output);
+        assert!(image_prefetch_generation_matches(output, generation));
+        remove_image_prefetch_generation(output);
+        assert!(!image_prefetch_generation_matches(output, generation));
+
+        let replacement_generation = begin_image_prefetch_generation(output);
+        assert_ne!(replacement_generation, generation);
+        assert!(!image_prefetch_generation_matches(output, generation));
+        remove_image_prefetch_generation(output);
+    }
+}

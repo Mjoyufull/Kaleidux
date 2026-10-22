@@ -1,4 +1,4 @@
-.TH KALEIDUX-DAEMON 1 "JANUARY 2026" "0.0.1-kneecap" "Kaleidux Manual"
+.TH KALEIDUX-DAEMON 1 "OCTOBER 2026" "0.0.1-kneecap" "Kaleidux Manual"
 .SH NAME
 kaleidux-daemon \- High-performance hardware-accelerated wallpaper daemon
 .SH SYNOPSIS
@@ -6,20 +6,41 @@ kaleidux-daemon \- High-performance hardware-accelerated wallpaper daemon
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B kaleidux-daemon
-is a sophisticated wallpaper daemon for Wayland and X11 that specializes in smooth, hardware-accelerated transitions. It provides seamless blending between high-resolution images and videos using WGPU and GStreamer.
+displays images and looping videos on Wayland and X11, with transitions and hardware decoding when available. Video playback uses FFmpeg, libmpv, or GStreamer appsink.
 .SH OPTIONS
 .TP
-.B \-v, \-\-version
-Show version information.
+.B \-\-video-backend \fI<BACKEND>\fR
+Select auto, ffmpeg, mpv, or appsink. Auto tries FFmpeg, then mpv, then appsink. An explicitly selected backend reports failures instead of switching backends.
 .TP
-.B \-\-demo
-Start the daemon in demo mode, cycling through built-in transitions and sample content.
+.B \-\-video-mode \fI<MODE>\fR
+Select auto, cpu, cuda, dmabuf, nv12, or rgba. CPU mode disables hardware decoding in FFmpeg and appsink. Other explicit modes require appsink; explicit modes cannot be combined with mpv.
 .TP
 .B \-\-log \fI<LOG>\fR
-Set the logging verbosity (e.g., debug, info, warn) or specify a log file destination.
+Set diagnostic verbosity from 1 (warnings) through 5 (trace-all). Level 4 includes performance diagnostics and adds monitoring overhead.
 .TP
 .B \-h, \-\-help
 Print help information.
+.TP
+.B \-\-streamed
+Enable the experimental memory policy with smaller media caches and read-ahead. Source cadence and hardware decoding are preserved.
+.TP
+.B \-\-log-sensitive
+Include identifying paths, URLs and monitor names in diagnostic logs. These fields are redacted by default.
+.SH CONFIGURATION
+The global main-monitor option selects the default command output. Its default, auto, chooses the largest active pixel area, then the first name in lexical order. kldctl's \-o all targets every output.
+.PP
+Set volume from 0 to 100 for audio on any video backend. Zero disables audio decoding.
+.PP
+long-video-excerpts defaults to true. Videos longer than twice the output duration receive multiple bounded slideshow excerpts when the queue has more than one source. Each excerpt loops within its interval. Set false to play whole files.
+.PP
+margin is an array of physical-pixel insets in top, left, bottom, right order. tile repeats images at their prepared pixel size. Both work on Wayland and X11.
+.SH ENVIRONMENT
+.TP
+.B KLD_NATIVE_HWDECODER
+FFmpeg decoder preference: auto, software, vulkan, vaapi, nvdec, or another available platform API. Unavailable hardware falls back to supported candidates and then software.
+.TP
+.B WGPU_BACKEND
+Rendering API selection, such as vulkan or gl. This does not select the video decoder.
 .SH FILES
 .TP
 .I ~/.config/kaleidux/config.toml
