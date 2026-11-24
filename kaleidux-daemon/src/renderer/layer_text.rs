@@ -1,7 +1,7 @@
 //! Builds a small text overlay from printable ASCII glyphs.
 //!
 //! Glyphs are the public-domain VGA font from font8x8 by Daniel Hepper,
-//! based on Marcel Sondaar and IBM. https://github.com/dhepper/font8x8
+//! based on Marcel Sondaar and IBM. <https://github.com/dhepper/font8x8>
 
 use std::fmt::Write;
 
