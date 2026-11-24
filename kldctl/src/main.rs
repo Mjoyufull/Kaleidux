@@ -57,7 +57,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Replace this output's shader stack (no arguments clears)
-    #[command(name = "shader", visible_alias = "filter")]
+    #[command(name = "shader", alias = "filter")]
     Filter {
         layers: Vec<String>,
         /// Idle animation rate; zero waits for new wallpaper frames
@@ -134,7 +134,7 @@ enum Commands {
         #[arg(long, value_name = "PNG", conflicts_with = "transition")]
         reveal_map: Option<std::path::PathBuf>,
         /// Built-in transition name or custom:NAME for this switch
-        #[arg(long = "transhader", visible_alias = "transition", value_name = "NAME")]
+        #[arg(long = "transhader", alias = "transition", value_name = "NAME")]
         transition: Option<String>,
     },
     /// Open a local Wallpaper Engine project, package or installed Workshop item

@@ -1,4 +1,4 @@
-//! Local IPC for ordered wallpaper filters and screen-space morphs.
+//! Local IPC for ordered wallpaper shaders and screen-space morphs.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ pub const LAYER_FPS_UNLIMITED: u16 = u16::MAX;
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerStage {
-    #[serde(alias = "shader")]
+    #[serde(rename = "shader", alias = "filter")]
     Filter,
     Morph,
     Wallpaper,
@@ -32,8 +32,10 @@ pub struct LayerSelection {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct OutputLayers {
     pub output: String,
+    #[serde(rename = "shaders", alias = "filters")]
     pub filters: Vec<String>,
     pub morphs: Vec<String>,
+    #[serde(rename = "shader_fps", alias = "filter_fps")]
     pub filter_fps: u16,
     pub morph_fps: u16,
     pub wallpaper: Vec<String>,

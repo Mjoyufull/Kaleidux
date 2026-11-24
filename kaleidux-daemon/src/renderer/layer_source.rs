@@ -329,17 +329,24 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
         "Use a layer name or an absolute .wgsl file path"
     );
     let directory = match stage {
-        LayerStage::Filter => "filters",
+        LayerStage::Filter | LayerStage::Wallpaper => "shaders",
         LayerStage::Morph => "morphs",
-        LayerStage::Wallpaper => "shaders",
     };
-    let root = dirs::config_dir().context("Missing configuration directory")?;
-    read_shader(
-        &root
-            .join("kaleidux")
-            .join(directory)
-            .join(format!("{name}.wgsl")),
-    )
+    let root = dirs::config_dir()
+        .context("Missing configuration directory")?
+        .join("kaleidux");
+    let file = format!("{name}.wgsl");
+    match read_shader(&root.join(directory).join(&file)) {
+        Err(error)
+            if stage == LayerStage::Filter
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            read_shader(&root.join("filters").join(file))
+        }
+        source => source,
+    }
 }
 
 pub(crate) fn is_shader_file(path: &Path) -> bool {

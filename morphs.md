@@ -57,7 +57,7 @@ background can be omitted. See [reactive.kldscene.toml](./examples/scenes/reacti
 
 Use local `.wgsl`, `.frag`, `.glsl`, `.fs` or `.fsh` files. The
 `set` and `shader-wallpaper` commands can display a shader on its own.
-Named WGSL effects live in `$XDG_CONFIG_HOME/kaleidux/filters/` and morphs
+Named WGSL effects live in `$XDG_CONFIG_HOME/kaleidux/shaders/` and morphs
 in `$XDG_CONFIG_HOME/kaleidux/morphs/`.
 
 ```wgsl
