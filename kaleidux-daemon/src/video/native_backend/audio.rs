@@ -63,6 +63,9 @@ struct AudioSession {
     output: output::AudioOutput,
     stream_index: usize,
     time_base: ffmpeg::Rational,
+    network: bool,
+    sequential: bool,
+    source_anchor_ns: Option<u64>,
     epoch: u64,
     seek_ns: u64,
     cursor_ns: u64,
@@ -78,7 +81,8 @@ fn run(
     let interrupt_control = control.clone();
     let interrupt_stop = stopped.clone();
     let mut options = ffmpeg::Dictionary::new();
-    if uri.contains("://") {
+    let network = uri.contains("://");
+    if network {
         options.set("rw_timeout", "10000000");
         options.set("user_agent", "Mozilla/5.0");
     }
@@ -96,6 +100,7 @@ fn run(
         .decoder()
         .audio()?;
     super::decode::discard_unselected_streams(&mut input, stream_index);
+    let sequential = network && input.duration() <= 0;
     let mut session = AudioSession {
         input,
         decoder,
@@ -103,6 +108,9 @@ fn run(
         output: output::AudioOutput::new()?,
         stream_index,
         time_base,
+        network,
+        sequential,
+        source_anchor_ns: None,
         epoch: u64::MAX,
         seek_ns: 0,
         cursor_ns: 0,
@@ -164,13 +172,26 @@ fn run(
 impl AudioSession {
     fn restart(&mut self, control: &NativePlaybackControl) -> anyhow::Result<()> {
         self.seek_ns = control.position_ns();
-        self.input
-            .seek((self.seek_ns / 1000).min(i64::MAX as u64) as i64, ..)?;
-        self.decoder.flush();
+        if !self.sequential {
+            match self
+                .input
+                .seek((self.seek_ns / 1000).min(i64::MAX as u64) as i64, ..)
+            {
+                Ok(()) => {
+                    self.decoder.flush();
+                    self.eof = false;
+                }
+                Err(error) if self.network => {
+                    tracing::debug!("[NATIVE-AUDIO] Using sequential playback: {error}");
+                    self.sequential = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.resampler = None;
+        self.source_anchor_ns = None;
         self.cursor_ns = 0;
         self.wall_anchor = Instant::now();
-        self.eof = false;
         self.epoch = control.play_epoch();
         tracing::debug!(
             "[NATIVE-AUDIO] reset epoch={} position_ns={}",
@@ -211,10 +232,17 @@ impl AudioSession {
             }
             Err(error) => return Err(error.into()),
         }
-        let pts_ns = decoded
+        let source_pts_ns = decoded
             .pts()
-            .and_then(|pts| super::decode::timestamp_to_ns(pts, self.time_base))
-            .unwrap_or(self.seek_ns + self.cursor_ns);
+            .and_then(|pts| super::decode::timestamp_to_ns(pts, self.time_base));
+        let pts_ns = match source_pts_ns {
+            Some(pts) if self.sequential => {
+                let anchor = *self.source_anchor_ns.get_or_insert(pts);
+                self.seek_ns.saturating_add(pts.saturating_sub(anchor))
+            }
+            Some(pts) => pts,
+            None => self.seek_ns.saturating_add(self.cursor_ns),
+        };
         let frame_end = pts_ns.saturating_add(
             decoded.samples() as u64 * 1_000_000_000 / u64::from(decoded.rate().max(1)),
         );
