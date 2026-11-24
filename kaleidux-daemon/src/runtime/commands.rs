@@ -161,6 +161,14 @@ pub(crate) async fn handle_command(
     let mut starting_preview = None;
     let req = match req {
         Request::Preview { path, output } => {
+            if video_players.iter().any(|(name, player)| {
+                player.renders_natively()
+                    && output.as_ref().is_none_or(|target| {
+                        target == name || monitor_manager.shares_playback_with(target, name)
+                    })
+            }) {
+                return Response::Error("Preview requires composed libmpv playback".into());
+            }
             if !pending_video_switches.is_empty()
                 || renderers
                     .values()
