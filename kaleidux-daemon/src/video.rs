@@ -60,6 +60,16 @@ pub use mpv_native::{MpvComposedVideoTarget, MpvNativeVideoTarget};
 #[path = "video/excerpts.rs"]
 mod excerpts;
 
+#[path = "video/gif.rs"]
+mod gif;
+pub(crate) use gif::{GifOptions, is_gif_path};
+#[path = "video/canvas.rs"]
+mod canvas;
+pub(crate) use canvas::CanvasSource;
+#[path = "video/web.rs"]
+mod web;
+pub(crate) use web::is_web_path;
+
 #[path = "video/lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::{AppsinkQueueLevels, VideoPrebufferProfile, VideoPrebufferResult};
@@ -208,6 +218,7 @@ pub struct VideoPlayer {
     appsink: Option<gst_app::AppSink>,
     mpv: Option<mpv_backend::MpvPlayer>,
     native: Option<native_backend::NativePlayer>,
+    canvas: Option<canvas::CanvasPlayer>,
     backend_kind: VideoBackendKind,
     is_running: Arc<AtomicBool>,
     bus_watch: Option<BusWatchHandle>,
@@ -234,6 +245,8 @@ impl VideoPlayer {
             VideoBackendKind::Appsink => "appsink",
             VideoBackendKind::Mpv => "mpv",
             VideoBackendKind::Ffmpeg => "ffmpeg",
+            VideoBackendKind::Gif => "gif",
+            VideoBackendKind::Web => "web",
         }
     }
 
@@ -465,6 +478,7 @@ impl VideoPlayer {
             appsink: Some(appsink),
             mpv: None,
             native: None,
+            canvas: None,
             backend_kind,
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
@@ -523,6 +537,7 @@ impl VideoPlayer {
             appsink: None,
             mpv: Some(mpv),
             native: None,
+            canvas: None,
             backend_kind,
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
@@ -577,6 +592,7 @@ impl VideoPlayer {
             appsink: None,
             mpv: None,
             native: Some(native),
+            canvas: None,
             backend_kind,
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
@@ -594,6 +610,58 @@ impl VideoPlayer {
         };
         player.log_backend_snapshot("created");
         Ok(player)
+    }
+
+    pub(crate) fn new_canvas(
+        path: &std::path::Path,
+        source_id: Arc<String>,
+        session_id: u64,
+        frame_mailbox: LatestFrameMailbox,
+        player_event_tx: tokio::sync::mpsc::Sender<PlayerEvent>,
+        kind: CanvasSource,
+        size: Option<(u32, u32)>,
+        fps: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        let canvas = canvas::CanvasPlayer::open(
+            path.to_owned(),
+            Arc::from(source_id.as_str()),
+            session_id,
+            frame_mailbox.clone(),
+            kind,
+            size,
+            fps,
+        )?;
+        let player = Self {
+            source_uri: path.to_string_lossy().into_owned(),
+            pipeline: None,
+            appsink: None,
+            mpv: None,
+            native: None,
+            canvas: Some(canvas),
+            backend_kind: match kind {
+                CanvasSource::Gif(_) => VideoBackendKind::Gif,
+                CanvasSource::Web => VideoBackendKind::Web,
+            },
+            is_running: Arc::new(AtomicBool::new(false)),
+            bus_watch: None,
+            frame_mailbox,
+            player_event_tx,
+            source_id,
+            session_id,
+            start_time: std::time::Instant::now(),
+            first_frame_logged: Arc::new(AtomicBool::new(false)),
+            decode_path_logged: Arc::new(AtomicBool::new(false)),
+            accept_samples: Arc::new(AtomicBool::new(true)),
+            pending_start_position_ns: None,
+            playback_window: None,
+            appsink_import_recovery_enabled: false,
+        };
+        player.log_backend_snapshot("created");
+        Ok(player)
+    }
+
+    pub(crate) fn canvas_kind(&self) -> Option<&'static str> {
+        self.canvas.as_ref().map(|_| self.backend_label())
     }
 
     pub(crate) fn native_decode_group_id(&self) -> Option<u64> {
@@ -640,6 +708,9 @@ impl VideoPlayer {
     }
 
     pub fn current_position_ns(&self) -> Option<u64> {
+        if let Some(canvas) = &self.canvas {
+            return Some(canvas.position_ns());
+        }
         if let Some(native) = self.native.as_ref() {
             return Some(native.current_position_ns());
         }
@@ -694,6 +765,9 @@ impl VideoPlayer {
     }
 
     pub fn is_paused(&self) -> bool {
+        if let Some(canvas) = &self.canvas {
+            return canvas.paused();
+        }
         #[cfg(feature = "backend-ffmpeg")]
         if let Some(native) = self.native.as_ref() {
             return native.is_paused();

@@ -168,6 +168,26 @@ pub(crate) fn switch_wallpaper_content(
         mpv_composed_targets,
     } = ctx;
 
+    // The layer compiler installs procedural sources using the selected output's
+    // generation; an older media producer can keep the last wallpaper visible.
+    if crate::renderer::is_shader_file(&path) || crate::scene::is_scene(&path) {
+        return;
+    }
+
+    let config = monitor_manager.get_output_config(&name);
+    let canvas = if video::is_gif_path(&path) {
+        Some(video::CanvasSource::Gif(video::GifOptions {
+            speed: config.map_or(1.0, |config| config.gif_speed),
+            repeat: config.is_none_or(|config| config.gif_loop),
+        }))
+    } else {
+        video::is_web_path(&path).then_some(video::CanvasSource::Web)
+    };
+    let content_type = if canvas.is_some() {
+        queue::ContentType::Video
+    } else {
+        content_type
+    };
     info!("{}: {} -> {:?}", log_prefix, name, path.display());
     debug!(
         "[SWITCH] {}: content_type={:?}, renderer exists={}",
@@ -247,6 +267,7 @@ pub(crate) fn switch_wallpaper_content(
     });
     let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
+        r.clear_shader_wallpaper();
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time;
         r.active_transition = resolved_transition.clone();
@@ -499,6 +520,7 @@ pub(crate) fn switch_wallpaper_content(
         create_and_start_video_player(
             VideoPlayerStartRequest {
                 path: path.clone(),
+                canvas,
                 playlist_blacklist,
                 output_name: name.clone(),
                 session_id,

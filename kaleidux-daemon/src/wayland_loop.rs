@@ -332,6 +332,7 @@ pub async fn run(
             ctx.drain_player_events(player_event_buf, loop_start);
         }
 
+        ctx.sync_layer_rules();
         ctx.mark_due_layer_redraws(Instant::now());
         {
             for (name, renderer) in &ctx.renderers {

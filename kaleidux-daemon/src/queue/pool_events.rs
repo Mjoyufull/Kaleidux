@@ -103,6 +103,16 @@ impl SmartQueue {
         });
 
         for event in events {
+            let playlist_changed = match &event {
+                PoolEvent::Added(path) | PoolEvent::Removed(path) | PoolEvent::Modified(path) => {
+                    path.starts_with(&self.root_path) && super::advanced_sources::is_list(path)
+                }
+                PoolEvent::Rescan(_) => false,
+            };
+            if playlist_changed {
+                self.schedule_root_rescan();
+                continue;
+            }
             match event {
                 PoolEvent::Added(path) => {
                     if !path.starts_with(&self.root_path) {

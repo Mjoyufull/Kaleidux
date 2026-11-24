@@ -241,17 +241,32 @@ impl ScriptManager {
 }
 
 fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
+    let tx = commands.clone();
+    engine.register_fn("react", move |input: &str| {
+        let signals =
+            serde_json::from_str::<kaleidux_common::LayerInputs>(input).map_err(|error| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    error.to_string().into(),
+                    Position::NONE,
+                ))
+            })?;
+        tx.submit(Request::LayerInputs(signals))
+    });
     for (name, stage) in [
         ("filters", kaleidux_common::LayerStage::Filter),
+        ("shaders", kaleidux_common::LayerStage::Filter),
+        ("shader_wallpaper", kaleidux_common::LayerStage::Wallpaper),
         ("morphs", kaleidux_common::LayerStage::Morph),
     ] {
         let tx = commands.clone();
         engine.register_fn(name, move |names: rhai::Array, fps: i64, output: String| {
             let invalid =
                 |reason: &str| Box::new(EvalAltResult::ErrorRuntime(reason.into(), Position::NONE));
-            if names.len() > kaleidux_common::MAX_LAYERS_PER_STAGE || !(0..=60).contains(&fps) {
+            if names.len() > kaleidux_common::MAX_LAYERS_PER_STAGE
+                || !(-1..=i64::from(u16::MAX - 1)).contains(&fps)
+            {
                 return Err(invalid(
-                    "Use at most eight layers and a frame rate from 0 to 60",
+                    "Use at most eight layers and a frame rate of -1 (unlimited), 0 or higher",
                 ));
             }
             let layers = names
@@ -267,7 +282,11 @@ fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
                 output,
                 stage,
                 layers,
-                fps: fps as u8,
+                fps: if fps == -1 {
+                    kaleidux_common::LAYER_FPS_UNLIMITED
+                } else {
+                    fps as u16
+                },
             }))
         });
     }

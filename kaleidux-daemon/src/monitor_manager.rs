@@ -50,6 +50,10 @@ pub struct MonitorManager {
 }
 
 impl MonitorManager {
+    pub(crate) fn layer_rules(&self) -> &[crate::runtime::layer_rules::LayerRule] {
+        &self.config.global.layer_rules
+    }
+
     pub fn remove_output(&mut self, name: &str) {
         self.outputs.remove(name);
         self.shared_join_retries.remove(name);

@@ -11,14 +11,18 @@ const SAMPLE: &str = include_str!("../shaders/layers/sample.wgsl");
 pub(super) const HEART: &str = include_str!("../shaders/layers/heart.wgsl");
 
 pub(crate) struct PreparedLayers {
-    pub(super) stage: LayerStage,
-    pub(super) fps: u8,
-    pub(super) shaders: Vec<PreparedLayer>,
+    pub(crate) stage: LayerStage,
+    pub(crate) fps: u16,
+    pub(crate) shaders: Vec<PreparedLayer>,
+    pub(crate) source: Option<String>,
 }
 
-pub(super) struct PreparedLayer {
-    pub(super) name: String,
+pub(crate) struct PreparedLayer {
+    pub(crate) name: String,
     pub(super) source: String,
+    pub(crate) fragment_only: bool,
+    pub(crate) bitmap: Option<image::RgbaImage>,
+    pub(crate) rectangle: Option<[f32; 4]>,
 }
 
 impl PreparedLayers {
@@ -32,7 +36,10 @@ impl PreparedLayers {
 
     /// Read and validate sources on a bounded worker before sending the IPC command.
     pub(crate) async fn load(selection: &LayerSelection) -> Result<Self> {
-        anyhow::ensure!(selection.fps <= 60, "Layer FPS must be between 0 and 60");
+        anyhow::ensure!(
+            selection.stage != LayerStage::Wallpaper || selection.layers.len() <= 1,
+            "Choose one shader wallpaper",
+        );
         anyhow::ensure!(
             selection.layers.len() <= MAX_LAYERS_PER_STAGE,
             "A stage supports at most {MAX_LAYERS_PER_STAGE} layers"
@@ -42,6 +49,7 @@ impl PreparedLayers {
                 stage: selection.stage,
                 fps: 0,
                 shaders: Vec::new(),
+                source: None,
             });
         }
         let selection = selection.clone();
@@ -55,44 +63,167 @@ impl PreparedLayers {
     }
 
     fn read_and_validate(selection: LayerSelection) -> Result<Self> {
-        let shaders = selection
-            .layers
-            .iter()
-            .map(|name| {
-                let body = read_body(selection.stage, name)
-                    .with_context(|| format!("Could not read layer {name:?}"))?;
-                let source = assemble(selection.stage, &body);
-                validate_abi(selection.stage, &source)
-                    .with_context(|| format!("Invalid layer {name:?}"))?;
-                Ok(PreparedLayer {
-                    name: name.clone(),
-                    source,
-                })
-            })
-            .collect::<Result<_>>()?;
+        if selection.stage == LayerStage::Wallpaper
+            && let Some(source) = selection.layers.first()
+            && crate::scene::is_scene(Path::new(source))
+        {
+            return crate::scene::open(Path::new(source));
+        }
+        let mut shaders = Vec::new();
+        for name in &selection.layers {
+            let path = Path::new(name);
+            if selection.stage == LayerStage::Filter
+                && path.extension().is_some_and(|ext| ext == "glslp")
+            {
+                for pass in preset_paths(path)? {
+                    shaders.push(prepare_layer(selection.stage, &pass.to_string_lossy())?);
+                }
+            } else {
+                shaders.push(
+                    prepare_layer(selection.stage, name)
+                        .with_context(|| format!("Invalid layer {name:?}"))?,
+                );
+            }
+            anyhow::ensure!(
+                shaders.len() <= MAX_LAYERS_PER_STAGE,
+                "Too many shader passes"
+            );
+        }
+        if selection.stage == LayerStage::Filter {
+            anyhow::ensure!(
+                shaders
+                    .iter()
+                    .filter(|layer| layer.bitmap.is_some())
+                    .count()
+                    <= 1,
+                "Only one depth map may appear in a shader stack"
+            );
+        }
         Ok(Self {
             stage: selection.stage,
             fps: selection.fps,
             shaders,
+            source: selection.layers.first().cloned(),
         })
     }
+}
+
+pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLayer> {
+    let (name, options) = spec.split_once('|').unwrap_or((spec, ""));
+    let mut rectangle = None;
+    let mut font = None;
+    let mut colour = "#ffffff";
+    for option in options.split('|').filter(|option| !option.is_empty()) {
+        let (key, value) = option
+            .split_once('=')
+            .context("Expected layer option key=value")?;
+        match key {
+            "rect" if stage == LayerStage::Morph => rectangle = Some(parse_rectangle(value)?),
+            "font" if stage == LayerStage::Morph => font = Some(value),
+            "colour" | "color" if stage == LayerStage::Morph => colour = value,
+            _ => anyhow::bail!("Unknown layer option {key:?}"),
+        }
+    }
+    let mut bitmap = None;
+    let fragment_only = is_fragment_file(Path::new(name));
+    let body = if stage != LayerStage::Filter
+        && let Some(path) = name.strip_prefix("image=")
+    {
+        bitmap = Some(super::layer_bitmap::read(Path::new(path))?);
+        include_str!("../shaders/layers/bitmap.wgsl").into()
+    } else if stage == LayerStage::Morph
+        && let Some(text) = name.strip_prefix("text=")
+        && (font.is_some() || !text.is_ascii() || colour != "#ffffff")
+    {
+        bitmap = Some(super::layer_bitmap::label(
+            text,
+            font.unwrap_or("Sans 24"),
+            colour,
+        )?);
+        rectangle.get_or_insert([0.03, 0.03, 0.35, 0.07]);
+        include_str!("../shaders/layers/bitmap.wgsl").into()
+    } else if stage == LayerStage::Filter
+        && let Some(path) = name.strip_prefix("parallax=")
+    {
+        bitmap = Some(super::layer_bitmap::depth(Path::new(path))?);
+        include_str!("../shaders/layers/parallax.wgsl").into()
+    } else {
+        read_body(stage, name)?
+    };
+    let source = if fragment_only {
+        super::layer_glsl::translate(stage, &body)?
+    } else {
+        assemble(stage, &body)
+    };
+    validate_abi(stage, &source, fragment_only, bitmap.is_some())?;
+    Ok(PreparedLayer {
+        name: spec.to_owned(),
+        source,
+        fragment_only,
+        bitmap,
+        rectangle,
+    })
+}
+
+pub(crate) fn prepare_rgba_layer(
+    name: String,
+    bitmap: image::RgbaImage,
+    rectangle: Option<[f32; 4]>,
+) -> Result<PreparedLayer> {
+    let source = assemble(
+        LayerStage::Morph,
+        include_str!("../shaders/layers/bitmap.wgsl"),
+    );
+    validate_abi(LayerStage::Morph, &source, false, true)?;
+    Ok(PreparedLayer {
+        name,
+        source,
+        fragment_only: false,
+        bitmap: Some(bitmap),
+        rectangle,
+    })
+}
+
+fn parse_rectangle(value: &str) -> Result<[f32; 4]> {
+    let coordinates: Vec<f32> = value.split(',').map(str::parse).collect::<Result<_, _>>()?;
+    let result: [f32; 4] = coordinates
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Use rect=x,y,width,height"))?;
+    let [x, y, w, h] = result;
+    anyhow::ensure!(
+        result
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0 && *value <= 1.0)
+            && w > 0.0
+            && h > 0.0
+            && x + w <= 1.0
+            && y + h <= 1.0,
+        "Morph rectangle must fit inside the normalized output"
+    );
+    Ok(result)
 }
 
 pub(super) fn assemble(stage: LayerStage, body: &str) -> String {
     match stage {
         LayerStage::Filter => [FRAME, SAMPLE, body].join("\n"),
-        LayerStage::Morph => [FRAME, body].join("\n"),
+        LayerStage::Morph | LayerStage::Wallpaper => [FRAME, body].join("\n"),
     }
 }
 
-fn validate_abi(stage: LayerStage, source: &str) -> Result<()> {
+fn validate_abi(stage: LayerStage, source: &str, fragment_only: bool, bitmap: bool) -> Result<()> {
     let module = naga::front::wgsl::parse_str(source)
         .map_err(|error| anyhow::anyhow!("{}", error.emit_to_string(source)))?;
     anyhow::ensure!(
-        module.entry_points.len() == 2,
+        module.entry_points.len() == if fragment_only { 1 } else { 2 },
         "Layer defines an extra entry point"
     );
-    let expected_bindings = if stage == LayerStage::Filter { 3 } else { 1 };
+    let expected_bindings = if stage == LayerStage::Filter {
+        4
+    } else if bitmap {
+        3
+    } else {
+        1
+    };
     anyhow::ensure!(
         module
             .global_variables
@@ -122,14 +253,21 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
         (LayerStage::Filter, "mono") => {
             return Ok(include_str!("../shaders/layers/mono.wgsl").into());
         }
+        (LayerStage::Filter, "parallax") => {
+            return Ok(include_str!("../shaders/layers/parallax.wgsl").into());
+        }
+        (LayerStage::Filter, "pan") => return Ok(include_str!("../shaders/layers/pan.wgsl").into()),
+        (LayerStage::Morph, "spectrum") => {
+            return Ok(include_str!("../shaders/layers/spectrum.wgsl").into());
+        }
         (LayerStage::Morph, "heart") => return Ok(HEART.into()),
         _ => {}
     }
     let path = Path::new(name);
     if path.is_absolute() {
         anyhow::ensure!(
-            path.extension().is_some_and(|ext| ext == "wgsl"),
-            "Expected a .wgsl file"
+            is_fragment_file(path) || path.extension().is_some_and(|ext| ext == "wgsl"),
+            "Expected a .wgsl, .glsl or .frag file"
         );
         return read_shader(path);
     }
@@ -144,6 +282,7 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
     let directory = match stage {
         LayerStage::Filter => "filters",
         LayerStage::Morph => "morphs",
+        LayerStage::Wallpaper => "shaders",
     };
     let root = dirs::config_dir().context("Missing configuration directory")?;
     read_shader(
@@ -152,6 +291,88 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
             .join(directory)
             .join(format!("{name}.wgsl")),
     )
+}
+
+pub(crate) fn is_shader_file(path: &Path) -> bool {
+    is_fragment_file(path) || path.extension().is_some_and(|ext| ext == "wgsl")
+}
+
+pub(crate) fn is_fragment_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("glsl" | "frag" | "fs" | "fsh")
+    )
+}
+
+fn preset_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let source = read_shader(path)?;
+    let root = path
+        .parent()
+        .context("GLSL preset has no parent directory")?;
+    let mut fields = std::collections::HashMap::new();
+    for line in source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        anyhow::ensure!(
+            !line.starts_with("#reference"),
+            "Inherited GLSL presets need to be flattened"
+        );
+        if line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .context("Expected GLSL preset key = value")?;
+        anyhow::ensure!(
+            fields
+                .insert(key.trim(), value.trim().trim_matches('"'))
+                .is_none(),
+            "Duplicate GLSL preset key {key:?}"
+        );
+    }
+    let count: usize = fields
+        .remove("shaders")
+        .context("GLSL preset needs a shader count")?
+        .parse()?;
+    anyhow::ensure!(
+        (1..=MAX_LAYERS_PER_STAGE).contains(&count),
+        "Invalid GLSL preset shader count"
+    );
+    let mut passes = Vec::with_capacity(count);
+    for index in 0..count {
+        let entry = fields
+            .remove(format!("shader{index}").as_str())
+            .context("GLSL preset is missing a pass")?;
+        let pass = root.join(entry).canonicalize()?;
+        anyhow::ensure!(
+            is_fragment_file(&pass),
+            "GLSL preset pass must be a fragment shader"
+        );
+        for (prefix, supported) in [
+            ("scale_type", "source"),
+            ("scale", "1.0"),
+            ("filter_linear", "true"),
+            ("wrap_mode", "clamp_to_edge"),
+        ] {
+            if let Some(value) = fields.remove(format!("{prefix}{index}").as_str()) {
+                let supported_scale =
+                    prefix == "scale" && value.parse::<f32>().is_ok_and(|scale| scale == 1.0);
+                anyhow::ensure!(
+                    value == supported || supported_scale,
+                    "Unsupported GLSL preset setting {prefix}{index} = {value}"
+                );
+            }
+        }
+        passes.push(pass);
+    }
+    anyhow::ensure!(
+        fields.is_empty(),
+        "Unsupported GLSL preset settings {:?}",
+        fields.keys()
+    );
+    Ok(passes)
 }
 
 fn read_shader(path: &Path) -> Result<String> {
@@ -183,18 +404,38 @@ mod tests {
         for (stage, name) in [
             (LayerStage::Filter, "crt"),
             (LayerStage::Filter, "mono"),
+            (LayerStage::Filter, "pan"),
+            (LayerStage::Morph, "spectrum"),
             (LayerStage::Morph, "heart"),
             (LayerStage::Morph, "text=Kaleidux"),
         ] {
             let source = assemble(stage, &read_body(stage, name).unwrap());
-            validate_abi(stage, &source).unwrap();
+            validate_abi(stage, &source, false, false).unwrap();
         }
+    }
+
+    #[test]
+    fn shadertoy_fragment_uses_the_layer_layout() {
+        let source = super::super::layer_glsl::translate(
+            LayerStage::Filter,
+            "void mainImage(out vec4 colour, in vec2 xy) { colour = texture(iChannel0, xy / iResolution.xy); }",
+        )
+        .unwrap();
+        validate_abi(LayerStage::Filter, &source, true, false).unwrap();
     }
 
     #[test]
     fn shader_cannot_add_bindings() {
         let body = "@group(0) @binding(1) var x: sampler;
                     fn layer(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }";
-        assert!(validate_abi(LayerStage::Morph, &assemble(LayerStage::Morph, body)).is_err());
+        assert!(
+            validate_abi(
+                LayerStage::Morph,
+                &assemble(LayerStage::Morph, body),
+                false,
+                false
+            )
+            .is_err()
+        );
     }
 }

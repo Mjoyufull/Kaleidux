@@ -35,6 +35,7 @@ impl SmartQueue {
         let discovery_start = std::time::Instant::now();
         let blacklist = super::BlacklistIdentity::new(blacklist);
         let mut files = Vec::new();
+        let mut lists = Vec::new();
         let mut ct_cache: HashMap<PathBuf, ContentType> = HashMap::new();
         let mut cache_updates: Vec<(PathBuf, crate::cache::FileMetadata)> = Vec::new();
 
@@ -56,6 +57,10 @@ impl SmartQueue {
             .filter(|e| e.file_type().is_file())
             .filter_map(|entry| {
                 let path = entry.path();
+                if super::advanced_sources::is_list(&path) {
+                    lists.push(path);
+                    return None;
+                }
                 if blacklist.contains(path.as_path()) {
                     return None;
                 }
@@ -139,6 +144,25 @@ impl SmartQueue {
                         },
                     ));
                 }
+            }
+        }
+
+        for list in lists {
+            match super::advanced_sources::entries(&list) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if blacklist.contains(&entry) || ct_cache.contains_key(&entry) {
+                            continue;
+                        }
+                        if let Some(kind) =
+                            Self::get_content_type(&entry).filter(|kind| kind.supported())
+                        {
+                            files.push(entry.clone());
+                            ct_cache.insert(entry, kind);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("[QUEUE] Wallpaper list skipped: {error:#}"),
             }
         }
 

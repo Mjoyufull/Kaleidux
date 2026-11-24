@@ -60,7 +60,7 @@ impl super::Renderer {
 
     pub(super) fn present_black_frame(
         &mut self,
-        _context: BackendContext,
+        context: BackendContext,
         encoder: wgpu::CommandEncoder,
         output: wgpu::SurfaceTexture,
         view: &wgpu::TextureView,
@@ -86,7 +86,7 @@ impl super::Renderer {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -101,6 +101,11 @@ impl super::Renderer {
                 .render(&self.ctx, &mut encoder, view, size, render_start, 1.0);
         }
         self.ctx.submit(std::iter::once(encoder.finish()));
+        if self.layer_uses_display_clock()
+            && let BackendContext::Wayland { surface, qh, .. } = &context
+        {
+            self.arm_frame_callback_for_present(surface, qh);
+        }
         output.present();
         self.last_present_time = std::time::Instant::now();
         self.needs_redraw = false;

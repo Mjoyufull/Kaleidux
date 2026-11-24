@@ -55,6 +55,8 @@ pub enum VideoBackendKind {
     Appsink,
     Mpv,
     Ffmpeg,
+    Gif,
+    Web,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

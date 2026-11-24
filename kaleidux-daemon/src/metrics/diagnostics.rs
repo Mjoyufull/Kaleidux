@@ -276,6 +276,7 @@ impl PerformanceMetrics {
             crate::video::VideoBackendKind::Appsink => VideoBackendMetricKind::AppsinkSession,
             crate::video::VideoBackendKind::Mpv => VideoBackendMetricKind::MpvSession,
             crate::video::VideoBackendKind::Ffmpeg => VideoBackendMetricKind::NativeSession,
+            crate::video::VideoBackendKind::Gif | crate::video::VideoBackendKind::Web => return,
         };
         self.record_video_backend_metric(kind);
     }

@@ -7,7 +7,7 @@ use crate::monitor_manager::MonitorManager;
 use crate::renderer::PreparedLayers;
 use crate::renderer::layer_pipeline::LayerPipelines;
 use crate::renderer::{Renderer, WgpuContext};
-use kaleidux_common::{LayerStage, Request, Response};
+use kaleidux_common::{LayerInputs, LayerStage, Request, Response};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +25,22 @@ struct LayerTarget {
 }
 
 impl CompiledLayers {
-    pub(super) fn install(self, ctx: &mut CommandContext<'_>) -> anyhow::Result<()> {
+    pub(super) fn install(
+        self,
+        ctx: &mut CommandContext<'_>,
+        rule_ticket: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(ticket) = rule_ticket
+            && self.targets.iter().any(|(target, _)| {
+                let is_current = ctx
+                    .renderers
+                    .get(&target.name)
+                    .is_some_and(|renderer| renderer.layer_rule_ticket() == ticket);
+                !is_current
+            })
+        {
+            return Ok(());
+        }
         for (target, pipeline) in &self.targets {
             let renderer = ctx.renderers.get(&target.name).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -43,11 +58,29 @@ impl CompiledLayers {
                 "Layers require composed playback; disable the libmpv GL overlay"
             );
         }
+        anyhow::ensure!(
+            self.stage != LayerStage::Wallpaper || ctx.preview.is_none(),
+            "End the current preview before setting a shader wallpaper"
+        );
         for (target, pipeline) in self.targets {
+            if self.stage == LayerStage::Wallpaper {
+                super::commands::clear_media(ctx, &target.name);
+                if let Some(output) = ctx.monitor_manager.outputs.get_mut(&target.name) {
+                    output.current_path = pipeline
+                        .as_ref()
+                        .and_then(|stack| stack.source.as_ref())
+                        .map(std::path::PathBuf::from);
+                    output.display_start_time = None;
+                    output.next_change = None;
+                }
+            }
             ctx.renderers
                 .get_mut(&target.name)
                 .expect("validated output is live")
-                .replace_layers(self.stage, pipeline);
+                .replace_layers(self.stage, pipeline, rule_ticket.is_some());
+            if self.stage == LayerStage::Wallpaper && rule_ticket.is_some() {
+                ctx.monitor_manager.mark_transition_completed(&target.name);
+            }
         }
         Ok(())
     }
@@ -195,6 +228,39 @@ pub(super) fn query(
     Ok(Response::Layers(outputs))
 }
 
+pub(super) fn input(
+    ctx: &mut CommandContext<'_>,
+    mut inputs: LayerInputs,
+) -> anyhow::Result<Response> {
+    let normalized = |value: &f32| value.is_finite() && (0.0..=1.0).contains(value);
+    anyhow::ensure!(
+        inputs.pointer.iter().flatten().all(normalized),
+        "Pointer values must be in 0..=1"
+    );
+    if let Some(bands) = &inputs.audio {
+        anyhow::ensure!(
+            bands.len() <= 64 && bands.iter().all(normalized),
+            "Use at most 64 audio values in 0..=1"
+        );
+    }
+    anyhow::ensure!(
+        inputs
+            .data
+            .iter()
+            .flatten()
+            .chain(inputs.date.iter().flatten())
+            .all(|value| value.is_finite()),
+        "Shader data values must be finite"
+    );
+    let outputs = targets(ctx.monitor_manager, ctx.renderers, inputs.output.take())?;
+    for name in outputs {
+        if let Some(renderer) = ctx.renderers.get_mut(&name) {
+            renderer.apply_layer_inputs(&inputs);
+        }
+    }
+    Ok(Response::Ok)
+}
+
 pub(super) fn love(ctx: &mut CommandContext<'_>, path: String, multiplier: f32) -> Response {
     let position = ctx.monitor_manager.love_heart_position();
     let selected = if position.is_some() && multiplier > 1.0 {
@@ -224,6 +290,22 @@ pub(super) fn love(ctx: &mut CommandContext<'_>, path: String, multiplier: f32) 
         }
     }
     Response::Ok
+}
+
+pub(super) fn love_current(
+    ctx: &mut CommandContext<'_>,
+    output: Option<String>,
+    multiplier: f32,
+) -> anyhow::Result<Response> {
+    let names = targets(ctx.monitor_manager, ctx.renderers, output)?;
+    anyhow::ensure!(names.len() == 1, "Select a single output");
+    let source = ctx
+        .monitor_manager
+        .outputs
+        .get(&names[0])
+        .and_then(|output| output.current_path.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Output has no wallpaper"))?;
+    Ok(love(ctx, source.to_string_lossy().into_owned(), multiplier))
 }
 
 fn targets(

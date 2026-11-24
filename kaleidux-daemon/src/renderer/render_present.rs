@@ -223,7 +223,8 @@ impl super::Renderer {
         // is legal in the protocol, but Hyprland can leave it unscheduled when
         // no new buffer accompanies that commit. That stalled transitions and
         // starved the demand-driven video decoder after its first frame.
-        if (self.transition_active
+        if (self.layer_uses_display_clock()
+            || self.transition_active
             || (self.valid_content_type == crate::queue::ContentType::Video
                 && self.steady_video_uses_frame_callbacks()))
             && let super::BackendContext::Wayland { surface, qh, .. } = &context

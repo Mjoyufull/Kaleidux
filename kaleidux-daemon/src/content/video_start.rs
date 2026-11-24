@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 
 pub(crate) struct VideoPlayerStartRequest {
     pub(crate) path: PathBuf,
+    pub(crate) canvas: Option<video::CanvasSource>,
     pub(crate) playlist_blacklist: Option<std::collections::HashSet<PathBuf>>,
     pub(crate) output_name: String,
     pub(crate) session_id: u64,
@@ -43,6 +44,7 @@ pub(crate) fn create_and_start_video_player(
 ) {
     let VideoPlayerStartRequest {
         path,
+        canvas,
         playlist_blacklist,
         output_name,
         session_id,
@@ -107,7 +109,11 @@ pub(crate) fn create_and_start_video_player(
                     super::check_playlist_blacklist(&path, blacklist)?;
                 }
                 let resolved_source = crate::media_source::resolve_for_playback(&path_str, should_abort)?;
-                let candidates = video::candidate_video_backends(backend_request);
+                let candidates = if canvas.is_some() {
+                    vec![video::VideoBackendRequest::Auto]
+                } else {
+                    video::candidate_video_backends(backend_request)
+                };
                 let num_candidates = candidates.len();
                 let backend_is_explicitly_forced = video::backend_is_explicitly_forced(backend_request);
                 let mut last_error = None;
@@ -124,7 +130,13 @@ pub(crate) fn create_and_start_video_player(
                     };
 
                     let create_start = Instant::now();
-                    let mut vp = match video::VideoPlayer::new(
+                    let created = if let Some(kind) = canvas {
+                        video::VideoPlayer::new_canvas(
+                            &path, name_arc.clone(), session_id, frame_mailbox_clone.clone(),
+                            attempt_event_tx, kind, render_size, max_publish_fps,
+                        )
+                    } else {
+                        video::VideoPlayer::new(
                         &resolved_source,
                         name_arc.clone(),
                         session_id,
@@ -139,7 +151,9 @@ pub(crate) fn create_and_start_video_player(
                         mpv_native_target.clone(),
                         mpv_composed_target.clone(),
                         playback_window,
-                    ) {
+                        )
+                    };
+                    let mut vp = match created {
                         Ok(player) => player,
                         Err(e) => {
                             frame_mailbox_clone.clear_session(&name_str, session_id);
@@ -215,7 +229,8 @@ pub(crate) fn create_and_start_video_player(
                         continue;
                     }
 
-                    if let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0)
+                    if vp.canvas_kind().is_none()
+                        && let Some(position_ns) = start_position_ns.filter(|pos| *pos > 0)
                         && !vp.has_active_peer_subscribers()
                     {
                         vp.set_start_position_ns(position_ns);

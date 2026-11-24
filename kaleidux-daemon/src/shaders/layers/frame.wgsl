@@ -4,9 +4,19 @@ struct LayerFrame {
     seconds: f32,
     progress: f32,
     params: vec4<f32>,
+    timing: vec4<f32>,
+    pointer: vec4<f32>,
+    data: vec4<f32>,
+    date: vec4<f32>,
+    audio: array<vec4<f32>, 16>,
 }
 
 @group(0) @binding(0) var<uniform> frame: LayerFrame;
+
+fn audio_band(index: u32) -> f32 {
+    let band = min(index, 63u);
+    return frame.audio[band / 4u][band % 4u];
+}
 
 struct Vertex {
     @builtin(position) position: vec4<f32>,

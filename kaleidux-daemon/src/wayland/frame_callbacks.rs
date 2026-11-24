@@ -113,6 +113,9 @@ pub(crate) fn process_frame_callbacks(
             }
             r.frame_callback_pending = false;
             r.last_frame_request = None;
+            if r.layer_uses_display_clock() {
+                r.needs_redraw = true;
+            }
             if !barrier_blocks {
                 if native_surface_presented {
                     mark_presented = true;

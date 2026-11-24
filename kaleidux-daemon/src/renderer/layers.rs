@@ -2,17 +2,88 @@
 
 use super::WgpuContext;
 use super::layer_pipeline::{FILTER_FORMAT, LayerFrame, LayerPipelines};
-use kaleidux_common::{LayerStage, OutputLayers};
+use kaleidux_common::{LayerInputs, LayerStage, OutputLayers};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const LOVE_LIFETIME: Duration = Duration::from_millis(900);
 
 #[derive(Default)]
 pub(super) struct Layers {
-    filters: Option<LayerPipelines>,
-    morphs: Option<LayerPipelines>,
+    wallpaper: Option<LayerPipelines>,
+    filters: LayerSlot,
+    morphs: LayerSlot,
+    rule_path: Option<PathBuf>,
+    rule_ticket: u64,
     filter_targets: Option<FilterTargets>,
     love: Option<LovePulse>,
+    signals: Signals,
+    paused_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct LayerSlot {
+    manual: Option<LayerPipelines>,
+    selected: Option<Option<LayerPipelines>>,
+}
+
+impl LayerSlot {
+    fn active(&self) -> Option<&LayerPipelines> {
+        self.selected.as_ref().unwrap_or(&self.manual).as_ref()
+    }
+
+    fn active_mut(&mut self) -> Option<&mut LayerPipelines> {
+        self.selected.as_mut().unwrap_or(&mut self.manual).as_mut()
+    }
+
+    fn set(&mut self, next: Option<LayerPipelines>, rule: bool) {
+        if rule {
+            self.selected = Some(next);
+        } else {
+            self.manual = next;
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct Signals {
+    pointer: [f32; 4],
+    data: [f32; 4],
+    date: [f32; 4],
+    audio: [[f32; 4]; 16],
+}
+
+impl Default for Signals {
+    fn default() -> Self {
+        Self {
+            pointer: [0.5, 0.5, 0.0, 0.0],
+            data: [0.0; 4],
+            date: [0.0; 4],
+            audio: [[0.0; 4]; 16],
+        }
+    }
+}
+
+impl Signals {
+    fn apply(mut self, input: &LayerInputs) -> Self {
+        if let Some(pointer) = input.pointer {
+            self.pointer = pointer;
+        }
+        if let Some(data) = input.data {
+            self.data = data;
+        }
+        if let Some(date) = input.date {
+            self.date = date;
+        }
+        if let Some(bands) = &input.audio {
+            self.audio.fill([0.0; 4]);
+            for (index, band) in bands.iter().enumerate() {
+                self.audio[index / 4][index % 4] = *band;
+            }
+        }
+        self
+    }
 }
 
 struct LovePulse {
@@ -32,16 +103,20 @@ struct FilterTarget {
 
 impl Layers {
     pub(super) fn requires_composition(&self) -> bool {
-        self.filters.is_some() || self.morphs.is_some() || self.love.is_some()
+        self.wallpaper.is_some()
+            || self.filters.active().is_some()
+            || self.morphs.active().is_some()
+            || self.love.is_some()
     }
 
-    fn replace(&mut self, stage: LayerStage, next: Option<LayerPipelines>) {
+    fn replace(&mut self, stage: LayerStage, next: Option<LayerPipelines>, rule: bool) {
         match stage {
             LayerStage::Filter => {
-                self.filters = next;
+                self.filters.set(next, rule);
                 self.filter_targets = None;
             }
-            LayerStage::Morph => self.morphs = next,
+            LayerStage::Morph => self.morphs.set(next, rule),
+            LayerStage::Wallpaper => self.wallpaper = next,
         }
     }
 
@@ -51,7 +126,7 @@ impl Layers {
         width: u32,
         height: u32,
     ) -> Option<&wgpu::TextureView> {
-        let filters = self.filters.as_ref()?;
+        let filters = self.filters.active()?;
         let size = [width, height];
         let targets = self
             .filter_targets
@@ -71,8 +146,38 @@ impl Layers {
         now: Instant,
         progress: f32,
     ) {
-        if let (Some(filters), Some(targets)) = (&mut self.filters, &self.filter_targets) {
-            let frame = layer_frame(size, filters, now, progress);
+        let animation_time = self.paused_at.unwrap_or(now);
+        if let Some(wallpaper) = &mut self.wallpaper {
+            let target = self
+                .filter_targets
+                .as_ref()
+                .map_or(destination, |targets| &targets.targets[0].view);
+            wallpaper.write_frame(
+                ctx,
+                layer_frame(size, wallpaper, animation_time, progress, self.signals),
+            );
+            let mut pass = begin_pass(
+                encoder,
+                target,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            let pipelines =
+                if self.filter_targets.is_some() && !wallpaper.wallpaper_intermediate.is_empty() {
+                    &wallpaper.wallpaper_intermediate
+                } else {
+                    &wallpaper.pipelines
+                };
+            for (index, pipeline) in pipelines.iter().enumerate() {
+                pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, size[0], size[1]);
+                if let Some(rect) = wallpaper.rectangles[index] {
+                    set_rectangle(&mut pass, size, rect);
+                }
+                draw(&mut pass, pipeline, &wallpaper.morph_bindings[index]);
+            }
+        }
+        if let (Some(filters), Some(targets)) = (self.filters.active_mut(), &self.filter_targets) {
+            let frame = layer_frame(size, filters, animation_time, progress, self.signals);
             filters.write_frame(ctx, frame);
             for (index, pipeline) in filters.pipelines.iter().enumerate() {
                 let input = &targets.targets[index % targets.targets.len()];
@@ -92,44 +197,44 @@ impl Layers {
         }) {
             self.love = None;
         }
-        if self.morphs.is_none() && self.love.is_none() {
+        if self.morphs.active().is_none() && self.love.is_none() {
             return;
         }
         let mut pass = begin_pass(encoder, destination, wgpu::LoadOp::Load);
-        if let Some(morphs) = &mut self.morphs {
-            morphs.write_frame(ctx, layer_frame(size, morphs, now, progress));
-            let binding = morphs
-                .morph_binding
-                .as_ref()
-                .expect("morph has a uniform binding");
-            for (name, pipeline) in morphs.names.iter().zip(&morphs.pipelines) {
-                if name == "heart" {
+        if let Some(morphs) = self.morphs.active_mut() {
+            morphs.write_frame(
+                ctx,
+                layer_frame(size, morphs, animation_time, progress, self.signals),
+            );
+            for (index, pipeline) in morphs.pipelines.iter().enumerate() {
+                pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, size[0], size[1]);
+                if let Some(rect) = morphs.rectangles[index] {
+                    set_rectangle(&mut pass, size, rect);
+                } else if morphs.names[index] == "heart" {
                     scissor_heart(&mut pass, size, [0.91, 0.88]);
-                } else {
-                    pass.set_scissor_rect(0, 0, size[0], size[1]);
                 }
-                draw(&mut pass, pipeline, binding);
+                draw(&mut pass, pipeline, &morphs.morph_bindings[index]);
             }
         }
         if let Some(pulse) = &mut self.love {
-            let mut frame = layer_frame(size, &pulse.pipeline, now, progress);
+            let mut frame = layer_frame(size, &pulse.pipeline, now, progress, self.signals);
             frame.progress = frame.seconds / LOVE_LIFETIME.as_secs_f32();
             frame.params = [pulse.position[0], pulse.position[1], 0.0, 1.0];
             pulse.pipeline.write_frame(ctx, frame);
-            let binding = pulse
-                .pipeline
-                .morph_binding
-                .as_ref()
-                .expect("heart has a uniform binding");
+            let binding = &pulse.pipeline.morph_bindings[0];
+            pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
             scissor_heart(&mut pass, size, pulse.position);
             draw(&mut pass, &pulse.pipeline.pipelines[0], binding);
         }
     }
 
     fn frame_interval(&self) -> Option<Duration> {
-        self.filters
+        self.wallpaper
             .iter()
-            .chain(&self.morphs)
+            .chain(self.filters.active())
+            .chain(self.morphs.active())
+            .filter(|_| self.paused_at.is_none())
             .filter_map(LayerPipelines::frame_interval)
             .chain(
                 self.love
@@ -147,6 +252,19 @@ impl Layers {
     }
 }
 
+fn set_rectangle(pass: &mut wgpu::RenderPass<'_>, size: [u32; 2], rect: [f32; 4]) {
+    let width = size[0] as f32;
+    let height = size[1] as f32;
+    let x = (rect[0] * width).floor();
+    let y = (rect[1] * height).floor();
+    let right = ((rect[0] + rect[2]) * width).ceil().min(width);
+    let bottom = ((rect[1] + rect[3]) * height).ceil().min(height);
+    if right > x && bottom > y {
+        pass.set_viewport(x, y, right - x, bottom - y, 0.0, 1.0);
+        pass.set_scissor_rect(x as u32, y as u32, (right - x) as u32, (bottom - y) as u32);
+    }
+}
+
 fn scissor_heart(pass: &mut wgpu::RenderPass<'_>, size: [u32; 2], position: [f32; 2]) {
     let radius = (size[0].min(size[1]) as f32 * 0.1).ceil();
     let center = [position[0] * size[0] as f32, position[1] * size[1] as f32];
@@ -157,7 +275,13 @@ fn scissor_heart(pass: &mut wgpu::RenderPass<'_>, size: [u32; 2], position: [f32
     pass.set_scissor_rect(x, y, width, height);
 }
 
-fn layer_frame(size: [u32; 2], layers: &LayerPipelines, now: Instant, progress: f32) -> LayerFrame {
+fn layer_frame(
+    size: [u32; 2],
+    layers: &LayerPipelines,
+    now: Instant,
+    progress: f32,
+    signals: Signals,
+) -> LayerFrame {
     LayerFrame {
         size: [size[0] as f32, size[1] as f32],
         seconds: if layers.fps != 0 {
@@ -167,6 +291,8 @@ fn layer_frame(size: [u32; 2], layers: &LayerPipelines, now: Instant, progress: 
         },
         progress,
         params: [0.0; 4],
+        timing: [0.0; 4],
+        signals,
     }
 }
 
@@ -230,12 +356,49 @@ fn draw(
 }
 
 impl super::Renderer {
-    pub(crate) fn replace_layers(&mut self, stage: LayerStage, next: Option<LayerPipelines>) {
+    pub(crate) fn replace_layers(
+        &mut self,
+        stage: LayerStage,
+        next: Option<LayerPipelines>,
+        rule: bool,
+    ) {
         if next.is_some() {
             self.retain_native_frame_for_layers();
         }
-        self.layers.replace(stage, next);
+        self.layers.replace(stage, next, rule);
         self.needs_redraw = true;
+    }
+
+    pub(crate) fn prepare_layer_rule(&mut self, path: Option<&Path>) -> Option<u64> {
+        if self.layers.rule_path.as_deref() == path {
+            return None;
+        }
+        self.invalidate_layer_rule();
+        self.layers.rule_path = path.map(Path::to_owned);
+        Some(self.layers.rule_ticket)
+    }
+
+    pub(crate) fn invalidate_layer_rule(&mut self) {
+        self.layers.rule_ticket = rand::random();
+        self.layers.rule_path = None;
+        let had_shaders = self.layers.filters.selected.take().is_some();
+        let had_morphs = self.layers.morphs.selected.take().is_some();
+        if had_shaders {
+            self.layers.filter_targets = None;
+        }
+        self.needs_redraw |= had_shaders || had_morphs;
+    }
+
+    pub(crate) fn layer_rule_ticket(&self) -> u64 {
+        self.layers.rule_ticket
+    }
+
+    pub(crate) fn apply_layer_inputs(&mut self, inputs: &LayerInputs) {
+        let signals = self.layers.signals.apply(inputs);
+        if signals != self.layers.signals {
+            self.layers.signals = signals;
+            self.needs_redraw |= self.layers.requires_composition();
+        }
     }
 
     pub(crate) fn output_layers(&self) -> OutputLayers {
@@ -245,14 +408,17 @@ impl super::Renderer {
                 |pipeline| (pipeline.names.clone(), pipeline.fps),
             )
         };
-        let (filters, filter_fps) = fields(self.layers.filters.as_ref());
-        let (morphs, morph_fps) = fields(self.layers.morphs.as_ref());
+        let (wallpaper, wallpaper_fps) = fields(self.layers.wallpaper.as_ref());
+        let (filters, filter_fps) = fields(self.layers.filters.active());
+        let (morphs, morph_fps) = fields(self.layers.morphs.active());
         OutputLayers {
             output: self.name.clone(),
             filters,
             morphs,
             filter_fps,
             morph_fps,
+            wallpaper,
+            wallpaper_fps,
         }
     }
 
@@ -274,8 +440,49 @@ impl super::Renderer {
         }
     }
 
+    pub(crate) fn shader_wallpaper(&self) -> Option<&str> {
+        self.layers.wallpaper.as_ref()?.source.as_deref()
+    }
+
+    pub(crate) fn clear_shader_wallpaper(&mut self) {
+        self.layers.wallpaper = None;
+    }
+
+    pub(crate) fn update_layer_clock(&mut self, paused: bool, now: Instant) {
+        if paused {
+            self.layers.paused_at.get_or_insert(now);
+        } else if let Some(previous) = self.layers.paused_at.take() {
+            let LayerSlot {
+                manual: shaders,
+                selected: rule_shaders,
+            } = &mut self.layers.filters;
+            let LayerSlot {
+                manual: morphs,
+                selected: rule_morphs,
+            } = &mut self.layers.morphs;
+            for stack in [
+                self.layers.wallpaper.as_mut(),
+                shaders.as_mut(),
+                rule_shaders.as_mut().and_then(Option::as_mut),
+                morphs.as_mut(),
+                rule_morphs.as_mut().and_then(Option::as_mut),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stack.start += now.saturating_duration_since(previous.max(stack.start));
+            }
+        }
+    }
+
+    pub(crate) fn layer_uses_display_clock(&self) -> bool {
+        self.layers
+            .frame_interval()
+            .is_some_and(|interval| interval.is_zero())
+    }
+
     pub(crate) fn layer_animation_deadline(&self) -> Option<Instant> {
-        if self.needs_redraw || self.transition_active {
+        if self.needs_redraw || self.transition_active || self.frame_callback_pending {
             return None;
         }
         self.layers

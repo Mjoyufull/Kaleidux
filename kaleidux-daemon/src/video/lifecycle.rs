@@ -72,6 +72,22 @@ impl VideoPlayer {
         F: Fn() -> bool,
     {
         debug!("[VIDEO] {}: Pre-buffering video pipeline", self.source_id);
+        if let Some(canvas) = self.canvas.as_mut() {
+            let start = std::time::Instant::now();
+            let frame = canvas.prebuffer(should_abort)?;
+            return Ok(VideoPrebufferResult {
+                frame: Some(frame),
+                profile: VideoPrebufferProfile {
+                    set_state: std::time::Duration::ZERO,
+                    state_wait: std::time::Duration::ZERO,
+                    pull_preroll: start.elapsed(),
+                    set_state_result: "canvas-paused",
+                    state_wait_settled: true,
+                    current_state: gst::State::Paused,
+                    pending_state: gst::State::VoidPending,
+                },
+            });
+        }
         if let Some(native) = self.native.as_mut() {
             let pull_preroll_start = std::time::Instant::now();
             let frame = native.prebuffer(&should_abort)?;
@@ -267,6 +283,11 @@ impl VideoPlayer {
 
     /// Initialize backend workers without advancing media before session commit.
     pub fn start_with_pause(&mut self, paused: bool) -> anyhow::Result<()> {
+        if let Some(canvas) = &self.canvas {
+            canvas.set_paused(paused);
+            self.is_running.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         if self.is_running.load(Ordering::SeqCst) {
             return if paused { self.pause() } else { self.resume() };
         }
@@ -525,6 +546,10 @@ impl VideoPlayer {
         self.accept_samples.store(false, Ordering::SeqCst);
         self.frame_mailbox
             .clear_session(self.source_id.as_ref(), self.session_id);
+        if let Some(canvas) = &mut self.canvas {
+            canvas.stop();
+            return Ok(());
+        }
         if let Some(native) = self.native.as_mut() {
             native.stop()?;
             return Ok(());
@@ -581,6 +606,10 @@ impl VideoPlayer {
     }
 
     pub fn pause(&self) -> anyhow::Result<()> {
+        if let Some(canvas) = &self.canvas {
+            canvas.set_paused(true);
+            return Ok(());
+        }
         if let Some(native) = self.native.as_ref() {
             native.pause();
             return Ok(());
@@ -596,6 +625,10 @@ impl VideoPlayer {
     }
 
     pub fn resume(&self) -> anyhow::Result<()> {
+        if let Some(canvas) = &self.canvas {
+            canvas.set_paused(false);
+            return Ok(());
+        }
         if let Some(native) = self.native.as_ref() {
             native.resume();
             return Ok(());

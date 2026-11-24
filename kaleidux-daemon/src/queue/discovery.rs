@@ -138,7 +138,7 @@ impl SmartQueue {
                             let bl = super::BlacklistIdentity::new(&bl);
                             cp.into_iter()
                                 .filter(|p| {
-                                    p.exists()
+                                    (p.exists() || crate::media_source::MediaSource::is_virtual(p))
                                         && !bl.contains(p)
                                         && (ContentType::Video.supported()
                                             || Self::get_content_type(p)
@@ -342,6 +342,12 @@ impl SmartQueue {
             }
             crate::media_source::MediaSource::Colour(_) => return Some(ContentType::Image),
             crate::media_source::MediaSource::File(_) => {}
+        }
+        if crate::renderer::is_shader_file(path) || crate::scene::is_scene(path) {
+            return Some(ContentType::Image);
+        }
+        if crate::video::is_web_path(path) {
+            return cfg!(feature = "wallpaper-web").then_some(ContentType::Video);
         }
         super::media_probe::probe(path)
     }

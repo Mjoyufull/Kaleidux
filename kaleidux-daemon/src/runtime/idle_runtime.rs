@@ -121,11 +121,10 @@ impl MainLoopContext {
     }
 
     pub(crate) fn mark_due_layer_redraws(&mut self, now: Instant) {
-        if self.display_power_suspended {
-            return;
-        }
         for (name, renderer) in &mut self.renderers {
-            if !self.powered_off_outputs.contains(name)
+            let powered = !self.display_power_suspended && !self.powered_off_outputs.contains(name);
+            renderer.update_layer_clock(!powered || self.monitor_manager.is_paused(), now);
+            if powered
                 && renderer
                     .layer_animation_deadline()
                     .is_some_and(|wake| wake <= now)

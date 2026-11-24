@@ -40,51 +40,67 @@ impl MainLoopContext {
     }
 
     fn send_wallpaper_info(&self, output: Option<String>, response: oneshot::Sender<Response>) {
-        let details =
-            self.inspection_output(output).and_then(|name| {
-                let renderer = self
-                    .renderers
-                    .get(&name)
-                    .context("Output is still connecting")?;
-                let output = self
-                    .monitor_manager
-                    .outputs
-                    .get(&name)
-                    .context("Output disconnected")?;
-                let loading = renderer.content_is_loading()
-                    || self.pending_video_switches.contains_key(&name);
-                let source = output
+        let details = self.inspection_output(output).and_then(|name| {
+            let renderer = self
+                .renderers
+                .get(&name)
+                .context("Output is still connecting")?;
+            let output = self
+                .monitor_manager
+                .outputs
+                .get(&name)
+                .context("Output disconnected")?;
+            let shader = renderer.shader_wallpaper();
+            let loading = shader.is_none()
+                && (renderer.content_is_loading()
+                    || self.pending_video_switches.contains_key(&name));
+            let source = shader.map(str::to_owned).or_else(|| {
+                output
                     .current_path
                     .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned());
-                let kind = source.as_ref().filter(|_| !loading).map(|_| {
+                    .map(|path| path.to_string_lossy().into_owned())
+            });
+            let kind = source.as_ref().filter(|_| !loading).map(|_| {
+                if shader.is_some_and(|source| crate::scene::is_scene(std::path::Path::new(source)))
+                {
+                    "scene".into()
+                } else if shader.is_some() {
+                    "shader".into()
+                } else if let Some(kind) = self
+                    .video_players
+                    .get(&name)
+                    .and_then(crate::video::VideoPlayer::canvas_kind)
+                {
+                    kind.into()
+                } else {
                     match renderer.valid_content_type {
                         ContentType::Image => "image".into(),
                         ContentType::Video => "video".into(),
                     }
-                });
-                Ok(WallpaperInfo {
-                    width: renderer.config.width,
-                    height: renderer.config.height,
-                    paused: self.monitor_manager.is_paused()
-                        || self.display_power_suspended
-                        || self.powered_off_outputs.contains(&name)
-                        || renderer.transition_playback_is_held(),
-                    output: name,
-                    source,
-                    kind,
-                    loading,
-                    transition_progress: renderer
-                        .transition_active
-                        .then_some(renderer.transition_progress),
-                    slideshow_duration_ns: output.config.duration.as_nanos().min(u64::MAX as u128)
-                        as u64,
-                    media_duration_ns: None,
-                    scene_start_ns: None,
-                    scene_duration_ns: None,
-                    position_ns: None,
-                })
+                }
             });
+            Ok(WallpaperInfo {
+                width: renderer.config.width,
+                height: renderer.config.height,
+                paused: self.monitor_manager.is_paused()
+                    || self.display_power_suspended
+                    || self.powered_off_outputs.contains(&name)
+                    || renderer.transition_playback_is_held(),
+                output: name,
+                source,
+                kind,
+                loading,
+                transition_progress: renderer
+                    .transition_active
+                    .then_some(renderer.transition_progress),
+                slideshow_duration_ns: output.config.duration.as_nanos().min(u64::MAX as u128)
+                    as u64,
+                media_duration_ns: None,
+                scene_start_ns: None,
+                scene_duration_ns: None,
+                position_ns: None,
+            })
+        });
         let mut info = match details {
             Ok(info) => info,
             Err(error) => return send_error(response, error),
@@ -92,7 +108,7 @@ impl MainLoopContext {
         let Some(player) = self
             .video_players
             .get(&info.output)
-            .filter(|_| info.kind.as_deref() == Some("video"))
+            .filter(|_| matches!(info.kind.as_deref(), Some("video" | "gif" | "web")))
         else {
             let _ = response.send(Response::WallpaperInfo(info));
             return;

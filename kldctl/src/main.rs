@@ -56,12 +56,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Replace this output's ordered post-processing filters (no arguments clears)
+    /// Replace this output's shader stack (no arguments clears)
+    #[command(name = "shader", visible_alias = "filter")]
     Filter {
         layers: Vec<String>,
         /// Idle animation rate; zero waits for new wallpaper frames
-        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=60))]
-        fps: u8,
+        #[arg(long, default_value_t = 0, value_parser = layers::parse_layer_fps)]
+        fps: u16,
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -69,12 +70,26 @@ enum Commands {
     Morph {
         layers: Vec<String>,
         /// Idle animation rate; zero leaves the overlays static
-        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=60))]
-        fps: u8,
+        #[arg(long, default_value_t = 0, value_parser = layers::parse_layer_fps)]
+        fps: u16,
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Print the configured filter and morph order as JSON
+    /// Use one procedural shader as the wallpaper. No path clears it.
+    ShaderWallpaper {
+        path: Option<String>,
+        #[arg(long, default_value = "unlimited", value_parser = layers::parse_layer_fps)]
+        fps: u16,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Send pointer, audio, date and custom values to the active shaders (JSON)
+    React {
+        values: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Print the configured shader and morph order as JSON
     Layers {
         #[arg(short, long)]
         output: Option<String>,
@@ -119,8 +134,14 @@ enum Commands {
         #[arg(long, value_name = "PNG", conflicts_with = "transition")]
         reveal_map: Option<std::path::PathBuf>,
         /// Built-in transition name or custom:NAME for this switch
-        #[arg(long, value_name = "NAME")]
+        #[arg(long = "transhader", visible_alias = "transition", value_name = "NAME")]
         transition: Option<String>,
+    },
+    /// Open a local Wallpaper Engine project, package or installed Workshop item
+    Workshop {
+        item: String,
+        #[arg(short, long)]
+        output: Option<String>,
     },
     /// Display an image or video from the slideshow or an external path
     Img {
@@ -153,8 +174,12 @@ enum Commands {
     /// Loved files appear more often based on their multiplier.
     /// A multiplier of 2.0 means 2x more likely to be picked.
     Love {
-        /// Path to the file
-        path: String,
+        /// Path to the file (defaults to the current wallpaper)
+        path: Option<std::path::PathBuf>,
+
+        /// Output to read the current wallpaper from
+        #[arg(short, long, conflicts_with = "path")]
+        output: Option<String>,
 
         /// Frequency multiplier (e.g., 2.0 = 2x more likely)
         #[arg(short, long, default_value = "2.0")]
@@ -320,6 +345,19 @@ async fn main() -> anyhow::Result<()> {
             fps,
             output,
         } => layer_request(kaleidux_common::LayerStage::Morph, layers, fps, output)?,
+        Commands::ShaderWallpaper { path, fps, output } => layers::layer_request(
+            kaleidux_common::LayerStage::Wallpaper,
+            path.into_iter().collect(),
+            fps,
+            output,
+        )?,
+        Commands::React { values, output } => {
+            let mut inputs: kaleidux_common::LayerInputs = serde_json::from_str(&values)?;
+            if output.is_some() {
+                inputs.output = output;
+            }
+            Request::LayerInputs(inputs)
+        }
         Commands::Layers { output } => Request::LayersQuery { output },
         Commands::Info { output } => Request::WallpaperInfo { output },
         Commands::Frame(args) => Request::Frame(args.request()?),
@@ -361,12 +399,30 @@ async fn main() -> anyhow::Result<()> {
                 Request::Set { path, output }
             }
         }
+        Commands::Workshop { item, output } => {
+            let item = if item.bytes().all(|byte| byte.is_ascii_digit()) {
+                item
+            } else {
+                media_locator(item.into())?
+            };
+            Request::Workshop { item, output }
+        }
         Commands::Img { path, output } => Request::Img {
             path: media_locator(path)?,
             output,
         },
         Commands::Prev { output } => Request::Prev { output },
-        Commands::Love { path, multiplier } => Request::Love { path, multiplier },
+        Commands::Love {
+            path,
+            output,
+            multiplier,
+        } => match path {
+            Some(path) => Request::Love {
+                path: media_locator(path)?,
+                multiplier,
+            },
+            None => Request::LoveCurrent { output, multiplier },
+        },
         Commands::Unlove { path } => Request::Unlove { path },
         Commands::Lovelist => Request::LoveitList,
         Commands::Pause => Request::Pause,

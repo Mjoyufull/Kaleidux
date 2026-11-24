@@ -58,6 +58,8 @@ pub struct OutputConfig {
     /// Advance incoming video while its transition plays.
     #[serde(default = "default_true")]
     pub play_during_transition: bool,
+    pub gif_speed: f32,
+    pub gif_loop: bool,
     #[serde(default = "default_volume")]
     pub volume: u8,
     #[serde(default)]
@@ -155,12 +157,16 @@ pub struct GlobalConfig {
     /// Love morph center in output-relative coordinates, with the origin at top left.
     pub love_heart_position: Option<[f32; 2]>,
     #[serde(default)]
+    pub(crate) layer_rules: Vec<crate::runtime::layer_rules::LayerRule>,
+    #[serde(default)]
     pub monitor_behavior: MonitorBehavior,
     #[serde(default)]
     pub _custom_transitions: bool,
     pub video_ratio: Option<u8>,
     pub transition_time: Option<u32>,
     pub play_during_transition: Option<bool>,
+    pub gif_speed: Option<f32>,
+    pub gif_loop: Option<bool>,
     pub volume: Option<u8>,
     pub script_path: Option<PathBuf>,
     pub sorting: Option<SortingStrategy>,
@@ -203,11 +209,14 @@ impl Default for GlobalConfig {
             main_monitor: None,
             love_heart: None,
             love_heart_position: None,
+            layer_rules: Vec::new(),
             monitor_behavior: MonitorBehavior::default(),
             _custom_transitions: false,
             video_ratio: None,
             transition_time: None,
             play_during_transition: None,
+            gif_speed: None,
+            gif_loop: None,
             volume: None,
             script_path: None,
             sorting: None,
@@ -238,6 +247,8 @@ pub struct PartialOutputConfig {
     pub transition: Option<crate::shaders::Transition>,
     pub transition_time: Option<u32>,
     pub play_during_transition: Option<bool>,
+    pub gif_speed: Option<f32>,
+    pub gif_loop: Option<bool>,
     pub volume: Option<u8>,
     pub sorting: Option<SortingStrategy>,
     pub layer: Option<Layer>,
@@ -317,13 +328,25 @@ impl Config {
         let table: toml::Table =
             toml::from_str(content).with_context(|| "Failed to parse config TOML")?;
 
-        let global: GlobalConfig = if let Some(v) = table.get("global") {
+        let mut global: GlobalConfig = if let Some(v) = table.get("global") {
             v.clone()
                 .try_into()
                 .with_context(|| "Failed to parse [global] config section")?
         } else {
             GlobalConfig::default()
         };
+
+        for rule in &mut global.layer_rules {
+            if let Ok(relative) = rule.path.strip_prefix("~")
+                && let Some(home) = dirs::home_dir()
+            {
+                rule.path = home.join(relative);
+            }
+            anyhow::ensure!(
+                rule.path.is_absolute(),
+                "Wallpaper layer rule paths must be absolute"
+            );
+        }
 
         let any: PartialOutputConfig = if let Some(v) = table.get("any") {
             v.clone()
@@ -389,6 +412,8 @@ impl Config {
             transition: None,
             transition_time: self.global.transition_time,
             play_during_transition: self.global.play_during_transition,
+            gif_speed: self.global.gif_speed,
+            gif_loop: self.global.gif_loop,
             volume: self.global.volume,
             sorting: self.global.sorting,
             layer: None,
@@ -446,6 +471,12 @@ impl PartialOutputConfig {
         if other.transition_time.is_some() {
             self.transition_time = other.transition_time;
         }
+        if other.gif_speed.is_some() {
+            self.gif_speed = other.gif_speed;
+        }
+        if other.gif_loop.is_some() {
+            self.gif_loop = other.gif_loop;
+        }
         if other.play_during_transition.is_some() {
             self.play_during_transition = other.play_during_transition;
         }
@@ -484,6 +515,12 @@ impl PartialOutputConfig {
             transition: self.transition.unwrap_or(crate::shaders::Transition::Fade),
             transition_time: self.transition_time.unwrap_or(1000),
             play_during_transition: self.play_during_transition.unwrap_or(true),
+            gif_speed: self
+                .gif_speed
+                .filter(|speed| speed.is_finite())
+                .unwrap_or(1.0)
+                .clamp(0.1, 8.0),
+            gif_loop: self.gif_loop.unwrap_or(true),
             volume: self.volume.unwrap_or(100),
             sorting: self.sorting.unwrap_or_default(),
             layer: self.layer.unwrap_or_default(),

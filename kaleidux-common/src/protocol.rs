@@ -17,6 +17,8 @@ pub enum Request {
     Frame(FrameRequest),
     #[serde(rename = "layers_set")]
     LayersSet(crate::LayerSelection),
+    #[serde(rename = "layer_inputs")]
+    LayerInputs(crate::LayerInputs),
     #[serde(rename = "layers_query")]
     LayersQuery { output: Option<String> },
     #[serde(rename = "query_outputs")]
@@ -35,6 +37,11 @@ pub enum Request {
     },
     #[serde(rename = "preview_end")]
     PreviewEnd { apply: bool },
+    #[serde(rename = "workshop")]
+    Workshop {
+        item: String,
+        output: Option<String>,
+    },
     #[serde(rename = "set")]
     Set {
         path: String,
@@ -63,6 +70,11 @@ pub enum Request {
     Prev { output: Option<String> },
     #[serde(rename = "love")]
     Love { path: String, multiplier: f32 },
+    #[serde(rename = "love_current")]
+    LoveCurrent {
+        output: Option<String>,
+        multiplier: f32,
+    },
     #[serde(rename = "unlove")]
     Unlove { path: String },
     #[serde(rename = "loveitlist")]

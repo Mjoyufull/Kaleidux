@@ -19,6 +19,7 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
     ctx.monitor_manager.update_config(config);
     let mut restarts = Vec::new();
     for (name, renderer) in ctx.renderers.iter_mut() {
+        renderer.invalidate_layer_rule();
         if let Some(output_config) = ctx.monitor_manager.get_output_config(name) {
             let kind = if renderer.valid_content_type == ContentType::Video
                 || ctx.pending_video_switches.contains_key(name)

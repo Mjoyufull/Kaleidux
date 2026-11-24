@@ -25,8 +25,12 @@ pub(crate) async fn handle_command(
                 return Response::Error("Layers were not compiled".into());
             };
             return layers
-                .install(&mut ctx)
+                .install(&mut ctx, command.layer_rule_ticket)
                 .map(|()| Response::Ok)
+                .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
+        }
+        Request::LayerInputs(inputs) => {
+            return super::layer_commands::input(&mut ctx, inputs)
                 .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         }
         Request::LayersQuery { output } => {
@@ -67,6 +71,7 @@ pub(crate) async fn handle_command(
                 | Request::Playlist(_)
                 | Request::Blacklist(_)
                 | Request::Love { .. }
+                | Request::LoveCurrent { .. }
                 | Request::Unlove { .. }
         )
     {
@@ -81,6 +86,10 @@ pub(crate) async fn handle_command(
     }
     if let Request::Love { path, multiplier } = req {
         return super::layer_commands::love(&mut ctx, path, multiplier);
+    }
+    if let Request::LoveCurrent { output, multiplier } = req {
+        return super::layer_commands::love_current(&mut ctx, output, multiplier)
+            .unwrap_or_else(|error| Response::Error(error.to_string()));
     }
     let CommandContext {
         preview,
@@ -216,6 +225,7 @@ pub(crate) async fn handle_command(
         | Request::PreviewEnd { .. }
         | Request::Jump { .. }
         | Request::Set { .. }
+        | Request::Workshop { .. }
         | Request::SetReveal { .. }
         | Request::SetTransition { .. }
         | Request::Img { .. } => {
@@ -327,7 +337,11 @@ pub(crate) async fn handle_command(
         Request::Playlist(cmd) => monitor_manager.handle_playlist_command(cmd),
         Request::Blacklist(cmd) => monitor_manager.handle_blacklist_command(cmd),
         Request::LoveitList => Response::LoveitList(monitor_manager.get_loveitlist()),
-        Request::LayersSet(_) | Request::LayersQuery { .. } | Request::Love { .. } => {
+        Request::LayersSet(_)
+        | Request::LayerInputs(_)
+        | Request::LayersQuery { .. }
+        | Request::LoveCurrent { .. }
+        | Request::Love { .. } => {
             unreachable!("layer commands handled before dispatch")
         }
         Request::Unlove { path } => monitor_manager
@@ -469,6 +483,10 @@ pub(crate) async fn handle_command(
                 set_pending_video_session(pending_video_sessions, &name, None);
                 pending_video_switches.remove(&name);
                 frame_mailbox.clear_source(&name);
+                if let Some(output) = monitor_manager.outputs.get_mut(&name) {
+                    output.current_path = None;
+                    output.display_start_time = Some(std::time::Instant::now());
+                }
                 if let Some(vp) = video_players.remove(&name) {
                     stop_video_player_in_background(name.clone(), vp);
                 }
@@ -476,11 +494,28 @@ pub(crate) async fn handle_command(
                     stop_video_player_in_background(name.clone(), vp);
                 }
                 if let Some(r) = renderers.get_mut(&name) {
+                    r.prepare_layer_rule(None);
+                    r.clear_shader_wallpaper();
                     r.clear();
                 }
             }
             Response::Ok
         }
+    }
+}
+
+pub(super) fn clear_media(ctx: &mut CommandContext<'_>, name: &str) {
+    set_pending_video_session(ctx.pending_video_sessions, name, None);
+    ctx.pending_video_switches.remove(name);
+    ctx.frame_mailbox.clear_source(name);
+    for players in [&mut ctx.video_players, &mut ctx.pending_image_video_stops] {
+        if let Some(player) = players.remove(name) {
+            stop_video_player_in_background(name.to_owned(), player);
+        }
+    }
+    if let Some(renderer) = ctx.renderers.get_mut(name) {
+        renderer.clear_shader_wallpaper();
+        renderer.clear();
     }
 }
 

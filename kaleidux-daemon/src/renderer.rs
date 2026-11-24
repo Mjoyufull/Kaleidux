@@ -75,12 +75,14 @@ mod video_snapshot;
 mod video_upload;
 mod video_zero_copy_upload;
 
+mod layer_bitmap;
+mod layer_glsl;
 pub(crate) mod layer_pipeline;
-mod layer_source;
+pub(crate) mod layer_source;
 mod layer_text;
 mod layers;
 mod render_blit;
-pub(crate) use layer_source::PreparedLayers;
+pub(crate) use layer_source::{PreparedLayers, is_shader_file};
 pub(crate) mod frame_capture;
 #[path = "renderer/render_present.rs"]
 mod render_present;

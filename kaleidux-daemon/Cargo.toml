@@ -11,6 +11,7 @@ repository.workspace = true
 default = ["full"]
 full = [
     "network-sources",
+    "wallpaper-web",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -19,6 +20,7 @@ full = [
 ]
 wayland-only = [
     "network-sources",
+    "wallpaper-web",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -26,6 +28,7 @@ wayland-only = [
 ]
 minimal-static = ["display-wayland"]
 network-sources = []
+wallpaper-web = []
 backend-appsink = []
 backend-mpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 backend-ffmpeg = ["dep:ffmpeg-next", "dep:libva-sys"]

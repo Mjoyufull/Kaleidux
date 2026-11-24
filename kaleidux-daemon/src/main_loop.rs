@@ -146,6 +146,7 @@ pub struct MainLoopContext {
     pub latest_video_frames: video::LatestFrameMailbox,
 
     pub cmd_rx: tokio::sync::mpsc::Receiver<CmdMsg>,
+    pub(crate) rule_command_sender: CommandSender,
     pub(crate) layer_compile_queue:
         tokio::sync::mpsc::Sender<crate::runtime::layer_commands::LayerCompileJob>,
     pub image_rx: tokio::sync::mpsc::Receiver<LoadedImage>,
@@ -413,6 +414,7 @@ impl MainLoopContext {
             startup_present_barrier: None,
             latest_video_frames,
             cmd_rx,
+            rule_command_sender: cmd_tx.clone(),
             layer_compile_queue: crate::runtime::layer_commands::start_worker(cmd_tx),
             image_rx,
             image_tx,

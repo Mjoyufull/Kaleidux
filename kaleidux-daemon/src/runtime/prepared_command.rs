@@ -10,6 +10,7 @@ pub struct PreparedCommand {
     pub request: Request,
     pub(crate) transition_override: Option<TransitionOverride>,
     pub(crate) prepared_layers: Option<crate::renderer::PreparedLayers>,
+    pub(super) layer_rule_ticket: Option<u64>,
     pub(super) compiled_layers: Option<super::layer_commands::CompiledLayers>,
 }
 
@@ -19,6 +20,7 @@ impl From<Request> for PreparedCommand {
             request,
             transition_override: None,
             prepared_layers: None,
+            layer_rule_ticket: None,
             compiled_layers: None,
         }
     }
@@ -30,7 +32,48 @@ pub(crate) enum TransitionOverride {
     Named(Transition),
 }
 
+pub(crate) fn needs_preparation(request: &Request) -> bool {
+    match request {
+        Request::Set { path, .. } => {
+            let path = std::path::Path::new(path);
+            crate::renderer::is_shader_file(path) || crate::scene::is_scene(path)
+        }
+        Request::Workshop { .. }
+        | Request::SetReveal { .. }
+        | Request::SetTransition { .. }
+        | Request::LayersSet(_) => true,
+        _ => false,
+    }
+}
+
 pub(crate) async fn prepare_command(request: Request) -> anyhow::Result<PreparedCommand> {
+    let request = if let Request::Workshop { item, output } = request {
+        let job = spawn_blocking_tracked(BackgroundWorkKind::QueueDiscovery, move || {
+            crate::scene::workshop_path(std::path::Path::new(&item))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Workshop discovery is busy"))?;
+        Request::Set {
+            path: job.await??.to_string_lossy().into_owned(),
+            output,
+        }
+    } else {
+        request
+    };
+    let request = match request {
+        Request::Set { path, output }
+            if !path.contains("://")
+                && (crate::renderer::is_shader_file(std::path::Path::new(&path))
+                    || crate::scene::is_scene(std::path::Path::new(&path))) =>
+        {
+            Request::LayersSet(kaleidux_common::LayerSelection {
+                output,
+                stage: kaleidux_common::LayerStage::Wallpaper,
+                layers: vec![path],
+                fps: kaleidux_common::LAYER_FPS_UNLIMITED,
+            })
+        }
+        request => request,
+    };
     let mut command = PreparedCommand::from(request);
     if let Request::SetReveal { map, .. } = &command.request {
         let path = PathBuf::from(map);

@@ -106,6 +106,7 @@ impl ContentType {
     }
 }
 
+mod advanced_sources;
 mod discovery;
 mod excerpts;
 pub use excerpts::QueueEntry;

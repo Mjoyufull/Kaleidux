@@ -1,7 +1,7 @@
 //! Preserves Rhai call order across asset preparation and asynchronous installs.
 
 use crate::main_loop::CommandSender;
-use crate::runtime::prepared_command::prepare_command;
+use crate::runtime::prepared_command::{needs_preparation, prepare_command};
 use kaleidux_common::{Request, Response};
 use parking_lot::Mutex;
 use rhai::{EvalAltResult, Position};
@@ -58,13 +58,6 @@ impl ScriptCommands {
             .try_send((request, response))
             .map_err(|error| runtime_error(format!("command queue full: {error}")))
     }
-}
-
-fn needs_preparation(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::SetReveal { .. } | Request::SetTransition { .. } | Request::LayersSet(_)
-    )
 }
 
 async fn drain(mut pending: mpsc::Receiver<ScriptRequest>, display: CommandSender) {

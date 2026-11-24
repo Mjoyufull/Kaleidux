@@ -135,6 +135,11 @@ fn collect_output_candidates(
         }
     }
 
+    candidates.retain(|(path, _)| {
+        !crate::renderer::is_shader_file(path)
+            && !crate::scene::is_scene(path)
+            && !crate::video::is_gif_path(path)
+    });
     candidates
 }
 

@@ -18,7 +18,10 @@ mod wallpaper_data;
 
 use transition_defaults::*;
 
-pub use layers::{LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE, OutputLayers};
+pub use layers::{
+    LAYER_FPS_UNLIMITED, LayerInputs, LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE,
+    OutputLayers,
+};
 pub use protocol::{
     BlacklistCommand, KEntry, MAX_INHIBITOR_REASON_LEN, MAX_INHIBITORS, OutputInfo,
     PlaylistCommand, Request, Response, validate_inhibit_reason,

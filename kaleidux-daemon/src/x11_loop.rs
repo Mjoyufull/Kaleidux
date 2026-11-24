@@ -426,6 +426,7 @@ pub async fn run(
         ctx.process_script_tick();
         ctx.process_scheduled(loop_start);
         ctx.drain_commands(cmd_buf, loop_start).await;
+        ctx.sync_layer_rules();
         ctx.mark_due_layer_redraws(Instant::now());
         ctx.drain_player_events(player_event_buf, loop_start);
 
