@@ -251,6 +251,7 @@ impl super::Renderer {
             );
         }
         output.present();
+        self.presented_surface_buffer = true;
         if self.display_timer_pending {
             self.display_timer_pending = false;
             self.display_timer_ready = true;

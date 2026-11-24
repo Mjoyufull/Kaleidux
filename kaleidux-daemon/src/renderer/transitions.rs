@@ -179,6 +179,7 @@ impl super::Renderer {
     #[allow(dead_code)]
     pub fn recreate_surface(&mut self, surface: wgpu::Surface<'static>) {
         self.surface = surface;
+        self.presented_surface_buffer = false;
         self.configured = false;
         self.needs_redraw = true;
     }

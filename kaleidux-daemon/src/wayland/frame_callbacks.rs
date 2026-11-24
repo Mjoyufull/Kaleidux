@@ -175,8 +175,27 @@ pub(crate) fn process_frame_callbacks(
         // The black presentation clears needs_redraw, restoring idle waiting.
         let should_request =
             (r.needs_redraw || r.transition_active || pending_video) && !barrier_blocks;
-        if should_request {
-            if let Some(layer_surface) = backend.surfaces.get(name) {
+        if should_request && let Some(layer_surface) = backend.surfaces.get(name) {
+            if r.needs_redraw && !r.presented_surface_buffer {
+                // An unmapped layer-shell surface can wait indefinitely for a
+                // frame callback. A shader or morph has no media upload to map it.
+                let rendered = r
+                    .render(
+                        renderer::BackendContext::Wayland {
+                            surface: layer_surface,
+                            qh,
+                            presentation: backend.presentation_proxy(),
+                        },
+                        loop_start,
+                    )
+                    .is_ok()
+                    && r.presented_surface_buffer;
+                *callback_flush_needed |= rendered;
+                if rendered && !ctx.first_frame_recorded {
+                    ctx.metrics.record_first_frame();
+                    ctx.first_frame_recorded = true;
+                }
+            } else {
                 *callback_flush_needed |= r.request_frame_callback(layer_surface, qh);
             }
         }

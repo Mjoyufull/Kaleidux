@@ -316,6 +316,7 @@ pub struct Renderer {
     pub configured: bool,
     pub needs_redraw: bool,
     pub last_present_time: std::time::Instant,
+    pub(crate) presented_surface_buffer: bool,
     last_presentation_feedback_request: Option<std::time::Instant>,
     pub frame_callback_pending: bool, // Track if we've requested a frame callback
     pub last_frame_request: Option<std::time::Instant>, // Failsafe for lost callbacks
@@ -511,6 +512,7 @@ impl Renderer {
             configured: false,
             needs_redraw: true,
             last_present_time: std::time::Instant::now(),
+            presented_surface_buffer: false,
             last_presentation_feedback_request: None,
             frame_callback_pending: false,
             last_frame_request: None,

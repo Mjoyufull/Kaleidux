@@ -107,6 +107,7 @@ impl super::Renderer {
             self.arm_frame_callback_for_present(surface, qh);
         }
         output.present();
+        self.presented_surface_buffer = true;
         self.last_present_time = std::time::Instant::now();
         self.needs_redraw = false;
 

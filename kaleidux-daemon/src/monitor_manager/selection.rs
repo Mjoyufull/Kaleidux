@@ -53,6 +53,8 @@ impl MonitorManager {
             .ok_or_else(|| anyhow::anyhow!("Path is not supported media"))?;
         if content_type == crate::queue::ContentType::Image
             && !crate::media_source::MediaSource::is_virtual(&path)
+            && !crate::renderer::is_shader_file(&path)
+            && !crate::scene::is_scene(&path)
         {
             image::ImageReader::open(&path)?
                 .with_guessed_format()?
