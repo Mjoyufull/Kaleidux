@@ -98,6 +98,10 @@ impl ContentType {
             ))
     }
 
+    fn supported_at(self, path: &std::path::Path) -> bool {
+        self.supported() || (cfg!(feature = "wallpaper-web") && crate::video::is_web_path(path))
+    }
+
     fn other(self) -> Self {
         match self {
             Self::Image => Self::Video,

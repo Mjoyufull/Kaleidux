@@ -16,7 +16,7 @@ impl SmartQueue {
         let mut pool = Vec::with_capacity(snapshot.entries.len());
         let mut content_types = HashMap::with_capacity(snapshot.entries.len());
         for entry in snapshot.entries.iter() {
-            if entry.content_type.supported() && !blacklist.contains(&entry.path) {
+            if entry.content_type.supported_at(&entry.path) && !blacklist.contains(&entry.path) {
                 pool.push(entry.path.clone());
                 content_types.insert(entry.path.clone(), entry.content_type);
             }
@@ -141,8 +141,7 @@ impl SmartQueue {
                                     (p.exists() || crate::media_source::MediaSource::is_virtual(p))
                                         && !bl.contains(p)
                                         && (ContentType::Video.supported()
-                                            || Self::get_content_type(p)
-                                                == Some(ContentType::Image))
+                                            || Self::get_content_type(p).is_some())
                                 })
                                 .collect::<Vec<PathBuf>>()
                         },
@@ -301,8 +300,7 @@ impl SmartQueue {
         let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
         pool.retain(|path| {
             !blacklist.contains(path)
-                && (ContentType::Video.supported()
-                    || Self::get_content_type(path) == Some(ContentType::Image))
+                && (ContentType::Video.supported() || Self::get_content_type(path).is_some())
         });
         drop(blacklist);
         pool.sort();

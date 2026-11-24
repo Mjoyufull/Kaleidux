@@ -124,7 +124,7 @@ impl SmartQueue {
                 }
             };
 
-            if let Some(ct) = content_type.filter(|ct| ct.supported()) {
+            if let Some(ct) = content_type.filter(|ct| ct.supported_at(&p)) {
                 files.push(p.clone());
                 ct_cache.insert(p.clone(), ct);
 
@@ -155,7 +155,7 @@ impl SmartQueue {
                             continue;
                         }
                         if let Some(kind) =
-                            Self::get_content_type(&entry).filter(|kind| kind.supported())
+                            Self::get_content_type(&entry).filter(|kind| kind.supported_at(&entry))
                         {
                             files.push(entry.clone());
                             ct_cache.insert(entry, kind);

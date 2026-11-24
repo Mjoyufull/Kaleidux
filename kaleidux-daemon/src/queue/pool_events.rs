@@ -28,7 +28,9 @@ impl SmartQueue {
         let mut content_types: std::collections::HashMap<_, _> = snapshot
             .entries
             .iter()
-            .filter(|entry| entry.content_type.supported() && !blacklist.contains(&entry.path))
+            .filter(|entry| {
+                entry.content_type.supported_at(&entry.path) && !blacklist.contains(&entry.path)
+            })
             .map(|entry| (entry.path.clone(), entry.content_type))
             .collect();
         self.pool = if let Some(playlist) = playlist {
@@ -46,7 +48,7 @@ impl SmartQueue {
                         return false;
                     }
                     if let Some(kind) = self.content_type_cache.get(*path).copied() {
-                        if !kind.supported() {
+                        if !kind.supported_at(path) {
                             return false;
                         }
                         content_types.insert((*path).clone(), kind);

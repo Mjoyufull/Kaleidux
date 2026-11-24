@@ -25,24 +25,31 @@ fn minimal_static_filters_video_from_discovery_and_seeded_pools() {
     let dir = unique_test_dir("minimal-static");
     let image = dir.join("image.png");
     let video = dir.join("video.webm");
+    let web = dir.join("local.html");
     let mut bytes = [0_u8; 16];
     bytes[..4].copy_from_slice(&[0x89, 0x50, 0x4e, 0x47]);
     fs::write(&image, bytes).unwrap();
     bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
     fs::write(&video, bytes).unwrap();
+    fs::write(&web, "<p>Kaleidux</p>").unwrap();
+    let mut expected = vec![image.clone()];
+    if cfg!(feature = "wallpaper-web") {
+        expected.push(web.clone());
+    }
     let cache = test_cache();
-    let (pool, _) =
+    let (mut pool, _) =
         SmartQueue::discover_content(&dir, &HashSet::new(), cache.clone(), None).unwrap();
-    assert_eq!(pool, vec![image.clone()]);
+    pool.sort_unstable();
+    assert_eq!(pool, expected);
     let queue = SmartQueue::new_from_pool(
         &dir,
-        vec![image.clone(), video],
+        vec![image, video, web],
         50,
         crate::orchestration::SortingStrategy::Random,
         cache,
     )
     .unwrap();
-    assert_eq!(queue.pool, vec![image]);
+    assert_eq!(queue.pool, expected);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -311,8 +318,11 @@ fn new_from_pool_populates_content_type_cache_for_reused_pool() {
     );
     assert_eq!(
         queue.content_type_cache.get(&video),
-        Some(&ContentType::Video)
+        ContentType::Video
+            .supported()
+            .then_some(&ContentType::Video)
     );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
