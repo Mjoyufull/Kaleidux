@@ -9,14 +9,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 impl SmartQueue {
-    fn root_index_fields(
-        path: &Path,
-        pool: &[PathBuf],
-        content_types: &HashMap<PathBuf, ContentType>,
-    ) -> (Arc<super::media_index::RootMediaIndex>, u64) {
-        let index = super::media_index::shared_root_index(path);
-        let snapshot = index.install_if_empty(pool, content_types);
-        (index, snapshot.generation)
+    fn indexed_pool(
+        snapshot: &super::media_index::RootMediaSnapshot,
+        blacklist: &super::BlacklistIdentity<'_>,
+    ) -> (Vec<PathBuf>, HashMap<PathBuf, ContentType>) {
+        let mut pool = Vec::with_capacity(snapshot.entries.len());
+        let mut content_types = HashMap::with_capacity(snapshot.entries.len());
+        for entry in snapshot.entries.iter() {
+            if entry.content_type.supported() && !blacklist.contains(&entry.path) {
+                pool.push(entry.path.clone());
+                content_types.insert(entry.path.clone(), entry.content_type);
+            }
+        }
+        pool.sort_unstable();
+        (pool, content_types)
     }
 
     fn content_type_from_metadata(meta: crate::cache::FileMetadata) -> ContentType {
@@ -88,16 +94,7 @@ impl SmartQueue {
         let shared_snapshot = shared_index.snapshot();
         if !shared_snapshot.entries.is_empty() && !shared_index.rescan_running() {
             let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
-            let mut pool = Vec::with_capacity(shared_snapshot.entries.len());
-            let mut content_type_cache = HashMap::with_capacity(shared_snapshot.entries.len());
-            for entry in shared_snapshot.entries.iter() {
-                if entry.content_type.supported() && !blacklist.contains(&entry.path) {
-                    pool.push(entry.path.clone());
-                    content_type_cache.insert(entry.path.clone(), entry.content_type);
-                }
-            }
-            pool.sort();
-            drop(blacklist);
+            let (pool, content_type_cache) = Self::indexed_pool(&shared_snapshot, &blacklist);
             let current_index = Self::fallback_current_index(strategy, pool.len());
             tracing::info!(
                 "[QUEUE] Reusing shared root media index generation {} ({} files) for {:?}",
@@ -190,7 +187,7 @@ impl SmartQueue {
                     );
 
                     Self::schedule_root_rescan_for(
-                        super::media_index::shared_root_index(path),
+                        shared_index.clone(),
                         path.to_path_buf(),
                         cache.clone(),
                     );
@@ -229,15 +226,10 @@ impl SmartQueue {
             pool.len()
         );
 
-        let mut pool = pool;
-        // Sort the pool initially for sequential strategies
-        pool.sort();
-
+        let snapshot = shared_index.install_if_empty(&pool, &ct_cache_init.unwrap_or_default());
+        let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
+        let (pool, content_type_cache) = Self::indexed_pool(&snapshot, &blacklist);
         let current_index = Self::fallback_current_index(strategy, pool.len());
-
-        let content_type_cache = ct_cache_init.unwrap_or_default();
-        let (root_index, root_generation) =
-            Self::root_index_fields(path, &pool, &content_type_cache);
         Ok(Self {
             pool,
             stats,
@@ -255,8 +247,8 @@ impl SmartQueue {
             cache,
             pending_stats_updates: HashMap::new(),
             content_type_cache,
-            root_index,
-            root_generation,
+            root_index: shared_index,
+            root_generation: snapshot.generation,
         })
     }
 
@@ -317,23 +309,12 @@ impl SmartQueue {
 
         let seeded_types = Self::populate_content_type_cache_from_pool(&cache, &pool);
         let snapshot = root_index.install_if_empty(&pool, &seeded_types);
-        // The shared root may have advanced while a cached pool was prepared.
-        // Adopt its entries together with its generation, never tag stale data
-        // with the newer generation and thereby miss later synchronization.
-        let identity = super::BlacklistIdentity::new(&stats.blacklist);
-        let content_type_cache: HashMap<_, _> = snapshot
-            .entries
-            .iter()
-            .filter(|entry| entry.content_type.supported() && !identity.contains(&entry.path))
-            .map(|entry| (entry.path.clone(), entry.content_type))
-            .collect();
-        let mut current_pool: Vec<_> = content_type_cache.keys().cloned().collect();
-        current_pool.sort();
-        let current_index = Self::fallback_current_index(strategy, current_pool.len());
-        let root_generation = snapshot.generation;
+        let blacklist = super::BlacklistIdentity::new(&stats.blacklist);
+        let (pool, content_type_cache) = Self::indexed_pool(&snapshot, &blacklist);
+        let current_index = Self::fallback_current_index(strategy, pool.len());
         Ok(Self {
             content_type_cache,
-            pool: current_pool,
+            pool,
             stats,
             video_ratio,
             strategy,
@@ -349,7 +330,7 @@ impl SmartQueue {
             cache,
             pending_stats_updates: HashMap::new(),
             root_index,
-            root_generation,
+            root_generation: snapshot.generation,
         })
     }
 

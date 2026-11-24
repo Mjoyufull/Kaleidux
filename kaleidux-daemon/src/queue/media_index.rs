@@ -116,7 +116,7 @@ impl RootMediaIndex {
             .state
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.entries.is_empty() {
+        if state.generation == 0 && !pool.is_empty() {
             replace_locked(&mut state, pool, content_types);
         }
         snapshot_locked(&state)

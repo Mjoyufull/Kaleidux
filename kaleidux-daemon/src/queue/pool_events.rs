@@ -25,22 +25,38 @@ impl SmartQueue {
             .as_ref()
             .and_then(|name| self.stats.playlists.get(name));
         let blacklist = super::BlacklistIdentity::new(&self.stats.blacklist);
-        self.pool = snapshot
+        let mut content_types: std::collections::HashMap<_, _> = snapshot
             .entries
             .iter()
-            .filter(|entry| {
-                entry.content_type.supported()
-                    && !blacklist.contains(&entry.path)
-                    && (self.active_playlist.is_none()
-                        || playlist.is_some_and(|playlist| playlist.paths.contains(&entry.path)))
-            })
-            .map(|entry| entry.path.clone())
-            .collect();
-        self.content_type_cache = snapshot
-            .entries
-            .iter()
+            .filter(|entry| entry.content_type.supported() && !blacklist.contains(&entry.path))
             .map(|entry| (entry.path.clone(), entry.content_type))
             .collect();
+        self.pool = if let Some(playlist) = playlist {
+            playlist
+                .paths
+                .iter()
+                .filter(|path| {
+                    if content_types.contains_key(*path) {
+                        return true;
+                    }
+                    if path.starts_with(&self.root_path) || blacklist.contains(path) {
+                        return false;
+                    }
+                    let Some(kind) = Self::get_content_type(path).filter(|kind| kind.supported())
+                    else {
+                        return false;
+                    };
+                    content_types.insert((*path).clone(), kind);
+                    true
+                })
+                .cloned()
+                .collect()
+        } else if self.active_playlist.is_none() {
+            content_types.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        self.content_type_cache = content_types;
         self.root_generation = snapshot.generation;
         self.selected_images.retain(|path| {
             (path.is_file() || crate::media_source::MediaSource::is_virtual(path))

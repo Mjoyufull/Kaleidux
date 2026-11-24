@@ -640,6 +640,66 @@ fn playlist_events_do_not_replace_the_shared_root_index() {
     assert_eq!(unfiltered.pool, vec![first, second, third]);
 }
 
+#[tokio::test]
+async fn cached_queue_uses_the_installed_root_snapshot() {
+    let root = unique_test_dir("cached-root-snapshot");
+    let cached = root.join("cached.jpg");
+    let fresh = root.join("fresh.jpg");
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&[0xff, 0xd8, 0xff, 0xd9]);
+    fs::write(&cached, bytes).unwrap();
+    let cache = test_cache();
+    cache.set_cached_pool(&root, &[cached]).unwrap();
+    let index = super::media_index::shared_root_index(&root);
+    let current = index.replace(
+        std::slice::from_ref(&fresh),
+        &HashMap::from([(fresh.clone(), ContentType::Image)]),
+    );
+    // A running rescan makes the constructor take its cached-pool path.
+    assert!(index.request_rescan().is_some());
+    let queue = SmartQueue::new_with_cache(
+        &root,
+        0,
+        crate::orchestration::SortingStrategy::Ascending,
+        cache,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(queue.root_generation, current.generation);
+    assert_eq!(queue.cached_content_type(&fresh), Some(ContentType::Image));
+    assert_eq!(queue.pool, vec![fresh]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn external_playlist_entries_survive_root_refresh() {
+    let root = unique_test_dir("external-playlist-root");
+    let outside = unique_test_dir("external-playlist-files");
+    let external = outside.join("external.jpg");
+    let indexed = root.join("indexed.jpg");
+    for path in [&external, &indexed] {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(&[0xff, 0xd8, 0xff, 0xd9]);
+        fs::write(path, bytes).unwrap();
+    }
+    let strategy = crate::orchestration::SortingStrategy::Ascending;
+    let mut queue = SmartQueue::new_from_pool(&root, vec![], 0, strategy, test_cache()).unwrap();
+    queue.stats.playlists.insert(
+        "external".into(),
+        Playlist {
+            paths: vec![external.clone()],
+            strategy,
+            enabled: true,
+        },
+    );
+    queue.set_playlist(Some("external".into())).unwrap();
+    queue.apply_pool_events(vec![crate::cache::PoolEvent::Added(indexed)]);
+    assert_eq!(queue.pool, vec![external]);
+    fs::remove_dir_all(outside).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(any(
     feature = "backend-ffmpeg",
     feature = "backend-mpv",
