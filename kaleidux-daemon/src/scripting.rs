@@ -1,8 +1,15 @@
+//! Loads bounded Rhai hooks and exposes daemon control to scripts.
+
+mod wallpaper_query;
+
+use crate::main_loop::CommandSender;
 use kaleidux_common::{PlaylistCommand, Request, Response};
 use rhai::{AST, CallFnOptions, Engine, EvalAltResult, Position, Scope};
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 pub const SCRIPT_MAX_OPERATIONS: u64 = 50_000;
@@ -21,7 +28,7 @@ pub struct ScriptManager {
 }
 
 impl ScriptManager {
-    pub fn new(cmd_tx: mpsc::Sender<(Request, oneshot::Sender<Response>)>) -> Self {
+    pub fn new(cmd_tx: CommandSender) -> Self {
         let mut engine = Engine::new();
         engine.set_max_operations(SCRIPT_MAX_OPERATIONS);
         engine.set_max_call_levels(SCRIPT_MAX_CALL_LEVELS);
@@ -32,10 +39,13 @@ impl ScriptManager {
         // Filesystem module imports can block the display thread outside the
         // operation budget. Scripts use the supplied in-process API only.
         engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver::new());
+        wallpaper_query::register(&mut engine, cmd_tx.clone());
 
         engine.register_fn("print", |text: String| {
             info!("[Script] {}", text);
         });
+
+        register_layer_commands(&mut engine, &cmd_tx);
 
         type ImageRequest = fn(String, Option<String>) -> Request;
         let image_commands: [(&str, ImageRequest); 3] = [
@@ -54,6 +64,33 @@ impl ScriptManager {
                 let (resp_tx, _) = oneshot::channel();
                 let output = Some(if output == "*" { "all".into() } else { output });
                 enqueue_script_command(&tx, request(path, output), resp_tx)
+            });
+        }
+
+        type PreparedSwitch = fn(String, String, Option<String>) -> Request;
+        let prepared_switches: [(&str, PreparedSwitch); 2] = [
+            ("set_reveal", |path, map, output| Request::SetReveal {
+                path,
+                map,
+                output,
+            }),
+            ("set_transition", |path, transition, output| {
+                Request::SetTransition {
+                    path,
+                    transition,
+                    output,
+                }
+            }),
+        ];
+        for (name, request) in prepared_switches {
+            let tx = cmd_tx.clone();
+            engine.register_fn(name, move |path: String, effect: String| {
+                enqueue_prepared_script_command(&tx, request(path, effect, None))
+            });
+            let tx = cmd_tx.clone();
+            engine.register_fn(name, move |path: String, effect: String, output: String| {
+                let output = Some(if output == "*" { "all".into() } else { output });
+                enqueue_prepared_script_command(&tx, request(path, effect, output))
             });
         }
 
@@ -234,7 +271,7 @@ impl ScriptManager {
 }
 
 fn enqueue_script_command(
-    tx: &mpsc::Sender<(Request, oneshot::Sender<Response>)>,
+    tx: &CommandSender,
     request: Request,
     response: oneshot::Sender<Response>,
 ) -> Result<(), Box<EvalAltResult>> {
@@ -242,11 +279,78 @@ fn enqueue_script_command(
         kaleidux_common::validate_inhibit_reason(reason)
             .map_err(|error| Box::new(EvalAltResult::ErrorRuntime(error.into(), Position::NONE)))?;
     }
-    tx.try_send((request, response)).map_err(|error| {
+    tx.try_send((request.into(), response)).map_err(|error| {
         warn!("[Script] Command was not enqueued: {error}");
         let msg = format!("command queue full: {error}");
         EvalAltResult::ErrorRuntime(msg.into(), Position::NONE).into()
     })
+}
+
+fn enqueue_prepared_script_command(
+    tx: &CommandSender,
+    request: Request,
+) -> Result<(), Box<EvalAltResult>> {
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            error.to_string().into(),
+            Position::NONE,
+        ))
+    })?;
+    let permit = tx.clone().try_reserve_owned().map_err(|error| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            error.to_string().into(),
+            Position::NONE,
+        ))
+    })?;
+    runtime.spawn(async move {
+        match crate::runtime::prepared_command::prepare_command(request).await {
+            Ok(command) => {
+                let (send, receive) = oneshot::channel();
+                permit.send((command, send));
+                if let Ok(Response::Error(error)) = receive.await {
+                    warn!("[Script] Command failed: {error}");
+                }
+            }
+            Err(error) => warn!("[Script] Preparing command failed: {error:#}"),
+        }
+    });
+    Ok(())
+}
+
+fn register_layer_commands(engine: &mut Engine, cmd_tx: &CommandSender) {
+    for (name, stage) in [
+        ("filters", kaleidux_common::LayerStage::Filter),
+        ("morphs", kaleidux_common::LayerStage::Morph),
+    ] {
+        let tx = cmd_tx.clone();
+        engine.register_fn(name, move |names: rhai::Array, fps: i64, output: String| {
+            let invalid =
+                |reason: &str| Box::new(EvalAltResult::ErrorRuntime(reason.into(), Position::NONE));
+            if names.len() > kaleidux_common::MAX_LAYERS_PER_STAGE || !(0..=60).contains(&fps) {
+                return Err(invalid(
+                    "Use at most eight layers and a frame rate from 0 to 60",
+                ));
+            }
+            let layers = names
+                .into_iter()
+                .map(|name| {
+                    name.into_string()
+                        .map_err(|_| invalid("Layer names must be strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output =
+                (!output.is_empty()).then(|| if output == "*" { "all".into() } else { output });
+            enqueue_prepared_script_command(
+                &tx,
+                Request::LayersSet(kaleidux_common::LayerSelection {
+                    output,
+                    stage,
+                    layers,
+                    fps: fps as u8,
+                }),
+            )
+        });
+    }
 }
 
 #[cfg(test)]
@@ -277,13 +381,13 @@ mod tests {
             .eval(r#"jump("/a.png"); set("/b.png", "DP-1"); img("/c.png", "*");"#)
             .unwrap();
         assert!(
-            matches!(rx.try_recv().unwrap().0, Request::Jump { path, output: None } if path == "/a.png")
+            matches!(rx.try_recv().unwrap().0.request, Request::Jump { path, output: None } if path == "/a.png")
         );
         assert!(
-            matches!(rx.try_recv().unwrap().0, Request::Set { path, output: Some(output) } if path == "/b.png" && output == "DP-1")
+            matches!(rx.try_recv().unwrap().0.request, Request::Set { path, output: Some(output) } if path == "/b.png" && output == "DP-1")
         );
         assert!(
-            matches!(rx.try_recv().unwrap().0, Request::Img { path, output: Some(output) } if path == "/c.png" && output == "all")
+            matches!(rx.try_recv().unwrap().0.request, Request::Img { path, output: Some(output) } if path == "/c.png" && output == "all")
         );
     }
 
@@ -300,12 +404,12 @@ mod tests {
         "#,
             )
             .unwrap();
-        assert!(matches!(rx.try_recv().unwrap().0, Request::Pause));
+        assert!(matches!(rx.try_recv().unwrap().0.request, Request::Pause));
         manager.tick_result().unwrap();
         assert!(rx.try_recv().is_err());
         manager.tick_result().unwrap();
         assert!(matches!(
-            rx.try_recv().unwrap().0,
+            rx.try_recv().unwrap().0.request,
             Request::Next { output: None }
         ));
         assert!(rx.try_recv().is_err());
@@ -399,7 +503,7 @@ mod tests {
 
         // Now drain one and verify a command succeeds again
         let (req, _) = rx.try_recv().expect("drain queue");
-        assert!(matches!(req, Request::Next { output: Some(output) } if output == "all"));
+        assert!(matches!(req.request, Request::Next { output: Some(output) } if output == "all"));
 
         assert!(
             sm.eval(r#"inhibit("game");"#).is_ok(),
@@ -414,35 +518,35 @@ mod tests {
 
         assert!(sm.eval(r#"inhibit("gaming");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv inhibit");
-        match req {
+        match req.request {
             Request::Inhibit { reason } => assert_eq!(reason, "gaming"),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"uninhibit("gaming");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv uninhibit");
-        match req {
+        match req.request {
             Request::Uninhibit { reason } => assert_eq!(reason, "gaming"),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"prev("*");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv prev all");
-        match req {
+        match req.request {
             Request::Prev { output } => assert_eq!(output, Some("all".into())),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"prev("DP-1");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv prev single");
-        match req {
+        match req.request {
             Request::Prev { output } => assert_eq!(output, Some("DP-1".to_string())),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"load_playlist("night");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv load_playlist");
-        match req {
+        match req.request {
             Request::Playlist(PlaylistCommand::Load { name }) => {
                 assert_eq!(name, Some("night".to_string()))
             }
@@ -451,21 +555,21 @@ mod tests {
 
         assert!(sm.eval(r#"load_playlist("");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv unload playlist");
-        match req {
+        match req.request {
             Request::Playlist(PlaylistCommand::Load { name }) => assert_eq!(name, None),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"clear("*");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv clear all");
-        match req {
+        match req.request {
             Request::Clear { output } => assert_eq!(output, Some("all".into())),
             _ => panic!("unexpected request"),
         }
 
         assert!(sm.eval(r#"clear("HDMI-A-1");"#).is_ok());
         let (req, _) = rx.try_recv().expect("recv clear single");
-        match req {
+        match req.request {
             Request::Clear { output } => assert_eq!(output, Some("HDMI-A-1".to_string())),
             _ => panic!("unexpected request"),
         }

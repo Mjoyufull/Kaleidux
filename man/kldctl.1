@@ -21,6 +21,12 @@ Show version information.
 Print help information.
 .SH COMMANDS
 .TP
+.B info [-o OUTPUT]
+Report the current selection and scene-relative playback position as JSON. Times are in nanoseconds.
+.TP
+.B frame [--first] [--source PATH] [--at SECONDS] [--max-size PIXELS] [--file PATH] [-o OUTPUT]
+Export the ready base wallpaper frame as PNG. With --first, use FFmpeg to open a local file at the start of its selected scene. Use --source to prepare a frame before setting the wallpaper. The default destination is standard output.
+.TP
 .B preview PATH [-o OUTPUT]
 Display a candidate while retaining the original wallpaper, queue and slideshow timer. Accepts local media, supported URLs and colours. Wait for pending wallpaper loads to complete before previewing.
 .TP
@@ -33,8 +39,9 @@ Set a solid colour. Also accepts #RRGGBBAA and the alias color.
 .B jump PATH [-o OUTPUT]
 Display an image inside the slideshow directory using the normal transition and history.
 .TP
-.B set PATH [-o OUTPUT]
+.B set PATH [-o OUTPUT] [--transition NAME | --reveal-map MAP.png]
 Insert supported media into the current in-memory queue and advance to it immediately.
+The optional override applies for this switch. Use custom:NAME for shaders/NAME.glsl in the Kaleidux config directory. A reveal map encodes when each pixel changes in the PNG's red channel.
 .TP
 .B img PATH [-o OUTPUT]
 Select slideshow media or insert external media and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept supported images and videos and honor output groups; omitted output uses main-monitor. Use -o all for every output. Queue rebuilds can discard external entries.

@@ -200,6 +200,13 @@ kldctl query
 
 # Sync all monitors to the next wallpaper
 kldctl next -o all
+
+# Apply a filter and a text morph
+kldctl filter crt
+kldctl morph 'text=Kaleidux'
+
+# Save the current wallpaper frame
+kldctl frame --file wallpaper.png
 ```
 
 ## Configuration
@@ -222,6 +229,7 @@ See [config.example.toml](./config.example.toml) for configuration options and
 [transitions_examples.toml](./transitions_examples.toml) for transition parameters.
 [USAGE.md](./USAGE.md) is the command, configuration, transition, scripting, and
 troubleshooting reference, including gaming and sleep automation recipes.
+[morphs.md](./morphs.md) covers filters, morphs and their shader API.
 
 ## Troubleshooting
 
@@ -253,6 +261,8 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [FFmpeg](https://ffmpeg.org/)
 - [mpv](https://mpv.io/)
 - [WiVRn](https://github.com/WiVRn/WiVRn)
+- [Jolt](https://github.com/jordond/jolt)
+- [pocket-dots](https://github.com/diegoMalagrida/pocket-dots), for reveal maps
 
 ## License
 

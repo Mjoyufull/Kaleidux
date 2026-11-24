@@ -1,5 +1,6 @@
 //! Applies IPC requests to the display-loop-owned monitor and playback state.
 
+use super::prepared_command::PreparedCommand;
 use crate::content::sessions::{set_pending_video_session, stop_video_player_in_background};
 use crate::content::switch::{
     ContentSwitchContext, ContentSwitchRequest, switch_wallpaper_content,
@@ -13,7 +14,33 @@ use std::sync::atomic::Ordering;
 use tracing::{error, info};
 
 /// Handle an IPC command request.
-pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) -> Response {
+pub(crate) async fn handle_command(
+    command: PreparedCommand,
+    mut ctx: CommandContext<'_>,
+) -> Response {
+    let transition_override = command.transition_override;
+    let req = match command.request {
+        Request::LayersSet(_) => {
+            let Some(layers) = command.compiled_layers else {
+                return Response::Error("Layers were not compiled".into());
+            };
+            return layers
+                .install(&mut ctx)
+                .map(|()| Response::Ok)
+                .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
+        }
+        Request::LayersQuery { output } => {
+            return super::layer_commands::query(&ctx, output)
+                .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
+        }
+        Request::SetReveal { path, output, .. } | Request::SetTransition { path, output, .. } => {
+            if transition_override.is_none() {
+                return Response::Error("Transition was not prepared".into());
+            }
+            Request::Set { path, output }
+        }
+        request => request,
+    };
     if let Request::PreviewEnd { apply } = req {
         let Some(state) = ctx.preview.take() else {
             return Response::Error("No preview is active".into());
@@ -51,6 +78,9 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
         && let Some(state) = ctx.preview.take()
     {
         state.finish(true, &mut ctx);
+    }
+    if let Request::Love { path, multiplier } = req {
+        return super::layer_commands::love(&mut ctx, path, multiplier);
     }
     let CommandContext {
         preview,
@@ -171,10 +201,15 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
         request => request,
     };
     match req {
+        Request::WallpaperInfo { .. } | Request::Frame(_) => {
+            unreachable!("wallpaper data handled before dispatch")
+        }
         Request::Preview { .. }
         | Request::PreviewEnd { .. }
         | Request::Jump { .. }
         | Request::Set { .. }
+        | Request::SetReveal { .. }
+        | Request::SetTransition { .. }
         | Request::Img { .. } => {
             unreachable!("normalized image selection")
         }
@@ -216,6 +251,7 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
                         batch_id: Some(batch),
                         batch_trigger_time: Some(loop_start),
                         shared_image_target: change.shared_image_target,
+                        transition_override: transition_override.clone(),
                         log_prefix: "NEXT",
                     },
                     ContentSwitchContext {
@@ -252,6 +288,7 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
                         batch_id: Some(batch),
                         batch_trigger_time: Some(loop_start),
                         shared_image_target: change.shared_image_target,
+                        transition_override: None,
                         log_prefix: "PREV",
                     },
                     ContentSwitchContext {
@@ -282,10 +319,9 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
         Request::Playlist(cmd) => monitor_manager.handle_playlist_command(cmd),
         Request::Blacklist(cmd) => monitor_manager.handle_blacklist_command(cmd),
         Request::LoveitList => Response::LoveitList(monitor_manager.get_loveitlist()),
-        Request::Love { path, multiplier } => monitor_manager
-            .love_file(path, multiplier)
-            .map(|_| Response::Ok)
-            .unwrap_or_else(|e| Response::Error(e.to_string())),
+        Request::LayersSet(_) | Request::LayersQuery { .. } | Request::Love { .. } => {
+            unreachable!("layer commands handled before dispatch")
+        }
         Request::Unlove { path } => monitor_manager
             .unlove_file(path)
             .map(|_| Response::Ok)
@@ -345,6 +381,7 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
                     pending_image_video_stops,
                     display_power_suspended,
                     powered_off_outputs,
+                    renderers,
                 );
             } else if monitor_manager.is_paused() {
                 info!(
@@ -373,6 +410,7 @@ pub(crate) async fn handle_command(req: Request, mut ctx: CommandContext<'_>) ->
                         pending_image_video_stops,
                         display_power_suspended,
                         powered_off_outputs,
+                        renderers,
                     );
                 } else if monitor_manager.is_paused() {
                     info!(
@@ -454,12 +492,17 @@ fn resume_active_video_players(
     pending_image_video_stops: &HashMap<String, crate::video::VideoPlayer>,
     display_power_suspended: bool,
     powered_off_outputs: &std::collections::HashSet<String>,
+    renderers: &HashMap<String, crate::renderer::Renderer>,
 ) {
     if display_power_suspended {
         info!("[CMD] Video resume deferred until compositor outputs are powered on");
     } else {
         for (name, player) in video_players.iter().chain(pending_image_video_stops.iter()) {
-            if powered_off_outputs.contains(name) {
+            if powered_off_outputs.contains(name)
+                || renderers
+                    .get(name)
+                    .is_some_and(crate::renderer::Renderer::transition_playback_is_held)
+            {
                 continue;
             }
             if let Err(e) = player.resume() {

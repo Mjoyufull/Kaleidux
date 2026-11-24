@@ -167,7 +167,7 @@ impl super::Renderer {
             (Some(texture), Some((w, h))) => texture_byte_size(w, h, texture.mip_level_count()),
             _ => 0,
         };
-        let composition_bytes = if self.composition_texture.is_some() {
+        let transition_composition_bytes = if self.composition_texture.is_some() {
             texture_byte_size(self.config.width.max(1), self.config.height.max(1), 1)
         } else {
             0
@@ -192,7 +192,8 @@ impl super::Renderer {
         RetainedTextureFootprint {
             current_bytes,
             prev_bytes,
-            composition_bytes,
+            composition_bytes: transition_composition_bytes
+                .saturating_add(self.layers.retained_texture_bytes()),
             video_aux_bytes,
         }
     }

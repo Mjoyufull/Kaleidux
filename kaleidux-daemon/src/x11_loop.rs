@@ -426,6 +426,7 @@ pub async fn run(
         ctx.process_script_tick();
         ctx.process_scheduled(loop_start);
         ctx.drain_commands(cmd_buf, loop_start).await;
+        ctx.mark_due_layer_redraws(Instant::now());
         ctx.drain_player_events(player_event_buf, loop_start);
 
         // ─── Frame handling (X11: immediate render) ─────────────────────
@@ -448,9 +449,10 @@ pub async fn run(
                     !r.frame_callback_pending || !r.has_current_texture()
                 };
 
-                if should_upload {
+                if should_upload && !r.transition_playback_is_held() {
                     let video_start = std::time::Instant::now();
                     r.upload_frame(&frame);
+                    r.pause_incoming_after_upload(ctx.video_players.get(src.as_ref()));
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
                     ctx.metrics.record_video_frame_uploaded();

@@ -16,6 +16,7 @@ use crate::monitor_manager;
 use crate::orchestration::VideoFpsProfile;
 use crate::queue;
 use crate::renderer;
+use crate::runtime::prepared_command::TransitionOverride;
 use crate::video;
 use kaleidux_common::Transition;
 use std::collections::HashMap;
@@ -89,6 +90,7 @@ pub(crate) struct ContentSwitchRequest {
     pub(crate) batch_id: Option<u64>,
     pub(crate) batch_trigger_time: Option<Instant>,
     pub(crate) shared_image_target: Option<(u32, u32)>,
+    pub(crate) transition_override: Option<TransitionOverride>,
     pub(crate) log_prefix: &'static str,
 }
 
@@ -145,6 +147,7 @@ pub(crate) fn switch_wallpaper_content(
         batch_id,
         batch_trigger_time,
         shared_image_target,
+        transition_override,
         log_prefix,
     } = request;
     let ContentSwitchContext {
@@ -172,8 +175,18 @@ pub(crate) fn switch_wallpaper_content(
         content_type,
         renderers.contains_key(&name)
     );
+    let hold_video = monitor_manager
+        .get_output_config(&name)
+        .is_some_and(|config| !config.play_during_transition);
+    let requires_composed_video = transition_override.is_some() || hold_video;
+    let (resolved_transition, transition_asset) = match transition_override {
+        Some(TransitionOverride::Asset(asset)) => (Transition::Fade, Some(asset)),
+        Some(TransitionOverride::Named(transition)) => (transition, None),
+        None => (resolve_transition_for_output(monitor_manager, &name), None),
+    };
 
     if content_type == queue::ContentType::Video
+        && !hold_video
         && renderers.contains_key(&name)
         && video_players.get(&name).is_some_and(|player| {
             player.is_native_experimental_backend()
@@ -185,12 +198,12 @@ pub(crate) fn switch_wallpaper_content(
         })
         && let Some(renderer) = renderers.get_mut(&name)
     {
-        let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
         renderer.active_batch_id = batch_id;
         renderer.batch_start_time = batch_trigger_time;
         renderer.active_transition = resolved_transition;
         renderer.set_content_type(queue::ContentType::Video);
         renderer.switch_content();
+        renderer.set_transition_asset(transition_asset);
         frame_mailbox.clear_source(&name);
         pending_video_switches.remove(&name);
         set_pending_video_session(pending_video_sessions, &name, None);
@@ -220,7 +233,7 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
-    let mut native_decode_group_id = batch_id.map(|batch| {
+    let mut native_decode_group_id = batch_id.filter(|_| !hold_video).map(|batch| {
         use std::hash::{Hash, Hasher};
         if let Some(length) = monitor_manager.excerpt_request(&name).1 {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -232,7 +245,6 @@ pub(crate) fn switch_wallpaper_content(
     });
     let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
-        let resolved_transition = resolve_transition_for_output(monitor_manager, &name);
         r.active_batch_id = batch_id;
         r.batch_start_time = batch_trigger_time;
         r.active_transition = resolved_transition.clone();
@@ -245,6 +257,7 @@ pub(crate) fn switch_wallpaper_content(
             r.active_image_session_id = session_id;
             r.active_video_session_id = 0;
             r.switch_content();
+            r.set_transition_asset(transition_asset);
             let (output_width, output_height) = r.content_size();
             let tile_image = r.tile;
             let (target_width, target_height) = shared_image_target
@@ -387,21 +400,22 @@ pub(crate) fn switch_wallpaper_content(
         } else {
             backend_request = video::VideoBackendRequest::Auto;
             video_render_size = Some(r.content_size());
-            if let Some((peer_name, peer_player)) = video_players
-                .iter()
-                .find(|(output, player)| {
-                    output.as_str() != name.as_str()
-                        && monitor_manager.shares_playback_with(&name, output)
-                        && monitor_manager
-                            .outputs
-                            .get(output.as_str())
-                            .and_then(|o| o.current_path.as_deref())
-                            .is_some_and(|p| p == path.as_path())
-                        && std::path::Path::new(player.source_uri()) == path.as_path()
-                        && player.playback_window() == monitor_manager.excerpt_request(&name).0
-                        && player.current_position_ns().is_some()
-                })
-                .map(|(output, player)| (output.clone(), player))
+            if !hold_video
+                && let Some((peer_name, peer_player)) = video_players
+                    .iter()
+                    .find(|(output, player)| {
+                        output.as_str() != name.as_str()
+                            && monitor_manager.shares_playback_with(&name, output)
+                            && monitor_manager
+                                .outputs
+                                .get(output.as_str())
+                                .and_then(|o| o.current_path.as_deref())
+                                .is_some_and(|p| p == path.as_path())
+                            && std::path::Path::new(player.source_uri()) == path.as_path()
+                            && player.playback_window() == monitor_manager.excerpt_request(&name).0
+                            && player.current_position_ns().is_some()
+                    })
+                    .map(|(output, player)| (output.clone(), player))
             {
                 broker_start_position_ns = peer_player.current_position_ns();
                 native_decode_group_id = peer_player.native_decode_group_id().or(batch_id);
@@ -423,6 +437,8 @@ pub(crate) fn switch_wallpaper_content(
                     batch_id,
                     batch_trigger_time,
                     transition: resolved_transition,
+                    transition_asset,
+                    hold_video,
                 },
             );
             should_prepare_video = true;
@@ -459,7 +475,9 @@ pub(crate) fn switch_wallpaper_content(
             .outputs
             .get(&name)
             .and_then(|output| configured_max_publish_fps(output.config.video_fps));
-        let mpv_native_target = mpv_native_targets.and_then(|targets| targets.get(&name).cloned());
+        let mpv_native_target = mpv_native_targets
+            .filter(|_| !requires_composed_video)
+            .and_then(|targets| targets.get(&name).cloned());
         let mpv_composed_target = mpv_composed_targets
             .and_then(|targets| targets.get(&name).cloned())
             .map(|target| {

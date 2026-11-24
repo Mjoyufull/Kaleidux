@@ -66,6 +66,7 @@ pub enum DeadlineReason {
     Metrics,
     X11Randr,
     DisplayPower,
+    Layers,
 }
 
 impl DeadlineReason {
@@ -81,6 +82,7 @@ impl DeadlineReason {
             Self::Metrics => 7,
             Self::X11Randr => 8,
             Self::DisplayPower => 9,
+            Self::Layers => 10,
         }
     }
 
@@ -96,11 +98,12 @@ impl DeadlineReason {
             Self::Metrics => "metrics",
             Self::X11Randr => "x11_randr",
             Self::DisplayPower => "display_power",
+            Self::Layers => "layers",
         }
     }
 }
 
-pub const DEADLINE_REASON_COUNT: usize = 10;
+pub const DEADLINE_REASON_COUNT: usize = 11;
 pub const DEADLINE_REASONS: [DeadlineReason; DEADLINE_REASON_COUNT] = [
     DeadlineReason::PeriodicFallback,
     DeadlineReason::ContentSwitch,
@@ -112,4 +115,5 @@ pub const DEADLINE_REASONS: [DeadlineReason; DEADLINE_REASON_COUNT] = [
     DeadlineReason::Metrics,
     DeadlineReason::X11Randr,
     DeadlineReason::DisplayPower,
+    DeadlineReason::Layers,
 ];

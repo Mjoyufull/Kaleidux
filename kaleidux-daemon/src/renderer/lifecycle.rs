@@ -310,7 +310,6 @@ impl super::Renderer {
         &self,
         transition: &Transition,
     ) -> Option<Arc<wgpu::RenderPipeline>> {
-        let compile_start = std::time::Instant::now();
         let name = transition.name();
         let cache_key = crate::shaders::ShaderManager::transition_cache_key(transition);
 
@@ -358,6 +357,26 @@ impl super::Renderer {
                 }
             };
 
+        Some(self.cache_transition_pipeline(&name, cache_key, &fragment_shader_code))
+    }
+
+    pub(super) fn get_prepared_transition_pipeline(
+        &self,
+        shader: &super::PreparedShader,
+    ) -> Arc<wgpu::RenderPipeline> {
+        if let Some(pipeline) = self.ctx.transition_pipelines.lock().get(&shader.cache_key) {
+            return pipeline.clone();
+        }
+        self.cache_transition_pipeline(&shader.name, shader.cache_key.clone(), &shader.wgsl)
+    }
+
+    fn cache_transition_pipeline(
+        &self,
+        name: &str,
+        cache_key: String,
+        fragment_shader_code: &str,
+    ) -> Arc<wgpu::RenderPipeline> {
+        let compile_start = std::time::Instant::now();
         // Create vertex shader module from the built-in quad.wgsl
         let vertex_shader = self
             .ctx
@@ -431,7 +450,7 @@ impl super::Renderer {
             m.record_shader_compile_cpu_time(compile_duration);
         }
 
-        Some(pipeline_arc)
+        pipeline_arc
     }
 }
 

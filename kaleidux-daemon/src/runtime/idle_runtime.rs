@@ -67,6 +67,18 @@ impl MainLoopContext {
             );
             deadline = min_deadline_with_reason(deadline, Some(script_deadline));
         }
+        if !self.display_power_suspended {
+            let layers = self
+                .renderers
+                .iter()
+                .filter(|(name, _)| !self.powered_off_outputs.contains(*name))
+                .filter_map(|(_, renderer)| renderer.layer_animation_deadline())
+                .min();
+            deadline = min_deadline_with_reason(
+                deadline,
+                layers.map(|wake| (wake, DeadlineReason::Layers)),
+            );
+        }
         deadline = min_deadline_with_reason(
             deadline,
             self.startup_present_barrier
@@ -106,6 +118,21 @@ impl MainLoopContext {
             );
         }
         deadline
+    }
+
+    pub(crate) fn mark_due_layer_redraws(&mut self, now: Instant) {
+        if self.display_power_suspended {
+            return;
+        }
+        for (name, renderer) in &mut self.renderers {
+            if !self.powered_off_outputs.contains(name)
+                && renderer
+                    .layer_animation_deadline()
+                    .is_some_and(|wake| wake <= now)
+            {
+                renderer.needs_redraw = true;
+            }
+        }
     }
 
     pub fn next_wayland_idle_deadline(&self, now: Instant) -> Option<(Instant, DeadlineReason)> {

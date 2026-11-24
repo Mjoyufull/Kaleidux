@@ -75,10 +75,21 @@ mod video_snapshot;
 mod video_upload;
 mod video_zero_copy_upload;
 
+pub(crate) mod layer_pipeline;
+mod layer_source;
+mod layer_text;
+mod layers;
 mod render_blit;
+pub(crate) use layer_source::PreparedLayers;
+pub(crate) mod frame_capture;
 #[path = "renderer/render_present.rs"]
 mod render_present;
 mod render_transition;
+mod reveal_map;
+mod transition_asset;
+mod transition_playback;
+pub(crate) use reveal_map::RevealMap;
+pub(crate) use transition_asset::{PreparedShader, TransitionAsset};
 
 mod layout;
 #[path = "renderer/lifecycle.rs"]
@@ -343,6 +354,9 @@ pub struct Renderer {
 
     // Cached Bind Groups to avoid per-frame creation overhead
     transition_bind_group: Option<wgpu::BindGroup>,
+    reveal_bind_group: Option<Arc<wgpu::BindGroup>>,
+    prepared_transition_shader: Option<Arc<PreparedShader>>,
+    transition_playback: transition_playback::TransitionPlayback,
     blit_bind_group: Option<Arc<wgpu::BindGroup>>,
     external_blit_bind_groups:
         std::collections::HashMap<usize, (Arc<wgpu::TextureView>, Arc<wgpu::BindGroup>)>,
@@ -410,6 +424,7 @@ pub struct Renderer {
     final_i420_bind_group: Option<Arc<wgpu::BindGroup>>,
     native_wayland_snapshot_frame: Option<crate::video::VideoFrame>,
     active_yuv_source: Option<YuvSource>,
+    layers: layers::Layers,
 }
 
 impl Renderer {
@@ -545,6 +560,9 @@ impl Renderer {
             prev_texture_view: None,
             composition_texture_view: None,
             transition_bind_group: None,
+            reveal_bind_group: None,
+            prepared_transition_shader: None,
+            transition_playback: transition_playback::TransitionPlayback::Playing,
             blit_bind_group: None,
             external_blit_bind_groups: std::collections::HashMap::new(),
             blit_source_is_composition: false,
@@ -594,6 +612,7 @@ impl Renderer {
             final_i420_bind_group: None,
             native_wayland_snapshot_frame: None,
             active_yuv_source: None,
+            layers: layers::Layers::default(),
         };
         // Shader precompilation is deferred to apply_config() which knows
         // the actual configured transition. No need to precompile 10 hardcoded

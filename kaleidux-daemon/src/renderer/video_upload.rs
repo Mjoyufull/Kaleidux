@@ -25,6 +25,9 @@ fn trace_video_upload_enabled() -> bool {
 
 impl super::Renderer {
     pub fn upload_frame(&mut self, frame: &crate::video::VideoFrame) {
+        if self.transition_playback_is_held() {
+            return;
+        }
         if !self.transition_active && !self.content_swap_pending && self.has_previous_texture() {
             self.release_prev_texture("video upload cleanup");
         }

@@ -332,6 +332,7 @@ pub async fn run(
             ctx.drain_player_events(player_event_buf, loop_start);
         }
 
+        ctx.mark_due_layer_redraws(Instant::now());
         {
             for (name, renderer) in &ctx.renderers {
                 if !renderer.can_present_native_wayland_surface() {
@@ -403,10 +404,11 @@ pub async fn run(
                     !r.frame_callback_pending || !r.has_current_texture()
                 };
 
-                if !native_surface_presented && should_upload {
+                if !native_surface_presented && should_upload && !r.transition_playback_is_held() {
                     callback_flush_needed |= backend.hide_native_dmabuf(source_id.as_ref());
                     let video_start = std::time::Instant::now();
                     r.upload_frame(frame.as_ref().expect("frame is live"));
+                    r.pause_incoming_after_upload(ctx.video_players.get(source_id.as_ref()));
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
                     ctx.metrics.record_video_frame_uploaded();

@@ -58,6 +58,7 @@ impl super::Renderer {
                     // Only set flag if transition was just completed (not already completed)
                     if self.transition_active {
                         self.transition_active = false;
+                        self.clear_transition_asset();
                         self.release_prev_texture("transition completed");
                         self.transition_just_completed = true;
                         self.arm_display_timer_on_present();
@@ -148,9 +149,13 @@ impl super::Renderer {
 
         if should_render_transition {
             // 1. Get/Create pipeline (this will cache it if needed)
-            let pipeline = match self.get_transition_pipeline(&self.active_transition) {
-                Some(p) => p,
-                None => {
+            let standard_pipeline = if self.reveal_bind_group.is_none() {
+                let pipeline = if let Some(shader) = &self.prepared_transition_shader {
+                    Some(self.get_prepared_transition_pipeline(shader))
+                } else {
+                    self.get_transition_pipeline(&self.active_transition)
+                };
+                if pipeline.is_none() {
                     warn!(
                         "[TRANSITION] {}: Failed to get/create transition pipeline for {}",
                         self.name,
@@ -158,6 +163,9 @@ impl super::Renderer {
                     );
                     return false;
                 }
+                pipeline
+            } else {
+                None
             };
 
             // 2. Now we can do immutable borrows
@@ -197,7 +205,17 @@ impl super::Renderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                render_pass.set_pipeline(&pipeline);
+                if let Some(map) = &self.reveal_bind_group {
+                    let pipeline = self
+                        .ctx
+                        .reveal_pipeline
+                        .get()
+                        .expect("reveal layout initialized before map binding");
+                    render_pass.set_pipeline(pipeline.render());
+                    render_pass.set_bind_group(1, map.as_ref(), &[]);
+                } else if let Some(pipeline) = &standard_pipeline {
+                    render_pass.set_pipeline(pipeline);
+                }
                 render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.draw(0..3, 0..1);
 

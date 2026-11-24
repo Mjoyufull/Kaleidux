@@ -9,16 +9,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod layers;
 mod protocol;
 mod transition_defaults;
 mod transition_impl;
 mod transition_params;
+mod wallpaper_data;
 
 use transition_defaults::*;
 
+pub use layers::{LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE, OutputLayers};
 pub use protocol::{
     BlacklistCommand, KEntry, MAX_INHIBITOR_REASON_LEN, MAX_INHIBITORS, OutputInfo,
     PlaylistCommand, Request, Response, validate_inhibit_reason,
+};
+pub use wallpaper_data::{
+    DEFAULT_FRAME_EDGE, FrameRequest, MAX_FRAME_EDGE, MAX_FRAME_PNG_BYTES, WallpaperInfo,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

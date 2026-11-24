@@ -14,7 +14,10 @@ impl super::Renderer {
         surface_id: ObjectId,
         output_size: (u32, u32),
     ) -> bool {
-        if self.native_gl_surface_failed || !native_gl_surface_enabled() {
+        if self.layers.requires_composition()
+            || self.native_gl_surface_failed
+            || !native_gl_surface_enabled()
+        {
             return false;
         }
         if frame.color != crate::video::VideoColorMetadata::default()
@@ -73,7 +76,8 @@ impl super::Renderer {
     }
 
     pub(crate) fn can_present_native_wayland_surface(&self) -> bool {
-        self.margin == [0; 4]
+        !self.layers.requires_composition()
+            && self.margin == [0; 4]
             && !self.pause_on_fullscreen
             && self.valid_content_type == crate::queue::ContentType::Video
             && !self.transition_active
@@ -179,53 +183,7 @@ impl super::Renderer {
         descriptor: &crate::video::NativeDmaBufNv12,
         origin: super::YuvOrigin,
     ) -> bool {
-        let staging_created = self.prepare_native_nv12_staging(width, height);
-        if staging_created {
-            // Prime WGPU's texture tracker once. Raw Vulkan then preserves a
-            // stable SHADER_READ_ONLY ↔ TRANSFER_DST layout contract.
-            if let Some(output) = output {
-                self.render_nv12_to_rgba(output, "Native DMA-BUF Staging Prime");
-            } else {
-                let prime = self.ctx.get_texture_from_pool(
-                    1,
-                    1,
-                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    self.metrics.as_deref(),
-                );
-                self.render_nv12_to_rgba(&prime, "Native DMA-BUF Staging Prime");
-                self.ctx.return_texture_to_pool(prime, 1, 1);
-            }
-        }
-
-        let mut interop = match self.native_dmabuf_interop.take() {
-            Some(interop) => interop,
-            None => match super::native_dmabuf_interop::NativeDmaBufInterop::new(&self.ctx) {
-                Ok(interop) => interop,
-                Err(error) => {
-                    self.record_dmabuf_import_failure(
-                        origin,
-                        format!("cannot initialize DMA-BUF import: {error:#}"),
-                    );
-                    return false;
-                }
-            },
-        };
-        let copy_result = interop.copy_nv12_to_staging(
-            &self.ctx,
-            descriptor,
-            video_frame.session_id,
-            video_frame.storage.clone(),
-            self.nv12_y_texture
-                .as_ref()
-                .expect("native luma texture created above"),
-            self.nv12_uv_texture
-                .as_ref()
-                .expect("native UV texture created above"),
-            width,
-            height,
-        );
-        self.native_dmabuf_interop = Some(interop);
-        match copy_result {
+        match self.stage_native_dmabuf_nv12(video_frame, output, width, height, descriptor) {
             Ok(cache_hit) => self.record_dmabuf_import(descriptor.surface_id, cache_hit, origin),
             Err(error) => {
                 self.record_dmabuf_import_failure(
@@ -253,6 +211,56 @@ impl super::Renderer {
             );
         }
         true
+    }
+
+    // This copy also serves one-shot capture. Only playback decides whether
+    // an import failure should change the selected delivery path.
+    pub(super) fn stage_native_dmabuf_nv12(
+        &mut self,
+        video_frame: &crate::video::VideoFrame,
+        output: Option<&wgpu::Texture>,
+        width: u32,
+        height: u32,
+        descriptor: &crate::video::NativeDmaBufNv12,
+    ) -> anyhow::Result<bool> {
+        let staging_created = self.prepare_native_nv12_staging(width, height);
+        if staging_created {
+            // Prime WGPU's texture tracker once. Raw Vulkan then preserves a
+            // stable SHADER_READ_ONLY ↔ TRANSFER_DST layout contract.
+            if let Some(output) = output {
+                self.render_nv12_to_rgba(output, "Native DMA-BUF Staging Prime");
+            } else {
+                let prime = self.ctx.get_texture_from_pool(
+                    1,
+                    1,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    self.metrics.as_deref(),
+                );
+                self.render_nv12_to_rgba(&prime, "Native DMA-BUF Staging Prime");
+                self.ctx.return_texture_to_pool(prime, 1, 1);
+            }
+        }
+
+        let mut interop = match self.native_dmabuf_interop.take() {
+            Some(interop) => interop,
+            None => super::native_dmabuf_interop::NativeDmaBufInterop::new(&self.ctx)?,
+        };
+        let copy_result = interop.copy_nv12_to_staging(
+            &self.ctx,
+            descriptor,
+            video_frame.session_id,
+            video_frame.storage.clone(),
+            self.nv12_y_texture
+                .as_ref()
+                .expect("native luma texture created above"),
+            self.nv12_uv_texture
+                .as_ref()
+                .expect("native UV texture created above"),
+            width,
+            height,
+        );
+        self.native_dmabuf_interop = Some(interop);
+        copy_result
     }
 
     fn prepare_native_nv12_staging(&mut self, width: u32, height: u32) -> bool {

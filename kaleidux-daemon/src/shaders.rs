@@ -2,6 +2,7 @@ pub use kaleidux_common::Transition;
 
 mod builtin_mapping;
 mod builtin_sources;
+mod custom_request;
 mod safe_sources;
 
 use safe_sources::{CUBE_SAFE_GLSL, DISPLACEMENT_SAFE_GLSL, GLSL_PRELUDE};

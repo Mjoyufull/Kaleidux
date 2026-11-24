@@ -78,7 +78,12 @@ pub(crate) fn apply_update(ctx: &mut crate::main_loop::MainLoopContext, update: 
             }
             renderer.needs_redraw = true;
         }
-        if !ctx.monitor_manager.is_paused() {
+        if !ctx.monitor_manager.is_paused()
+            && !ctx
+                .renderers
+                .get(name)
+                .is_some_and(crate::renderer::Renderer::transition_playback_is_held)
+        {
             for player in ctx
                 .video_players
                 .get(name)

@@ -58,6 +58,7 @@ impl MainLoopContext {
 
                         let mut should_render = false;
                         let mut startup_ready = false;
+                        let mut hold_video = false;
                         if let Some(r) = self.renderers.get_mut(&name) {
                             r.active_batch_id = pending.batch_id;
                             r.batch_start_time = pending.batch_trigger_time;
@@ -66,10 +67,15 @@ impl MainLoopContext {
                             r.active_image_session_id = 0;
                             r.active_video_session_id = session_id;
                             r.switch_content();
+                            r.set_transition_asset(pending.transition_asset);
+                            if pending.hold_video {
+                                r.request_transition_playback_hold();
+                            }
 
                             if let Some(frame) = preroll_frame.as_ref() {
                                 let upload_start = Instant::now();
                                 r.upload_frame(frame);
+                                hold_video = r.hold_transition_playback_if_ready();
                                 self.metrics.record_video_cpu_time(upload_start.elapsed());
                                 self.metrics.record_video_frame_uploaded();
                                 startup_ready = true;
@@ -84,7 +90,8 @@ impl MainLoopContext {
                         }
 
                         if let Err(e) = player.start_with_pause(
-                            self.monitor_manager.is_paused()
+                            hold_video
+                                || self.monitor_manager.is_paused()
                                 || self.display_power_suspended
                                 || self.powered_off_outputs.contains(&name),
                         ) {
@@ -407,6 +414,7 @@ impl MainLoopContext {
                     batch_id: Some(batch_id),
                     batch_trigger_time: Some(loop_start),
                     shared_image_target: None,
+                    transition_override: None,
                     log_prefix: "STARTUP-RETRY",
                 },
                 ContentSwitchContext {

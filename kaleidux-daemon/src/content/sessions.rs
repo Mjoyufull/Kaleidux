@@ -34,6 +34,8 @@ pub struct PendingVideoSwitch {
     pub batch_id: Option<u64>,
     pub batch_trigger_time: Option<Instant>,
     pub transition: Transition,
+    pub(crate) transition_asset: Option<crate::renderer::TransitionAsset>,
+    pub(crate) hold_video: bool,
 }
 
 pub(crate) fn stop_video_player_in_background(name: String, mut player: video::VideoPlayer) {

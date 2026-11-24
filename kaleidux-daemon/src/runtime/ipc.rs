@@ -1,7 +1,18 @@
 //! Bounds request buffering while the caller owns the connected Unix stream.
 
-use tokio::io::AsyncReadExt;
+use kaleidux_common::Response;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
+
+pub(crate) async fn write_response(
+    stream: &mut tokio::net::UnixStream,
+    response: Response,
+) -> std::io::Result<()> {
+    match response {
+        Response::FramePng(bytes) => stream.write_all(&bytes).await,
+        response => stream.write_all(&serde_json::to_vec(&response)?).await,
+    }
+}
 
 pub(crate) async fn read_ipc_request_line(
     stream: &mut tokio::net::UnixStream,

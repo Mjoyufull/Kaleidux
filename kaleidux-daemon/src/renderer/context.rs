@@ -52,6 +52,7 @@ pub struct WgpuContext {
         parking_lot::Mutex<HashMap<wgpu::TextureFormat, Arc<wgpu::RenderPipeline>>>,
     pub blit_bind_group_layout: wgpu::BindGroupLayout,
     pub transition_bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) reveal_pipeline: std::sync::OnceLock<super::reveal_map::RevealPipeline>,
     #[allow(dead_code)]
     pub mipmap_bind_group_layout: wgpu::BindGroupLayout,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
@@ -376,6 +377,7 @@ impl WgpuContext {
                 mipmap_pipelines: parking_lot::Mutex::new(HashMap::new()),
                 blit_bind_group_layout,
                 transition_bind_group_layout,
+                reveal_pipeline: std::sync::OnceLock::new(),
                 mipmap_bind_group_layout,
                 nv12_bind_group_layout,
                 nv12_pipeline,

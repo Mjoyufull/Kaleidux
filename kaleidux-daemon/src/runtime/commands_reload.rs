@@ -75,6 +75,7 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
                 batch_id: Some(batch),
                 batch_trigger_time: Some(ctx.loop_start),
                 shared_image_target: None,
+                transition_override: None,
                 log_prefix: "RELOAD",
             },
             ContentSwitchContext {

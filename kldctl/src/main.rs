@@ -10,6 +10,9 @@ use clap::{Parser, Subcommand};
 use kaleidux_common::{Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+mod layers;
+mod wallpaper_data;
+use layers::layer_request;
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +56,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Replace this output's ordered post-processing filters (no arguments clears)
+    Filter {
+        layers: Vec<String>,
+        /// Idle animation rate; zero waits for new wallpaper frames
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=60))]
+        fps: u8,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Replace this output's ordered wallpaper overlays (no arguments clears)
+    Morph {
+        layers: Vec<String>,
+        /// Idle animation rate; zero leaves the overlays static
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=60))]
+        fps: u8,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Print the configured filter and morph order as JSON
+    Layers {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show wallpaper and scene timing on one output
+    Info {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Export a PNG of the current wallpaper frame or the start of a scene
+    Frame(wallpaper_data::FrameArgs),
     /// Show a candidate while preserving the current wallpaper and queue
     Preview {
         path: std::path::PathBuf,
@@ -82,6 +115,12 @@ enum Commands {
         path: std::path::PathBuf,
         #[arg(short, long)]
         output: Option<String>,
+        /// PNG with per-pixel transition timing
+        #[arg(long, value_name = "PNG", conflicts_with = "transition")]
+        reveal_map: Option<std::path::PathBuf>,
+        /// Built-in transition name or custom:NAME for this switch
+        #[arg(long, value_name = "NAME")]
+        transition: Option<String>,
     },
     /// Display an image or video from the slideshow or an external path
     Img {
@@ -266,7 +305,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let frame_file = match &cli.command {
+        Commands::Frame(args) => Some(args.file.clone()),
+        _ => None,
+    };
     let request = match cli.command {
+        Commands::Filter {
+            layers,
+            fps,
+            output,
+        } => layer_request(kaleidux_common::LayerStage::Filter, layers, fps, output)?,
+        Commands::Morph {
+            layers,
+            fps,
+            output,
+        } => layer_request(kaleidux_common::LayerStage::Morph, layers, fps, output)?,
+        Commands::Layers { output } => Request::LayersQuery { output },
+        Commands::Info { output } => Request::WallpaperInfo { output },
+        Commands::Frame(args) => Request::Frame(args.request()?),
         Commands::Preview { path, output } => Request::Preview {
             path: media_locator(path)?,
             output,
@@ -282,10 +338,29 @@ async fn main() -> anyhow::Result<()> {
             path: media_locator(path)?,
             output,
         },
-        Commands::Set { path, output } => Request::Set {
-            path: media_locator(path)?,
+        Commands::Set {
+            path,
             output,
-        },
+            reveal_map,
+            transition,
+        } => {
+            let path = media_locator(path)?;
+            if let Some(map) = reveal_map {
+                Request::SetReveal {
+                    path,
+                    output,
+                    map: map.canonicalize()?.to_string_lossy().into_owned(),
+                }
+            } else if let Some(transition) = transition {
+                Request::SetTransition {
+                    path,
+                    output,
+                    transition,
+                }
+            } else {
+                Request::Set { path, output }
+            }
+        }
         Commands::Img { path, output } => Request::Img {
             path: media_locator(path)?,
             output,
@@ -349,6 +424,9 @@ async fn main() -> anyhow::Result<()> {
             let req_json = serde_json::to_string(&request)?;
             stream.write_all(req_json.as_bytes()).await?;
             stream.write_all(b"\n").await?;
+            if let Some(file) = frame_file {
+                return wallpaper_data::read_png(stream, file).await;
+            }
 
             // Read response
             let mut response = String::new();
@@ -358,6 +436,13 @@ async fn main() -> anyhow::Result<()> {
                 // Try to parse as Response to pretty print if it's a list
                 if let Ok(resp) = serde_json::from_str::<Response>(&response) {
                     match resp {
+                        Response::WallpaperInfo(info) => {
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        }
+                        Response::FramePng(_) => anyhow::bail!("Unexpected PNG response"),
+                        Response::Layers(layers) => {
+                            println!("{}", serde_json::to_string_pretty(&layers)?)
+                        }
                         Response::LoveitList(entries) => {
                             println!("{:<50} | {:<5} | {:<5}", "Path", "Loveit", "Uses");
                             println!("{}", "-".repeat(66));

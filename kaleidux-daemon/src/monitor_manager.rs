@@ -99,6 +99,13 @@ impl MonitorManager {
         self.love_file(path, 1.0)
     }
 
+    pub(crate) fn love_heart_position(&self) -> Option<[f32; 2]> {
+        let global = &self.config.global;
+        let position = global.love_heart_position.unwrap_or([0.91, 0.88]);
+        (global.love_heart.unwrap_or(true) && position.iter().all(|value| value.is_finite()))
+            .then(|| position.map(|value| value.clamp(0.0, 1.0)))
+    }
+
     pub fn get_loveitlist(&self) -> Vec<KEntry> {
         let mut list = HashMap::new();
         // Consolidate from all queues

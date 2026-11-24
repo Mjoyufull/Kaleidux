@@ -1,4 +1,4 @@
-//! Presents renderer-owned content or a black frame using the active surface context.
+//! Presents renderer-owned content or a black frame under the selected layers.
 
 use crate::observability::present::RendererPresentKind;
 use tracing::{debug, error, warn};
@@ -74,11 +74,16 @@ impl super::Renderer {
         );
 
         let mut encoder = encoder;
+        let size = [self.config.width, self.config.height];
         {
+            let target = self
+                .layers
+                .base_view(&self.ctx, size[0], size[1])
+                .unwrap_or(view);
             let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Black Frame Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -91,6 +96,10 @@ impl super::Renderer {
             });
         }
 
+        if self.layers.requires_composition() {
+            self.layers
+                .render(&self.ctx, &mut encoder, view, size, render_start, 1.0);
+        }
         self.ctx.submit(std::iter::once(encoder.finish()));
         output.present();
         self.last_present_time = std::time::Instant::now();

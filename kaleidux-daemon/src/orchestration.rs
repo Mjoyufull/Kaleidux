@@ -55,6 +55,9 @@ pub struct OutputConfig {
     pub transition: crate::shaders::Transition,
     #[serde(default = "default_transition_time")]
     pub transition_time: u32,
+    /// Advance incoming video while its transition plays.
+    #[serde(default = "default_true")]
+    pub play_during_transition: bool,
     #[serde(default = "default_volume")]
     pub volume: u8,
     #[serde(default)]
@@ -147,12 +150,17 @@ struct RegexOutputOverride {
 pub struct GlobalConfig {
     /// Default command target; omitted or "auto" selects the largest active output.
     pub main_monitor: Option<String>,
+    /// Briefly show a heart when the active wallpaper is loved. Defaults on.
+    pub love_heart: Option<bool>,
+    /// Love morph center in output-relative coordinates, with the origin at top left.
+    pub love_heart_position: Option<[f32; 2]>,
     #[serde(default)]
     pub monitor_behavior: MonitorBehavior,
     #[serde(default)]
     pub _custom_transitions: bool,
     pub video_ratio: Option<u8>,
     pub transition_time: Option<u32>,
+    pub play_during_transition: Option<bool>,
     pub volume: Option<u8>,
     pub script_path: Option<PathBuf>,
     pub sorting: Option<SortingStrategy>,
@@ -193,10 +201,13 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             main_monitor: None,
+            love_heart: None,
+            love_heart_position: None,
             monitor_behavior: MonitorBehavior::default(),
             _custom_transitions: false,
             video_ratio: None,
             transition_time: None,
+            play_during_transition: None,
             volume: None,
             script_path: None,
             sorting: None,
@@ -226,6 +237,7 @@ pub struct PartialOutputConfig {
     )]
     pub transition: Option<crate::shaders::Transition>,
     pub transition_time: Option<u32>,
+    pub play_during_transition: Option<bool>,
     pub volume: Option<u8>,
     pub sorting: Option<SortingStrategy>,
     pub layer: Option<Layer>,
@@ -376,6 +388,7 @@ impl Config {
             video_ratio: self.global.video_ratio,
             transition: None,
             transition_time: self.global.transition_time,
+            play_during_transition: self.global.play_during_transition,
             volume: self.global.volume,
             sorting: self.global.sorting,
             layer: None,
@@ -433,6 +446,9 @@ impl PartialOutputConfig {
         if other.transition_time.is_some() {
             self.transition_time = other.transition_time;
         }
+        if other.play_during_transition.is_some() {
+            self.play_during_transition = other.play_during_transition;
+        }
         if other.volume.is_some() {
             self.volume = other.volume;
         }
@@ -467,6 +483,7 @@ impl PartialOutputConfig {
             video_ratio: self.video_ratio.unwrap_or(50),
             transition: self.transition.unwrap_or(crate::shaders::Transition::Fade),
             transition_time: self.transition_time.unwrap_or(1000),
+            play_during_transition: self.play_during_transition.unwrap_or(true),
             volume: self.volume.unwrap_or(100),
             sorting: self.sorting.unwrap_or_default(),
             layer: self.layer.unwrap_or_default(),

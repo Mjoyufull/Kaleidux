@@ -140,25 +140,26 @@ impl super::Renderer {
             return Ok(());
         }
 
-        // Get format-specific blit pipeline from shared context
+        let size = [self.config.width, self.config.height];
+        let stage_base = self.layers.base_view(&self.ctx, size[0], size[1]);
+        let format = if stage_base.is_some() {
+            super::layer_pipeline::FILTER_FORMAT
+        } else {
+            self.config.format
+        };
+        // Filters sample the established base blit, including its crop and margins.
         let blit_pipeline = match final_yuv.map(|source| source.format) {
-            Some(super::YuvFormat::Nv12) => {
-                self.ctx.get_native_nv12_blit_pipeline(self.config.format)
-            }
-            Some(super::YuvFormat::P010) => {
-                self.ctx.get_native_nv12_blit_pipeline(self.config.format)
-            }
-            Some(super::YuvFormat::I420) => {
-                self.ctx.get_final_i420_blit_pipeline(self.config.format)
-            }
-            None => self.ctx.get_blit_pipeline(self.config.format),
+            Some(super::YuvFormat::Nv12) => self.ctx.get_native_nv12_blit_pipeline(format),
+            Some(super::YuvFormat::P010) => self.ctx.get_native_nv12_blit_pipeline(format),
+            Some(super::YuvFormat::I420) => self.ctx.get_final_i420_blit_pipeline(format),
+            None => self.ctx.get_blit_pipeline(format),
         };
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Blit Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: stage_base.unwrap_or(&view),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -197,6 +198,15 @@ impl super::Renderer {
             }
         } // render_pass dropped here
 
+        if self.layers.requires_composition() {
+            let progress = if self.transition_active {
+                self.transition_progress
+            } else {
+                1.0
+            };
+            self.layers
+                .render(&self.ctx, &mut encoder, &view, size, frame_time, progress);
+        }
         self.ctx.submit(std::iter::once(encoder.finish()));
         if let (Some(source), Some(metrics)) = (final_yuv, &self.metrics) {
             use crate::observability::video_backend::VideoBackendMetricKind;

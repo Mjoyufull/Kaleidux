@@ -90,7 +90,10 @@ pub(crate) struct PendingContentSwitch {
 }
 
 /// Type aliases to reduce verbosity in signatures
-pub type CmdMsg = (Request, tokio::sync::oneshot::Sender<Response>);
+pub type CmdMsg = (
+    crate::runtime::prepared_command::PreparedCommand,
+    tokio::sync::oneshot::Sender<Response>,
+);
 pub type PlayerEventMsg = video::PlayerEvent;
 pub type CommandSender = tokio::sync::mpsc::Sender<CmdMsg>;
 pub type PlayerReadySender = tokio::sync::mpsc::Sender<VideoPlayerResult>;
@@ -143,6 +146,8 @@ pub struct MainLoopContext {
     pub latest_video_frames: video::LatestFrameMailbox,
 
     pub cmd_rx: tokio::sync::mpsc::Receiver<CmdMsg>,
+    pub(crate) layer_compile_queue:
+        tokio::sync::mpsc::Sender<crate::runtime::layer_commands::LayerCompileJob>,
     pub image_rx: tokio::sync::mpsc::Receiver<LoadedImage>,
     pub image_tx: tokio::sync::mpsc::Sender<LoadedImage>,
     pub player_rx: tokio::sync::mpsc::Receiver<VideoPlayerResult>,
@@ -276,6 +281,7 @@ impl MainLoopContext {
         // Spawn IPC Listener
         let cmd_tx_clone = cmd_tx.clone();
         let ipc_permits = Arc::new(tokio::sync::Semaphore::new(IPC_CONCURRENCY_LIMIT));
+        let frame_export = Arc::new(tokio::sync::Semaphore::new(1));
         tokio::spawn(async move {
             loop {
                 let permit = match ipc_permits.clone().acquire_owned().await {
@@ -285,6 +291,7 @@ impl MainLoopContext {
                 match listener.accept().await {
                     Ok((mut stream, _)) => {
                         let cmd_tx = cmd_tx_clone.clone();
+                        let frame_export = frame_export.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
                             const MAX_MESSAGE_SIZE: usize = 8192;
@@ -300,6 +307,39 @@ impl MainLoopContext {
                             let Ok(req) = serde_json::from_str::<Request>(req_str.trim()) else {
                                 warn!("[IPC] Failed to parse control request JSON");
                                 return;
+                            };
+                            let _frame_export = if matches!(req, Request::Frame(_)) {
+                                match frame_export.try_acquire() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        let response =
+                                            Response::Error("Frame export is busy".into());
+                                        let _ = tokio::time::timeout(
+                                            IPC_RESPONSE_TIMEOUT,
+                                            crate::runtime::ipc::write_response(
+                                                &mut stream,
+                                                response,
+                                            ),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let req = match crate::runtime::prepared_command::prepare_command(req)
+                                .await
+                            {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    if let Ok(json) = serde_json::to_string(&Response::Error(
+                                        format!("{error:#}"),
+                                    )) {
+                                        let _ = stream.write_all(json.as_bytes()).await;
+                                    }
+                                    return;
+                                }
                             };
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             let response = match cmd_tx.try_send((req, resp_tx)) {
@@ -317,10 +357,12 @@ impl MainLoopContext {
                                     Some(Response::Error("daemon is shutting down".to_string()))
                                 }
                             };
-                            if let Some(response) = response
-                                && let Ok(json) = serde_json::to_string(&response)
-                            {
-                                let _ = stream.write_all(json.as_bytes()).await;
+                            if let Some(response) = response {
+                                let _ = tokio::time::timeout(
+                                    IPC_RESPONSE_TIMEOUT,
+                                    crate::runtime::ipc::write_response(&mut stream, response),
+                                )
+                                .await;
                             }
                         });
                     }
@@ -371,6 +413,7 @@ impl MainLoopContext {
             startup_present_barrier: None,
             latest_video_frames,
             cmd_rx,
+            layer_compile_queue: crate::runtime::layer_commands::start_worker(cmd_tx),
             image_rx,
             image_tx,
             player_rx,
@@ -402,14 +445,22 @@ impl MainLoopContext {
     // ─── Channel draining ───────────────────────────────────────────────
 
     pub fn mark_output_presented_if_ready(&mut self, name: &str) {
-        let should_mark = self.renderers.get_mut(name).is_some_and(|renderer| {
-            let ready = renderer.take_display_timer_ready();
-            if ready {
-                renderer.transition_just_completed = false;
+        if let Some(renderer) = self.renderers.get_mut(name)
+            && renderer.take_display_timer_ready()
+        {
+            renderer.transition_just_completed = false;
+            if renderer.end_transition_playback_hold()
+                && !self.monitor_manager.is_paused()
+                && !self.display_power_suspended
+                && !self.powered_off_outputs.contains(name)
+                && let Some(player) = self.video_players.get(name)
+            {
+                if let Err(error) = player.resume() {
+                    warn!("[VIDEO] Failed to resume incoming video for {name}: {error}");
+                } else {
+                    player.request_video_frame();
+                }
             }
-            ready
-        });
-        if should_mark {
             self.runtime_recoveries.remove(name);
             self.monitor_manager.mark_transition_completed(name);
             self.mark_startup_output_presented(name, Instant::now());

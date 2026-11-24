@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 default = ["full"]
@@ -43,7 +44,7 @@ gstreamer-allocators = { workspace = true }
 glib = { workspace = true }
 ash = { workspace = true }
 naga = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "fs", "time", "sync", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "fs", "time", "sync", "signal", "macros", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

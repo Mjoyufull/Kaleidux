@@ -29,6 +29,7 @@ the tables below explain their defaults and behavior.
   - [Output Settings Reference](#output-settings-reference)
   - [Complete Configuration Example](#complete-configuration-example)
 - [Transitions Reference](#transitions-reference)
+  - [Reveal Maps](#reveal-maps)
   - [Syntax Styles](#syntax-styles)
   - [Parameterless Transitions](#parameterless-transitions)
   - [Parametric Transitions](#parametric-transitions)
@@ -220,6 +221,37 @@ DP-1       | 2560x1440  | /home/your-user/Pictures/mountain.jpg
 HDMI-A-1   | 1920x1080  | /home/your-user/Videos/rain.mp4
 ```
 
+#### Wallpaper Timeline and Frames
+
+```sh
+kldctl info -o DP-1
+kldctl frame -o DP-1 --file current.png
+kldctl frame --first -o DP-1 > scene.png
+kldctl frame --first --source incoming.mp4 --at 12.5 --max-size 1080 > incoming.png
+```
+
+Omit `-o` to inspect the main monitor. `info` reports the selection and
+times in nanoseconds. `position_ns` starts at zero for the selected scene.
+`scene_start_ns` locates that scene in the full video. Unavailable video
+properties use null values. Slideshow and media durations have separate fields.
+
+`frame` captures the latest ready content in the output's content rectangle
+before the transition, filters and morphs. During a transition it captures the
+incoming frame. This works with the FFmpeg DMA-BUF path. The separate native
+mpv overlay requires composed playback for current-frame capture.
+`--first` decodes a local source at the start
+of the selected scene. `--source` lets a script prepare a mask for an incoming
+file before it sets the wallpaper. `--at` offsets from the scene start, or
+from zero when `--source` is supplied.
+Install FFmpeg for local file decoding. The longest edge is capped at 1920
+pixels by default and can be changed up to 3840. Exports run one at a time.
+
+The Unix socket accepts `{"method":"wallpaper_info","params":{"output":"DP-1"}}`
+or `{"method":"frame","params":{"output":"DP-1","first":false,"max_size":1920}}`
+followed by a newline. Read the response until EOF. A successful frame response
+starts with the PNG signature and contains raw PNG bytes. Errors use the
+ordinary JSON response. A first-frame request accepts `source` and `at_ns`.
+
 #### Queue Navigation
 
 ```sh
@@ -254,6 +286,31 @@ kldctl color '#112233ff'
 ```
 
 A preview pauses the previous player and freezes slideshow selection. Cancel restores its GPU frame, queue position, remaining duration and playback state, including active pause inhibitors. Apply keeps the candidate and preserves the remaining duration on untouched outputs. Finish an active preview before another selection, reload or `stop`; pending original loads must settle before preview begins. Applying a candidate that is still loading returns an error so it can be retried. Colours also work as `set '#1a1b26'` or a configured `path = "colour:#1a1b26"`.
+
+#### Filters and Morphs
+
+```sh
+kldctl filter mono crt
+kldctl morph 'text=Kaleidux' heart -o DP-1
+kldctl layers -o all
+kldctl filter -o DP-1
+```
+
+Pass layers in draw order. Filters run after the transition and morphs draw on
+top. An empty list clears the corresponding stage. `--fps 0`, the default,
+keeps static images idle. Use a rate up to 60 for animated layers.
+
+A named local WGSL layer defines `fn layer(uv: vec2<f32>) -> vec4<f32>`.
+Filters read the previous image with `sample(uv)`. Morphs return straight-alpha
+RGBA. Both use `frame.size`, `frame.seconds`, and `frame.progress` for the output
+size, local layer time, and wallpaper transition progress. The built-in CRT
+uses the same shader ABI as files in `kaleidux/filters` under the config directory.
+Put morph sources in `kaleidux/morphs`. See [morphs.md](./morphs.md) for the full ABI.
+
+Rhai can set both stacks with `filters(["crt"], 0, "*")` and
+`morphs(["text=Kaleidux"], 0, "DP-1")`. Loving the current wallpaper shows a
+brief heart by default. Configure `love-heart` and `love-heart-position` in
+`[global]`.
 
 #### Playback Control
 
@@ -445,6 +502,7 @@ Applicable within `[any]`, `[<output>]`, and `["re:<pattern>"]`:
 | `video-ratio` | Integer `0..=100` | Inherited (`50`) | Probability percentage of selecting video over image. |
 | `transition` | String or Table | `{ type = "fade" }` | Transition effect and parameters. |
 | `transition-time` | Integer (ms) | Inherited (`1000`) | Transition duration in milliseconds for this output. |
+| `play-during-transition` | Boolean | Inherited (`true`) | Advance incoming video during transitions. Set `false` to hold its first frame until the transition is presented. |
 | `volume` | Integer `0..=100` | Inherited (`100`) | Audio volume percentage (0 disables audio decoding). |
 | `sorting` | String | Inherited (`"loveit"`) | Output sorting strategy override. |
 | `layer` | String | `"background"` | Wayland `wlr-layer-shell` layer: `"background"`, `"bottom"`, `"top"`, or `"overlay"`. |
@@ -525,6 +583,48 @@ duration = "20m"
 ## Transitions Reference
 
 Kaleidux compiles WGSL transition shaders executed via WGPU on the GPU. Transitions can be configured using canonical table syntax, simple string syntax, or legacy single-key table syntax.
+
+Use `kldctl set MEDIA --transition NAME` to choose a transition for one switch.
+Use `custom:NAME` for `shaders/NAME.glsl` in the Kaleidux config directory.
+Custom files use the GLSL transition function described below and are limited
+to 64 KiB. Rhai has `set_transition(media, name[, output])`, and IPC
+has `set_transition` with `path`, `transition` and optional `output`.
+The setting `transition-time` controls the duration.
+
+### Reveal Maps
+
+`kldctl set MEDIA --reveal-map MAP.png -o OUTPUT` uses a map for that switch.
+The normal transition duration applies. Rhai scripts can call
+`set_reveal(media, map)` or `set_reveal(media, map, output)`. Preparation
+finishes asynchronously and dispatches the selection when its map is ready.
+IPC clients can send `set_reveal` with `path`, `map` and optional `output`.
+
+Each red channel value says when that pixel switches to the new wallpaper.
+Black switches first and full red switches last. An RGB or RGBA PNG can use
+green for a white highlight near the reveal edge. A grayscale PNG supplies
+timing alone. PNGs are limited to 1024 pixels per edge and 8 MiB on disk.
+Keep the map at the incoming image or video's display aspect ratio for the
+same center crop. The map is read in linear value space.
+
+```sh
+# Generate a map from a video still and a subject outline.
+kldctl frame --first --source /path/to/video.mp4 --file first.png
+# Export a mask or transparent cutout from an external subject detector.
+rembg i -om -m birefnet-general first.png subject.png
+python3 examples/reveal-map.py outline subject.png reveal.png
+kldctl set /path/to/video.mp4 --reveal-map reveal.png
+
+# Generate a map from scattered colonies. This example uses a 16:9 source.
+python3 examples/reveal-map.py contagion --seed 42 reveal.png
+kldctl set /path/to/wallpaper.png --reveal-map reveal.png
+```
+
+The map generator uses Python with Pillow and works with a mask from
+[rembg](https://github.com/danielgatis/rembg) or an image editor.
+Set `play-during-transition = false`
+in the output configuration when the reveal should trace the held first frame.
+Mapped switches use normal composition, including when experimenting with mpv's
+native overlay. The reveal map is retained only for the current switch.
 
 ### Syntax Styles
 
@@ -825,6 +925,7 @@ These functions are available in addition to Rhai's standard language operations
 | `jump(path, output)` | Selects supported media inside the slideshow directory. |
 | `set(path, output)` | Inserts supported media into the current queue and displays it. |
 | `img(path, output)` | Selects slideshow media or inserts external media and displays it. |
+| `wallpaper_info(output)` | Starts a timeline query for one output. Omit the output for the main monitor. Call `.read()` on the result in a later tick. |
 
 For `jump`, `set` and `img`, omit `output` to target the main monitor or pass `"*"` for all outputs.
 Use absolute paths in scripts: relative paths use the daemon's working directory,
@@ -833,6 +934,11 @@ not the script directory. Selection errors are handled by the daemon after enque
 `next()`, `prev()`, and `clear()` without an argument target the main monitor.
 `load_playlist()` without an argument unloads the playlist. `resume()` clears
 manual pause only; named inhibitors can keep playback paused.
+
+`wallpaper_info()` returns immediately. Store its handle and call `.read()`
+in a later tick. A pending query returns `()`. A completed query returns a
+map with the same keys as `kldctl info`, and consumes the reply. Use the frame
+IPC from external scripts to work with PNG bytes.
 
 ### Execution Semantics and Limits
 

@@ -85,6 +85,7 @@ impl MainLoopContext {
                     batch_id: Some(batch_id),
                     batch_trigger_time: None,
                     shared_image_target: change.shared_image_target,
+                    transition_override: None,
                     log_prefix,
                 },
                 ContentSwitchContext {

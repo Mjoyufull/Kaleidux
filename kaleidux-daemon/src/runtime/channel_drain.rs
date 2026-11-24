@@ -66,6 +66,7 @@ impl MainLoopContext {
                         batch_id: Some(batch_id),
                         batch_trigger_time: Some(loop_start),
                         shared_image_target: change.shared_image_target,
+                        transition_override: None,
                         log_prefix: "SCHEDULED",
                     },
                     ContentSwitchContext {
@@ -157,10 +158,14 @@ impl MainLoopContext {
 
     /// Drain and handle all pending commands.
     pub async fn drain_commands(&mut self, cmd_buf: Option<CmdMsg>, loop_start: Instant) {
-        let cmd_iter = std::iter::once(cmd_buf)
-            .flatten()
-            .chain(std::iter::from_fn(|| self.cmd_rx.try_recv().ok()));
-        for (req, resp) in cmd_iter {
+        let mut buffered = cmd_buf;
+        while let Some((req, resp)) = buffered.take().or_else(|| self.cmd_rx.try_recv().ok()) {
+            let Some((req, resp)) = self.dispatch_wallpaper_data(req, resp) else {
+                continue;
+            };
+            let Some((req, resp)) = self.dispatch_layers(req, resp) else {
+                continue;
+            };
             let response = handle_command(
                 req,
                 CommandContext {

@@ -1,3 +1,4 @@
+use crate::wallpaper_data::{FrameRequest, WallpaperInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10,6 +11,14 @@ pub struct KEntry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
+    #[serde(rename = "wallpaper_info")]
+    WallpaperInfo { output: Option<String> },
+    #[serde(rename = "frame")]
+    Frame(FrameRequest),
+    #[serde(rename = "layers_set")]
+    LayersSet(crate::LayerSelection),
+    #[serde(rename = "layers_query")]
+    LayersQuery { output: Option<String> },
     #[serde(rename = "query_outputs")]
     QueryOutputs,
     #[serde(rename = "next")]
@@ -30,6 +39,20 @@ pub enum Request {
     Set {
         path: String,
         output: Option<String>,
+    },
+    /// Switch to media with a one-shot reveal map prepared outside the display loop.
+    #[serde(rename = "set_reveal")]
+    SetReveal {
+        path: String,
+        output: Option<String>,
+        map: String,
+    },
+    /// Use one named built-in transition for this switch.
+    #[serde(rename = "set_transition")]
+    SetTransition {
+        path: String,
+        output: Option<String>,
+        transition: String,
     },
     #[serde(rename = "img")]
     Img {
@@ -121,6 +144,11 @@ pub enum BlacklistCommand {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
+    WallpaperInfo(WallpaperInfo),
+    /// The Unix socket sends these bytes directly. Errors remain JSON.
+    #[serde(skip)]
+    FramePng(Vec<u8>),
+    Layers(Vec<crate::OutputLayers>),
     Ok,
     Error(String),
     OutputInfo(Vec<OutputInfo>),

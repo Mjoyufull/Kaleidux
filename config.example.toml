@@ -8,6 +8,12 @@
 # └─────────────────────────────────────────────────────────────────────────────┘
 
 [global]
+# Show a brief heart when loving the current wallpaper.
+love-heart = true
+love-heart-position = [0.91, 0.88]
+
+# Set false to hold the incoming video's first frame during its transition.
+play-during-transition = true
 # Default command target: largest active output, then name; use -o all for all.
 main-monitor = "auto"
 # main-monitor = "HDMI-A-1"
