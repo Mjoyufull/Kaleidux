@@ -51,18 +51,19 @@ pub(super) fn label(text: &str, font: &str, colour: &str) -> Result<RgbaImage> {
     );
     let scratch = Scratch::new()?;
     let output = scratch.0.join("label.png");
-    let mut child = Command::new("pango-view")
-        .args(["--no-display", "--margin=0", "--background=transparent"])
-        .arg(format!("--font={font}"))
-        .arg(format!("--foreground={colour}"))
-        .arg(format!("--text={text}"))
-        .arg("--output")
-        .arg(&output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("System font morphs require pango-view")?;
+    let mut child =
+        Command::new(std::env::var_os("KLD_PANGO_VIEW").unwrap_or_else(|| "pango-view".into()))
+            .args(["--no-display", "--margin=0", "--background=transparent"])
+            .arg(format!("--font={font}"))
+            .arg(format!("--foreground={colour}"))
+            .arg(format!("--text={text}"))
+            .arg("--output")
+            .arg(&output)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("System font morphs require pango-view")?;
     let deadline = Instant::now() + Duration::from_secs(4);
     let status = loop {
         if let Some(status) = child.try_wait()? {

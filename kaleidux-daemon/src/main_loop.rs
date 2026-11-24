@@ -149,6 +149,8 @@ pub struct MainLoopContext {
     pub(crate) rule_command_sender: CommandSender,
     pub(crate) layer_compile_queue:
         tokio::sync::mpsc::Sender<crate::runtime::layer_commands::LayerCompileJob>,
+    pub(crate) deferred_layer_rules:
+        std::collections::VecDeque<crate::runtime::layer_commands::LayerCompileJob>,
     pub image_rx: tokio::sync::mpsc::Receiver<LoadedImage>,
     pub image_tx: tokio::sync::mpsc::Sender<LoadedImage>,
     pub player_rx: tokio::sync::mpsc::Receiver<VideoPlayerResult>,
@@ -416,6 +418,7 @@ impl MainLoopContext {
             cmd_rx,
             rule_command_sender: cmd_tx.clone(),
             layer_compile_queue: crate::runtime::layer_commands::start_worker(cmd_tx),
+            deferred_layer_rules: std::collections::VecDeque::new(),
             image_rx,
             image_tx,
             player_rx,

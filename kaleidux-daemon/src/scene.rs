@@ -79,10 +79,12 @@ fn push_layer(layers: &mut Vec<PreparedLayer>, layer: PreparedLayer) -> Result<(
     let retained: usize = layers
         .iter()
         .chain(std::iter::once(&layer))
-        .filter_map(|layer| layer.bitmap.as_ref())
-        .map(|bitmap| bitmap.as_raw().len())
+        .map(PreparedLayer::texture_bytes)
         .sum();
-    anyhow::ensure!(retained <= 96 * 1024 * 1024, "Scene textures exceed 96 MiB");
+    anyhow::ensure!(
+        retained <= crate::renderer::layer_source::MAX_LAYER_TEXTURE_BYTES,
+        "Scene textures exceed 96 MiB"
+    );
     layers.push(layer);
     Ok(())
 }

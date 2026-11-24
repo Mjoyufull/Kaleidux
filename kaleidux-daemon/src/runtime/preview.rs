@@ -25,10 +25,20 @@ impl PreviewState {
     pub(crate) fn is_loading(&self, ctx: &CommandContext<'_>) -> bool {
         self.originals.keys().any(|name| {
             ctx.pending_video_switches.contains_key(name)
-                || ctx
-                    .renderers
-                    .get(name)
-                    .is_some_and(|renderer| renderer.content_is_loading())
+                || ctx.renderers.get(name).is_some_and(|renderer| {
+                    renderer.content_is_loading()
+                        || ctx
+                            .monitor_manager
+                            .outputs
+                            .get(name)
+                            .and_then(|output| output.current_path.as_deref())
+                            .is_some_and(|path| {
+                                (crate::renderer::is_shader_file(path)
+                                    || crate::scene::is_scene(path))
+                                    && renderer.shader_wallpaper().map(std::path::Path::new)
+                                        != Some(path)
+                            })
+                })
         })
     }
     pub(crate) fn begin(

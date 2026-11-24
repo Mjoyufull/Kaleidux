@@ -20,6 +20,7 @@ impl MonitorManager {
         output_config: &OutputConfig,
     ) -> Option<SmartQueue> {
         let path = output_config.path.as_ref()?;
+        let virtual_source = crate::media_source::MediaSource::is_virtual(path);
         let blacklist = match cache.get_all_blacklisted() {
             Ok(blacklist) => blacklist,
             Err(e) => {
@@ -36,8 +37,13 @@ impl MonitorManager {
             .ok()
             .flatten()
             .unwrap_or_default();
-        pool.retain(|p| p.exists() && !blacklist.contains(p));
-        if pool.is_empty() {
+        pool.retain(|p| {
+            (p.exists() || crate::media_source::MediaSource::is_virtual(p))
+                && !blacklist.contains(p)
+        });
+        if virtual_source {
+            pool = vec![path.clone()];
+        } else if pool.is_empty() {
             pool = match SmartQueue::discover_content(path, &blacklist, cache.clone(), metrics) {
                 Ok((p, _)) => p,
                 Err(e) => {
@@ -51,13 +57,24 @@ impl MonitorManager {
             };
         }
 
-        match SmartQueue::new_from_pool(
-            path,
-            pool,
-            output_config.video_ratio,
-            output_config.sorting,
-            cache,
-        ) {
+        let queue = if virtual_source {
+            SmartQueue::new_manual_from_pool(
+                path,
+                pool,
+                output_config.video_ratio,
+                output_config.sorting,
+                cache,
+            )
+        } else {
+            SmartQueue::new_from_pool(
+                path,
+                pool,
+                output_config.video_ratio,
+                output_config.sorting,
+                cache,
+            )
+        };
+        match queue {
             Ok(mut q) => {
                 if let Some(pl_name) = &output_config.default_playlist {
                     if let Err(e) = q.set_playlist(Some(pl_name.clone())) {

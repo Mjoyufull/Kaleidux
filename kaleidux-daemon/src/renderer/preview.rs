@@ -12,6 +12,8 @@ pub(crate) struct FrozenWallpaper {
     image_session: u64,
     video_session: u64,
     tiled_image: bool,
+    shader_wallpaper: Option<super::layer_pipeline::LayerPipelines>,
+    frozen_at: std::time::Instant,
 }
 
 impl super::Renderer {
@@ -46,11 +48,14 @@ impl super::Renderer {
             image_session: self.active_image_session_id,
             video_session: self.active_video_session_id,
             tiled_image: self.tiled_image,
+            shader_wallpaper: self.take_shader_wallpaper(),
+            frozen_at: std::time::Instant::now(),
         }
     }
 
     pub(crate) fn restore_wallpaper(&mut self, frozen: FrozenWallpaper) {
         self.clear();
+        self.invalidate_layer_rule();
         self.current_texture = frozen.texture;
         self.current_texture_size = self
             .current_texture
@@ -70,6 +75,11 @@ impl super::Renderer {
         self.active_video_session_id = frozen.video_session;
         self.tiled_image = frozen.tiled_image;
         self.prev_tiled_image = frozen.tiled_image;
+        let shader = frozen.shader_wallpaper.map(|mut stack| {
+            stack.start += frozen.frozen_at.elapsed();
+            stack
+        });
+        self.restore_shader_wallpaper(shader);
         self.needs_redraw = true;
     }
 

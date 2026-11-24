@@ -1,6 +1,6 @@
 //! Shares preroll, pause and frame delivery for software-rendered canvases.
 
-use super::{LatestFrameMailbox, VideoFrame};
+use super::{LatestFrameMailbox, PlayerEvent, PlayerEventKind, VideoBackendKind, VideoFrame};
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
 use std::path::PathBuf;
@@ -20,6 +20,15 @@ pub(super) struct CanvasPlayer {
 pub(crate) enum CanvasSource {
     Gif(super::gif::GifOptions),
     Web,
+}
+
+impl CanvasSource {
+    pub(super) fn backend(self) -> VideoBackendKind {
+        match self {
+            Self::Gif(_) => VideoBackendKind::Gif,
+            Self::Web => VideoBackendKind::Web,
+        }
+    }
 }
 
 pub(super) struct FrameStream {
@@ -70,6 +79,7 @@ impl CanvasPlayer {
         kind: CanvasSource,
         size: Option<(u32, u32)>,
         fps: Option<u32>,
+        event_sender: tokio::sync::mpsc::Sender<PlayerEvent>,
     ) -> Result<Self> {
         let (send, receive) = mpsc::sync_channel(1);
         let control = Arc::new(Clock {
@@ -100,7 +110,13 @@ impl CanvasPlayer {
                     if let Some(send) = stream.first.take() {
                         let _ = send.send(Err(error));
                     } else if !stream.stopped() {
-                        tracing::warn!("[CANVAS] Playback stopped: {error:#}");
+                        let _ = event_sender.blocking_send(PlayerEvent {
+                            source_id: stream.source.to_string(),
+                            session_id: session,
+                            backend_kind: kind.backend(),
+                            kind: PlayerEventKind::Error,
+                            reason: format!("Canvas playback stopped: {error:#}"),
+                        });
                     }
                 }
             })?;

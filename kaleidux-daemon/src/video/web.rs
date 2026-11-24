@@ -61,7 +61,7 @@ mod helper {
         let height = (f64::from(height) * scale).round().max(1.0) as u32;
         let interval = Duration::from_secs_f64(1.0 / f64::from(fps.unwrap_or(30).clamp(1, 120)));
         let mut browser = Browser(
-            Command::new("python3")
+            Command::new(std::env::var_os("KLD_WEB_PYTHON").unwrap_or_else(|| "python3".into()))
                 .args(["-u", "-c", include_str!("web_helper.py")])
                 .arg(path)
                 .arg(width.to_string())
@@ -86,23 +86,36 @@ mod helper {
         loop {
             let started = Instant::now();
             input.write_all(b"R")?;
-            let mut pixels = vec![0; width as usize * height as usize * 4];
-            if !read_frame(&mut output, &mut pixels, stream)? {
+            let mut status = [0];
+            if !read_frame(&mut output, &mut status, stream)? {
                 return Ok(());
             }
-            let frame = VideoFrame {
-                storage: VideoFrameStorage::Cpu(Arc::from(pixels)),
-                width,
-                height,
-                stride: width * 4,
-                format: VideoFrameFormat::Rgba,
-                session_id,
-                pts_ns: Some(position_ns),
-                duration_ns: Some(interval.as_nanos() as u64),
-                color: Default::default(),
-                geometry: VideoGeometry::for_dimensions(width, height),
-            };
-            if !stream.publish(frame) || !stream.wait(interval.saturating_sub(started.elapsed())) {
+            match status[0] {
+                b'F' => {
+                    let mut pixels = vec![0; width as usize * height as usize * 4];
+                    if !read_frame(&mut output, &mut pixels, stream)? {
+                        return Ok(());
+                    }
+                    let frame = VideoFrame {
+                        storage: VideoFrameStorage::Cpu(Arc::from(pixels)),
+                        width,
+                        height,
+                        stride: width * 4,
+                        format: VideoFrameFormat::Rgba,
+                        session_id,
+                        pts_ns: Some(position_ns),
+                        duration_ns: Some(interval.as_nanos() as u64),
+                        color: Default::default(),
+                        geometry: VideoGeometry::for_dimensions(width, height),
+                    };
+                    if !stream.publish(frame) {
+                        return Ok(());
+                    }
+                }
+                b'I' => {}
+                _ => anyhow::bail!("Invalid HTML renderer frame status"),
+            }
+            if !stream.wait(interval.saturating_sub(started.elapsed())) {
                 return Ok(());
             }
             position_ns = position_ns.saturating_add(interval.as_nanos() as u64);

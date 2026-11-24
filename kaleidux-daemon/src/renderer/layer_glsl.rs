@@ -35,11 +35,24 @@ float kldAudio(int index) { int n = clamp(index, 0, 63); return kld_frame.audio[
 const GLSL_SAMPLE: &str = r#"
 layout(set = 0, binding = 1) uniform texture2D kld_input;
 layout(set = 0, binding = 2) uniform sampler kld_sampler;
-layout(set = 0, binding = 3) uniform texture2D kld_depth;
 #define iChannel0 sampler2D(kld_input, kld_sampler)
-#define iChannelResolution vec3[4](iResolution, vec3(0.0), vec3(0.0), vec3(0.0))
 #define iChannelTime float[4](iTime, 0.0, 0.0, 0.0)
-#define u_tex sampler2D(kld_input, kld_sampler)
+#define u_tex iChannel0
+"#;
+
+const GLSL_WALLPAPER_SAMPLE: &str = r#"
+layout(set = 0, binding = 3) uniform texture2D kld_channel1;
+layout(set = 0, binding = 4) uniform texture2D kld_channel2;
+layout(set = 0, binding = 5) uniform texture2D kld_channel3;
+#define iChannel1 sampler2D(kld_channel1, kld_sampler)
+#define iChannel2 sampler2D(kld_channel2, kld_sampler)
+#define iChannel3 sampler2D(kld_channel3, kld_sampler)
+#define iChannelResolution vec3[4](vec3(textureSize(iChannel0, 0), 1.0), vec3(textureSize(iChannel1, 0), 1.0), vec3(textureSize(iChannel2, 0), 1.0), vec3(textureSize(iChannel3, 0), 1.0))
+"#;
+
+const GLSL_EFFECT_SAMPLE: &str = r#"
+layout(set = 0, binding = 3) uniform texture2D kld_depth;
+#define iChannelResolution vec3[4](iResolution, vec3(0.0), vec3(0.0), vec3(0.0))
 vec4 sampleWallpaper(vec2 uv) { return texture(u_tex, uv); }
 "#;
 
@@ -60,7 +73,7 @@ pub(super) fn translate(stage: LayerStage, source: &str) -> Result<String> {
     // Preserve source line numbers when dropping declarations supplied by this ABI.
     static DECLARATIONS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?m)^[\t ]*(?:#version[^\n]*|precision\s+(?:lowp|mediump|highp)\s+\w+\s*;|uniform\s+\w+\s+(?:iResolution|iTime|iGlobalTime|iFrame|iTimeDelta|iFrameRate|iDate|iMouse|iChannel0|u_resolution|u_time|u_tex)\s*;)",
+            r"(?m)^[\t ]*(?:#version[^\n]*|precision\s+(?:lowp|mediump|highp)\s+\w+\s*;|uniform\s+\w+\s+(?:iResolution|iTime|iGlobalTime|iFrame|iTimeDelta|iFrameRate|iDate|iMouse|iChannel[0-3]|iChannelResolution|iChannelTime|u_resolution|u_time|u_tex)(?:\s*\[\s*4\s*\])?\s*;)",
         )
         .expect("fixed GLSL declarations")
     });
@@ -100,9 +113,9 @@ pub(super) fn translate(stage: LayerStage, source: &str) -> Result<String> {
         (body.into_owned(), "")
     };
     let sample = if stage == LayerStage::Filter {
-        GLSL_SAMPLE
+        GLSL_EFFECT_SAMPLE
     } else {
-        ""
+        GLSL_WALLPAPER_SAMPLE
     };
     let entry = if body.contains("mainImage(") || body.contains("mainImage (") {
         r#"
@@ -115,7 +128,9 @@ void main() {
     } else {
         ""
     };
-    let full = format!("#version 450\n{GLSL_FRAME}\n{sample}\n{retro_prelude}\n{body}\n{entry}");
+    let full = format!(
+        "#version 450\n{GLSL_FRAME}\n{GLSL_SAMPLE}\n{sample}\n{retro_prelude}\n{body}\n{entry}"
+    );
     let module = naga::front::glsl::Frontend::default()
         .parse(
             &naga::front::glsl::Options::from(naga::ShaderStage::Fragment),

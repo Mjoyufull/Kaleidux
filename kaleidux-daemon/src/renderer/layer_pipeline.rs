@@ -54,13 +54,17 @@ impl LayerPipelines {
 
     fn create(ctx: &WgpuContext, format: wgpu::TextureFormat, prepared: &PreparedLayers) -> Self {
         let filter = prepared.stage == LayerStage::Filter;
-        let has_bitmap = prepared.shaders.iter().any(|layer| layer.bitmap.is_some());
-        let (layout, uniform, sampler) = resources(ctx, filter, has_bitmap);
+        let fragment_channels = !filter && prepared.shaders.iter().any(|layer| layer.fragment_only);
+        let has_bitmap = prepared
+            .shaders
+            .iter()
+            .any(|layer| layer.assets[0].is_some());
+        let (layout, uniform, sampler) = resources(ctx, filter, has_bitmap, fragment_channels);
         let depth = filter.then(|| {
             let source = prepared
                 .shaders
                 .iter()
-                .find_map(|layer| layer.bitmap.as_ref());
+                .find_map(|layer| layer.assets[0].as_ref());
             asset_view(ctx, source, wgpu::TextureFormat::Rgba8Unorm)
         });
         let pipeline_layout = ctx
@@ -86,23 +90,37 @@ impl LayerPipelines {
         let morph_bindings = if filter {
             Vec::new()
         } else {
+            let empty = sampler
+                .as_ref()
+                .map(|_| asset_view(ctx, None, FILTER_FORMAT));
             prepared
                 .shaders
                 .iter()
                 .map(|layer| {
                     let mut entries = vec![uniform_entry(&uniform)];
-                    let view = sampler.as_ref().map(|sampler| {
-                        let view = asset_view(ctx, layer.bitmap.as_ref(), FILTER_FORMAT);
-                        (view, sampler)
-                    });
-                    if let Some((view, sampler)) = &view {
-                        entries.extend([
-                            texture_entry(1, view),
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(sampler),
+                    let channels = if fragment_channels { 4 } else { 1 };
+                    let views: Vec<_> = if sampler.is_some() {
+                        layer.assets[..channels]
+                            .iter()
+                            .map(|asset| {
+                                asset
+                                    .as_ref()
+                                    .map(|asset| asset_view(ctx, Some(asset), FILTER_FORMAT))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if let (Some(sampler), Some(empty)) = (&sampler, &empty) {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        });
+                        entries.extend([1, 3, 4, 5].into_iter().zip(&views).map(
+                            |(binding, view)| {
+                                texture_entry(binding, view.as_ref().unwrap_or(empty))
                             },
-                        ]);
+                        ));
                     }
                     ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Morph uniforms and texture"),
@@ -157,7 +175,7 @@ impl LayerPipelines {
                 name: "heart".into(),
                 source: assemble(LayerStage::Morph, HEART),
                 fragment_only: false,
-                bitmap: None,
+                assets: [None, None, None, None],
                 rectangle: None,
             }],
         };
@@ -266,12 +284,23 @@ fn resources(
     ctx: &WgpuContext,
     filter: bool,
     has_bitmap: bool,
+    fragment_channels: bool,
 ) -> (wgpu::BindGroupLayout, wgpu::Buffer, Option<wgpu::Sampler>) {
     let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
         binding,
         ty,
         visibility: wgpu::ShaderStages::FRAGMENT,
         count: None,
+    };
+    let tex_binding = |binding| {
+        entry(
+            binding,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+        )
     };
     let entries = [
         entry(
@@ -282,33 +311,23 @@ fn resources(
                 min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<LayerFrame>() as u64),
             },
         ),
-        entry(
-            1,
-            wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-        ),
+        tex_binding(1),
         entry(
             2,
             wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         ),
-        entry(
-            3,
-            wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-        ),
+        tex_binding(3),
+        tex_binding(4),
+        tex_binding(5),
     ];
     let layout = ctx
         .device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Wallpaper layer bindings"),
-            entries: if filter {
+            entries: if fragment_channels {
                 &entries
+            } else if filter {
+                &entries[..4]
             } else if has_bitmap {
                 &entries[..3]
             } else {
@@ -321,7 +340,7 @@ fn resources(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let sampler = (filter || has_bitmap).then(|| {
+    let sampler = (filter || has_bitmap || fragment_channels).then(|| {
         ctx.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Wallpaper filter sampler"),
             mag_filter: wgpu::FilterMode::Linear,

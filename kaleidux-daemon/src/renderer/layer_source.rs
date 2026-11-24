@@ -6,6 +6,7 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_SHADER_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_LAYER_TEXTURE_BYTES: usize = 96 * 1024 * 1024;
 const FRAME: &str = include_str!("../shaders/layers/frame.wgsl");
 const SAMPLE: &str = include_str!("../shaders/layers/sample.wgsl");
 pub(super) const HEART: &str = include_str!("../shaders/layers/heart.wgsl");
@@ -21,8 +22,18 @@ pub(crate) struct PreparedLayer {
     pub(crate) name: String,
     pub(super) source: String,
     pub(crate) fragment_only: bool,
-    pub(crate) bitmap: Option<image::RgbaImage>,
+    pub(crate) assets: [Option<image::RgbaImage>; 4],
     pub(crate) rectangle: Option<[f32; 4]>,
+}
+
+impl PreparedLayer {
+    pub(crate) fn texture_bytes(&self) -> usize {
+        self.assets
+            .iter()
+            .flatten()
+            .map(|asset| asset.as_raw().len())
+            .sum()
+    }
 }
 
 impl PreparedLayers {
@@ -53,11 +64,12 @@ impl PreparedLayers {
             });
         }
         let selection = selection.clone();
-        crate::background::spawn_blocking_tracked(
+        crate::background::spawn_blocking_tracked_wait(
             crate::background::BackgroundWorkKind::RendererInit,
             move || Self::read_and_validate(selection),
         )
-        .context("Renderer workers busy; try again shortly")?
+        .await
+        .context("Renderer workers are shutting down")?
         .await
         .context("Layer preparation did not complete")?
     }
@@ -88,12 +100,20 @@ impl PreparedLayers {
                 shaders.len() <= MAX_LAYERS_PER_STAGE,
                 "Too many shader passes"
             );
+            anyhow::ensure!(
+                shaders
+                    .iter()
+                    .map(PreparedLayer::texture_bytes)
+                    .sum::<usize>()
+                    <= MAX_LAYER_TEXTURE_BYTES,
+                "Shader textures exceed 96 MiB"
+            );
         }
         if selection.stage == LayerStage::Filter {
             anyhow::ensure!(
                 shaders
                     .iter()
-                    .filter(|layer| layer.bitmap.is_some())
+                    .filter(|layer| layer.assets[0].is_some())
                     .count()
                     <= 1,
                 "Only one depth map may appear in a shader stack"
@@ -103,13 +123,23 @@ impl PreparedLayers {
             stage: selection.stage,
             fps: selection.fps,
             shaders,
-            source: selection.layers.first().cloned(),
+            source: selection.layers.first().map(|name| {
+                name.split_once('|')
+                    .map_or(name.as_str(), |(path, _)| path)
+                    .to_owned()
+            }),
         })
     }
 }
 
 pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLayer> {
     let (name, options) = spec.split_once('|').unwrap_or((spec, ""));
+    let shader_path = Path::new(name);
+    let fragment_only = !["text=", "image=", "parallax="]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        && is_fragment_file(shader_path);
+    let mut assets = [None, None, None, None];
     let mut rectangle = None;
     let mut font = None;
     let mut colour = "#ffffff";
@@ -121,21 +151,38 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
             "rect" if stage == LayerStage::Morph => rectangle = Some(parse_rectangle(value)?),
             "font" if stage == LayerStage::Morph => font = Some(value),
             "colour" | "color" if stage == LayerStage::Morph => colour = value,
+            "channel0" | "channel1" | "channel2" | "channel3"
+                if fragment_only && stage != LayerStage::Filter =>
+            {
+                let index = usize::from(key.as_bytes()[7] - b'0');
+                let directory = shader_path
+                    .parent()
+                    .context("GLSL path needs a parent directory")?;
+                anyhow::ensure!(assets[index].is_none(), "Duplicate GLSL channel {index}");
+                assets[index] = Some(super::layer_bitmap::read(&directory.join(value))?);
+                anyhow::ensure!(
+                    assets
+                        .iter()
+                        .flatten()
+                        .map(|asset| asset.as_raw().len())
+                        .sum::<usize>()
+                        <= MAX_LAYER_TEXTURE_BYTES,
+                    "Shader textures exceed 96 MiB"
+                );
+            }
             _ => anyhow::bail!("Unknown layer option {key:?}"),
         }
     }
-    let mut bitmap = None;
-    let fragment_only = is_fragment_file(Path::new(name));
     let body = if stage != LayerStage::Filter
         && let Some(path) = name.strip_prefix("image=")
     {
-        bitmap = Some(super::layer_bitmap::read(Path::new(path))?);
+        assets[0] = Some(super::layer_bitmap::read(Path::new(path))?);
         include_str!("../shaders/layers/bitmap.wgsl").into()
     } else if stage == LayerStage::Morph
         && let Some(text) = name.strip_prefix("text=")
         && (font.is_some() || !text.is_ascii() || colour != "#ffffff")
     {
-        bitmap = Some(super::layer_bitmap::label(
+        assets[0] = Some(super::layer_bitmap::label(
             text,
             font.unwrap_or("Sans 24"),
             colour,
@@ -145,7 +192,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
     } else if stage == LayerStage::Filter
         && let Some(path) = name.strip_prefix("parallax=")
     {
-        bitmap = Some(super::layer_bitmap::depth(Path::new(path))?);
+        assets[0] = Some(super::layer_bitmap::depth(Path::new(path))?);
         include_str!("../shaders/layers/parallax.wgsl").into()
     } else {
         read_body(stage, name)?
@@ -155,12 +202,12 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
     } else {
         assemble(stage, &body)
     };
-    validate_abi(stage, &source, fragment_only, bitmap.is_some())?;
+    validate_abi(stage, &source, fragment_only, assets[0].is_some())?;
     Ok(PreparedLayer {
         name: spec.to_owned(),
         source,
         fragment_only,
-        bitmap,
+        assets,
         rectangle,
     })
 }
@@ -179,7 +226,7 @@ pub(crate) fn prepare_rgba_layer(
         name,
         source,
         fragment_only: false,
-        bitmap: Some(bitmap),
+        assets: [Some(bitmap), None, None, None],
         rectangle,
     })
 }
@@ -219,6 +266,8 @@ fn validate_abi(stage: LayerStage, source: &str, fragment_only: bool, bitmap: bo
     );
     let expected_bindings = if stage == LayerStage::Filter {
         4
+    } else if fragment_only {
+        6
     } else if bitmap {
         3
     } else {

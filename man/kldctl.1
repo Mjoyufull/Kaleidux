@@ -39,9 +39,27 @@ Set a solid colour. Also accepts #RRGGBBAA and the alias color.
 .B jump PATH [-o OUTPUT]
 Display an image inside the slideshow directory using the normal transition and history.
 .TP
-.B set PATH [-o OUTPUT] [--transition NAME | --reveal-map MAP.png]
+.B set PATH [-o OUTPUT] [--transhader NAME | --reveal-map MAP.png]
 Insert supported media into the current in-memory queue and advance to it immediately.
-The optional override applies for this switch. Use custom:NAME for shaders/NAME.glsl in the Kaleidux config directory. A reveal map encodes when each pixel changes in the PNG's red channel.
+The optional override applies for this switch. Use custom:NAME for shaders/NAME.glsl in the Kaleidux config directory. A reveal map encodes when each pixel changes in the PNG's red channel. Set also accepts native GIF, GLSL or WGSL wallpapers, local HTML, and Kaleidux scene recipes.
+.TP
+.B shader [PASS ...] [--fps RATE] [-o OUTPUT]
+Replace the shader stack applied to the wallpaper. An empty list clears the stack.
+.TP
+.B shader-wallpaper [PATH] [--fps RATE] [-o OUTPUT]
+Display a procedural shader. Use unlimited for the display animation clock or 0 for a passive shader.
+.TP
+.B morph [LAYER ...] [--fps RATE] [-o OUTPUT]
+Replace the overlay stack. Text, image and shader morphs can have a normalized screen rectangle.
+.TP
+.B layers [-o OUTPUT]
+Report the active stacks and animation rates.
+.TP
+.B react JSON [-o OUTPUT]
+Send pointer coordinates, audio bands, date and user data to the shader inputs.
+.TP
+.B workshop ITEM [-o OUTPUT]
+Set a supported Wallpaper Engine project from a local path or Steam Workshop ID.
 .TP
 .B img PATH [-o OUTPUT]
 Select slideshow media or insert external media and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept supported images and videos and honor output groups; omitted output uses main-monitor. Use -o all for every output. Queue rebuilds can discard external entries.
@@ -55,8 +73,8 @@ Force the daemon to skip to the next wallpaper in the queue.
 .B prev \fR(alias: \fBp\fR)
 Switch back to the previously displayed wallpaper if history is available.
 .TP
-.B love \fI<PATH>\fR [\fI-m MULTIPLIER\fR]
-Mark the specified file as "loved", increasing its selection frequency in the "loveit" sorting strategy.
+.B love [\fIPATH\fR] [-o OUTPUT] [-m MULTIPLIER]
+Mark the current wallpaper or the specified file as loved and increase its selection frequency. Loving the active wallpaper shows a heart when enabled.
 .TP
 .B unlove \fI<PATH>\fR
 Remove the love status from a file, resetting its selection weight.

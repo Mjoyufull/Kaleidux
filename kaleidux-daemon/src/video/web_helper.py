@@ -17,6 +17,7 @@ def main():
     window = Gtk.OffscreenWindow()
     window.set_default_size(width, height)
     view = WebKit2.WebView.new_with_context(WebKit2.WebContext.new_ephemeral())
+    view.set_is_muted(True)
     settings = view.get_settings()
     settings.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
     settings.set_enable_write_console_messages_to_stdout(False)
@@ -25,9 +26,20 @@ def main():
 
     loaded = False
     requested = False
+    dirty = True
+
+    def damaged(*_):
+        nonlocal dirty
+        dirty = True
+        return False
 
     def capture():
-        nonlocal requested
+        nonlocal dirty, requested
+        if not dirty:
+            sys.stdout.buffer.write(b"I")
+            sys.stdout.buffer.flush()
+            requested = False
+            return False
         pixbuf = window.get_pixbuf()
         if pixbuf is None:
             return True
@@ -37,12 +49,14 @@ def main():
             pixbuf = pixbuf.add_alpha(False, 0, 0, 0)
         pixels = pixbuf.get_pixels()
         stride = pixbuf.get_rowstride()
+        sys.stdout.buffer.write(b"F")
         if stride == width * 4:
             sys.stdout.buffer.write(pixels)
         else:
             for offset in range(0, stride * height, stride):
                 sys.stdout.buffer.write(pixels[offset:offset + width * 4])
         sys.stdout.buffer.flush()
+        dirty = False
         requested = False
         return False
 
@@ -70,6 +84,7 @@ def main():
     view.connect("load-changed", on_load)
     view.connect("load-failed", load_failed)
     view.connect("web-process-terminated", load_failed)
+    window.connect("damage-event", damaged)
     GLib.io_add_watch(0, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, request)
     with Path(path).open("rb") as markup:
         data = markup.read(8 * 1024 * 1024 + 1)

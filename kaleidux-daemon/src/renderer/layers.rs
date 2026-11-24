@@ -393,6 +393,10 @@ impl super::Renderer {
         self.layers.rule_ticket
     }
 
+    pub(crate) fn layer_rule_matches(&self, ticket: u64, source: Option<&Path>) -> bool {
+        self.layers.rule_ticket == ticket && self.layers.rule_path.as_deref() == source
+    }
+
     pub(crate) fn apply_layer_inputs(&mut self, inputs: &LayerInputs) {
         let signals = self.layers.signals.apply(inputs);
         if signals != self.layers.signals {
@@ -446,6 +450,14 @@ impl super::Renderer {
 
     pub(crate) fn clear_shader_wallpaper(&mut self) {
         self.layers.wallpaper = None;
+    }
+
+    pub(super) fn take_shader_wallpaper(&mut self) -> Option<LayerPipelines> {
+        self.layers.wallpaper.take()
+    }
+
+    pub(super) fn restore_shader_wallpaper(&mut self, wallpaper: Option<LayerPipelines>) {
+        self.layers.wallpaper = wallpaper;
     }
 
     pub(crate) fn update_layer_clock(&mut self, paused: bool, now: Instant) {

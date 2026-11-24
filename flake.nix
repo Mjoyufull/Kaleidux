@@ -35,6 +35,7 @@
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           dav1d
+          lz4
         ];
         runtimeBaseDeps = runtimeCoreDeps ++ [ pkgs.libva ] ++ vaDriverDeps;
         x11RuntimeDeps = with pkgs; [
@@ -52,6 +53,10 @@
         ];
         mpvRuntimeDeps = [ pkgs.mpv ];
         ffmpegRuntimeDeps = [ pkgs.ffmpeg ];
+        webPython = pkgs.python3.withPackages (ps: [ ps.pygobject3 ]);
+        webTypelibPath = pkgs.lib.makeSearchPathOutput "out" "lib/girepository-1.0" (with pkgs; [
+          glib gobject-introspection gtk3 webkitgtk_4_1 gdk-pixbuf pango harfbuzz at-spi2-core cairo libsoup_3
+        ]);
 
         runtimeDeps = runtimeBaseDeps
           ++ x11RuntimeDeps
@@ -90,6 +95,7 @@
           withMpv ? true,
           withFfmpeg ? true,
           withX11 ? true,
+          withWeb ? false,
         }:
           let
             withVaapi = withFfmpeg || withMpv || withAppsink;
@@ -118,6 +124,10 @@
               "${packageVaDriverPrefix}--suffix LIBVA_DRIVERS_PATH : \"/run/opengl-driver/lib/dri\"";
             packageGstWrapperArgs = pkgs.lib.optionalString (withAppsink || withFfmpeg)
               "--prefix GST_PLUGIN_SYSTEM_PATH_1_0 : \"${packageGstPluginPath}\"";
+            packageWebWrapperArgs = pkgs.lib.optionalString withWeb
+              ("--set KLD_WEB_PYTHON \"${webPython}/bin/python3\" "
+                + "--prefix GI_TYPELIB_PATH : \"${webTypelibPath}\" "
+                + "--set KLD_PANGO_VIEW \"${pkgs.lib.getBin pkgs.pango}/bin/pango-view\"");
           in naersk-lib.buildPackage {
           inherit pname;
           version = "0.0.1-kneecap";
@@ -180,6 +190,7 @@
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath packageRuntimeDeps}:/run/opengl-driver/lib" \
               ${packageVaWrapperArgs} \
               ${packageGstWrapperArgs} \
+              ${packageWebWrapperArgs} \
               --suffix XDG_DATA_DIRS : "/usr/share"
             
             mkdir -p $out/share/man/man1
@@ -197,10 +208,12 @@
 
         kaleidux = mkKaleidux {
           pname = "kaleidux";
+          withWeb = true;
         };
         kaleiduxWayland = mkKaleidux {
           pname = "kaleidux-wayland";
           withX11 = false;
+          withWeb = true;
           featureArgs = [
             "--no-default-features"
             "--features"

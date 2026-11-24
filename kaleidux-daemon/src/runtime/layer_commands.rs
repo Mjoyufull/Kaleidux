@@ -1,7 +1,7 @@
 //! Installs prepared layer stacks atomically on selected live renderers.
 
 use super::prepared_command::PreparedCommand;
-use crate::background::{BackgroundWorkKind, spawn_blocking_tracked};
+use crate::background::{BackgroundWorkKind, spawn_blocking_tracked_wait};
 use crate::main_loop::{CmdMsg, CommandContext, CommandSender, MainLoopContext};
 use crate::monitor_manager::MonitorManager;
 use crate::renderer::PreparedLayers;
@@ -32,10 +32,15 @@ impl CompiledLayers {
     ) -> anyhow::Result<()> {
         if let Some(ticket) = rule_ticket
             && self.targets.iter().any(|(target, _)| {
+                let source = ctx
+                    .monitor_manager
+                    .outputs
+                    .get(&target.name)
+                    .and_then(|output| output.current_path.as_deref());
                 let is_current = ctx
                     .renderers
                     .get(&target.name)
-                    .is_some_and(|renderer| renderer.layer_rule_ticket() == ticket);
+                    .is_some_and(|renderer| renderer.layer_rule_matches(ticket, source));
                 !is_current
             })
         {
@@ -59,10 +64,11 @@ impl CompiledLayers {
             );
         }
         anyhow::ensure!(
-            self.stage != LayerStage::Wallpaper || ctx.preview.is_none(),
+            self.stage != LayerStage::Wallpaper || ctx.preview.is_none() || rule_ticket.is_some(),
             "End the current preview before setting a shader wallpaper"
         );
         for (target, pipeline) in self.targets {
+            let starts_wallpaper = self.stage == LayerStage::Wallpaper && pipeline.is_some();
             if self.stage == LayerStage::Wallpaper {
                 super::commands::clear_media(ctx, &target.name);
                 if let Some(output) = ctx.monitor_manager.outputs.get_mut(&target.name) {
@@ -78,7 +84,7 @@ impl CompiledLayers {
                 .get_mut(&target.name)
                 .expect("validated output is live")
                 .replace_layers(self.stage, pipeline, rule_ticket.is_some());
-            if self.stage == LayerStage::Wallpaper && rule_ticket.is_some() {
+            if starts_wallpaper {
                 ctx.monitor_manager.mark_transition_completed(&target.name);
             }
         }
@@ -91,6 +97,24 @@ pub(crate) struct LayerCompileJob {
     response: oneshot::Sender<Response>,
     prepared: PreparedLayers,
     targets: Vec<LayerTarget>,
+}
+
+impl LayerCompileJob {
+    fn is_current_rule(&self, renderers: &HashMap<String, Renderer>) -> bool {
+        self.command.layer_rule_ticket.is_some_and(|ticket| {
+            self.targets.iter().all(|target| {
+                renderers
+                    .get(&target.name)
+                    .is_some_and(|renderer| renderer.layer_rule_ticket() == ticket)
+            })
+        })
+    }
+
+    fn same_rule_stage(&self, other: &Self) -> bool {
+        self.prepared.stage() == other.prepared.stage()
+            && self.targets.first().map(|target| &target.name)
+                == other.targets.first().map(|target| &target.name)
+    }
 }
 
 /// The single compiler keeps per-device validation scopes ordered.
@@ -108,9 +132,10 @@ pub(crate) fn start_worker(command_sender: CommandSender) -> mpsc::Sender<LayerC
                 continue;
             }
             let runtime = tokio::runtime::Handle::current();
-            let task = spawn_blocking_tracked(BackgroundWorkKind::RendererInit, move || {
+            let task = spawn_blocking_tracked_wait(BackgroundWorkKind::RendererInit, move || {
                 runtime.block_on(compile_layers(prepared, targets))
-            });
+            })
+            .await;
             let Some(task) = task else {
                 respond_error(
                     response,
@@ -135,7 +160,7 @@ pub(crate) fn start_worker(command_sender: CommandSender) -> mpsc::Sender<LayerC
 
 impl MainLoopContext {
     pub(super) fn dispatch_layers(
-        &self,
+        &mut self,
         mut command: PreparedCommand,
         response: oneshot::Sender<Response>,
     ) -> Option<CmdMsg> {
@@ -157,16 +182,42 @@ impl MainLoopContext {
                     prepared,
                     targets,
                 };
-                if let Err(error) = self.layer_compile_queue.try_send(job) {
-                    respond_error(
+                if job.command.layer_rule_ticket.is_some() && !job.is_current_rule(&self.renderers)
+                {
+                    return None;
+                }
+                match self.layer_compile_queue.try_send(job) {
+                    Err(mpsc::error::TrySendError::Full(job))
+                        if job.command.layer_rule_ticket.is_some() =>
+                    {
+                        self.deferred_layer_rules
+                            .retain(|pending| !pending.same_rule_stage(&job));
+                        self.deferred_layer_rules.push_back(job);
+                    }
+                    Err(error) => respond_error(
                         error.into_inner().response,
                         anyhow::anyhow!("Layer compiler queue is busy; try again shortly"),
-                    );
+                    ),
+                    Ok(()) => {}
                 }
             }
             Err(error) => respond_error(response, error),
         }
         None
+    }
+
+    pub(super) fn drain_deferred_layer_rules(&mut self) {
+        self.deferred_layer_rules
+            .retain(|job| job.is_current_rule(&self.renderers));
+        while !self.deferred_layer_rules.is_empty()
+            && let Ok(permit) = self.layer_compile_queue.try_reserve()
+        {
+            permit.send(
+                self.deferred_layer_rules
+                    .pop_front()
+                    .expect("checked for pending rules"),
+            );
+        }
     }
 
     fn layer_targets(

@@ -630,6 +630,7 @@ impl VideoPlayer {
             kind,
             size,
             fps,
+            player_event_tx.clone(),
         )?;
         let player = Self {
             source_uri: path.to_string_lossy().into_owned(),
@@ -638,10 +639,7 @@ impl VideoPlayer {
             mpv: None,
             native: None,
             canvas: Some(canvas),
-            backend_kind: match kind {
-                CanvasSource::Gif(_) => VideoBackendKind::Gif,
-                CanvasSource::Web => VideoBackendKind::Web,
-            },
+            backend_kind: kind.backend(),
             is_running: Arc::new(AtomicBool::new(false)),
             bus_watch: None,
             frame_mailbox,

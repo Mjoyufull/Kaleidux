@@ -77,9 +77,15 @@ fn layer(uv: vec2<f32>) -> vec4<f32> {
 GLSL accepts a fragment `main()` or Shadertoy's `mainImage()`. Shadertoy
 inputs include `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`,
 `iMouse`, and `iDate`. On the effects stack, `iChannel0` is the previous
-image. `kldPointer`, `kldData`, and `kldAudio(index)` are available in
-both modes. Shadertoy Buffer passes, uploaded channels and feedback need
-ports to the Kaleidux layer ABI.
+image. Shader wallpapers and GLSL morphs can bind four local image
+channels. Paths in `channel0=` through `channel3=` are relative to the shader
+file or absolute. `kldPointer`, `kldData`, and `kldAudio(index)` are available
+in both modes. Shadertoy Buffer passes and feedback need ports.
+
+```sh
+kldctl shader-wallpaper 'desktop.frag|channel0=sky.png|channel1=clouds.png'
+kldctl morph 'badge.frag|channel2=/home/me/art.png|rect=0.04,0.08,0.12,0.12'
+```
 
 Use `kldctl shader /path/to/preset.glslp` for same-size Libretro GLSL
 passes. The fragment ABI includes `Texture`, `TextureSize`, `InputSize`,

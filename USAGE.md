@@ -316,7 +316,8 @@ GIFs use native frame delays. Set `gif-speed` and `gif-loop` in `[global]` or
 for an output. Local HTML uses Python GI, GTK 3 and WebKitGTK 4.1. The default
 build includes `wallpaper-web`. HTML snapshots are limited to 1920×1080 and
 use 30 fps when `video-fps` is unlimited. Use a lower video rate to reduce
-snapshot cost.
+snapshot cost. A static page is uploaded only when its canvas redraws.
+HTML wallpapers play muted.
 
 Workshop projects can point to a video, local HTML, or a PKG containing a 2D
 image-layer scene. PKG textures support ordinary images and TEXV0005 RGBA,

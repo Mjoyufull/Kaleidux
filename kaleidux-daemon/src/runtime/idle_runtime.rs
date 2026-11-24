@@ -79,6 +79,12 @@ impl MainLoopContext {
                 layers.map(|wake| (wake, DeadlineReason::Layers)),
             );
         }
+        if !self.deferred_layer_rules.is_empty() {
+            deadline = min_deadline_with_reason(
+                deadline,
+                Some((now + Duration::from_millis(50), DeadlineReason::Layers)),
+            );
+        }
         deadline = min_deadline_with_reason(
             deadline,
             self.startup_present_barrier

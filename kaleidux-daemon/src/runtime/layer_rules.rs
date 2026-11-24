@@ -70,6 +70,7 @@ impl MainLoopContext {
                 });
             }
         }
+        self.drain_deferred_layer_rules();
     }
 }
 
