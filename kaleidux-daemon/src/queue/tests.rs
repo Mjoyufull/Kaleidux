@@ -677,6 +677,7 @@ fn external_playlist_entries_survive_root_refresh() {
     let root = unique_test_dir("external-playlist-root");
     let outside = unique_test_dir("external-playlist-files");
     let external = outside.join("external.jpg");
+    let unavailable = outside.join("mount-offline.jpg");
     let indexed = root.join("indexed.jpg");
     for path in [&external, &indexed] {
         let mut bytes = [0_u8; 16];
@@ -688,14 +689,22 @@ fn external_playlist_entries_survive_root_refresh() {
     queue.stats.playlists.insert(
         "external".into(),
         Playlist {
-            paths: vec![external.clone()],
+            paths: vec![external.clone(), unavailable.clone()],
             strategy,
             enabled: true,
         },
     );
     queue.set_playlist(Some("external".into())).unwrap();
+    queue
+        .content_type_cache
+        .insert(external.clone(), ContentType::Image);
+    fs::remove_file(&external).unwrap();
     queue.apply_pool_events(vec![crate::cache::PoolEvent::Added(indexed)]);
-    assert_eq!(queue.pool, vec![external]);
+    assert_eq!(
+        queue.cached_content_type(&external),
+        Some(ContentType::Image)
+    );
+    assert_eq!(queue.pool, vec![external, unavailable]);
     fs::remove_dir_all(outside).unwrap();
     fs::remove_dir_all(root).unwrap();
 }

@@ -36,17 +36,21 @@ impl SmartQueue {
                 .paths
                 .iter()
                 .filter(|path| {
-                    if content_types.contains_key(*path) {
-                        return true;
+                    if path.starts_with(&self.root_path) {
+                        return content_types.contains_key(*path);
                     }
-                    if path.starts_with(&self.root_path) || blacklist.contains(path) {
+                    // A directory refresh knows nothing about external
+                    // playlist entries. Keep their existing types and leave
+                    // uncached entries to normal selection.
+                    if self.stats.blacklist.contains(*path) {
                         return false;
                     }
-                    let Some(kind) = Self::get_content_type(path).filter(|kind| kind.supported())
-                    else {
-                        return false;
-                    };
-                    content_types.insert((*path).clone(), kind);
+                    if let Some(kind) = self.content_type_cache.get(*path).copied() {
+                        if !kind.supported() {
+                            return false;
+                        }
+                        content_types.insert((*path).clone(), kind);
+                    }
                     true
                 })
                 .cloned()
