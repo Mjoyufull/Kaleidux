@@ -3,7 +3,8 @@
 use super::MonitorManager;
 use crate::orchestration::MonitorBehavior;
 use crate::queue::SmartQueue;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum ManualQueueTarget {
@@ -49,6 +50,19 @@ impl MonitorManager {
             ManualQueueTarget::Group(group) => self.group_queues.get(group),
             ManualQueueTarget::Output(name) => self.outputs.get(name)?.queue.as_ref(),
         }
+    }
+
+    pub(crate) fn external_playlist_blacklist(
+        &self,
+        output: &str,
+        path: &Path,
+    ) -> Option<HashSet<PathBuf>> {
+        let queue = self.manual_queue(&self.queue_target(output))?;
+        (queue.active_playlist.is_some()
+            && !queue.stats.blacklist.is_empty()
+            && !path.starts_with(&queue.root_path)
+            && !crate::media_source::MediaSource::is_virtual(path))
+        .then(|| queue.stats.blacklist.clone())
     }
 
     pub(super) fn validate_manual_queues(

@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 
 pub(crate) struct VideoPlayerStartRequest {
     pub(crate) path: PathBuf,
+    pub(crate) playlist_blacklist: Option<std::collections::HashSet<PathBuf>>,
     pub(crate) output_name: String,
     pub(crate) session_id: u64,
     pub(crate) volume: f64,
@@ -42,6 +43,7 @@ pub(crate) fn create_and_start_video_player(
 ) {
     let VideoPlayerStartRequest {
         path,
+        playlist_blacklist,
         output_name,
         session_id,
         volume,
@@ -101,6 +103,9 @@ pub(crate) fn create_and_start_video_player(
 
             let mut prepare_failure = VideoPrepareFailure::Media;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(blacklist) = playlist_blacklist.as_ref() {
+                    super::check_playlist_blacklist(&path, blacklist)?;
+                }
                 let resolved_source = crate::media_source::resolve_for_playback(&path_str, should_abort)?;
                 let candidates = video::candidate_video_backends(backend_request);
                 let num_candidates = candidates.len();

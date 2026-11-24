@@ -175,6 +175,7 @@ pub(crate) fn switch_wallpaper_content(
         content_type,
         renderers.contains_key(&name)
     );
+    let mut playlist_blacklist = monitor_manager.external_playlist_blacklist(&name, &path);
     let hold_video = monitor_manager
         .get_output_config(&name)
         .is_some_and(|config| !config.play_during_transition);
@@ -187,6 +188,7 @@ pub(crate) fn switch_wallpaper_content(
 
     if content_type == queue::ContentType::Video
         && !hold_video
+        && playlist_blacklist.is_none()
         && renderers.contains_key(&name)
         && video_players.get(&name).is_some_and(|player| {
             player.is_native_experimental_backend()
@@ -288,6 +290,7 @@ pub(crate) fn switch_wallpaper_content(
                 output_height,
                 shared_image_target.is_some()
             );
+            let image_blacklist = playlist_blacklist.take();
             tokio::spawn(async move {
                 if shutdown_flag.load(Ordering::SeqCst) || !background::is_accepting_new_work() {
                     debug!(
@@ -298,6 +301,24 @@ pub(crate) fn switch_wallpaper_content(
                 }
 
                 let request_start = Instant::now();
+                if let Some(blacklist) = image_blacklist {
+                    let path = path_clone.clone();
+                    let validation = async {
+                        let task = background::spawn_blocking_tracked_wait(
+                            BackgroundWorkKind::ImageDecode,
+                            move || super::check_playlist_blacklist(&path, &blacklist),
+                        )
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("Image preparation is shutting down"))?;
+                        task.await?
+                    }
+                    .await;
+                    if let Err(error) = validation {
+                        report_image_failure(&tx, name_clone, image_session_id, path_clone, error)
+                            .await;
+                        return;
+                    }
+                }
                 let tile_target = if tile_image {
                     crate::image::runtime_probe::probe_descriptor(
                         &path_clone,
@@ -380,19 +401,8 @@ pub(crate) fn switch_wallpaper_content(
                             );
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to decode image {}: {}", path_clone.display(), e);
-                        let _ = tx
-                            .send(LoadedImage {
-                                name: name_clone,
-                                session_id: image_session_id,
-                                data: None,
-                                width: 0,
-                                height: 0,
-                                profile: None,
-                                _path: path_clone,
-                                _byte_permit: None,
-                            })
+                    Err(error) => {
+                        report_image_failure(&tx, name_clone, image_session_id, path_clone, error)
                             .await;
                     }
                 }
@@ -489,6 +499,7 @@ pub(crate) fn switch_wallpaper_content(
         create_and_start_video_player(
             VideoPlayerStartRequest {
                 path: path.clone(),
+                playlist_blacklist,
                 output_name: name.clone(),
                 session_id,
                 volume,
@@ -516,6 +527,28 @@ pub(crate) fn switch_wallpaper_content(
     let prefetch_generation = begin_image_prefetch_generation(&name);
     let prefetch_plan = prefetch::build_plan(monitor_manager, renderers, &name);
     schedule_image_prefetch_plan(&name, prefetch_generation, prefetch_plan, metrics.clone());
+}
+
+async fn report_image_failure(
+    tx: &tokio::sync::mpsc::Sender<LoadedImage>,
+    name: String,
+    session_id: u64,
+    path: PathBuf,
+    error: anyhow::Error,
+) {
+    error!("Failed to prepare image {}: {error}", path.display());
+    let _ = tx
+        .send(LoadedImage {
+            name,
+            session_id,
+            data: None,
+            width: 0,
+            height: 0,
+            profile: None,
+            _path: path,
+            _byte_permit: None,
+        })
+        .await;
 }
 
 #[cfg(test)]

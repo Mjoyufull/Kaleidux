@@ -53,7 +53,7 @@ impl MonitorManager {
         self.start_output_queue(target);
     }
 
-    fn queue_target(&self, name: &str) -> ManualQueueTarget {
+    pub(super) fn queue_target(&self, name: &str) -> ManualQueueTarget {
         match &self.config.global.monitor_behavior {
             MonitorBehavior::Synchronized => ManualQueueTarget::Shared,
             MonitorBehavior::Grouped(_) if self.output_groups.contains_key(name) => {
