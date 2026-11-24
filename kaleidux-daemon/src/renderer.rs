@@ -476,7 +476,7 @@ impl Renderer {
                 .copied()
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto)
         };
-        let present_mode = select_present_mode(&caps.present_modes);
+        let present_mode = select_present_mode(&caps.present_modes, wayland_window);
 
         if caps.formats.is_empty() {
             info!(
