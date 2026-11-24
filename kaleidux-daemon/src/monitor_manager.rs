@@ -372,6 +372,18 @@ impl MonitorManager {
         }
     }
 
+    pub(crate) fn has_pending_stats(&self) -> bool {
+        self.shared_queue
+            .iter()
+            .chain(self.group_queues.values())
+            .chain(
+                self.outputs
+                    .values()
+                    .filter_map(|output| output.queue.as_ref()),
+            )
+            .any(SmartQueue::has_pending_stats)
+    }
+
     /// Forward filesystem watcher events to all active queues for incremental pool updates
     pub fn apply_pool_events(&mut self, events: Vec<crate::cache::PoolEvent>) {
         if events.is_empty() {

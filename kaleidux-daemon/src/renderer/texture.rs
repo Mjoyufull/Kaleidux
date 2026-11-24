@@ -231,6 +231,13 @@ impl super::WgpuContext {
             .sum();
         (count, bytes)
     }
+
+    pub(crate) fn has_pooled_textures(&self) -> bool {
+        self.texture_pool
+            .lock()
+            .values()
+            .any(|entries| !entries.is_empty())
+    }
 }
 
 #[cfg(test)]

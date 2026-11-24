@@ -74,20 +74,28 @@ impl MainLoopContext {
                 .and_then(|barrier| startup_barrier_next_deadline(barrier, now))
                 .map(|deadline| (deadline, DeadlineReason::StartupBarrier)),
         );
-        deadline = min_deadline_with_reason(
-            deadline,
-            Some((
-                self.last_pool_cleanup + Duration::from_secs(3),
-                DeadlineReason::PoolCleanup,
-            )),
-        );
-        deadline = min_deadline_with_reason(
-            deadline,
-            Some((
-                self.last_stats_flush + Duration::from_secs(5),
-                DeadlineReason::StatsFlush,
-            )),
-        );
+        if self
+            .wgpu_ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_pooled_textures())
+        {
+            deadline = min_deadline_with_reason(
+                deadline,
+                Some((
+                    self.last_pool_cleanup + Duration::from_secs(3),
+                    DeadlineReason::PoolCleanup,
+                )),
+            );
+        }
+        if self.monitor_manager.has_pending_stats() {
+            deadline = min_deadline_with_reason(
+                deadline,
+                Some((
+                    self.last_stats_flush + Duration::from_secs(5),
+                    DeadlineReason::StatsFlush,
+                )),
+            );
+        }
         if tracing::enabled!(tracing::Level::INFO) {
             deadline = min_deadline_with_reason(
                 deadline,

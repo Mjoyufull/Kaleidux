@@ -6,6 +6,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 impl SmartQueue {
+    pub(crate) fn has_pending_stats(&self) -> bool {
+        !self.pending_stats_updates.is_empty()
+    }
+
     pub(super) fn update_stats(&mut self, path: &Path) {
         let now = Utc::now();
         // get_or_insert_mut promotes existing entries and auto-evicts oldest when at capacity

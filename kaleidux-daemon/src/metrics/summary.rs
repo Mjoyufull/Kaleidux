@@ -26,6 +26,7 @@ impl PerformanceMetrics {
                 self.wake_reason_summary(),
                 self.wake_sleep_summary()
             ),
+            format!("deadline={}", self.deadline_reason_summary()),
             format!("monitor_self_cost={}", self.get_monitor_stage_summary()),
             format!("thread_cpu={}", self.thread_cpu_summary()),
         ]
