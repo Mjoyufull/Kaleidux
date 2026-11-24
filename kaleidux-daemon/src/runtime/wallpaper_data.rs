@@ -98,6 +98,7 @@ impl MainLoopContext {
             return;
         };
         let scene = player.playback_window();
+        let held_position = self.renderers[&info.output].held_transition_position();
         if let Some(pipeline) = player.pipeline.clone() {
             let Ok(permit) = GST_TIMELINE.try_acquire() else {
                 send_error(response, anyhow::anyhow!("Wallpaper timeline is busy"));
@@ -114,7 +115,7 @@ impl MainLoopContext {
                     &mut info,
                     scene,
                     duration.map(gstreamer::ClockTime::nseconds),
-                    position.map(gstreamer::ClockTime::nseconds),
+                    held_position.or_else(|| position.map(gstreamer::ClockTime::nseconds)),
                 );
                 let _ = response.send(Response::WallpaperInfo(info));
             });
@@ -123,7 +124,7 @@ impl MainLoopContext {
                 &mut info,
                 scene,
                 player.duration_ns(),
-                player.current_position_ns(),
+                held_position.or_else(|| player.current_position_ns()),
             );
             let _ = response.send(Response::WallpaperInfo(info));
         }

@@ -452,7 +452,10 @@ pub async fn run(
                 if should_upload && !r.transition_playback_is_held() {
                     let video_start = std::time::Instant::now();
                     r.upload_frame(&frame);
-                    r.pause_incoming_after_upload(ctx.video_players.get(src.as_ref()));
+                    r.pause_incoming_after_upload(
+                        ctx.video_players.get(src.as_ref()),
+                        frame.pts_ns,
+                    );
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
                     ctx.metrics.record_video_frame_uploaded();

@@ -75,7 +75,7 @@ impl MainLoopContext {
                             if let Some(frame) = preroll_frame.as_ref() {
                                 let upload_start = Instant::now();
                                 r.upload_frame(frame);
-                                hold_video = r.hold_transition_playback_if_ready();
+                                hold_video = r.hold_transition_playback_if_ready(frame.pts_ns);
                                 self.metrics.record_video_cpu_time(upload_start.elapsed());
                                 self.metrics.record_video_frame_uploaded();
                                 startup_ready = true;

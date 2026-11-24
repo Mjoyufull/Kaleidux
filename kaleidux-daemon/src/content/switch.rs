@@ -233,7 +233,7 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
-    let mut native_decode_group_id = batch_id.filter(|_| !hold_video).map(|batch| {
+    let mut native_decode_group_id = batch_id.map(|batch| {
         use std::hash::{Hash, Hasher};
         if let Some(length) = monitor_manager.excerpt_request(&name).1 {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -400,22 +400,21 @@ pub(crate) fn switch_wallpaper_content(
         } else {
             backend_request = video::VideoBackendRequest::Auto;
             video_render_size = Some(r.content_size());
-            if !hold_video
-                && let Some((peer_name, peer_player)) = video_players
-                    .iter()
-                    .find(|(output, player)| {
-                        output.as_str() != name.as_str()
-                            && monitor_manager.shares_playback_with(&name, output)
-                            && monitor_manager
-                                .outputs
-                                .get(output.as_str())
-                                .and_then(|o| o.current_path.as_deref())
-                                .is_some_and(|p| p == path.as_path())
-                            && std::path::Path::new(player.source_uri()) == path.as_path()
-                            && player.playback_window() == monitor_manager.excerpt_request(&name).0
-                            && player.current_position_ns().is_some()
-                    })
-                    .map(|(output, player)| (output.clone(), player))
+            if let Some((peer_name, peer_player)) = video_players
+                .iter()
+                .find(|(output, player)| {
+                    output.as_str() != name.as_str()
+                        && monitor_manager.shares_playback_with(&name, output)
+                        && monitor_manager
+                            .outputs
+                            .get(output.as_str())
+                            .and_then(|o| o.current_path.as_deref())
+                            .is_some_and(|p| p == path.as_path())
+                        && std::path::Path::new(player.source_uri()) == path.as_path()
+                        && player.playback_window() == monitor_manager.excerpt_request(&name).0
+                        && player.current_position_ns().is_some()
+                })
+                .map(|(output, player)| (output.clone(), player))
             {
                 broker_start_position_ns = peer_player.current_position_ns();
                 native_decode_group_id = peer_player.native_decode_group_id().or(batch_id);

@@ -86,9 +86,10 @@ pub(crate) fn process_frame_callbacks(
                 if native_surface_presented {
                     *callback_flush_needed = true;
                 }
-                if !native_surface_presented {
+                if !native_surface_presented && !r.transition_playback_is_held() {
                     let upload_start = std::time::Instant::now();
                     r.upload_frame(&frame);
+                    r.pause_incoming_after_upload(ctx.video_players.get(&name), frame.pts_ns);
                     ctx.metrics.record_video_cpu_time(upload_start.elapsed());
                     ctx.metrics.record_video_frame_uploaded();
                 }

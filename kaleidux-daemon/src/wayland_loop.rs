@@ -407,8 +407,12 @@ pub async fn run(
                 if !native_surface_presented && should_upload && !r.transition_playback_is_held() {
                     callback_flush_needed |= backend.hide_native_dmabuf(source_id.as_ref());
                     let video_start = std::time::Instant::now();
-                    r.upload_frame(frame.as_ref().expect("frame is live"));
-                    r.pause_incoming_after_upload(ctx.video_players.get(source_id.as_ref()));
+                    let incoming = frame.as_ref().expect("frame is live");
+                    r.upload_frame(incoming);
+                    r.pause_incoming_after_upload(
+                        ctx.video_players.get(source_id.as_ref()),
+                        incoming.pts_ns,
+                    );
                     let video_duration = video_start.elapsed();
                     ctx.metrics.record_video_cpu_time(video_duration);
                     ctx.metrics.record_video_frame_uploaded();
