@@ -40,6 +40,17 @@ video-ratio = 50
 # KLD_VIDEO_FRAME_CALLBACK_DAMAGE=full only for compositor damage debugging.
 video-fps = "unlimited"
 
+# Native GIF timing and looping can also be set per output.
+gif-speed = 1.0
+gif-loop = true
+
+# Optional shader and morph stacks selected by a directory or file.
+# [[global.layer-rules]]
+# path = "~/Pictures/anime"
+# shaders = ["crt"]
+# morphs = ['text=Anime|font=Sans 22|rect=0.03,0.03,0.2,0.06']
+# fps = 0
+
 # Split videos longer than twice the output duration into slideshow excerpts.
 # Each excerpt loops within its bounds; a queue with one file is left whole.
 long-video-excerpts = true

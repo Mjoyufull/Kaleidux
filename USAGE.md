@@ -236,7 +236,7 @@ times in nanoseconds. `position_ns` starts at zero for the selected scene.
 properties use null values. Slideshow and media durations have separate fields.
 
 `frame` captures the latest ready content in the output's content rectangle
-before the transition, filters and morphs. During a transition it captures the
+before the transhader, shader stack and morphs. During a transition it captures the
 incoming frame. This works with the FFmpeg DMA-BUF path. The separate native
 mpv overlay requires composed playback for current-frame capture.
 `--first` decodes a local source at the start
@@ -287,30 +287,48 @@ kldctl color '#112233ff'
 
 A preview pauses the previous player and freezes slideshow selection. Cancel restores its GPU frame, queue position, remaining duration and playback state, including active pause inhibitors. Apply keeps the candidate and preserves the remaining duration on untouched outputs. Finish an active preview before another selection, reload or `stop`; pending original loads must settle before preview begins. Applying a candidate that is still loading returns an error so it can be retried. Colours also work as `set '#1a1b26'` or a configured `path = "colour:#1a1b26"`.
 
-#### Filters and Morphs
+#### Shaders, Transhaders and Morphs
 
 ```sh
-kldctl filter mono crt
+kldctl shader mono crt
+kldctl set desktop.frag
+kldctl set photo.png --transhader fade
 kldctl morph 'text=Kaleidux' heart -o DP-1
 kldctl layers -o all
-kldctl filter -o DP-1
+kldctl shader -o DP-1
 ```
 
-Pass layers in draw order. Filters run after the transition and morphs draw on
-top. An empty list clears the corresponding stage. `--fps 0`, the default,
-keeps static images idle. Use a rate up to 60 for animated layers.
+Transhaders control the switch between wallpapers. Shaders process the image
+after the switch is composed. Morphs draw on top. Pass each stack in draw
+order. Use an empty list to clear that stage, `--fps 0` for passive layers, or
+`--fps unlimited` for display-paced animation. See [morphs.md](./morphs.md).
 
-A named local WGSL layer defines `fn layer(uv: vec2<f32>) -> vec4<f32>`.
-Filters read the previous image with `sample(uv)`. Morphs return straight-alpha
-RGBA. Both use `frame.size`, `frame.seconds`, and `frame.progress` for the output
-size, local layer time, and wallpaper transition progress. The built-in CRT
-uses the same shader ABI as files in `kaleidux/filters` under the config directory.
-Put morph sources in `kaleidux/morphs`. See [morphs.md](./morphs.md) for the full ABI.
+#### Animated GIF, HTML and scenes
 
-Rhai can set both stacks with `filters(["crt"], 0, "*")` and
-`morphs(["text=Kaleidux"], 0, "DP-1")`. Loving the current wallpaper shows a
-brief heart by default. Configure `love-heart` and `love-heart-position` in
-`[global]`.
+```sh
+kldctl set animation.gif
+kldctl set local-page.html
+kldctl set examples/scenes/reactive.kldscene.toml
+kldctl workshop /path/to/workshop/project.json
+```
+
+GIFs use native frame delays. Set `gif-speed` and `gif-loop` in `[global]` or
+for an output. Local HTML uses Python GI, GTK 3 and WebKitGTK 4.1. The default
+build includes `wallpaper-web`. HTML snapshots are limited to 1920×1080 and
+use 30 fps when `video-fps` is unlimited. Use a lower video rate to reduce
+snapshot cost.
+
+Workshop projects can point to a video, local HTML, or a PKG containing a 2D
+image-layer scene. PKG textures support ordinary images and TEXV0005 RGBA,
+DXT1/3/5, with LZ4 payloads when `liblz4.so.1` is present. Workshop effects,
+scripts, particles and 3D scenes require a fuller runtime. The
+`examples/linux-wallpaperengine` bridge takes the GUI's basic output and
+wallpaper selection arguments.
+
+Put `kaleidux-wallpapers.txt` or `kaleidux advanced wallpapers.txt` inside a
+wallpaper directory to include extra sources. Write one relative or absolute
+path, project folder, direct media URL, or colour per line. The list is part
+of the normal slideshow, including shuffle and history.
 
 #### Playback Control
 

@@ -229,7 +229,7 @@ See [config.example.toml](./config.example.toml) for configuration options and
 [transitions_examples.toml](./transitions_examples.toml) for transition parameters.
 [USAGE.md](./USAGE.md) is the command, configuration, transition, scripting, and
 troubleshooting reference, including gaming and sleep automation recipes.
-[morphs.md](./morphs.md) covers filters, morphs and their shader API.
+[morphs.md](./morphs.md) covers shaders, morphs and reactive inputs.
 
 ## Troubleshooting
 
@@ -263,6 +263,17 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [WiVRn](https://github.com/WiVRn/WiVRn)
 - [Jolt](https://github.com/jordond/jolt)
 - [pocket-dots](https://github.com/diegoMalagrida/pocket-dots), for reveal maps
+- [NeoWall](https://github.com/1ay1/neowall)
+- [Shader Desk](https://github.com/KMartianov/shader-desk)
+- [Papertoy](https://github.com/sin-ack/papertoy)
+- [shiftpaper](https://github.com/CPritch/shiftpaper)
+- [Anima](https://github.com/AkerimC/anima)
+- [Lively Wallpaper](https://github.com/rocksdanister/lively)
+- [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
+- [simple-linux-wallpaperengine-gui](https://github.com/Maxnights/simple-linux-wallpaperengine-gui)
+- [we-layerd](https://github.com/Aromatic05/we-layerd)
+- [Penguin Engine](https://github.com/ArjixWasTaken/penguin-engine)
+- [Libretro](https://docs.libretro.com/development/shader/glsl-shaders/)
 
 ## License
 
