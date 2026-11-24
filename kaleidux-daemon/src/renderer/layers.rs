@@ -460,6 +460,10 @@ impl super::Renderer {
         self.layers.wallpaper = wallpaper;
     }
 
+    pub(super) fn layer_clock_at(&self, now: Instant) -> Instant {
+        self.layers.paused_at.unwrap_or(now)
+    }
+
     pub(crate) fn update_layer_clock(&mut self, paused: bool, now: Instant) {
         if paused {
             self.layers.paused_at.get_or_insert(now);

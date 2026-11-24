@@ -84,7 +84,7 @@ impl CompiledLayers {
                 .get_mut(&target.name)
                 .expect("validated output is live")
                 .replace_layers(self.stage, pipeline, rule_ticket.is_some());
-            if starts_wallpaper {
+            if starts_wallpaper && ctx.monitor_manager.has_slideshow_queue(&target.name) {
                 ctx.monitor_manager.mark_transition_completed(&target.name);
             }
         }

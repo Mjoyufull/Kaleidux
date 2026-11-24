@@ -36,6 +36,10 @@ impl Drop for PendingOutputQueues {
 }
 
 impl MonitorManager {
+    pub(crate) fn has_slideshow_queue(&self, name: &str) -> bool {
+        self.queue_exists(&self.queue_target(name))
+    }
+
     pub(crate) fn add_output_deferred(&mut self, name: &str, description: &str) {
         let config = self.config.get_config_for_output(name, description);
         if let MonitorBehavior::Grouped(groups) = &self.config.global.monitor_behavior

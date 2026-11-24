@@ -483,9 +483,11 @@ pub(crate) async fn handle_command(
                 set_pending_video_session(pending_video_sessions, &name, None);
                 pending_video_switches.remove(&name);
                 frame_mailbox.clear_source(&name);
+                let still_rotates = monitor_manager.has_slideshow_queue(&name);
                 if let Some(output) = monitor_manager.outputs.get_mut(&name) {
                     output.current_path = None;
-                    output.display_start_time = Some(std::time::Instant::now());
+                    output.display_start_time = still_rotates.then(std::time::Instant::now);
+                    output.next_change = None;
                 }
                 if let Some(vp) = video_players.remove(&name) {
                     stop_video_player_in_background(name.clone(), vp);

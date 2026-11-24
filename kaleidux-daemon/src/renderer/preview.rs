@@ -12,8 +12,7 @@ pub(crate) struct FrozenWallpaper {
     image_session: u64,
     video_session: u64,
     tiled_image: bool,
-    shader_wallpaper: Option<super::layer_pipeline::LayerPipelines>,
-    frozen_at: std::time::Instant,
+    shader_wallpaper: Option<(super::layer_pipeline::LayerPipelines, std::time::Duration)>,
 }
 
 impl super::Renderer {
@@ -39,6 +38,7 @@ impl super::Renderer {
             })
             .or_else(|| external_view.clone());
         self.blit_bind_group = None;
+        let layer_time = self.layer_clock_at(std::time::Instant::now());
         FrozenWallpaper {
             texture,
             external_view,
@@ -48,8 +48,10 @@ impl super::Renderer {
             image_session: self.active_image_session_id,
             video_session: self.active_video_session_id,
             tiled_image: self.tiled_image,
-            shader_wallpaper: self.take_shader_wallpaper(),
-            frozen_at: std::time::Instant::now(),
+            shader_wallpaper: self.take_shader_wallpaper().map(|stack| {
+                let elapsed = layer_time.saturating_duration_since(stack.start);
+                (stack, elapsed)
+            }),
         }
     }
 
@@ -75,8 +77,9 @@ impl super::Renderer {
         self.active_video_session_id = frozen.video_session;
         self.tiled_image = frozen.tiled_image;
         self.prev_tiled_image = frozen.tiled_image;
-        let shader = frozen.shader_wallpaper.map(|mut stack| {
-            stack.start += frozen.frozen_at.elapsed();
+        let layer_time = self.layer_clock_at(std::time::Instant::now());
+        let shader = frozen.shader_wallpaper.map(|(mut stack, elapsed)| {
+            stack.start = layer_time.checked_sub(elapsed).unwrap_or(layer_time);
             stack
         });
         self.restore_shader_wallpaper(shader);

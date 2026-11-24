@@ -28,11 +28,19 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
             } else {
                 ContentType::Image
             };
+            let path = ctx
+                .monitor_manager
+                .outputs
+                .get(name)
+                .and_then(|output| output.current_path.as_ref());
             let restart = old_settings.get(name).is_some_and(|old| {
                 if kind == ContentType::Image {
                     return old.tile != output_config.tile;
                 }
                 old.video_fps != output_config.video_fps
+                    || ((old.gif_speed != output_config.gif_speed
+                        || old.gif_loop != output_config.gif_loop)
+                        && path.is_some_and(|path| crate::video::is_gif_path(path)))
                     || old.duration != output_config.duration
                     || old.long_video_excerpts != output_config.long_video_excerpts
                     || old.margin != output_config.margin
@@ -43,14 +51,8 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
                                 .get(name)
                                 .is_some_and(|player| player.is_appsink_backend())))
             });
-            if restart
-                && let Some(path) = ctx
-                    .monitor_manager
-                    .outputs
-                    .get(name)
-                    .and_then(|output| output.current_path.clone())
-            {
-                restarts.push((name.clone(), path, kind));
+            if restart && let Some(path) = path {
+                restarts.push((name.clone(), path.clone(), kind));
             }
             if let Some(player) = ctx.video_players.get_mut(name) {
                 player.set_volume(output_config.volume as f64 / 100.0);
