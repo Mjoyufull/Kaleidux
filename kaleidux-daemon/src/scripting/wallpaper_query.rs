@@ -1,6 +1,6 @@
 //! Exposes asynchronous wallpaper timeline queries to Rhai hooks.
 
-use crate::main_loop::CommandSender;
+use super::command_queue::ScriptCommands;
 use kaleidux_common::{Request, Response};
 use rhai::{Dynamic, Engine, EvalAltResult, Map, Position};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 #[derive(Clone)]
 struct WallpaperQuery(Arc<parking_lot::Mutex<oneshot::Receiver<Response>>>);
 
-pub(super) fn register(engine: &mut Engine, tx: CommandSender) {
+pub(super) fn register(engine: &mut Engine, tx: ScriptCommands) {
     engine.register_type_with_name::<WallpaperQuery>("WallpaperQuery");
     let default_tx = tx.clone();
     engine.register_fn("wallpaper_info", move || start(&default_tx, None));
@@ -19,10 +19,12 @@ pub(super) fn register(engine: &mut Engine, tx: CommandSender) {
     engine.register_fn("read", WallpaperQuery::read);
 }
 
-fn start(tx: &CommandSender, output: Option<String>) -> Result<WallpaperQuery, Box<EvalAltResult>> {
+fn start(
+    tx: &ScriptCommands,
+    output: Option<String>,
+) -> Result<WallpaperQuery, Box<EvalAltResult>> {
     let (sender, receiver) = oneshot::channel();
-    tx.try_send((Request::WallpaperInfo { output }.into(), sender))
-        .map_err(|_| runtime_error("Wallpaper command queue is unavailable"))?;
+    tx.enqueue(Request::WallpaperInfo { output }, sender)?;
     Ok(WallpaperQuery(Arc::new(parking_lot::Mutex::new(receiver))))
 }
 

@@ -1,16 +1,19 @@
 //! Loads bounded Rhai hooks and exposes daemon control to scripts.
 
+mod command_queue;
 mod wallpaper_query;
 
 use crate::main_loop::CommandSender;
-use kaleidux_common::{PlaylistCommand, Request, Response};
+use command_queue::ScriptCommands;
+#[cfg(test)]
+use kaleidux_common::Response;
+use kaleidux_common::{PlaylistCommand, Request};
 use rhai::{AST, CallFnOptions, Engine, EvalAltResult, Position, Scope};
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub const SCRIPT_MAX_OPERATIONS: u64 = 50_000;
 pub const SCRIPT_MAX_CALL_LEVELS: usize = 32;
@@ -39,13 +42,14 @@ impl ScriptManager {
         // Filesystem module imports can block the display thread outside the
         // operation budget. Scripts use the supplied in-process API only.
         engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver::new());
-        wallpaper_query::register(&mut engine, cmd_tx.clone());
+        let commands = ScriptCommands::new(cmd_tx);
+        wallpaper_query::register(&mut engine, commands.clone());
 
         engine.register_fn("print", |text: String| {
             info!("[Script] {}", text);
         });
 
-        register_layer_commands(&mut engine, &cmd_tx);
+        register_layer_commands(&mut engine, &commands);
 
         type ImageRequest = fn(String, Option<String>) -> Request;
         let image_commands: [(&str, ImageRequest); 3] = [
@@ -54,16 +58,12 @@ impl ScriptManager {
             ("img", |path, output| Request::Img { path, output }),
         ];
         for (name, request) in image_commands {
-            let tx = cmd_tx.clone();
-            engine.register_fn(name, move |path: String| {
-                let (resp_tx, _) = oneshot::channel();
-                enqueue_script_command(&tx, request(path, None), resp_tx)
-            });
-            let tx = cmd_tx.clone();
+            let tx = commands.clone();
+            engine.register_fn(name, move |path: String| tx.submit(request(path, None)));
+            let tx = commands.clone();
             engine.register_fn(name, move |path: String, output: String| {
-                let (resp_tx, _) = oneshot::channel();
                 let output = Some(if output == "*" { "all".into() } else { output });
-                enqueue_script_command(&tx, request(path, output), resp_tx)
+                tx.submit(request(path, output))
             });
         }
 
@@ -83,104 +83,74 @@ impl ScriptManager {
             }),
         ];
         for (name, request) in prepared_switches {
-            let tx = cmd_tx.clone();
+            let tx = commands.clone();
             engine.register_fn(name, move |path: String, effect: String| {
-                enqueue_prepared_script_command(&tx, request(path, effect, None))
+                tx.submit(request(path, effect, None))
             });
-            let tx = cmd_tx.clone();
+            let tx = commands.clone();
             engine.register_fn(name, move |path: String, effect: String, output: String| {
                 let output = Some(if output == "*" { "all".into() } else { output });
-                enqueue_prepared_script_command(&tx, request(path, effect, output))
+                tx.submit(request(path, effect, output))
             });
         }
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("next", move |output: String| {
-            let (resp_tx, _) = oneshot::channel();
             let out = Some(if output == "*" { "all".into() } else { output });
-            enqueue_script_command(&tx, Request::Next { output: out }, resp_tx)
+            tx.submit(Request::Next { output: out })
         });
 
-        let tx = cmd_tx.clone();
-        engine.register_fn("next", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Next { output: None }, resp_tx)
-        });
+        let tx = commands.clone();
+        engine.register_fn("next", move || tx.submit(Request::Next { output: None }));
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("prev", move |output: String| {
-            let (resp_tx, _) = oneshot::channel();
             let out = Some(if output == "*" { "all".into() } else { output });
-            enqueue_script_command(&tx, Request::Prev { output: out }, resp_tx)
+            tx.submit(Request::Prev { output: out })
         });
 
-        let tx = cmd_tx.clone();
-        engine.register_fn("prev", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Prev { output: None }, resp_tx)
-        });
+        let tx = commands.clone();
+        engine.register_fn("prev", move || tx.submit(Request::Prev { output: None }));
 
-        let tx = cmd_tx.clone();
-        engine.register_fn("pause", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Pause, resp_tx)
-        });
+        let tx = commands.clone();
+        engine.register_fn("pause", move || tx.submit(Request::Pause));
 
-        let tx = cmd_tx.clone();
-        engine.register_fn("resume", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Resume, resp_tx)
-        });
+        let tx = commands.clone();
+        engine.register_fn("resume", move || tx.submit(Request::Resume));
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("inhibit", move |reason: String| {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Inhibit { reason }, resp_tx)
+            tx.submit(Request::Inhibit { reason })
         });
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("uninhibit", move |reason: String| {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Uninhibit { reason }, resp_tx)
+            tx.submit(Request::Uninhibit { reason })
         });
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("load_playlist", move |name: String| {
-            let (resp_tx, _) = oneshot::channel();
             let load_name = if name.is_empty() || name == "*" {
                 None
             } else {
                 Some(name)
             };
-            enqueue_script_command(
-                &tx,
-                Request::Playlist(PlaylistCommand::Load { name: load_name }),
-                resp_tx,
-            )
+            tx.submit(Request::Playlist(PlaylistCommand::Load { name: load_name }))
         });
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("load_playlist", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(
-                &tx,
-                Request::Playlist(PlaylistCommand::Load { name: None }),
-                resp_tx,
-            )
+            tx.submit(Request::Playlist(PlaylistCommand::Load { name: None }))
         });
 
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn("clear", move |output: String| {
-            let (resp_tx, _) = oneshot::channel();
             let out = Some(if output == "*" { "all".into() } else { output });
-            enqueue_script_command(&tx, Request::Clear { output: out }, resp_tx)
+            tx.submit(Request::Clear { output: out })
         });
 
-        let tx = cmd_tx.clone();
-        engine.register_fn("clear", move || {
-            let (resp_tx, _) = oneshot::channel();
-            enqueue_script_command(&tx, Request::Clear { output: None }, resp_tx)
-        });
+        let tx = commands.clone();
+        engine.register_fn("clear", move || tx.submit(Request::Clear { output: None }));
 
         Self {
             engine,
@@ -270,59 +240,12 @@ impl ScriptManager {
     }
 }
 
-fn enqueue_script_command(
-    tx: &CommandSender,
-    request: Request,
-    response: oneshot::Sender<Response>,
-) -> Result<(), Box<EvalAltResult>> {
-    if let Request::Inhibit { reason } | Request::Uninhibit { reason } = &request {
-        kaleidux_common::validate_inhibit_reason(reason)
-            .map_err(|error| Box::new(EvalAltResult::ErrorRuntime(error.into(), Position::NONE)))?;
-    }
-    tx.try_send((request.into(), response)).map_err(|error| {
-        warn!("[Script] Command was not enqueued: {error}");
-        let msg = format!("command queue full: {error}");
-        EvalAltResult::ErrorRuntime(msg.into(), Position::NONE).into()
-    })
-}
-
-fn enqueue_prepared_script_command(
-    tx: &CommandSender,
-    request: Request,
-) -> Result<(), Box<EvalAltResult>> {
-    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-        Box::new(EvalAltResult::ErrorRuntime(
-            error.to_string().into(),
-            Position::NONE,
-        ))
-    })?;
-    let permit = tx.clone().try_reserve_owned().map_err(|error| {
-        Box::new(EvalAltResult::ErrorRuntime(
-            error.to_string().into(),
-            Position::NONE,
-        ))
-    })?;
-    runtime.spawn(async move {
-        match crate::runtime::prepared_command::prepare_command(request).await {
-            Ok(command) => {
-                let (send, receive) = oneshot::channel();
-                permit.send((command, send));
-                if let Ok(Response::Error(error)) = receive.await {
-                    warn!("[Script] Command failed: {error}");
-                }
-            }
-            Err(error) => warn!("[Script] Preparing command failed: {error:#}"),
-        }
-    });
-    Ok(())
-}
-
-fn register_layer_commands(engine: &mut Engine, cmd_tx: &CommandSender) {
+fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
     for (name, stage) in [
         ("filters", kaleidux_common::LayerStage::Filter),
         ("morphs", kaleidux_common::LayerStage::Morph),
     ] {
-        let tx = cmd_tx.clone();
+        let tx = commands.clone();
         engine.register_fn(name, move |names: rhai::Array, fps: i64, output: String| {
             let invalid =
                 |reason: &str| Box::new(EvalAltResult::ErrorRuntime(reason.into(), Position::NONE));
@@ -340,15 +263,12 @@ fn register_layer_commands(engine: &mut Engine, cmd_tx: &CommandSender) {
                 .collect::<Result<Vec<_>, _>>()?;
             let output =
                 (!output.is_empty()).then(|| if output == "*" { "all".into() } else { output });
-            enqueue_prepared_script_command(
-                &tx,
-                Request::LayersSet(kaleidux_common::LayerSelection {
-                    output,
-                    stage,
-                    layers,
-                    fps: fps as u8,
-                }),
-            )
+            tx.submit(Request::LayersSet(kaleidux_common::LayerSelection {
+                output,
+                stage,
+                layers,
+                fps: fps as u8,
+            }))
         });
     }
 }
@@ -356,6 +276,33 @@ fn register_layer_commands(engine: &mut Engine, cmd_tx: &CommandSender) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_calls_wait_for_install_before_later_script_calls() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut script = ScriptManager::new(tx);
+        script
+            .eval(r#"filters(["crt"], 0, "*"); filters([], 0, "*"); next();"#)
+            .unwrap();
+
+        let (install, installed) = rx.recv().await.unwrap();
+        assert!(
+            matches!(install.request, Request::LayersSet(selection) if selection.layers == ["crt"])
+        );
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        installed.send(Response::Ok).unwrap();
+
+        let (clear, cleared) = rx.recv().await.unwrap();
+        assert!(
+            matches!(clear.request, Request::LayersSet(selection) if selection.layers.is_empty())
+        );
+        cleared.send(Response::Ok).unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap().0.request,
+            Request::Next { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn oversized_unicode_script_reports_size_before_utf8() {
