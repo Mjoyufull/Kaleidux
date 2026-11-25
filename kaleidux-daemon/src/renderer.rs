@@ -76,8 +76,12 @@ mod video_upload;
 mod video_zero_copy_upload;
 
 mod layer_bitmap;
+mod layer_feedback;
 mod layer_glsl;
 pub(crate) mod layer_pipeline;
+#[cfg(feature = "retroarch-shaders")]
+pub(crate) mod layer_retro;
+pub(crate) mod layer_shadertoy;
 pub(crate) mod layer_source;
 mod layer_text;
 mod layers;

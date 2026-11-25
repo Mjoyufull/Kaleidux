@@ -274,6 +274,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [we-layerd](https://github.com/Aromatic05/we-layerd)
 - [Penguin Engine](https://github.com/ArjixWasTaken/penguin-engine)
 - [Libretro](https://docs.libretro.com/development/shader/glsl-shaders/)
+- [librashader](https://github.com/SnowflakePowered/librashader)
 
 ## License
 

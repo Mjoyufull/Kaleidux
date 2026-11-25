@@ -12,6 +12,7 @@ default = ["full"]
 full = [
     "network-sources",
     "wallpaper-web",
+    "retroarch-shaders",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -21,6 +22,7 @@ full = [
 wayland-only = [
     "network-sources",
     "wallpaper-web",
+    "retroarch-shaders",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -29,6 +31,13 @@ wayland-only = [
 minimal-static = ["display-wayland"]
 network-sources = []
 wallpaper-web = []
+retroarch-shaders = [
+    "dep:librashader-common",
+    "dep:librashader-pack",
+    "dep:librashader-presets",
+    "dep:librashader-runtime",
+    "dep:librashader-runtime-wgpu",
+]
 backend-appsink = []
 backend-mpv = ["dep:libmpv2", "dep:libmpv2-sys"]
 backend-ffmpeg = ["dep:ffmpeg-next", "dep:libva-sys"]
@@ -47,6 +56,12 @@ gstreamer-allocators = { workspace = true }
 glib = { workspace = true }
 ash = { workspace = true }
 naga = { workspace = true }
+# This runtime shares wgpu 23 with the renderer.
+librashader-common = { version = "=0.6.3", optional = true }
+librashader-pack = { version = "=0.6.3", optional = true }
+librashader-presets = { version = "=0.6.3", optional = true }
+librashader-runtime = { version = "=0.6.3", optional = true }
+librashader-runtime-wgpu = { version = "=0.6.3", features = ["stable"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "fs", "time", "sync", "signal", "macros", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

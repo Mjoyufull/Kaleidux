@@ -94,6 +94,15 @@ struct LovePulse {
 struct FilterTargets {
     size: [u32; 2],
     targets: Vec<FilterTarget>,
+    #[cfg(feature = "retroarch-shaders")]
+    retro: Option<RetroTargets>,
+}
+
+#[cfg(feature = "retroarch-shaders")]
+struct RetroTargets {
+    input: std::sync::Arc<wgpu::Texture>,
+    output: wgpu::TextureView,
+    binding: wgpu::BindGroup,
 }
 
 struct FilterTarget {
@@ -152,44 +161,19 @@ impl Layers {
                 .filter_targets
                 .as_ref()
                 .map_or(destination, |targets| &targets.targets[0].view);
-            wallpaper.write_frame(
-                ctx,
-                layer_frame(size, wallpaper, animation_time, progress, self.signals),
-            );
-            let mut pass = begin_pass(
-                encoder,
-                target,
-                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-            );
-            let pipelines =
-                if self.filter_targets.is_some() && !wallpaper.wallpaper_intermediate.is_empty() {
-                    &wallpaper.wallpaper_intermediate
-                } else {
-                    &wallpaper.pipelines
-                };
-            for (index, pipeline) in pipelines.iter().enumerate() {
-                pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
-                pass.set_scissor_rect(0, 0, size[0], size[1]);
-                if let Some(rect) = wallpaper.rectangles[index] {
-                    set_rectangle(&mut pass, size, rect);
-                }
-                draw(&mut pass, pipeline, &wallpaper.morph_bindings[index]);
+            let frame = layer_frame(size, wallpaper, animation_time, progress, self.signals);
+            let intermediate = self.filter_targets.is_some();
+            if let Some(feedback) = &mut wallpaper.feedback {
+                feedback.render(ctx, encoder, target, frame, wallpaper.fps, intermediate);
+            } else {
+                wallpaper.write_frame(ctx, frame);
+                draw_wallpaper(encoder, target, size, wallpaper, intermediate);
             }
         }
         if let (Some(filters), Some(targets)) = (self.filters.active_mut(), &self.filter_targets) {
             let frame = layer_frame(size, filters, animation_time, progress, self.signals);
             filters.write_frame(ctx, frame);
-            for (index, pipeline) in filters.pipelines.iter().enumerate() {
-                let input = &targets.targets[index % targets.targets.len()];
-                let last = index + 1 == filters.pipelines.len();
-                let target = if last {
-                    destination
-                } else {
-                    &targets.targets[(index + 1) % 2].view
-                };
-                let mut pass = begin_pass(encoder, target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
-                draw(&mut pass, pipeline, &input.binding);
-            }
+            targets.render(ctx, encoder, destination, filters);
         }
 
         if self.love.as_ref().is_some_and(|pulse| {
@@ -245,10 +229,54 @@ impl Layers {
     }
 
     pub(super) fn retained_texture_bytes(&self) -> u64 {
-        self.filter_targets.as_ref().map_or(0, |targets| {
+        let filter_bytes = self.filter_targets.as_ref().map_or(0, |targets| {
+            #[cfg(feature = "retroarch-shaders")]
+            if let (Some(_), Some(retro)) = (
+                &targets.retro,
+                self.filters
+                    .active()
+                    .and_then(|filter| filter.retro.as_ref()),
+            ) {
+                let bytes =
+                    super::texture::texture_byte_size(targets.size[0], targets.size[1], 1) * 2;
+                return bytes + retro.retained_texture_bytes();
+            }
             super::texture::texture_byte_size(targets.size[0], targets.size[1], 1)
                 .saturating_mul(targets.targets.len() as u64)
-        })
+        });
+        let feedback_bytes = self
+            .wallpaper
+            .as_ref()
+            .and_then(|wallpaper| wallpaper.feedback.as_ref())
+            .map_or(0, super::layer_feedback::Feedback::retained_texture_bytes);
+        filter_bytes + feedback_bytes
+    }
+}
+
+fn draw_wallpaper(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    size: [u32; 2],
+    wallpaper: &LayerPipelines,
+    intermediate: bool,
+) {
+    let mut pass = begin_pass(
+        encoder,
+        target,
+        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+    );
+    let pipelines = if intermediate && !wallpaper.wallpaper_intermediate.is_empty() {
+        &wallpaper.wallpaper_intermediate
+    } else {
+        &wallpaper.pipelines
+    };
+    for (index, pipeline) in pipelines.iter().enumerate() {
+        pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+        pass.set_scissor_rect(0, 0, size[0], size[1]);
+        if let Some(rect) = wallpaper.rectangles[index] {
+            set_rectangle(&mut pass, size, rect);
+        }
+        draw(&mut pass, pipeline, &wallpaper.morph_bindings[index]);
     }
 }
 
@@ -298,6 +326,30 @@ fn layer_frame(
 
 impl FilterTargets {
     fn new(ctx: &WgpuContext, filters: &LayerPipelines, size: [u32; 2]) -> Self {
+        #[cfg(feature = "retroarch-shaders")]
+        if filters.retro.is_some() {
+            use super::layer_retro::target_texture;
+            let input = std::sync::Arc::new(target_texture(ctx, size));
+            let output = target_texture(ctx, size);
+            let srgb = wgpu::TextureViewDescriptor {
+                format: Some(FILTER_FORMAT),
+                ..Default::default()
+            };
+            let view = input.create_view(&srgb);
+            return Self {
+                size,
+                targets: vec![FilterTarget {
+                    binding: filters.filter_binding(ctx, &view),
+                    view,
+                }],
+                retro: Some(RetroTargets {
+                    input,
+                    output: output.create_view(&Default::default()),
+                    binding: filters.filter_binding(ctx, &output.create_view(&srgb)),
+                }),
+            };
+        }
+
         let targets = (0..filters.pipelines.len().min(2))
             .map(|_| {
                 let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -322,11 +374,52 @@ impl FilterTargets {
                 }
             })
             .collect();
-        Self { size, targets }
+        Self {
+            size,
+            targets,
+            #[cfg(feature = "retroarch-shaders")]
+            retro: None,
+        }
+    }
+
+    fn render(
+        &self,
+        _ctx: &WgpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        destination: &wgpu::TextureView,
+        filters: &mut LayerPipelines,
+    ) {
+        #[cfg(feature = "retroarch-shaders")]
+        if let (Some(targets), Some(retro)) = (&self.retro, &mut filters.retro) {
+            let success = retro.render(_ctx, encoder, &targets.input, &targets.output, self.size);
+            let binding = if success {
+                &targets.binding
+            } else {
+                &self.targets[0].binding
+            };
+            let mut pass = begin_pass(
+                encoder,
+                destination,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            draw(&mut pass, &filters.pipelines[0], binding);
+            return;
+        }
+
+        for (index, pipeline) in filters.pipelines.iter().enumerate() {
+            let input = &self.targets[index % self.targets.len()];
+            let target = if index + 1 == filters.pipelines.len() {
+                destination
+            } else {
+                &self.targets[(index + 1) % 2].view
+            };
+            let mut pass = begin_pass(encoder, target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            draw(&mut pass, pipeline, &input.binding);
+        }
     }
 }
 
-fn begin_pass<'a>(
+pub(super) fn begin_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
@@ -345,7 +438,7 @@ fn begin_pass<'a>(
     })
 }
 
-fn draw(
+pub(super) fn draw(
     pass: &mut wgpu::RenderPass<'_>,
     pipeline: &wgpu::RenderPipeline,
     binding: &wgpu::BindGroup,

@@ -80,17 +80,39 @@ inputs include `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`,
 image. Shader wallpapers and GLSL morphs can bind four local image
 channels. Paths in `channel0=` through `channel3=` are relative to the shader
 file or absolute. `kldPointer`, `kldData`, and `kldAudio(index)` are available
-in both modes. Shadertoy Buffer passes and feedback need ports.
+in both modes.
 
 ```sh
 kldctl shader-wallpaper 'desktop.frag|channel0=sky.png|channel1=clouds.png'
 kldctl morph 'badge.frag|channel2=/home/me/art.png|rect=0.04,0.08,0.12,0.12'
 ```
 
+Save a Shadertoy JSON export with inline pass code as `name.shadertoy.json`.
+Kaleidux runs Common, Buffer A through D, and Image in that order.
+A buffer channel reads the current frame after its producer has run.
+Self-reads and reads from later buffers use the previous frame.
+Copy image assets next to the export and use relative `filepath` entries
+or mirror the export's `media/` paths. Channels support 2D images and
+buffers with nearest or linear sampling and clamp or repeat wrapping.
+At large resolutions the buffer targets downscale together to fit a
+192 MiB budget. Image still renders at output resolution.
+
+```sh
+kldctl shader-wallpaper /path/to/scene.shadertoy.json --fps 60
+```
+
+Use `kldctl shader /path/to/preset.slangp` for RetroArch Slang presets.
+Keep the preset's referenced shaders and images in place. Set parameter
+overrides in the preset file. Pass scaling, history, feedback, lookup
+textures, and includes use librashader. The output is SDR. Presets requiring
+more than 512 MiB of render targets at the active output size fall back
+to the unfiltered image. The full and Wayland builds include the
+`retroarch-shaders` feature.
+
 Use `kldctl shader /path/to/preset.glslp` for same-size Libretro GLSL
 passes. The fragment ABI includes `Texture`, `TextureSize`, `InputSize`,
 `OutputSize`, `FrameCount` and a single UV varying. Presets with custom
-vertex math, LUTs, feedback, scaling, `.slangp` or parameter overrides
+vertex math, LUTs, feedback, scaling or parameter overrides
 need a port. The opt-in native mpv GL overlay bypasses the layer renderer.
 
 ## Input providers and player morph

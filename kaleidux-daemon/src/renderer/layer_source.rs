@@ -16,6 +16,9 @@ pub(crate) struct PreparedLayers {
     pub(crate) fps: u16,
     pub(crate) shaders: Vec<PreparedLayer>,
     pub(crate) source: Option<String>,
+    pub(crate) feedback: Option<super::layer_shadertoy::PreparedToy>,
+    #[cfg(feature = "retroarch-shaders")]
+    pub(crate) retro: Option<super::layer_retro::PreparedPreset>,
 }
 
 pub(crate) struct PreparedLayer {
@@ -38,7 +41,7 @@ impl PreparedLayer {
 
 impl PreparedLayers {
     pub(crate) fn is_empty(&self) -> bool {
-        self.shaders.is_empty()
+        self.shaders.is_empty() && self.feedback.is_none()
     }
 
     pub(crate) fn stage(&self) -> LayerStage {
@@ -61,6 +64,9 @@ impl PreparedLayers {
                 fps: 0,
                 shaders: Vec::new(),
                 source: None,
+                feedback: None,
+                #[cfg(feature = "retroarch-shaders")]
+                retro: None,
             });
         }
         let selection = selection.clone();
@@ -77,9 +83,41 @@ impl PreparedLayers {
     fn read_and_validate(selection: LayerSelection) -> Result<Self> {
         if selection.stage == LayerStage::Wallpaper
             && let Some(source) = selection.layers.first()
+            && super::layer_shadertoy::is_manifest(Path::new(source))
+        {
+            return Ok(Self {
+                stage: selection.stage,
+                fps: selection.fps,
+                shaders: Vec::new(),
+                source: Some(source.clone()),
+                feedback: Some(super::layer_shadertoy::load(Path::new(source))?),
+                #[cfg(feature = "retroarch-shaders")]
+                retro: None,
+            });
+        }
+        if selection.stage == LayerStage::Wallpaper
+            && let Some(source) = selection.layers.first()
             && crate::scene::is_scene(Path::new(source))
         {
             return crate::scene::open(Path::new(source));
+        }
+        if selection.stage == LayerStage::Filter
+            && let Some(path) = selection.layers.iter().map(Path::new).find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "slangp")
+            })
+        {
+            anyhow::ensure!(
+                selection.layers.len() == 1,
+                "Choose a Slang preset on its own"
+            );
+            #[cfg(feature = "retroarch-shaders")]
+            return super::layer_retro::prepare(path, selection.fps);
+            #[cfg(not(feature = "retroarch-shaders"))]
+            {
+                let _ = path;
+                anyhow::bail!("This build does not include retroarch-shaders");
+            }
         }
         let mut shaders = Vec::new();
         for name in &selection.layers {
@@ -123,6 +161,9 @@ impl PreparedLayers {
             stage: selection.stage,
             fps: selection.fps,
             shaders,
+            feedback: None,
+            #[cfg(feature = "retroarch-shaders")]
+            retro: None,
             source: selection.layers.first().map(|name| {
                 name.split_once('|')
                     .map_or(name.as_str(), |(path, _)| path)
@@ -350,7 +391,9 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
 }
 
 pub(crate) fn is_shader_file(path: &Path) -> bool {
-    is_fragment_file(path) || path.extension().is_some_and(|ext| ext == "wgsl")
+    is_fragment_file(path)
+        || path.extension().is_some_and(|ext| ext == "wgsl")
+        || super::layer_shadertoy::is_manifest(path)
 }
 
 pub(crate) fn is_fragment_file(path: &Path) -> bool {
@@ -432,6 +475,10 @@ fn preset_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn read_shader(path: &Path) -> Result<String> {
+    read_bounded(path, MAX_SHADER_BYTES).context("Read shader source")
+}
+
+pub(super) fn read_bounded(path: &Path, max_bytes: usize) -> Result<String> {
     // Non-regular inputs can keep a worker occupied indefinitely.
     // O_NONBLOCK also covers replacement with a FIFO between path lookup and open.
     use std::os::unix::fs::OpenOptionsExt;
@@ -441,13 +488,16 @@ fn read_shader(path: &Path) -> Result<String> {
         .open(path)?;
     let metadata = file.metadata()?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_SHADER_BYTES as u64,
-        "Shader must be a regular file no larger than 64 KiB"
+        metadata.is_file() && metadata.len() <= max_bytes as u64,
+        "Shader source must be a regular file no larger than {max_bytes} bytes"
     );
     let mut source = String::new();
-    file.take((MAX_SHADER_BYTES + 1) as u64)
+    file.take((max_bytes + 1) as u64)
         .read_to_string(&mut source)?;
-    anyhow::ensure!(source.len() <= MAX_SHADER_BYTES, "Shader exceeds 64 KiB");
+    anyhow::ensure!(
+        source.len() <= max_bytes,
+        "Shader exceeds {max_bytes} bytes"
+    );
     Ok(source)
 }
 

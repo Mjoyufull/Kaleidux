@@ -70,6 +70,18 @@ layout(location = 0) out vec4 kld_retro_colour;
 "#;
 
 pub(super) fn translate(stage: LayerStage, source: &str) -> Result<String> {
+    translate_fragment(stage, source, None)
+}
+
+pub(super) fn translate_shadertoy(source: &str, buffer: bool) -> Result<String> {
+    translate_fragment(LayerStage::Wallpaper, source, Some(buffer))
+}
+
+fn translate_fragment(
+    stage: LayerStage,
+    source: &str,
+    shadertoy_buffer: Option<bool>,
+) -> Result<String> {
     // Preserve source line numbers when dropping declarations supplied by this ABI.
     static DECLARATIONS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
@@ -117,16 +129,40 @@ pub(super) fn translate(stage: LayerStage, source: &str) -> Result<String> {
     } else {
         GLSL_WALLPAPER_SAMPLE
     };
-    let entry = if body.contains("mainImage(") || body.contains("mainImage (") {
-        r#"
-layout(location = 0) out vec4 kld_colour;
-void main() {
-    vec2 xy = vec2(kld_uv.x, 1.0 - kld_uv.y) * kld_frame.size;
-    mainImage(kld_colour, xy);
-}
-"#
+    let sample = if shadertoy_buffer.is_some() {
+        let mut sample = sample.to_owned();
+        for (channel, binding) in [(1, 6), (2, 7), (3, 8)] {
+            sample = sample.replace(
+                &format!("kld_channel{channel}, kld_sampler)"),
+                &format!("kld_channel{channel}, kld_sampler{channel})"),
+            );
+            sample = format!(
+                "layout(set = 0, binding = {binding}) uniform sampler kld_sampler{channel};\n{sample}"
+            );
+        }
+        sample
     } else {
-        ""
+        sample.to_owned()
+    };
+    let entry = if shadertoy_buffer.is_some()
+        || body.contains("mainImage(")
+        || body.contains("mainImage (")
+    {
+        let coordinates = if shadertoy_buffer == Some(true) {
+            "kld_uv"
+        } else {
+            "vec2(kld_uv.x, 1.0 - kld_uv.y)"
+        };
+        format!(
+            r#"
+layout(location = 0) out vec4 kld_colour;
+void main() {{
+    mainImage(kld_colour, {coordinates} * kld_frame.size);
+}}
+"#
+        )
+    } else {
+        String::new()
     };
     let full = format!(
         "#version 450\n{GLSL_FRAME}\n{GLSL_SAMPLE}\n{sample}\n{retro_prelude}\n{body}\n{entry}"

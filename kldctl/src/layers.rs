@@ -19,9 +19,10 @@ pub(crate) fn layer_request(
             let path = std::path::Path::new(source);
             if path.is_absolute()
                 || (prefix.is_none()
+                    && !source.ends_with(".shadertoy.json")
                     && !matches!(
                         path.extension().and_then(|ext| ext.to_str()),
-                        Some("wgsl" | "glsl" | "frag" | "fs" | "fsh" | "glslp")
+                        Some("wgsl" | "glsl" | "frag" | "fs" | "fsh" | "glslp" | "slangp")
                     ))
             {
                 return Ok(name);

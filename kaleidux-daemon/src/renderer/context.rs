@@ -41,8 +41,8 @@ mod cuda_warmup_tests {
 pub struct WgpuContext {
     pub instance: Instance,
     pub adapter: Adapter,
-    pub device: Device,
-    pub queue: Queue,
+    pub device: Arc<Device>,
+    pub queue: Arc<Queue>,
     /// Serializes WGPU queue access with the raw Vulkan semaphore submits used
     /// by the mpv GL interop path.
     pub(super) queue_lock: parking_lot::Mutex<()>,
@@ -103,6 +103,10 @@ impl WgpuContext {
 
         super::context_video_caps::configure(&adapter);
         let mut required_features = wgpu::Features::empty();
+        #[cfg(feature = "retroarch-shaders")]
+        {
+            required_features |= adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        }
         if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
@@ -367,8 +371,8 @@ impl WgpuContext {
             Arc::new(Self {
                 instance,
                 adapter,
-                device,
-                queue,
+                device: Arc::new(device),
+                queue: Arc::new(queue),
                 queue_lock: parking_lot::Mutex::new(()),
                 transition_pipelines: parking_lot::Mutex::new(PipelineLRU::new(
                     MAX_PIPELINE_CACHE_SIZE,

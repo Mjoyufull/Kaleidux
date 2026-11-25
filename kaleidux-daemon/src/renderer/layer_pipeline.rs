@@ -33,6 +33,9 @@ pub(crate) struct LayerPipelines {
     depth: Option<wgpu::TextureView>,
     pub(super) morph_bindings: Vec<wgpu::BindGroup>,
     pub(super) rectangles: Vec<Option<[f32; 4]>>,
+    pub(super) feedback: Option<super::layer_feedback::Feedback>,
+    #[cfg(feature = "retroarch-shaders")]
+    pub(super) retro: Option<super::layer_retro::Retro>,
 }
 
 impl LayerPipelines {
@@ -41,14 +44,25 @@ impl LayerPipelines {
         format: wgpu::TextureFormat,
         prepared: &PreparedLayers,
     ) -> anyhow::Result<Option<Self>> {
-        if prepared.shaders.is_empty() {
+        if prepared.is_empty() {
             return Ok(None);
         }
         ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layers = Self::create(ctx, format, prepared);
+        #[cfg(feature = "retroarch-shaders")]
+        let retro = prepared
+            .retro
+            .as_ref()
+            .map(|preset| super::layer_retro::Retro::compile(ctx, preset))
+            .transpose();
         if let Some(error) = ctx.device.pop_error_scope().await {
             anyhow::bail!("Layer pipeline rejected by the graphics device: {error}");
         }
+        #[cfg(feature = "retroarch-shaders")]
+        let layers = Self {
+            retro: retro?,
+            ..layers
+        };
         Ok(Some(layers))
     }
 
@@ -141,11 +155,18 @@ impl LayerPipelines {
                 Vec::new()
             };
         Self {
-            names: prepared
-                .shaders
-                .iter()
-                .map(|layer| layer.name.clone())
-                .collect(),
+            names: if let Some(toy) = &prepared.feedback {
+                toy.passes
+                    .iter()
+                    .map(|pass| pass.layer.name.clone())
+                    .collect()
+            } else {
+                prepared
+                    .shaders
+                    .iter()
+                    .map(|layer| layer.name.clone())
+                    .collect()
+            },
             fps: prepared.fps,
             start: Instant::now(),
             pipelines,
@@ -163,6 +184,12 @@ impl LayerPipelines {
                 .iter()
                 .map(|layer| layer.rectangle)
                 .collect(),
+            feedback: prepared
+                .feedback
+                .as_ref()
+                .map(|toy| super::layer_feedback::Feedback::new(ctx, format, toy)),
+            #[cfg(feature = "retroarch-shaders")]
+            retro: None,
         }
     }
 
@@ -171,6 +198,9 @@ impl LayerPipelines {
             stage: LayerStage::Morph,
             fps: 30,
             source: None,
+            feedback: None,
+            #[cfg(feature = "retroarch-shaders")]
+            retro: None,
             shaders: vec![super::layer_source::PreparedLayer {
                 name: "heart".into(),
                 source: assemble(LayerStage::Morph, HEART),
@@ -232,14 +262,14 @@ impl LayerPipelines {
     }
 }
 
-fn texture_entry(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+pub(super) fn texture_entry(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::TextureView(view),
     }
 }
 
-fn asset_view(
+pub(super) fn asset_view(
     ctx: &WgpuContext,
     image: Option<&image::RgbaImage>,
     format: wgpu::TextureFormat,
@@ -273,7 +303,7 @@ fn asset_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn uniform_entry(uniform: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(super) fn uniform_entry(uniform: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding: 0,
         resource: uniform.as_entire_binding(),
@@ -334,12 +364,7 @@ fn resources(
                 &entries[..1]
             },
         });
-    let uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Wallpaper layer frame"),
-        size: std::mem::size_of::<LayerFrame>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let uniform = frame_uniform(ctx);
     let sampler = (filter || has_bitmap || fragment_channels).then(|| {
         ctx.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Wallpaper filter sampler"),
@@ -351,7 +376,16 @@ fn resources(
     (layout, uniform, sampler)
 }
 
-fn pipeline(
+pub(super) fn frame_uniform(ctx: &WgpuContext) -> wgpu::Buffer {
+    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Wallpaper layer frame"),
+        size: std::mem::size_of::<LayerFrame>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+pub(super) fn pipeline(
     ctx: &WgpuContext,
     layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,

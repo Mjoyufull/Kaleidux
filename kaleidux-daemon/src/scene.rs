@@ -68,6 +68,9 @@ pub(crate) fn open(path: &Path) -> Result<PreparedLayers> {
         fps,
         shaders,
         source: Some(path.to_string_lossy().into_owned()),
+        feedback: None,
+        #[cfg(feature = "retroarch-shaders")]
+        retro: None,
     })
 }
 
