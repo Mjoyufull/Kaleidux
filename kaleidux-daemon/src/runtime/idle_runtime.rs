@@ -179,7 +179,14 @@ impl MainLoopContext {
 
         let now = Instant::now();
         if self.latest_video_frames.has_signal_pending() {
-            let result = IdleWaitResult::immediate_video_frame();
+            let mut result = IdleWaitResult::immediate_video_frame();
+            // An over-budget video can keep its latest-frame slot full on
+            // every turn. Service control and completion messages even when
+            // the display loop never reaches the select below.
+            result.cmd = self.cmd_rx.try_recv().ok();
+            result.image = self.image_rx.try_recv().ok();
+            result.player = self.player_rx.try_recv().ok();
+            result.player_event = self.player_event_rx.try_recv().ok();
             self.metrics.record_loop_wake(
                 result.wake_reason,
                 result.requested_sleep,
