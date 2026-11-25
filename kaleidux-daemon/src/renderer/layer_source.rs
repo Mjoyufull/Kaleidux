@@ -27,6 +27,7 @@ pub(crate) struct PreparedLayer {
     pub(crate) fragment_only: bool,
     pub(crate) assets: [Option<image::RgbaImage>; 4],
     pub(crate) rectangle: Option<[f32; 4]>,
+    pub(super) action: Option<String>,
 }
 
 impl PreparedLayer {
@@ -182,6 +183,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
         && is_fragment_file(shader_path);
     let mut assets = [None, None, None, None];
     let mut rectangle = None;
+    let mut action = None;
     let mut font = None;
     let mut colour = "#ffffff";
     for option in options.split('|').filter(|option| !option.is_empty()) {
@@ -190,6 +192,16 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
             .context("Expected layer option key=value")?;
         match key {
             "rect" if stage == LayerStage::Morph => rectangle = Some(parse_rectangle(value)?),
+            "action" if stage == LayerStage::Morph => {
+                anyhow::ensure!(
+                    !value.is_empty()
+                        && value.len() <= 64
+                        && value.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')),
+                    "Morph action must be a short identifier"
+                );
+                action = Some(value.to_owned());
+            }
             "font" if stage == LayerStage::Morph => font = Some(value),
             "colour" | "color" if stage == LayerStage::Morph => colour = value,
             "channel0" | "channel1" | "channel2" | "channel3"
@@ -244,12 +256,17 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
         assemble(stage, &body)
     };
     validate_abi(stage, &source, fragment_only, assets[0].is_some())?;
+    anyhow::ensure!(
+        action.is_none() || rectangle.is_some(),
+        "A morph action needs a rectangle"
+    );
     Ok(PreparedLayer {
         name: spec.to_owned(),
         source,
         fragment_only,
         assets,
         rectangle,
+        action,
     })
 }
 
@@ -269,6 +286,7 @@ pub(crate) fn prepare_rgba_layer(
         fragment_only: false,
         assets: [Some(bitmap), None, None, None],
         rectangle,
+        action: None,
     })
 }
 

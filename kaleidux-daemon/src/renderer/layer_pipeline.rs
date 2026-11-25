@@ -33,6 +33,7 @@ pub(crate) struct LayerPipelines {
     depth: Option<wgpu::TextureView>,
     pub(super) morph_bindings: Vec<wgpu::BindGroup>,
     pub(super) rectangles: Vec<Option<[f32; 4]>>,
+    pub(super) actions: Vec<Option<String>>,
     pub(super) feedback: Option<super::layer_feedback::Feedback>,
     #[cfg(feature = "retroarch-shaders")]
     pub(super) retro: Option<super::layer_retro::Retro>,
@@ -184,6 +185,11 @@ impl LayerPipelines {
                 .iter()
                 .map(|layer| layer.rectangle)
                 .collect(),
+            actions: prepared
+                .shaders
+                .iter()
+                .map(|layer| layer.action.clone())
+                .collect(),
             feedback: prepared
                 .feedback
                 .as_ref()
@@ -207,6 +213,7 @@ impl LayerPipelines {
                 fragment_only: false,
                 assets: [None, None, None, None],
                 rectangle: None,
+                action: None,
             }],
         };
         Self::create(ctx, format, &prepared)

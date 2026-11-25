@@ -28,6 +28,7 @@ pub struct ScriptManager {
     ast: Option<AST>,
     scope: Scope<'static>,
     has_tick: bool,
+    has_morph_action: bool,
 }
 
 impl ScriptManager {
@@ -157,6 +158,7 @@ impl ScriptManager {
             ast: None,
             scope: Scope::new(),
             has_tick: false,
+            has_morph_action: false,
         }
     }
 
@@ -204,9 +206,32 @@ impl ScriptManager {
         self.has_tick = ast
             .iter_functions()
             .any(|function| function.name == "on_tick" && function.params.is_empty());
+        self.has_morph_action = ast
+            .iter_functions()
+            .any(|function| function.name == "on_morph_action" && function.params.len() == 4);
         self.ast = Some(ast);
         self.scope = scope;
         Ok(())
+    }
+
+    pub(crate) fn morph_action(&mut self, action: &str, output: &str, [x, y]: [f32; 2]) {
+        if self.has_morph_action
+            && let Some(ast) = &self.ast
+            && let Err(error) = self.engine.call_fn_with_options::<()>(
+                CallFnOptions::new().eval_ast(false),
+                &mut self.scope,
+                ast,
+                "on_morph_action",
+                (
+                    action.to_owned(),
+                    output.to_owned(),
+                    f64::from(x),
+                    f64::from(y),
+                ),
+            )
+        {
+            tracing::warn!("Rhai on_morph_action failed: {error}");
+        }
     }
 
     pub fn tick_result(&mut self) -> Result<(), Box<EvalAltResult>> {

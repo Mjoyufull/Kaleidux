@@ -21,6 +21,8 @@ pub enum Request {
     LayerInputs(crate::LayerInputs),
     #[serde(rename = "layers_query")]
     LayersQuery { output: Option<String> },
+    #[serde(rename = "morph_watch")]
+    MorphWatch { output: Option<String> },
     #[serde(rename = "query_outputs")]
     QueryOutputs,
     #[serde(rename = "next")]

@@ -75,6 +75,11 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Print morph activations as JSON lines
+    MorphWatch {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Use one procedural shader as the wallpaper. No path clears it.
     ShaderWallpaper {
         path: Option<String>,
@@ -461,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
             BlacklistSubcommand::List => kaleidux_common::BlacklistCommand::List,
         }),
         Commands::History { output } => Request::History { output },
+        Commands::MorphWatch { output } => Request::MorphWatch { output },
         Commands::PerfSnapshot => Request::PerfSnapshot,
     };
 
@@ -480,6 +486,9 @@ async fn main() -> anyhow::Result<()> {
             let req_json = serde_json::to_string(&request)?;
             stream.write_all(req_json.as_bytes()).await?;
             stream.write_all(b"\n").await?;
+            if matches!(request, Request::MorphWatch { .. }) {
+                return layers::watch_morphs(stream).await;
+            }
             if let Some(file) = frame_file {
                 return wallpaper_data::read_png(stream, file).await;
             }

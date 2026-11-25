@@ -37,6 +37,9 @@ pub(crate) async fn handle_command(
             return super::layer_commands::query(&ctx, output)
                 .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         }
+        Request::MorphWatch { .. } => {
+            return Response::Error("Use the morph event socket stream".into());
+        }
         Request::SetReveal { path, output, .. } | Request::SetTransition { path, output, .. } => {
             if transition_override.is_none() {
                 return Response::Error("Transition was not prepared".into());
@@ -340,6 +343,7 @@ pub(crate) async fn handle_command(
         Request::LayersSet(_)
         | Request::LayerInputs(_)
         | Request::LayersQuery { .. }
+        | Request::MorphWatch { .. }
         | Request::LoveCurrent { .. }
         | Request::Love { .. } => {
             unreachable!("layer commands handled before dispatch")

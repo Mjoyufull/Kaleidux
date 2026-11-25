@@ -19,7 +19,7 @@ mod wallpaper_data;
 use transition_defaults::*;
 
 pub use layers::{
-    LAYER_FPS_UNLIMITED, LayerInputs, LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE,
+    LAYER_FPS_UNLIMITED, LayerInputs, LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE, MorphEvent,
     OutputLayers,
 };
 pub use protocol::{

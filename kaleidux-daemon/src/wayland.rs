@@ -2,6 +2,7 @@ pub(crate) mod color;
 pub(crate) mod frame_callbacks;
 pub(crate) mod hotplug;
 pub(crate) mod native_dmabuf_surface;
+pub(crate) mod pointer;
 pub(crate) mod presentation;
 pub(crate) mod startup;
 mod surface_protocols;
@@ -12,6 +13,7 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::SeatState,
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -102,6 +104,8 @@ pub struct WaylandBackend {
     pub layer_shell: LayerShell,
     pub shm: Shm,
     pub surfaces: std::collections::HashMap<String, LayerSurface>,
+    seat_state: SeatState,
+    pointer: pointer::DesktopPointer,
     dmabuf_state: DmabufState,
     subcompositor_state: SubcompositorState,
     viewporter: SimpleGlobal<WpViewporter, 1>,
@@ -144,6 +148,7 @@ impl WaylandBackend {
         let layer_shell = LayerShell::bind(globals, qh)?;
         let shm = Shm::bind(globals, qh)?;
         let output_state = OutputState::new(globals, qh);
+        let seat_state = SeatState::new(globals, qh);
         let dmabuf_state = DmabufState::new(globals, qh);
         let subcompositor_state =
             SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)?;
@@ -165,6 +170,8 @@ impl WaylandBackend {
             layer_shell,
             shm,
             surfaces: std::collections::HashMap::new(),
+            seat_state,
+            pointer: pointer::DesktopPointer::default(),
             dmabuf_state,
             subcompositor_state,
             viewporter,
@@ -316,6 +323,7 @@ impl WaylandBackend {
         self.surface_content_types.remove(name);
         self.preferred_fractional_scales.remove(name);
         self.logical_surface_sizes.remove(name);
+        self.pointer.retire(name);
         self.retire_color_surface(name);
     }
 
@@ -347,6 +355,11 @@ impl WaylandBackend {
         layer_surface.set_size(0, 0);
         layer_surface.set_anchor(Anchor::all());
         layer_surface.set_exclusive_zone(-1);
+        let empty_region = self.compositor.wl_compositor().create_region(qh, ());
+        layer_surface
+            .wl_surface()
+            .set_input_region(Some(&empty_region));
+        empty_region.destroy();
         layer_surface.commit();
 
         Ok(layer_surface)
@@ -447,7 +460,7 @@ impl ProvidesRegistryState for WaylandBackend {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl CompositorHandler for WaylandBackend {

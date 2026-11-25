@@ -30,6 +30,17 @@ font description and `colour=#RRGGBB` for text colour. System fonts and
 Unicode text use `pango-view`. Simple ASCII labels can use the built-in VGA
 bitmap from [font8x8](https://github.com/dhepper/font8x8).
 
+On Wayland, a morph with `rect=` and `action=` accepts primary clicks.
+Overlapping buttons use the topmost matching morph. Clicks outside the
+buttons pass through the wallpaper. A press and release must land inside
+the same button. Run `kldctl morph-watch` to read the action, output name
+and coordinates within the button as JSON lines.
+
+```sh
+kldctl morph 'text=Next|font=Sans Bold 24|rect=0.05,0.8,0.15,0.07|action=next'
+kldctl morph-watch -o DP-1
+```
+
 ## Wallpaper rules
 
 ```toml
@@ -136,9 +147,8 @@ Hyprland. Other applications can send input through IPC.
 The player example reads MPRIS with `playerctl`, local album art, and a
 timed LRC file. It owns a single morph stack while running. Adjust
 `--rect`, `--font`, `--colour`, `--dim`, and `--art` for your desktop.
-Bind its `previous`, `play-pause` and `next` actions with your compositor.
-The panel surface is click-through. For more controls, run the same
-commands from a shell or another widget host.
+Its `previous`, `play-pause` and `next` buttons work on Wayland. Those
+actions are also available as commands for compositor bindings.
 
 ## Rhai and IPC
 
@@ -146,6 +156,10 @@ commands from a shell or another widget host.
 shaders(["crt"], 0, "*");
 morphs(["text=Kaleidux", "heart"], -1, "eDP-1");
 react("{\"pointer\":[0.7,0.4,0,0],\"output\":\"eDP-1\"}");
+
+fn on_morph_action(action, output, x, y) {
+    if action == "next" { next(output); }
+}
 ```
 
 Use `layers_set`, `layers_query` and `layer_inputs` over the Unix socket.
@@ -156,4 +170,9 @@ layers and 65535 for unlimited animation.
 {"method":"layers_set","params":{"output":"all","stage":"shader","layers":["mono","crt"],"fps":0}}
 {"method":"layer_inputs","params":{"output":"eDP-1","audio":[0.1,0.2],"data":[1,0,0,0]}}
 {"method":"layers_query","params":{"output":"all"}}
+{"method":"morph_watch","params":{"output":"DP-1"}}
 ```
+
+The watch connection replies with `"Ok"` and then one JSON event per line
+until it closes. Omit `output` to follow all outputs. For example, an event
+can be `{"output":"DP-1","action":"next","position":[0.5,0.25]}`.

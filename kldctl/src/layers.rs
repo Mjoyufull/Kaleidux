@@ -1,6 +1,7 @@
 //! Resolves ordered layer names and paths before IPC serialization.
 
 use kaleidux_common::Request;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) fn layer_request(
     stage: kaleidux_common::LayerStage,
@@ -55,4 +56,21 @@ pub(crate) fn parse_layer_fps(value: &str) -> Result<u16, String> {
     value
         .parse()
         .map_err(|_| "Use 0, a positive frame rate, or unlimited".into())
+}
+
+pub(crate) async fn watch_morphs(stream: tokio::net::UnixStream) -> anyhow::Result<()> {
+    let mut lines = BufReader::new(stream).lines();
+    let response = lines.next_line().await?.unwrap_or_default();
+    match serde_json::from_str::<kaleidux_common::Response>(&response)? {
+        kaleidux_common::Response::Ok => {}
+        kaleidux_common::Response::Error(error) => anyhow::bail!("{error}"),
+        _ => anyhow::bail!("Unexpected response to morph subscription"),
+    }
+    let mut output = tokio::io::stdout();
+    while let Some(event) = lines.next_line().await? {
+        output.write_all(event.as_bytes()).await?;
+        output.write_all(b"\n").await?;
+        output.flush().await?;
+    }
+    Ok(())
 }

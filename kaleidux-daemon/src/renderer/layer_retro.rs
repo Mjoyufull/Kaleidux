@@ -98,6 +98,7 @@ pub(super) fn prepare(path: &Path, fps: u16) -> Result<PreparedLayers> {
             fragment_only: false,
             assets: [None, None, None, None],
             rectangle: None,
+            action: None,
         }],
         feedback: None,
         retro: Some(PreparedPreset {

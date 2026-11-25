@@ -323,6 +323,7 @@ pub async fn run(
             }
         }
 
+        backend.dispatch_morph_pointer(&mut ctx);
         ctx.process_scheduled(loop_start);
         ctx.process_script_tick();
         if hot_loop_active || cmd_buf.is_some() {
@@ -333,6 +334,7 @@ pub async fn run(
         }
 
         ctx.sync_layer_rules();
+        callback_flush_needed |= backend.sync_morph_input_regions(&ctx.renderers, &qh);
         ctx.mark_due_layer_redraws(Instant::now());
         {
             for (name, renderer) in &ctx.renderers {

@@ -131,6 +131,7 @@ pub(crate) struct CommandContext<'a> {
 /// Shared state for both Wayland and X11 main loops.
 pub struct MainLoopContext {
     pub(crate) preview: Option<crate::runtime::preview::PreviewState>,
+    pub(crate) morph_events: tokio::sync::broadcast::Sender<kaleidux_common::MorphEvent>,
     pub metrics: Arc<metrics::PerformanceMetrics>,
     pub monitor_manager: monitor_manager::MonitorManager,
     pub renderers: HashMap<String, renderer::Renderer>,
@@ -285,6 +286,9 @@ impl MainLoopContext {
         let cmd_tx_clone = cmd_tx.clone();
         let ipc_permits = Arc::new(tokio::sync::Semaphore::new(IPC_CONCURRENCY_LIMIT));
         let frame_export = Arc::new(tokio::sync::Semaphore::new(1));
+        let (morph_events, _) = tokio::sync::broadcast::channel(64);
+        let morph_events_ipc = morph_events.clone();
+        let morph_watch_slots = Arc::new(tokio::sync::Semaphore::new(8));
         tokio::spawn(async move {
             loop {
                 let permit = match ipc_permits.clone().acquire_owned().await {
@@ -295,6 +299,8 @@ impl MainLoopContext {
                     Ok((mut stream, _)) => {
                         let cmd_tx = cmd_tx_clone.clone();
                         let frame_export = frame_export.clone();
+                        let morph_events = morph_events_ipc.clone();
+                        let morph_watch_slots = morph_watch_slots.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
                             const MAX_MESSAGE_SIZE: usize = 8192;
@@ -311,6 +317,28 @@ impl MainLoopContext {
                                 warn!("[IPC] Failed to parse control request JSON");
                                 return;
                             };
+                            if let Request::MorphWatch { output } = req {
+                                let Ok(_slot) = morph_watch_slots.try_acquire_owned() else {
+                                    let _ = tokio::time::timeout(
+                                        IPC_RESPONSE_TIMEOUT,
+                                        crate::runtime::ipc::write_response(
+                                            &mut stream,
+                                            Response::Error("Morph watcher limit reached".into()),
+                                        ),
+                                    )
+                                    .await;
+                                    return;
+                                };
+                                drop(_permit);
+                                let _ = crate::runtime::ipc::watch_morphs(
+                                    stream,
+                                    output,
+                                    morph_events.subscribe(),
+                                    IPC_RESPONSE_TIMEOUT,
+                                )
+                                .await;
+                                return;
+                            }
                             let _frame_export = if matches!(req, Request::Frame(_)) {
                                 match frame_export.try_acquire() {
                                     Ok(permit) => Some(permit),
@@ -402,6 +430,7 @@ impl MainLoopContext {
 
         Ok(MainLoopContext {
             preview: None,
+            morph_events,
             metrics,
             monitor_manager,
             renderers: HashMap::new(),

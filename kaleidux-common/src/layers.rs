@@ -55,3 +55,12 @@ pub struct LayerInputs {
     /// Year, month, day, and seconds since local midnight.
     pub date: Option<[f32; 4]>,
 }
+
+/// A primary-button activation inside a morph's configured rectangle.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MorphEvent {
+    pub output: String,
+    pub action: String,
+    /// Normalized coordinates within the selected morph, from its top left.
+    pub position: [f32; 2],
+}

@@ -3,11 +3,13 @@
 
 import argparse
 from bisect import bisect_right
+import json
 import os
 from pathlib import Path
 import re
+import secrets
+import selectors
 import subprocess
-import time
 from urllib.parse import unquote, urlparse
 
 
@@ -74,9 +76,12 @@ def layers(args, track, when, lines):
         values = left + x * width, top + y * height, w * width, h * height
         return ",".join(f"{value:.6f}" for value in values)
 
-    def label(value, box, colour):
+    def label(value, box, colour, action=None):
         text = " ".join(value.replace("|", " ").split())[:120]
-        return f"text={text}|font={args.font}|colour={colour}|rect={box}" if text else None
+        if not text:
+            return None
+        layer = f"text={text}|font={args.font}|colour={colour}|rect={box}"
+        return f"{layer}|action={args.action_prefix}{action}" if action else layer
 
     art = args.art or art
     layers = []
@@ -90,7 +95,9 @@ def layers(args, track, when, lines):
         label(current, rect(0, .14, 1, .17), args.colour),
         label(artist, rect(.28, .34, .72, .13), args.dim),
         label(title, rect(.28, .49, .72, .19), args.colour),
-        label("◀   " + ("Ⅱ" if state == "Playing" else "▶") + "   ▶|", rect(.32, .74, .5, .13), args.colour),
+        label("◀", rect(.34, .74, .12, .13), args.colour, "previous"),
+        label("Ⅱ" if state == "Playing" else "▶", rect(.49, .74, .12, .13), args.colour, "play-pause"),
+        label("▶▏", rect(.64, .74, .12, .13), args.colour, "next"),
     )
     return layers + [value for value in labels if value is not None]
 
@@ -114,22 +121,42 @@ def main():
         return media(args.player, args.action).returncode
     kldctl = os.environ.get("KLDCTL", "kldctl")
     command = [kldctl, "morph"]
+    watch = [kldctl, "morph-watch"]
     if args.output:
         command.extend(["-o", args.output])
+        watch.extend(["-o", args.output])
+    args.action_prefix = "player-" + secrets.token_hex(4) + "."
     when, lines = lyrics(args.lyrics)
     previous = None
-    try:
-        while True:
-            current = layers(args, snapshot(args.player), when, lines)
-            if current != previous:
-                subprocess.run([*command, *current], check=True, timeout=9)
-                previous = current
-            time.sleep(.35)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if previous:
-            subprocess.run(command, timeout=4)
+    with subprocess.Popen(watch, stdout=subprocess.PIPE) as watcher, selectors.DefaultSelector() as events:
+        events.register(watcher.stdout, selectors.EVENT_READ)
+        pending = b""
+        try:
+            while True:
+                current = layers(args, snapshot(args.player), when, lines)
+                if current != previous:
+                    subprocess.run([*command, *current], check=True, timeout=9)
+                    previous = current
+                if not events.select(.35):
+                    continue
+                chunk = os.read(watcher.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                *complete, pending = (pending + chunk).split(b"\n")
+                for line in complete:
+                    event = json.loads(line)
+                    action = event["action"]
+                    if action.startswith(args.action_prefix):
+                        action = action.removeprefix(args.action_prefix)
+                        if action in actions:
+                            media(args.player, action)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+            if previous:
+                subprocess.run(command, timeout=4)
     return 0
 
 

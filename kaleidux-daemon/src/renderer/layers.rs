@@ -498,6 +498,18 @@ impl super::Renderer {
         }
     }
 
+    pub(crate) fn morph_buttons(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = ([f32; 4], &str)> + Clone {
+        self.layers.morphs.active().into_iter().flat_map(|stack| {
+            stack
+                .rectangles
+                .iter()
+                .zip(&stack.actions)
+                .filter_map(|(rect, action)| Some(((*rect)?, action.as_deref()?)))
+        })
+    }
+
     pub(crate) fn output_layers(&self) -> OutputLayers {
         let fields = |stack: Option<&LayerPipelines>| {
             stack.map_or_else(

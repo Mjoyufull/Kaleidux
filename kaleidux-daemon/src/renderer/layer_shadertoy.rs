@@ -269,6 +269,7 @@ fn parse(source: &str, root: &Path) -> Result<PreparedToy> {
                 fragment_only: true,
                 assets: [None, None, None, None],
                 rectangle: None,
+                action: None,
             },
             order,
             channels,
