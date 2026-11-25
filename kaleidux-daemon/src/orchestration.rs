@@ -157,6 +157,9 @@ pub struct GlobalConfig {
     /// Love morph center in output-relative coordinates, with the origin at top left.
     pub love_heart_position: Option<[f32; 2]>,
     #[serde(default)]
+    pub desktop_audio: bool,
+    pub desktop_audio_source: Option<String>,
+    #[serde(default)]
     pub(crate) layer_rules: Vec<crate::runtime::layer_rules::LayerRule>,
     #[serde(default)]
     pub monitor_behavior: MonitorBehavior,
@@ -209,6 +212,8 @@ impl Default for GlobalConfig {
             main_monitor: None,
             love_heart: None,
             love_heart_position: None,
+            desktop_audio: false,
+            desktop_audio_source: None,
             layer_rules: Vec::new(),
             monitor_behavior: MonitorBehavior::default(),
             _custom_transitions: false,

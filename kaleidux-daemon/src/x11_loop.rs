@@ -307,6 +307,13 @@ pub async fn run(
                     x11_event_batch = x11_event_batch.saturating_add(1);
                     use x11rb::protocol::Event;
                     match event {
+                        Event::ButtonPress(_)
+                        | Event::ButtonRelease(_)
+                        | Event::MotionNotify(_)
+                        | Event::EnterNotify(_)
+                        | Event::LeaveNotify(_) => {
+                            backend.pointer.handle(&mut ctx, &window_to_renderer, event);
+                        }
                         Event::MapNotify(ev) if backend.capabilities.is_xwayland => {
                             // Rootless compositors can replace the initial
                             // position at map time. Reapply the RandR rectangle
@@ -427,6 +434,11 @@ pub async fn run(
         ctx.process_scheduled(loop_start);
         ctx.drain_commands(cmd_buf, loop_start).await;
         ctx.sync_layer_rules();
+        ctx.sync_desktop_audio();
+        let input_changed =
+            backend
+                .pointer
+                .sync_regions(&backend.conn, &backend.windows, &ctx.renderers)?;
         ctx.mark_due_layer_redraws(Instant::now());
         ctx.drain_player_events(player_event_buf, loop_start);
 
@@ -582,7 +594,7 @@ pub async fn run(
         }
 
         // Flush X11 commands only if something was rendered
-        if rendered_any {
+        if rendered_any || input_changed {
             let _ = backend.conn.flush();
         }
 

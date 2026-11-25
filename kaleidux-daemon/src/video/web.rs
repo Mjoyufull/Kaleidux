@@ -27,6 +27,7 @@ pub(super) use helper::run;
 #[cfg(feature = "wallpaper-web")]
 mod helper {
     use super::*;
+    use crate::video::canvas::WebWake;
     use crate::video::{VideoFrame, VideoFrameFormat, VideoFrameStorage, VideoGeometry};
     use anyhow::Context;
     use std::io::{ErrorKind, Read, Write};
@@ -59,13 +60,16 @@ mod helper {
             .min(1.0);
         let width = (f64::from(width) * scale).round().max(1.0) as u32;
         let height = (f64::from(height) * scale).round().max(1.0) as u32;
-        let interval = Duration::from_secs_f64(1.0 / f64::from(fps.unwrap_or(30).clamp(1, 120)));
+        let fps = fps.unwrap_or(30).clamp(1, 120);
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
         let mut browser = Browser(
             Command::new(std::env::var_os("KLD_WEB_PYTHON").unwrap_or_else(|| "python3".into()))
                 .args(["-u", "-c", include_str!("web_helper.py")])
                 .arg(path)
                 .arg(width.to_string())
                 .arg(height.to_string())
+                .arg(fps.to_string())
+                .arg(include_str!("web_bridge.js"))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -83,9 +87,18 @@ mod helper {
             .take()
             .context("Browser output unavailable")?;
         let mut position_ns = 0_u64;
+        let mut notified_paused = false;
+        let mut request = Vec::with_capacity(512);
         loop {
             let started = Instant::now();
-            input.write_all(b"R")?;
+            if let Some(signals) = stream.take_web_inputs() {
+                request.clear();
+                serde_json::to_writer(&mut request, &signals)?;
+                request.push(b'\n');
+                input.write_all(&request)?;
+            } else {
+                input.write_all(b"R\n")?;
+            }
             let mut status = [0];
             if !read_frame(&mut output, &mut status, stream)? {
                 return Ok(());
@@ -115,8 +128,15 @@ mod helper {
                 b'I' => {}
                 _ => anyhow::bail!("Invalid HTML renderer frame status"),
             }
-            if !stream.wait(interval.saturating_sub(started.elapsed())) {
-                return Ok(());
+            loop {
+                match stream.wait_web(interval.saturating_sub(started.elapsed()), notified_paused) {
+                    WebWake::Frame => break,
+                    WebWake::Paused(paused) => {
+                        notified_paused = paused;
+                        input.write_all(if paused { b"P\n" } else { b"C\n" })?;
+                    }
+                    WebWake::Stopped => return Ok(()),
+                }
             }
             position_ns = position_ns.saturating_add(interval.as_nanos() as u64);
         }

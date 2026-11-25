@@ -38,6 +38,22 @@ pub(super) struct FrameStream {
     source: Arc<str>,
 }
 
+#[cfg(feature = "wallpaper-web")]
+#[derive(Default, serde::Serialize)]
+pub(super) struct WebInputs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<Vec<f32>>,
+}
+
+#[cfg(feature = "wallpaper-web")]
+pub(super) enum WebWake {
+    Frame,
+    Paused(bool),
+    Stopped,
+}
+
 impl FrameStream {
     pub(super) fn publish(&mut self, frame: VideoFrame) -> bool {
         if let Some(send) = self.first.take() {
@@ -57,6 +73,39 @@ impl FrameStream {
     pub(super) fn stopped(&self) -> bool {
         self.clock.state.lock().stopped
     }
+
+    #[cfg(feature = "wallpaper-web")]
+    pub(super) fn take_web_inputs(&self) -> Option<WebInputs> {
+        let mut state = self.clock.state.lock();
+        let pending = &mut state.web_inputs;
+        if pending.pointer.is_none() && pending.audio.is_none() {
+            None
+        } else {
+            Some(std::mem::take(pending))
+        }
+    }
+
+    #[cfg(feature = "wallpaper-web")]
+    pub(super) fn wait_web(&self, mut remaining: Duration, notified_paused: bool) -> WebWake {
+        let mut state = self.clock.state.lock();
+        loop {
+            if state.stopped {
+                return WebWake::Stopped;
+            }
+            if state.paused != notified_paused {
+                return WebWake::Paused(state.paused);
+            }
+            if state.paused {
+                self.clock.changed.wait(&mut state);
+            } else if remaining.is_zero() {
+                return WebWake::Frame;
+            } else {
+                let started = Instant::now();
+                self.clock.changed.wait_for(&mut state, remaining);
+                remaining = remaining.saturating_sub(started.elapsed());
+            }
+        }
+    }
 }
 
 struct Clock {
@@ -68,6 +117,8 @@ struct Clock {
 struct Playback {
     paused: bool,
     stopped: bool,
+    #[cfg(feature = "wallpaper-web")]
+    web_inputs: WebInputs,
 }
 
 impl CanvasPlayer {
@@ -86,6 +137,8 @@ impl CanvasPlayer {
             state: Mutex::new(Playback {
                 paused: true,
                 stopped: false,
+                #[cfg(feature = "wallpaper-web")]
+                web_inputs: WebInputs::default(),
             }),
             changed: Condvar::new(),
             position_ns: AtomicU64::new(0),
@@ -147,6 +200,20 @@ impl CanvasPlayer {
     pub(super) fn set_paused(&self, paused: bool) {
         self.control.state.lock().paused = paused;
         self.control.changed.notify_one();
+    }
+
+    #[cfg(feature = "wallpaper-web")]
+    pub(super) fn apply_web_inputs(&self, input: &kaleidux_common::LayerInputs) {
+        let mut state = self.control.state.lock();
+        if input.pointer.is_some() {
+            state.web_inputs.pointer = input.pointer;
+        }
+        if let Some(audio) = &input.audio {
+            match &mut state.web_inputs.audio {
+                Some(pending) => pending.clone_from(audio),
+                None => state.web_inputs.audio = Some(audio.clone()),
+            }
+        }
     }
 
     pub(super) fn paused(&self) -> bool {

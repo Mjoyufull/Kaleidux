@@ -2,10 +2,9 @@
 
 mod package;
 mod texture;
+mod workshop;
 
-use crate::renderer::layer_source::{
-    PreparedLayer, PreparedLayers, prepare_layer, prepare_rgba_layer,
-};
+use crate::renderer::layer_source::{PreparedLayer, PreparedLayers, prepare_layer};
 use anyhow::{Context, Result};
 use kaleidux_common::{LAYER_FPS_UNLIMITED, LayerStage, MAX_LAYERS_PER_STAGE};
 use serde::Deserialize;
@@ -19,7 +18,9 @@ const MAX_SCENE_BYTES: u64 = 1024 * 1024;
 pub(crate) fn is_scene(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".kldscene.toml") || name.ends_with(".pkg"))
+        .is_some_and(|name| {
+            name.ends_with(".kldscene.toml") || name.ends_with(".pkg") || name == "scene.json"
+        })
 }
 
 #[derive(Deserialize)]
@@ -32,9 +33,10 @@ struct Scene {
 }
 
 pub(crate) fn open(path: &Path) -> Result<PreparedLayers> {
-    let (shaders, fps) = if path.extension().is_some_and(|ext| ext == "pkg") {
-        (load_package(path)?, 0)
-    } else {
+    let (shaders, fps) = if path
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".kldscene.toml"))
+    {
         let input = read_local(path, MAX_SCENE_BYTES)?;
         let scene: Scene = toml::from_str(std::str::from_utf8(&input)?)?;
         let root = path
@@ -58,6 +60,8 @@ pub(crate) fn open(path: &Path) -> Result<PreparedLayers> {
             }
         });
         (layers, fps)
+    } else {
+        (workshop::load(path)?, 0)
     };
     anyhow::ensure!(
         !shaders.is_empty() && shaders.len() <= MAX_LAYERS_PER_STAGE,
@@ -119,97 +123,6 @@ fn scene_layer(root: &Path, spec: &str, background: bool) -> Result<PreparedLaye
         layer.rectangle = None;
     }
     Ok(layer)
-}
-
-fn load_package(path: &Path) -> Result<Vec<PreparedLayer>> {
-    let mut package = package::Package::open(path)?;
-    let scene: Value = package.json("scene.json")?;
-    let projection = &scene["general"]["orthogonalprojection"];
-    let canvas_width = projection["width"]
-        .as_f64()
-        .filter(|value| *value > 0.0)
-        .unwrap_or(1920.0);
-    let canvas_height = projection["height"]
-        .as_f64()
-        .filter(|value| *value > 0.0)
-        .unwrap_or(1080.0);
-    let objects = scene["objects"]
-        .as_array()
-        .context("Package scene needs an object list")?;
-    let mut layers = Vec::new();
-    for object in objects {
-        let Some(source) = object["image"].as_str() else {
-            continue;
-        };
-        if object["visible"].as_bool() == Some(false) {
-            continue;
-        }
-        anyhow::ensure!(
-            layers.len() < MAX_LAYERS_PER_STAGE,
-            "Package contains too many image layers"
-        );
-        let name = resolve_texture(&mut package, source)?;
-        let bytes = package.read(&name, 64 * 1024 * 1024)?;
-        let image = texture::decode(&bytes)
-            .with_context(|| format!("Unsupported package texture {name:?}"))?;
-        let size =
-            vec2(&object["size"]).unwrap_or([f64::from(image.width()), f64::from(image.height())]);
-        let scale = vec2(&object["scale"]).unwrap_or([1.0, 1.0]);
-        let centred = vec2(&object["origin"]).unwrap_or([canvas_width * 0.5, canvas_height * 0.5]);
-        let w = (size[0] * scale[0].abs() / canvas_width).clamp(0.0, 1.0);
-        let h = (size[1] * scale[1].abs() / canvas_height).clamp(0.0, 1.0);
-        let x = (centred[0] / canvas_width - w * 0.5).clamp(0.0, 1.0 - w);
-        let y = (1.0 - centred[1] / canvas_height - h * 0.5).clamp(0.0, 1.0 - h);
-        if w > 0.0 && h > 0.0 {
-            push_layer(
-                &mut layers,
-                prepare_rgba_layer(name, image, Some([x as f32, y as f32, w as f32, h as f32]))?,
-            )?;
-        }
-    }
-    anyhow::ensure!(!layers.is_empty(), "Package has no supported image layers");
-    Ok(layers)
-}
-
-fn resolve_texture(package: &mut package::Package, name: &str) -> Result<String> {
-    let name = if name.ends_with(".json") {
-        let model: Value = package.json(name)?;
-        if let Some(material) = model["material"].as_str() {
-            let material: Value = package.json(material)?;
-            material["passes"][0]["textures"][0]
-                .as_str()
-                .context("Package material needs a base texture")?
-                .to_owned()
-        } else {
-            model["passes"][0]["textures"][0]
-                .as_str()
-                .context("Package model needs a base texture")?
-                .to_owned()
-        }
-    } else {
-        name.to_owned()
-    };
-    [
-        name.clone(),
-        format!("{name}.tex"),
-        format!("materials/{name}.tex"),
-        format!("materials/{name}"),
-    ]
-    .into_iter()
-    .find(|candidate| package.has(candidate))
-    .with_context(|| format!("Package texture {name:?} was not found"))
-}
-
-fn vec2(value: &Value) -> Option<[f64; 2]> {
-    let pair = if let Some(value) = value.as_str() {
-        let mut parts = value.split_whitespace();
-        [parts.next()?.parse().ok()?, parts.next()?.parse().ok()?]
-    } else {
-        [value[0].as_f64()?, value[1].as_f64()?]
-    };
-    pair.iter()
-        .all(|value: &f64| value.is_finite())
-        .then_some(pair)
 }
 
 fn read_local(path: &Path, max: u64) -> Result<Vec<u8>> {

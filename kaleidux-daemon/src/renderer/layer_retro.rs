@@ -99,6 +99,8 @@ pub(super) fn prepare(path: &Path, fps: u16) -> Result<PreparedLayers> {
             assets: [None, None, None, None],
             rectangle: None,
             action: None,
+            track_pointer: false,
+            track_audio: false,
         }],
         feedback: None,
         retro: Some(PreparedPreset {

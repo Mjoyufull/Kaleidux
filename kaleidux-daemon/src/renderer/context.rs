@@ -105,7 +105,9 @@ impl WgpuContext {
         let mut required_features = wgpu::Features::empty();
         #[cfg(feature = "retroarch-shaders")]
         {
-            required_features |= adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+            required_features |= adapter.features()
+                & (wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+                    | wgpu::Features::FLOAT32_FILTERABLE);
         }
         if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
             required_features |= wgpu::Features::PIPELINE_CACHE;

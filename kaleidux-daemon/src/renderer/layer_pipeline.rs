@@ -34,6 +34,8 @@ pub(crate) struct LayerPipelines {
     pub(super) morph_bindings: Vec<wgpu::BindGroup>,
     pub(super) rectangles: Vec<Option<[f32; 4]>>,
     pub(super) actions: Vec<Option<String>>,
+    pub(super) pointer_regions: Vec<[f32; 4]>,
+    pub(super) uses_audio: bool,
     pub(super) feedback: Option<super::layer_feedback::Feedback>,
     #[cfg(feature = "retroarch-shaders")]
     pub(super) retro: Option<super::layer_retro::Retro>,
@@ -190,6 +192,17 @@ impl LayerPipelines {
                 .iter()
                 .map(|layer| layer.action.clone())
                 .collect(),
+            pointer_regions: prepared
+                .shaders
+                .iter()
+                .filter(|layer| layer.track_pointer || layer.action.is_some())
+                .map(|layer| layer.rectangle.unwrap_or([0.0, 0.0, 1.0, 1.0]))
+                .collect(),
+            uses_audio: prepared.shaders.iter().any(|layer| layer.track_audio)
+                || prepared
+                    .feedback
+                    .as_ref()
+                    .is_some_and(|toy| toy.passes.iter().any(|pass| pass.layer.track_audio)),
             feedback: prepared
                 .feedback
                 .as_ref()
@@ -214,6 +227,8 @@ impl LayerPipelines {
                 assets: [None, None, None, None],
                 rectangle: None,
                 action: None,
+                track_pointer: false,
+                track_audio: false,
             }],
         };
         Self::create(ctx, format, &prepared)

@@ -104,6 +104,7 @@ pub struct WaylandBackend {
     pub layer_shell: LayerShell,
     pub shm: Shm,
     pub surfaces: std::collections::HashMap<String, LayerSurface>,
+    transparent_surfaces: std::collections::HashSet<String>,
     seat_state: SeatState,
     pointer: pointer::DesktopPointer,
     dmabuf_state: DmabufState,
@@ -170,6 +171,7 @@ impl WaylandBackend {
             layer_shell,
             shm,
             surfaces: std::collections::HashMap::new(),
+            transparent_surfaces: std::collections::HashSet::new(),
             seat_state,
             pointer: pointer::DesktopPointer::default(),
             dmabuf_state,
@@ -324,6 +326,7 @@ impl WaylandBackend {
         self.preferred_fractional_scales.remove(name);
         self.logical_surface_sizes.remove(name);
         self.pointer.retire(name);
+        self.transparent_surfaces.remove(name);
         self.retire_color_surface(name);
     }
 
@@ -407,10 +410,16 @@ impl WaylandBackend {
         name: String,
         layer: Layer,
     ) -> anyhow::Result<LayerSurface> {
+        let transparent = matches!(layer, Layer::Top | Layer::Overlay);
         let layer_surface =
             self.create_layer_surface_internal(output, qh, layer, "kaleidux-wallpaper")?;
 
         self.configure_wallpaper_surface_protocols(&name, layer_surface.wl_surface(), qh);
+        if transparent {
+            self.transparent_surfaces.insert(name.clone());
+        } else {
+            self.transparent_surfaces.remove(&name);
+        }
 
         if let Some(_prev) = self.surfaces.insert(name.clone(), layer_surface.clone()) {
             warn!("[WAYLAND] Replacing existing LayerSurface for {}", name);
@@ -632,12 +641,16 @@ impl LayerShellHandler for WaylandBackend {
         // We let WGPU's present() handle it, or we rely on the initial commit during creation.
 
         if let Some(name) = renderer_name {
-            self.set_surface_opaque_region(
-                layer_surface.wl_surface(),
-                width.max(1),
-                height.max(1),
-                _qh,
-            );
+            if self.transparent_surfaces.contains(&name) {
+                layer_surface.wl_surface().set_opaque_region(None);
+            } else {
+                self.set_surface_opaque_region(
+                    layer_surface.wl_surface(),
+                    width.max(1),
+                    height.max(1),
+                    _qh,
+                );
+            }
             self.queue_fractional_resize(&name, width, height, serial);
         } else if let Some(name) = mpv_name {
             if let Some(viewport) = self.mpv_surface_viewports.get(&name) {

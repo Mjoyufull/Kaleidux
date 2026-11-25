@@ -132,6 +132,7 @@ pub(crate) struct CommandContext<'a> {
 pub struct MainLoopContext {
     pub(crate) preview: Option<crate::runtime::preview::PreviewState>,
     pub(crate) morph_events: tokio::sync::broadcast::Sender<kaleidux_common::MorphEvent>,
+    pub(crate) desktop_audio: crate::runtime::desktop_audio::DesktopAudio,
     pub metrics: Arc<metrics::PerformanceMetrics>,
     pub monitor_manager: monitor_manager::MonitorManager,
     pub renderers: HashMap<String, renderer::Renderer>,
@@ -431,6 +432,7 @@ impl MainLoopContext {
         Ok(MainLoopContext {
             preview: None,
             morph_events,
+            desktop_audio: Default::default(),
             metrics,
             monitor_manager,
             renderers: HashMap::new(),
@@ -531,6 +533,7 @@ impl MainLoopContext {
     /// Calls `monitor_manager.tick()` and dispatches initial wallpaper content.
     /// Clean shutdown — stop all video players, quiesce background work, and save caches.
     pub async fn shutdown(&mut self) {
+        self.desktop_audio.stop();
         let shutdown_start = Instant::now();
         self.pending_video_switches.clear();
         if let Ok(mut sessions) = self.pending_video_sessions.lock() {

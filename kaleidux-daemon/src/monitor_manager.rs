@@ -54,6 +54,16 @@ impl MonitorManager {
         &self.config.global.layer_rules
     }
 
+    pub(crate) fn desktop_audio_source(&self) -> Option<&str> {
+        self.config.global.desktop_audio.then(|| {
+            self.config
+                .global
+                .desktop_audio_source
+                .as_deref()
+                .unwrap_or("@DEFAULT_MONITOR@")
+        })
+    }
+
     pub fn remove_output(&mut self, name: &str) {
         self.outputs.remove(name);
         self.shared_join_retries.remove(name);

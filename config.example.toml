@@ -81,6 +81,10 @@ volume = 100
 # Optional: Path to Rhai script for custom logic
 # script-path = "~/.config/kaleidux/automation.rhai"
 
+# Desktop output spectrum for reactive layers and HTML.
+# desktop-audio = true
+# desktop-audio-source = "@DEFAULT_MONITOR@"
+
 # How often to tick Rhai scripts (seconds)
 script-tick-interval = 1
 

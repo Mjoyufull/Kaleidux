@@ -236,6 +236,19 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
+    pub(crate) fn is_web_wallpaper(&self) -> bool {
+        self.backend_kind == VideoBackendKind::Web
+    }
+
+    pub(crate) fn apply_web_inputs(&self, _input: &kaleidux_common::LayerInputs) {
+        #[cfg(feature = "wallpaper-web")]
+        if self.backend_kind == VideoBackendKind::Web
+            && let Some(canvas) = &self.canvas
+        {
+            canvas.apply_web_inputs(_input);
+        }
+    }
+
     pub(crate) fn uses_mpv(&self) -> bool {
         self.backend_kind == VideoBackendKind::Mpv
     }

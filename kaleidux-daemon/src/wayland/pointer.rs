@@ -1,8 +1,8 @@
-//! Delivers compositor pointer events only inside explicitly interactive morphs.
+//! Delivers compositor pointer events inside the configured input regions.
 
 use super::WaylandBackend;
+use crate::runtime::morph_input;
 use crate::{main_loop::MainLoopContext, renderer::Renderer};
-use kaleidux_common::{LayerInputs, MorphEvent};
 use smithay_client_toolkit::seat::{
     Capability, SeatHandler, SeatState,
     pointer::{BTN_LEFT, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler},
@@ -62,12 +62,16 @@ impl WaylandBackend {
     ) -> bool {
         let mut changed = false;
         for (name, renderer) in renderers {
+            let regions = renderer.pointer_regions();
+            if self.pointer.regions.is_empty() && regions.clone().next().is_none() {
+                continue;
+            }
             let Some(surface) = self.surfaces.get(name) else {
                 continue;
             };
             let size =
                 self.logical_surface_size(name, (renderer.config.width, renderer.config.height));
-            let regions = renderer.morph_buttons().map(|(rect, _)| region(rect, size));
+            let regions = regions.map(|rect| morph_input::pixel_region(rect, size));
             let previous = self.pointer.regions.get(name);
             if regions.clone().eq(previous.into_iter().flatten().copied()) {
                 continue;
@@ -80,9 +84,8 @@ impl WaylandBackend {
             surface.wl_surface().set_input_region(Some(&region));
             region.destroy();
             surface.commit();
-            if regions.is_empty() {
-                self.pointer.regions.remove(name);
-            } else {
+            self.pointer.retire(name);
+            if !regions.is_empty() {
                 self.pointer.regions.insert(name.clone(), regions);
             }
             changed = true;
@@ -92,60 +95,17 @@ impl WaylandBackend {
 
     pub(crate) fn dispatch_morph_pointer(&mut self, ctx: &mut MainLoopContext) {
         for (name, position) in self.pointer.positions.drain() {
-            if ctx.powered_off_outputs.contains(&name) {
-                continue;
-            }
-            if let Some(renderer) = ctx.renderers.get_mut(&name) {
-                renderer.apply_layer_inputs(&LayerInputs {
-                    pointer: Some(position),
-                    ..Default::default()
-                });
-            }
+            morph_input::position(ctx, &name, position);
         }
         for activation in self.pointer.activations.drain(..) {
-            if ctx.powered_off_outputs.contains(&activation.output) {
-                continue;
-            }
-            let Some(renderer) = ctx.renderers.get(&activation.output) else {
-                continue;
-            };
-            if let Some((action, position)) =
-                renderer.morph_buttons().rev().find_map(|(bounds, action)| {
-                    local_position(bounds, activation.pressed)?;
-                    let position = local_position(bounds, activation.released)?;
-                    Some((action, position))
-                })
-            {
-                ctx.script_manager
-                    .morph_action(action, &activation.output, position);
-                if ctx.morph_events.receiver_count() != 0 {
-                    let _ = ctx.morph_events.send(MorphEvent {
-                        output: activation.output,
-                        action: action.to_owned(),
-                        position,
-                    });
-                }
-            }
+            morph_input::activate(
+                ctx,
+                activation.output,
+                activation.pressed,
+                activation.released,
+            );
         }
     }
-}
-
-fn region([x, y, width, height]: [f32; 4], (w, h): (u32, u32)) -> Region {
-    let (w, h) = (w as f32, h as f32);
-    let left = (x * w).floor();
-    let top = (y * h).floor();
-    let right = ((x + width) * w).ceil().min(w);
-    let bottom = ((y + height) * h).ceil().min(h);
-    [
-        left as i32,
-        top as i32,
-        (right - left) as i32,
-        (bottom - top) as i32,
-    ]
-}
-
-fn local_position([x, y, w, h]: [f32; 4], [px, py]: [f32; 2]) -> Option<[f32; 2]> {
-    (px >= x && px < x + w && py >= y && py < y + h).then_some([(px - x) / w, (py - y) / h])
 }
 
 impl SeatHandler for WaylandBackend {

@@ -308,6 +308,9 @@ pub(super) fn input(
         if let Some(renderer) = ctx.renderers.get_mut(&name) {
             renderer.apply_layer_inputs(&inputs);
         }
+        if let Some(player) = ctx.video_players.get(&name) {
+            player.apply_web_inputs(&inputs);
+        }
     }
     Ok(Response::Ok)
 }

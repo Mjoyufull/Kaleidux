@@ -30,7 +30,7 @@ font description and `colour=#RRGGBB` for text colour. System fonts and
 Unicode text use `pango-view`. Simple ASCII labels can use the built-in VGA
 bitmap from [font8x8](https://github.com/dhepper/font8x8).
 
-On Wayland, a morph with `rect=` and `action=` accepts primary clicks.
+On Wayland and X11, a morph with `rect=` and `action=` accepts primary clicks.
 Overlapping buttons use the topmost matching morph. Clicks outside the
 buttons pass through the wallpaper. A press and release must land inside
 the same button. Run `kldctl morph-watch` to read the action, output name
@@ -63,6 +63,15 @@ A standalone `.kldscene.toml` can use a `background` and up to eight
 ordered layers in total. Its paths are relative to the scene. Set
 `layers` with ordinary morph strings, bitmaps or shader paths. The
 background can be omitted. See [reactive.kldscene.toml](./examples/scenes/reactive.kldscene.toml).
+
+On Wayland, `layer = "top"` or `layer = "overlay"` in an output section
+lets a morph-only surface show the desktop through its transparent areas.
+Leave that output's wallpaper path unset or clear it with `kldctl clear`.
+
+Use `kldctl workshop PROJECT` for an installed Workshop project, and
+`kldctl set scene.json` for an unpacked scene. Scene image layers support
+position, rotation, scale, opacity and colour tint. The scene reader
+supports local bitmap and TEX assets and the basic image material chain.
 
 ## Shader files
 
@@ -129,7 +138,8 @@ need a port. The opt-in native mpv GL overlay bypasses the layer renderer.
 ## Input providers and player morph
 
 ```sh
-kldctl shader 'parallax=/home/me/depth.png'
+kldctl shader 'parallax=/home/me/depth.png|pointer=true'
+kldctl shader 'pan|pointer=true'
 kldctl react '{"pointer":[0.7,0.4,0,0],"data":[1,0,0,0]}'
 kldctl morph spectrum
 python3 examples/reactivity.py --audio -o DP-1
@@ -139,15 +149,31 @@ python3 examples/player-morph.py play-pause
 ```
 
 `pan` shifts a zoomed wallpaper with the pointer. `parallax=PATH` uses a
-16-bit grayscale depth image when one is available. Both work from the
-same pointer input. The example provider can get desktop audio from a
-PulseAudio or PipeWire monitor via GStreamer, and pointer position from
-Hyprland. Other applications can send input through IPC.
+16-bit grayscale depth image when one is available. Use `pointer=true` to
+receive local pointer events over the layer's rectangle or the whole
+wallpaper when it has no rectangle. `kldctl morph 'pointer|rect=0.2,0.2,0.6,0.6'`
+sets an input region without drawing artwork. The example provider can
+get desktop audio from a PulseAudio or PipeWire monitor via GStreamer.
+Other applications can send input through IPC.
+
+Set `desktop-audio = true` in `[global]` to use the desktop audio
+monitor directly. Optional `desktop-audio-source` selects a PulseAudio
+or PipeWire Pulse source. The default is `@DEFAULT_MONITOR@`.
+Capture runs while a visible shader reads spectrum data or a local HTML
+wallpaper is playing. It stops when playback is paused or those
+wallpapers are cleared. The external provider works without that setting.
+
+Local HTML wallpapers get `wallpaperRegisterAudioListener` and the
+`wallpaperPropertyListener` callbacks for FPS, initial properties and
+pause. The optional `project.json` beside the page supplies the initial
+properties. `kldctl react` sends the same pointer and audio data used by
+shaders. The audio bridge supplies 128 values by repeating the 64 bands
+for each channel.
 
 The player example reads MPRIS with `playerctl`, local album art, and a
 timed LRC file. It owns a single morph stack while running. Adjust
 `--rect`, `--font`, `--colour`, `--dim`, and `--art` for your desktop.
-Its `previous`, `play-pause` and `next` buttons work on Wayland. Those
+Its `previous`, `play-pause` and `next` buttons use morph actions. Those
 actions are also available as commands for compositor bindings.
 
 ## Rhai and IPC

@@ -258,6 +258,8 @@ fn parse(source: &str, root: &Path) -> Result<PreparedToy> {
             order != IMAGE,
         )
         .with_context(|| format!("Compile Shadertoy pass {:?}", pass.name))?;
+        let track_audio =
+            super::layer_source::uses_audio(code) || super::layer_source::uses_audio(&pass.code);
         prepared.push(PreparedPass {
             layer: PreparedLayer {
                 name: if order == IMAGE {
@@ -270,6 +272,8 @@ fn parse(source: &str, root: &Path) -> Result<PreparedToy> {
                 assets: [None, None, None, None],
                 rectangle: None,
                 action: None,
+                track_pointer: false,
+                track_audio,
             },
             order,
             channels,

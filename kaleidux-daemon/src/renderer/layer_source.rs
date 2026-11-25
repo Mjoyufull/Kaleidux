@@ -28,6 +28,8 @@ pub(crate) struct PreparedLayer {
     pub(crate) assets: [Option<image::RgbaImage>; 4],
     pub(crate) rectangle: Option<[f32; 4]>,
     pub(super) action: Option<String>,
+    pub(super) track_pointer: bool,
+    pub(super) track_audio: bool,
 }
 
 impl PreparedLayer {
@@ -184,6 +186,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
     let mut assets = [None, None, None, None];
     let mut rectangle = None;
     let mut action = None;
+    let mut track_pointer = stage == LayerStage::Morph && name == "pointer";
     let mut font = None;
     let mut colour = "#ffffff";
     for option in options.split('|').filter(|option| !option.is_empty()) {
@@ -192,6 +195,9 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
             .context("Expected layer option key=value")?;
         match key {
             "rect" if stage == LayerStage::Morph => rectangle = Some(parse_rectangle(value)?),
+            "pointer" => {
+                track_pointer = value.parse().context("Use pointer=true or pointer=false")?
+            }
             "action" if stage == LayerStage::Morph => {
                 anyhow::ensure!(
                     !value.is_empty()
@@ -250,6 +256,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
     } else {
         read_body(stage, name)?
     };
+    let track_audio = uses_audio(&body);
     let source = if fragment_only {
         super::layer_glsl::translate(stage, &body)?
     } else {
@@ -267,18 +274,18 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
         assets,
         rectangle,
         action,
+        track_pointer,
+        track_audio,
     })
 }
 
-pub(crate) fn prepare_rgba_layer(
+pub(crate) fn prepare_bitmap_layer(
     name: String,
     bitmap: image::RgbaImage,
     rectangle: Option<[f32; 4]>,
+    body: &str,
 ) -> Result<PreparedLayer> {
-    let source = assemble(
-        LayerStage::Morph,
-        include_str!("../shaders/layers/bitmap.wgsl"),
-    );
+    let source = assemble(LayerStage::Morph, body);
     validate_abi(LayerStage::Morph, &source, false, true)?;
     Ok(PreparedLayer {
         name,
@@ -287,7 +294,15 @@ pub(crate) fn prepare_rgba_layer(
         assets: [Some(bitmap), None, None, None],
         rectangle,
         action: None,
+        track_pointer: false,
+        track_audio: false,
     })
+}
+
+pub(super) fn uses_audio(source: &str) -> bool {
+    ["audio_band(", "frame.audio", "kldAudio("]
+        .iter()
+        .any(|symbol| source.contains(symbol))
 }
 
 fn parse_rectangle(value: &str) -> Result<[f32; 4]> {
@@ -369,6 +384,9 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
             return Ok(include_str!("../shaders/layers/spectrum.wgsl").into());
         }
         (LayerStage::Morph, "heart") => return Ok(HEART.into()),
+        (LayerStage::Morph, "pointer") => {
+            return Ok("fn layer(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }".into());
+        }
         _ => {}
     }
     let path = Path::new(name);

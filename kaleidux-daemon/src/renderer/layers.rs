@@ -510,6 +510,26 @@ impl super::Renderer {
         })
     }
 
+    pub(crate) fn pointer_regions(&self) -> impl Iterator<Item = [f32; 4]> + Clone {
+        [
+            self.layers.wallpaper.as_ref(),
+            self.layers.filters.active(),
+            self.layers.morphs.active(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|stack| stack.pointer_regions.iter().copied())
+    }
+
+    pub(crate) fn uses_desktop_audio(&self) -> bool {
+        self.layers
+            .wallpaper
+            .iter()
+            .chain(self.layers.filters.active())
+            .chain(self.layers.morphs.active())
+            .any(|stack| stack.uses_audio)
+    }
+
     pub(crate) fn output_layers(&self) -> OutputLayers {
         let fields = |stack: Option<&LayerPipelines>| {
             stack.map_or_else(

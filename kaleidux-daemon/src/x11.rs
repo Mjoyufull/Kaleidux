@@ -16,6 +16,8 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::xcb_ffi::XCBConnection;
 
+mod pointer;
+
 /// X11 Backend handling connection and window management
 pub struct X11Backend {
     pub conn: Arc<XCBConnection>,
@@ -28,6 +30,7 @@ pub struct X11Backend {
     pub monitors_dirty: std::sync::atomic::AtomicBool,
     pub capabilities: X11Capabilities,
     present_event_ids: HashMap<Window, u32>,
+    pub(crate) pointer: pointer::DesktopPointer,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +84,7 @@ impl X11Backend {
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         let capabilities = probe_capabilities(&conn, screen_num)?;
+        let pointer = pointer::DesktopPointer::new(&conn);
 
         // Intern atoms
         let _net_wm_window_type = conn
@@ -135,6 +139,7 @@ impl X11Backend {
             monitors_dirty: std::sync::atomic::AtomicBool::new(true),
             capabilities,
             present_event_ids: HashMap::new(),
+            pointer,
         })
     }
 
@@ -247,7 +252,9 @@ impl X11Backend {
 
         // Setup window attributes.
         let win_aux = CreateWindowAux::new()
-            .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY)
+            .event_mask(
+                EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY | self.pointer.event_mask(),
+            )
             // Xwayland is rootless and Hyprland does not treat EWMH desktop
             // windows as compositor wallpaper layers. Keeping the window
             // unmanaged preserves the requested monitor rectangle instead of
@@ -270,6 +277,7 @@ impl X11Backend {
                 0,
                 &win_aux,
             )?;
+            self.pointer.empty_input_region(&self.conn, win_id)?;
 
             // Set _NET_WM_WINDOW_TYPE = _NET_WM_WINDOW_TYPE_DESKTOP
             self.conn.change_property(
@@ -392,6 +400,7 @@ impl X11Backend {
         // coherent until then.
         self.windows.remove(name);
         self.present_event_ids.remove(&window);
+        self.pointer.retire(window);
         Ok(Some(window))
     }
 

@@ -95,7 +95,7 @@ smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
-x11rb = { version = "0.14", features = ["allow-unsafe-code", "dl-libxcb", "dri3", "present", "randr"], optional = true }
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "dl-libxcb", "dri3", "present", "randr", "shape"], optional = true }
 image = { version = "0.25", default-features = false, features = ["avif-native", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 rhai = { workspace = true }
 bytemuck = { version = "1.25", features = ["derive"] }

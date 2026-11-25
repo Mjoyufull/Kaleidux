@@ -54,6 +54,7 @@ pub async fn run(
     let mut last_presentation_log = Instant::now();
     let mut power_monitor =
         crate::hyprland_power::HyprlandPowerMonitor::from_environment(Instant::now());
+    let mut power_outputs = Vec::new();
     let mut deferred_power_resizes: HashMap<String, (u32, u32)> = HashMap::new();
 
     loop {
@@ -70,20 +71,28 @@ pub async fn run(
         }
         let mut callback_flush_needed = false;
 
-        let output_names: Vec<String> = ctx.renderers.keys().cloned().collect();
-        if let Some(update) = power_monitor.retain_outputs(&output_names, loop_start) {
-            crate::hyprland_power::apply_update(&mut ctx, update);
-        }
-        let has_active_video = ctx
-            .renderers
-            .values()
-            .any(|renderer| renderer.valid_content_type == crate::queue::ContentType::Video)
-            || !ctx.video_players.is_empty();
-        if let Some(update) = power_monitor
-            .poll_if_due(&output_names, has_active_video, loop_start)
-            .await
-        {
-            crate::hyprland_power::apply_update(&mut ctx, update);
+        if power_monitor.enabled() {
+            if power_outputs.len() != ctx.renderers.len()
+                || power_outputs
+                    .iter()
+                    .any(|name| !ctx.renderers.contains_key(name))
+            {
+                power_outputs.clear();
+                power_outputs.extend(ctx.renderers.keys().cloned());
+            }
+            if let Some(update) = power_monitor.retain_outputs(&power_outputs, loop_start) {
+                crate::hyprland_power::apply_update(&mut ctx, update);
+            }
+            let has_active_video = !ctx.video_players.is_empty()
+                || ctx.renderers.values().any(|renderer| {
+                    renderer.valid_content_type == crate::queue::ContentType::Video
+                });
+            if let Some(update) = power_monitor
+                .poll_if_due(&power_outputs, has_active_video, loop_start)
+                .await
+            {
+                crate::hyprland_power::apply_update(&mut ctx, update);
+            }
         }
 
         let renderer_activity =
@@ -334,6 +343,7 @@ pub async fn run(
         }
 
         ctx.sync_layer_rules();
+        ctx.sync_desktop_audio();
         callback_flush_needed |= backend.sync_morph_input_regions(&ctx.renderers, &qh);
         ctx.mark_due_layer_redraws(Instant::now());
         {

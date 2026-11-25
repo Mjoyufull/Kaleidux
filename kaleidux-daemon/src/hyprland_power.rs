@@ -216,6 +216,10 @@ impl HyprlandPowerMonitor {
         self.powered_outputs.get(output).copied().unwrap_or(true)
     }
 
+    pub(crate) fn enabled(&self) -> bool {
+        self.socket_path.is_some()
+    }
+
     pub(crate) fn is_suspended(&self) -> bool {
         self.suspended_since.is_some()
     }
@@ -231,19 +235,20 @@ impl HyprlandPowerMonitor {
         output_names: &[String],
         now: Instant,
     ) -> Option<PowerUpdate> {
-        let live_names: HashSet<String> = output_names.iter().cloned().collect();
-        if self.live_outputs != live_names {
+        if self.live_outputs.len() != output_names.len()
+            || output_names
+                .iter()
+                .any(|name| !self.live_outputs.contains(name))
+        {
             if let Some(query) = self.in_flight.take() {
                 query.abort();
             }
             self.result_check_deadline = None;
             self.next_probe = now;
-            self.live_outputs = live_names;
+            self.live_outputs.clear();
+            self.live_outputs.extend(output_names.iter().cloned());
         }
-        let live = output_names
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
+        let live = &self.live_outputs;
         self.powered_outputs
             .retain(|name, _| live.contains(name.as_str()));
         self.output_suspended_since
@@ -296,7 +301,7 @@ impl HyprlandPowerMonitor {
             };
             return self.apply_query_result(output_names, now, result);
         }
-        let path = self.socket_path.as_ref()?.clone();
+        let path = self.socket_path.as_ref()?;
         if has_active_video
             && self.next_probe.saturating_duration_since(now) > ACTIVE_VIDEO_POLL_INTERVAL
         {
@@ -315,6 +320,7 @@ impl HyprlandPowerMonitor {
         };
         self.next_probe = now + interval;
         self.result_check_deadline = Some(now + QUERY_RESULT_POLL_INTERVAL);
+        let path = path.clone();
         self.in_flight = Some(tokio::spawn(
             async move { query_powered_outputs(&path).await },
         ));
