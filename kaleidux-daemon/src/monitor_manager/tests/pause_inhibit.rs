@@ -8,6 +8,7 @@ fn make_test_manager() -> MonitorManager {
         FileCache::new_test(&temp.join("cache.redb")).expect("test cache should be created"),
     );
     let output_config = test_output_config(Duration::from_secs(60));
+    let image = write_test_image(&temp, "current.png");
     let mut outputs = HashMap::new();
     outputs.insert(
         "DP-1".to_string(),
@@ -16,8 +17,17 @@ fn make_test_manager() -> MonitorManager {
             description: "DP-1 desc".to_string(),
             phase_offset: Duration::ZERO,
             config: output_config.clone(),
-            queue: None,
-            current_path: Some(PathBuf::from("/tmp/DP-1-current")),
+            queue: Some(
+                SmartQueue::new_manual_from_pool(
+                    &temp,
+                    vec![image.clone()],
+                    0,
+                    SortingStrategy::Ascending,
+                    cache.clone(),
+                )
+                .unwrap(),
+            ),
+            current_path: Some(image),
             next_path: Some(PathBuf::from("/tmp/DP-1-next")),
             next_content_type: Some(crate::queue::ContentType::Image),
             next_change: Some(Instant::now() + Duration::from_secs(60)),

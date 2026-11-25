@@ -268,13 +268,23 @@ fn display_power_suspend_stops_and_rearms_content_deadlines() {
     let duration = Duration::from_secs(60);
     let mut config = test_output_config(duration);
     config.performance = crate::orchestration::PerformanceProfile::LowPower;
+    let image = write_test_image(&temp, "current.png");
     let orchestrator = OutputOrchestrator {
         _name: "eDP-1".to_string(),
         description: "Internal panel".to_string(),
         phase_offset: Duration::ZERO,
         config: config.clone(),
-        queue: None,
-        current_path: Some(PathBuf::from("/tmp/current.png")),
+        queue: Some(
+            SmartQueue::new_manual_from_pool(
+                &temp,
+                vec![image.clone()],
+                0,
+                SortingStrategy::Ascending,
+                cache.clone(),
+            )
+            .unwrap(),
+        ),
+        current_path: Some(image),
         next_path: None,
         next_content_type: None,
         next_change: Some(Instant::now()),

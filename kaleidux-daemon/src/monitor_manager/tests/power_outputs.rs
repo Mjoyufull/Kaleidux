@@ -97,3 +97,19 @@ fn individual_resume_preserves_remaining_duration_and_manual_reset_does_not_doub
     assert!(!manager.output_power_paused.contains_key("DP-1"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn resume_leaves_static_wallpapers_without_a_queue_off_the_slideshow_clock() {
+    let (mut manager, root) = manager_with_visible_peer(MonitorBehavior::Independent);
+    manager.set_paused(true);
+    manager.set_paused(false);
+    assert!(manager.outputs["DP-1"].next_deadline().is_some());
+    assert_eq!(manager.outputs["DP-2"].next_deadline(), None);
+
+    manager.inhibit("test".into()).unwrap();
+    manager.uninhibit("test").unwrap();
+    manager.set_power_suspended(true);
+    manager.set_power_suspended(false);
+    assert_eq!(manager.outputs["DP-2"].next_deadline(), None);
+    std::fs::remove_dir_all(root).unwrap();
+}

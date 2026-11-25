@@ -11,8 +11,16 @@ impl MonitorManager {
         for start in self.output_power_paused.values_mut() {
             *start = now;
         }
-        for orch in self.outputs.values_mut() {
-            if orch.current_path.is_some() {
+        for (name, orch) in &mut self.outputs {
+            let has_queue = match &self.config.global.monitor_behavior {
+                MonitorBehavior::Synchronized => self.shared_queue.is_some(),
+                MonitorBehavior::Grouped(_) => self.output_groups.get(name).map_or_else(
+                    || orch.queue.is_some(),
+                    |group| self.group_queues.contains_key(group),
+                ),
+                MonitorBehavior::Independent => orch.queue.is_some(),
+            };
+            if orch.current_path.is_some() && has_queue {
                 orch.display_start_time = Some(now);
                 orch.next_change = Some(now + orch.cycle_duration());
             } else {
@@ -20,11 +28,14 @@ impl MonitorManager {
                 orch.next_change = None;
             }
         }
-        self.shared_display_start_time = self
-            .outputs
-            .values()
-            .any(|output| output.current_path.is_some())
-            .then_some(now);
+        self.shared_display_start_time = (self.shared_queue.is_some()
+            && self
+                .outputs
+                .values()
+                .any(|output| output.current_path.is_some()))
+        .then_some(now);
+        self.group_display_start_times
+            .retain(|group, _| self.group_queues.contains_key(group));
         for start in self.group_display_start_times.values_mut() {
             *start = now;
         }

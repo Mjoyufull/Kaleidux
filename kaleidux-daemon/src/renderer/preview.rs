@@ -39,6 +39,11 @@ impl super::Renderer {
             .or_else(|| external_view.clone());
         self.blit_bind_group = None;
         let layer_time = self.layer_clock_at(std::time::Instant::now());
+        let shader_wallpaper = self.take_shader_wallpaper().map(|stack| {
+            self.invalidate_layer_rule();
+            let elapsed = layer_time.saturating_duration_since(stack.start);
+            (stack, elapsed)
+        });
         FrozenWallpaper {
             texture,
             external_view,
@@ -48,10 +53,7 @@ impl super::Renderer {
             image_session: self.active_image_session_id,
             video_session: self.active_video_session_id,
             tiled_image: self.tiled_image,
-            shader_wallpaper: self.take_shader_wallpaper().map(|stack| {
-                let elapsed = layer_time.saturating_duration_since(stack.start);
-                (stack, elapsed)
-            }),
+            shader_wallpaper,
         }
     }
 
