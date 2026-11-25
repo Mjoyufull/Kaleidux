@@ -84,7 +84,9 @@ impl MpvPlayer {
         start_time: Instant,
         playback_window: Option<crate::media_source::PlaybackWindow>,
     ) -> anyhow::Result<Self> {
-        if MpvRenderApiRequest::from_env().enables_composed_gl() && composed_target.is_none() {
+        if MpvRenderApiRequest::from_env() == MpvRenderApiRequest::ComposedGl
+            && composed_target.is_none()
+        {
             anyhow::bail!(
                 "production mpv GL/WGPU target is unavailable; refusing the software-render fallback"
             );

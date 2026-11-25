@@ -9,7 +9,6 @@ use crate::renderer::layer_pipeline::LayerPipelines;
 use crate::renderer::{Renderer, WgpuContext};
 use kaleidux_common::{LayerInputs, LayerStage, Request, Response};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -29,6 +28,7 @@ impl CompiledLayers {
         self,
         ctx: &mut CommandContext<'_>,
         rule_ticket: Option<u64>,
+        group: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(ticket) = rule_ticket
             && self.targets.iter().any(|(target, _)| {
@@ -62,6 +62,11 @@ impl CompiledLayers {
                 pipeline.is_none() || !is_overlay_target(ctx, &target.name),
                 "Layers require composed playback; disable the libmpv GL overlay"
             );
+            if self.stage == LayerStage::Morph
+                && let Some(stack) = pipeline
+            {
+                renderer.check_morph_budget(stack, rule_ticket.is_some(), group)?;
+            }
         }
         anyhow::ensure!(
             self.stage != LayerStage::Wallpaper || ctx.preview.is_none() || rule_ticket.is_some(),
@@ -83,7 +88,7 @@ impl CompiledLayers {
             ctx.renderers
                 .get_mut(&target.name)
                 .expect("validated output is live")
-                .replace_layers(self.stage, pipeline, rule_ticket.is_some());
+                .replace_layers(self.stage, pipeline, rule_ticket.is_some(), group);
             if starts_wallpaper && ctx.monitor_manager.has_slideshow_queue(&target.name) {
                 ctx.monitor_manager.mark_transition_completed(&target.name);
             }
@@ -228,9 +233,10 @@ impl MainLoopContext {
         let names = targets(&self.monitor_manager, &self.renderers, requested)?;
         anyhow::ensure!(
             prepared.is_empty()
-                || names
-                    .iter()
-                    .all(|name| !self.mpv_native_targets.contains_key(name)),
+                || names.iter().all(|name| !self
+                    .video_players
+                    .get(name)
+                    .is_some_and(crate::video::VideoPlayer::renders_natively)),
             "Layers require composed playback; disable the libmpv GL overlay"
         );
         let targets = names
@@ -294,6 +300,12 @@ pub(super) fn input(
             "Use at most 64 audio values in 0..=1"
         );
     }
+    if let Some(values) = &inputs.controls {
+        anyhow::ensure!(
+            values.len() <= 32 && values.iter().all(|value| value.is_finite()),
+            "Use at most 32 finite shader controls"
+        );
+    }
     anyhow::ensure!(
         inputs
             .data
@@ -316,34 +328,9 @@ pub(super) fn input(
 }
 
 pub(super) fn love(ctx: &mut CommandContext<'_>, path: String, multiplier: f32) -> Response {
-    let position = ctx.monitor_manager.love_heart_position();
-    let selected = if position.is_some() && multiplier > 1.0 {
-        ctx.monitor_manager
-            .outputs
-            .iter()
-            .filter(|(name, output)| {
-                output.current_path.as_deref() == Some(Path::new(&path))
-                    && !is_overlay_target(ctx, name)
-                    && !ctx.powered_off_outputs.contains(*name)
-            })
-            .map(|(name, _)| name.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if let Err(err) = ctx.monitor_manager.love_file(path, multiplier) {
-        return Response::Error(err.to_string());
-    }
-    if let Some(position) = position
-        && !ctx.display_power_suspended
-    {
-        for name in selected {
-            if let Some(renderer) = ctx.renderers.get_mut(&name) {
-                renderer.show_love(position);
-            }
-        }
-    }
-    Response::Ok
+    super::love_button::set(ctx.monitor_manager, ctx.renderers, path, multiplier)
+        .map(|()| Response::Ok)
+        .unwrap_or_else(|error| Response::Error(error.to_string()))
 }
 
 pub(super) fn love_current(
@@ -386,6 +373,15 @@ fn targets(
 }
 
 fn is_overlay_target(ctx: &CommandContext<'_>, name: &str) -> bool {
-    ctx.mpv_native_targets
-        .is_some_and(|targets| targets.contains_key(name))
+    ctx.video_players
+        .get(name)
+        .is_some_and(crate::video::VideoPlayer::renders_natively)
+        || (ctx.pending_video_switches.contains_key(name)
+            && ctx
+                .mpv_native_targets
+                .is_some_and(|targets| targets.contains_key(name))
+            && ctx
+                .monitor_manager
+                .get_output_config(name)
+                .is_none_or(|config| config.smooth_loop.is_none()))
 }

@@ -9,6 +9,7 @@ struct LayerFrame {
     data: vec4<f32>,
     date: vec4<f32>,
     audio: array<vec4<f32>, 16>,
+    controls: array<vec4<f32>, 8>,
 }
 
 @group(0) @binding(0) var<uniform> frame: LayerFrame;
@@ -16,6 +17,11 @@ struct LayerFrame {
 fn audio_band(index: u32) -> f32 {
     let band = min(index, 63u);
     return frame.audio[band / 4u][band % 4u];
+}
+
+fn control(index: u32) -> f32 {
+    let channel = min(index, 31u);
+    return frame.controls[channel / 4u][channel % 4u];
 }
 
 struct Vertex {

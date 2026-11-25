@@ -3,6 +3,7 @@
 use super::WaylandBackend;
 use crate::runtime::morph_input;
 use crate::{main_loop::MainLoopContext, renderer::Renderer};
+use kaleidux_common::MorphGesture;
 use smithay_client_toolkit::seat::{
     Capability, SeatHandler, SeatState,
     pointer::{BTN_LEFT, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler},
@@ -22,18 +23,21 @@ pub(super) struct DesktopPointer {
     regions: HashMap<String, Vec<Region>>,
     positions: HashMap<String, [f32; 4]>,
     activations: Vec<Activation>,
+    love_activations: Vec<String>,
 }
 
 struct SeatPointer {
     pointer: WlPointer,
     buttons: [bool; 2],
-    pressed: Option<(String, [f32; 2])>,
+    pressed: [Option<(String, [f32; 2])>; 2],
+    love_pressed: Option<String>,
 }
 
 struct Activation {
     output: String,
     pressed: [f32; 2],
     released: [f32; 2],
+    gesture: MorphGesture,
 }
 
 impl DesktopPointer {
@@ -42,13 +46,15 @@ impl DesktopPointer {
         self.positions.remove(name);
         self.activations
             .retain(|activation| activation.output != name);
+        self.love_activations.retain(|output| output != name);
         for seat in self.seats.values_mut() {
-            if seat
-                .pressed
-                .as_ref()
-                .is_some_and(|(output, _)| output == name)
-            {
-                seat.pressed = None;
+            for pressed in &mut seat.pressed {
+                if pressed.as_ref().is_some_and(|(output, _)| output == name) {
+                    *pressed = None;
+                }
+            }
+            if seat.love_pressed.as_deref() == Some(name) {
+                seat.love_pressed = None;
             }
         }
     }
@@ -94,6 +100,11 @@ impl WaylandBackend {
     }
 
     pub(crate) fn dispatch_morph_pointer(&mut self, ctx: &mut MainLoopContext) {
+        for output in self.pointer.love_activations.drain(..) {
+            if let Err(error) = crate::runtime::love_button::toggle(ctx, &output) {
+                tracing::warn!("Love button failed: {error:#}");
+            }
+        }
         for (name, position) in self.pointer.positions.drain() {
             morph_input::position(ctx, &name, position);
         }
@@ -103,6 +114,7 @@ impl WaylandBackend {
                 activation.output,
                 activation.pressed,
                 activation.released,
+                activation.gesture,
             );
         }
     }
@@ -131,7 +143,8 @@ impl SeatHandler for WaylandBackend {
                 SeatPointer {
                     pointer,
                     buttons: [false; 2],
-                    pressed: None,
+                    pressed: Default::default(),
+                    love_pressed: None,
                 },
             );
         }
@@ -167,6 +180,34 @@ impl PointerHandler for WaylandBackend {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if let Some((name, inside)) = self.find_love_surface(&event.surface, event.position) {
+                let name = name.to_owned();
+                if let Some(seat) = self
+                    .pointer
+                    .seats
+                    .values_mut()
+                    .find(|seat| seat.pointer == *pointer)
+                {
+                    match event.kind {
+                        PointerEventKind::Press {
+                            button: BTN_LEFT, ..
+                        } if inside => seat.love_pressed = Some(name),
+                        PointerEventKind::Release {
+                            button: BTN_LEFT, ..
+                        } => {
+                            if seat.love_pressed.take().as_deref() == Some(&name)
+                                && inside
+                                && self.pointer.love_activations.len() < 64
+                            {
+                                self.pointer.love_activations.push(name);
+                            }
+                        }
+                        PointerEventKind::Leave { .. } => seat.love_pressed = None,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             let Some(output) = self.find_renderer_surface_name(&event.surface) else {
                 continue;
             };
@@ -187,17 +228,19 @@ impl PointerHandler for WaylandBackend {
                 continue;
             };
             match event.kind {
-                PointerEventKind::Press {
-                    button: BTN_LEFT, ..
-                } => {
-                    seat.buttons[0] = true;
-                    seat.pressed = Some((output.clone(), position));
+                PointerEventKind::Press { button, .. }
+                    if matches!(button, BTN_LEFT | BTN_RIGHT) =>
+                {
+                    let index = usize::from(button == BTN_RIGHT);
+                    seat.buttons[index] = true;
+                    seat.pressed[index] = Some((output.clone(), position));
                 }
-                PointerEventKind::Release {
-                    button: BTN_LEFT, ..
-                } => {
-                    seat.buttons[0] = false;
-                    if let Some((origin, pressed)) = seat.pressed.take()
+                PointerEventKind::Release { button, .. }
+                    if matches!(button, BTN_LEFT | BTN_RIGHT) =>
+                {
+                    let index = usize::from(button == BTN_RIGHT);
+                    seat.buttons[index] = false;
+                    if let Some((origin, pressed)) = seat.pressed[index].take()
                         && origin == output
                         && self.pointer.activations.len() < 64
                     {
@@ -205,18 +248,39 @@ impl PointerHandler for WaylandBackend {
                             output: origin,
                             pressed,
                             released: position,
+                            gesture: if index == 0 {
+                                MorphGesture::Primary
+                            } else {
+                                MorphGesture::Secondary
+                            },
                         });
                     }
                 }
-                PointerEventKind::Press {
-                    button: BTN_RIGHT, ..
-                } => seat.buttons[1] = true,
-                PointerEventKind::Release {
-                    button: BTN_RIGHT, ..
-                } => seat.buttons[1] = false,
+                PointerEventKind::Axis { vertical, .. } => {
+                    let movement = if vertical.value120 != 0 {
+                        f64::from(vertical.value120)
+                    } else if vertical.discrete != 0 {
+                        f64::from(vertical.discrete)
+                    } else {
+                        vertical.absolute
+                    };
+                    if movement != 0.0 && self.pointer.activations.len() < 64 {
+                        self.pointer.activations.push(Activation {
+                            output: output.clone(),
+                            pressed: position,
+                            released: position,
+                            gesture: if movement < 0.0 {
+                                MorphGesture::ScrollUp
+                            } else {
+                                MorphGesture::ScrollDown
+                            },
+                        });
+                    }
+                }
                 PointerEventKind::Leave { .. } => {
                     seat.buttons = [false; 2];
-                    seat.pressed = None;
+                    seat.pressed = Default::default();
+                    seat.love_pressed = None;
                 }
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {}
                 _ => continue,

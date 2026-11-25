@@ -109,6 +109,7 @@ def main():
     cli.add_argument("--lyrics", type=Path, help="Timed LRC file for the current track")
     cli.add_argument("--art", type=Path, help="Override the local album art")
     cli.add_argument("--font", default="Sans 22")
+    cli.add_argument("--group", default="player", help="Independent name for the player morphs")
     cli.add_argument("--colour", default="#ffffff")
     cli.add_argument("--dim", default="#aeb3c2")
     cli.add_argument("--rect", type=rect_arg, default="0.06,0.55,0.33,0.35")
@@ -120,13 +121,16 @@ def main():
     if args.action != "show":
         return media(args.player, args.action).returncode
     kldctl = os.environ.get("KLDCTL", "kldctl")
-    command = [kldctl, "morph"]
+    command = [kldctl, "morph", "--group", args.group]
     watch = [kldctl, "morph-watch"]
     if args.output:
         command.extend(["-o", args.output])
         watch.extend(["-o", args.output])
     args.action_prefix = "player-" + secrets.token_hex(4) + "."
-    when, lines = lyrics(args.lyrics)
+    try:
+        when, lines = lyrics(args.lyrics)
+    except (OSError, UnicodeError) as error:
+        cli.error(str(error))
     previous = None
     with subprocess.Popen(watch, stdout=subprocess.PIPE) as watcher, selectors.DefaultSelector() as events:
         events.register(watcher.stdout, selectors.EVENT_READ)

@@ -141,6 +141,7 @@ impl MpvPlayer {
         let start_time = self.start_time;
         let publish_interval_ns = publish_interval_ns(self.max_publish_fps);
         let render_size = self.render_size;
+        let position_ns = self.position_ns.clone();
         let last_publish_ns = Arc::new(std::sync::atomic::AtomicU64::new(
             super::super::NEVER_PUBLISHED_NS,
         ));
@@ -164,8 +165,10 @@ impl MpvPlayer {
                                 render_size,
                                 false,
                             ) {
-                                Ok(Some(frame)) => {
+                                Ok(Some(mut frame)) => {
                                     consecutive_failures = 0;
+                                    let position = position_ns.load(Ordering::Acquire);
+                                    frame.pts_ns = (position != u64::MAX).then_some(position);
                                     if !first_frame_logged.swap(true, Ordering::SeqCst) {
                                         info!(
                                             "[ASSET] {}: First libmpv frame captured in {:.3}ms",
@@ -261,6 +264,7 @@ impl MpvPlayer {
             session_id: self.session_id,
             target,
             frame_mailbox: self.frame_mailbox.clone(),
+            position_ns: self.position_ns.clone(),
             stop_requested: self.stop_requested.clone(),
             first_frame_logged: self.first_frame_logged.clone(),
             metrics: self.metrics.clone(),

@@ -60,6 +60,8 @@ impl super::Renderer {
     pub fn switch_content(&mut self) {
         let had_current = self.has_current_texture();
         let flattened_active_transition = self.freeze_active_transition_to_current();
+        self.loop_playback = None;
+        self.last_loop_pts = None;
         self.clear_transition_asset();
         self.transition_playback = super::transition_playback::TransitionPlayback::Playing;
 
@@ -105,6 +107,8 @@ impl super::Renderer {
     }
 
     pub fn abort_transition(&mut self) {
+        self.loop_playback = None;
+        self.last_loop_pts = None;
         self.clear_transition_asset();
         self.transition_playback = super::transition_playback::TransitionPlayback::Playing;
         if self.transition_active || self.content_swap_pending || !self.has_current_texture() {
@@ -134,6 +138,8 @@ impl super::Renderer {
     /// surface so the next frame can clear the compositor-visible buffer.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        self.loop_playback = None;
+        self.last_loop_pts = None;
         self.clear_transition_asset();
         self.transition_playback = super::transition_playback::TransitionPlayback::Playing;
         // Explicitly drop textures to free GPU memory

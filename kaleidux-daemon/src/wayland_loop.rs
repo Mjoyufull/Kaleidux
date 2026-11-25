@@ -156,6 +156,12 @@ pub async fn run(
                 idle_deadline,
                 power_monitor.next_deadline(!ctx.renderers.is_empty()),
             );
+            idle_deadline = crate::runtime::timing::min_deadline_with_reason(
+                idle_deadline,
+                backend
+                    .love_deadline()
+                    .map(|due| (due, DeadlineReason::Layers)),
+            );
             let result = ctx.idle_wait(&wayland_fd, idle_deadline).await;
             cmd_buf = result.cmd;
             frame_ready = result.frame_ready;
@@ -343,6 +349,8 @@ pub async fn run(
         }
 
         ctx.sync_layer_rules();
+        ctx.sync_love_buttons(false, loop_start);
+        callback_flush_needed |= backend.sync_love_surfaces(&ctx, &qh, loop_start);
         ctx.sync_desktop_audio();
         callback_flush_needed |= backend.sync_morph_input_regions(&ctx.renderers, &qh);
         ctx.mark_due_layer_redraws(Instant::now());

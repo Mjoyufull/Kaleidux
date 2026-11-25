@@ -46,7 +46,31 @@ pub(crate) fn layer_request(
         stage,
         layers,
         fps,
+        group: None,
+        layout: None,
     }))
+}
+
+pub(crate) fn layout_columns(value: &str) -> Result<usize, String> {
+    match value {
+        "row" => Ok(0),
+        "column" => Ok(1),
+        _ => value
+            .strip_prefix("grid:")
+            .and_then(|columns| columns.parse().ok())
+            .filter(|columns| (1..=kaleidux_common::MAX_MORPHS_PER_OUTPUT).contains(columns))
+            .ok_or_else(|| "Use row, column, or grid:COLUMNS".into()),
+    }
+}
+
+pub(crate) fn layout_bounds(value: &str) -> Result<[f32; 4], String> {
+    value
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Use x,y,width,height".to_owned())?
+        .try_into()
+        .map_err(|_| "Use x,y,width,height".into())
 }
 
 pub(crate) fn parse_layer_fps(value: &str) -> Result<u16, String> {

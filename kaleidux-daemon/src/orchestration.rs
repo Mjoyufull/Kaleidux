@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -58,6 +59,7 @@ pub struct OutputConfig {
     /// Advance incoming video while its transition plays.
     #[serde(default = "default_true")]
     pub play_during_transition: bool,
+    pub smooth_loop: Option<SmoothLoop>,
     pub gif_speed: f32,
     pub gif_loop: bool,
     #[serde(default = "default_volume")]
@@ -82,6 +84,26 @@ pub struct OutputConfig {
     pub margin: [u32; 4],
     #[serde(default)]
     pub tile: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SmoothLoop {
+    /// Milliseconds. Zero disables a setting inherited from another section.
+    #[serde(default = "default_loop_duration")]
+    pub duration_ms: u32,
+    #[serde(
+        default,
+        deserialize_with = "transition_config::deserialize_optional_transition"
+    )]
+    pub transition: Option<crate::shaders::Transition>,
+    pub reveal_map: Option<PathBuf>,
+    #[serde(skip)]
+    pub(crate) prepared_map: Option<Arc<crate::renderer::RevealMap>>,
+}
+
+fn default_loop_duration() -> u32 {
+    450
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -152,10 +174,11 @@ struct RegexOutputOverride {
 pub struct GlobalConfig {
     /// Default command target; omitted or "auto" selects the largest active output.
     pub main_monitor: Option<String>,
-    /// Briefly show a heart when the active wallpaper is loved. Defaults on.
+    /// Show a clickable heart over the active wallpaper. Defaults on.
     pub love_heart: Option<bool>,
     /// Love morph center in output-relative coordinates, with the origin at top left.
     pub love_heart_position: Option<[f32; 2]>,
+    pub love_heart_animate_on_show: Option<bool>,
     #[serde(default)]
     pub desktop_audio: bool,
     pub desktop_audio_source: Option<String>,
@@ -168,6 +191,7 @@ pub struct GlobalConfig {
     pub video_ratio: Option<u8>,
     pub transition_time: Option<u32>,
     pub play_during_transition: Option<bool>,
+    pub smooth_loop: Option<SmoothLoop>,
     pub gif_speed: Option<f32>,
     pub gif_loop: Option<bool>,
     pub volume: Option<u8>,
@@ -212,6 +236,7 @@ impl Default for GlobalConfig {
             main_monitor: None,
             love_heart: None,
             love_heart_position: None,
+            love_heart_animate_on_show: None,
             desktop_audio: false,
             desktop_audio_source: None,
             layer_rules: Vec::new(),
@@ -220,6 +245,7 @@ impl Default for GlobalConfig {
             video_ratio: None,
             transition_time: None,
             play_during_transition: None,
+            smooth_loop: None,
             gif_speed: None,
             gif_loop: None,
             volume: None,
@@ -252,6 +278,7 @@ pub struct PartialOutputConfig {
     pub transition: Option<crate::shaders::Transition>,
     pub transition_time: Option<u32>,
     pub play_during_transition: Option<bool>,
+    pub smooth_loop: Option<SmoothLoop>,
     pub gif_speed: Option<f32>,
     pub gif_loop: Option<bool>,
     pub volume: Option<u8>,
@@ -405,7 +432,60 @@ impl Config {
             .await
             .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
 
-        Self::parse_str(&content)
+        let directory = config_path
+            .parent()
+            .expect("config has a directory")
+            .to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut config = Self::parse_str(&content)?;
+            config.prepare_loop_maps(&directory)?;
+            Ok(config)
+        })
+        .await
+        .context("Configuration worker failed")?
+    }
+
+    fn prepare_loop_maps(&mut self, directory: &Path) -> Result<()> {
+        let mut maps = HashMap::new();
+        for setting in self
+            .global
+            .smooth_loop
+            .iter_mut()
+            .chain(self.any.smooth_loop.iter_mut())
+            .chain(
+                self.outputs
+                    .values_mut()
+                    .filter_map(|output| output.smooth_loop.as_mut()),
+            )
+            .chain(
+                self.regex_outputs
+                    .iter_mut()
+                    .filter_map(|output| output.config.smooth_loop.as_mut()),
+            )
+        {
+            let Some(path) = setting
+                .reveal_map
+                .as_ref()
+                .filter(|_| setting.duration_ms != 0)
+            else {
+                continue;
+            };
+            let path = path
+                .strip_prefix("~")
+                .ok()
+                .and_then(|relative| dirs::home_dir().map(|home| home.join(relative)))
+                .unwrap_or_else(|| directory.join(path));
+            let map = match maps.entry(path) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let map = crate::renderer::RevealMap::load_png(entry.key())
+                        .context("Loading smooth-loop reveal map")?;
+                    entry.insert(Arc::new(map))
+                }
+            };
+            setting.prepared_map = Some(map.clone());
+        }
+        Ok(())
     }
 
     pub fn get_config_for_output(&self, name: &str, description: &str) -> OutputConfig {
@@ -417,6 +497,7 @@ impl Config {
             transition: None,
             transition_time: self.global.transition_time,
             play_during_transition: self.global.play_during_transition,
+            smooth_loop: self.global.smooth_loop.clone(),
             gif_speed: self.global.gif_speed,
             gif_loop: self.global.gif_loop,
             volume: self.global.volume,
@@ -485,6 +566,9 @@ impl PartialOutputConfig {
         if other.play_during_transition.is_some() {
             self.play_during_transition = other.play_during_transition;
         }
+        if other.smooth_loop.is_some() {
+            self.smooth_loop = other.smooth_loop.clone();
+        }
         if other.volume.is_some() {
             self.volume = other.volume;
         }
@@ -520,6 +604,7 @@ impl PartialOutputConfig {
             transition: self.transition.unwrap_or(crate::shaders::Transition::Fade),
             transition_time: self.transition_time.unwrap_or(1000),
             play_during_transition: self.play_during_transition.unwrap_or(true),
+            smooth_loop: self.smooth_loop.filter(|setting| setting.duration_ms > 0),
             gif_speed: self
                 .gif_speed
                 .filter(|speed| speed.is_finite())

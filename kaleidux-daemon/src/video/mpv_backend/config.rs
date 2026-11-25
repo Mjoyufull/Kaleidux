@@ -40,10 +40,10 @@ fn render_api_for_request(
     native_target_available: bool,
     composed_target_available: bool,
 ) -> MpvRenderApi {
-    if request.enables_composed_gl() && composed_target_available {
-        MpvRenderApi::ComposedGl
-    } else if request.enables_native_overlay() && native_target_available {
+    if request.enables_native_overlay() && native_target_available {
         MpvRenderApi::NativeGlOverlayDiagnostic
+    } else if request.enables_composed_gl() && composed_target_available {
+        MpvRenderApi::ComposedGl
     } else {
         MpvRenderApi::Software
     }
@@ -155,8 +155,12 @@ mod tests {
     #[test]
     fn native_gl_overlay_requires_explicit_request_and_target() {
         assert_eq!(
-            render_api_for_request(MpvRenderApiRequest::NativeGlOverlayDiagnostic, true, false),
+            render_api_for_request(MpvRenderApiRequest::NativeGlOverlayDiagnostic, true, true),
             MpvRenderApi::NativeGlOverlayDiagnostic
+        );
+        assert_eq!(
+            render_api_for_request(MpvRenderApiRequest::NativeGlOverlayDiagnostic, false, true),
+            MpvRenderApi::ComposedGl
         );
         assert_eq!(
             render_api_for_request(MpvRenderApiRequest::ComposedSoftware, true, true),

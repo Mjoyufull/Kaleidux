@@ -181,6 +181,8 @@ impl super::Renderer {
         self.last_yuv_uniforms = None;
         self.active_transition = config.transition.clone();
         self.transition_duration = (config.transition_time as f32 / 1000.0).max(0.001);
+        self.smooth_loop.clone_from(&config.smooth_loop);
+        self.last_loop_pts = None;
         self.pause_on_fullscreen = config.pause_on_fullscreen;
         {
             let clamped = resolved_frame_latency(config.frame_latency, self.default_frame_latency);
@@ -201,6 +203,21 @@ impl super::Renderer {
         let prewarm_targets = transition_prewarm_candidates(&self.active_transition);
         for transition in &prewarm_targets {
             let _ = self.get_transition_pipeline(transition);
+        }
+        if let Some(transition) = self
+            .smooth_loop
+            .as_ref()
+            .and_then(|setting| setting.transition.as_ref())
+            && !matches!(transition, crate::shaders::Transition::Random)
+        {
+            let _ = self.get_transition_pipeline(transition);
+        }
+        if let Some(map) = self
+            .smooth_loop
+            .as_ref()
+            .and_then(|setting| setting.prepared_map.as_ref())
+        {
+            self.upload_reveal_map(map);
         }
         debug!(
             "[RENDER] {}: Transition pipeline prewarm completed in {:.1}ms ({} target(s))",

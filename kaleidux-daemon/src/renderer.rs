@@ -85,6 +85,7 @@ pub(crate) mod layer_shadertoy;
 pub(crate) mod layer_source;
 mod layer_text;
 mod layers;
+pub(crate) use layers::{LOVE_FRAME_INTERVAL, LoveMark};
 mod render_blit;
 pub(crate) use layer_source::{PreparedLayers, is_shader_file};
 pub(crate) mod frame_capture;
@@ -94,6 +95,7 @@ mod render_transition;
 mod reveal_map;
 mod transition_asset;
 mod transition_playback;
+mod video_loop;
 pub(crate) use reveal_map::RevealMap;
 pub(crate) use transition_asset::{PreparedShader, TransitionAsset};
 
@@ -351,6 +353,9 @@ pub struct Renderer {
     // Transition Settings
     pub active_transition: Transition,
     pub transition_duration: f32,
+    smooth_loop: Option<crate::orchestration::SmoothLoop>,
+    loop_playback: Option<(crate::shaders::Transition, f32)>,
+    last_loop_pts: Option<u64>,
     pub transition_stats: Option<TransitionStats>,
 
     // Texture Reuse
@@ -562,6 +567,9 @@ impl Renderer {
             content_swap_pending: false,
             active_transition: Transition::Fade,
             transition_duration: 1.0,
+            smooth_loop: None,
+            loop_playback: None,
+            last_loop_pts: None,
             transition_stats: None,
             current_texture_size: None,
             current_texture_view: None,

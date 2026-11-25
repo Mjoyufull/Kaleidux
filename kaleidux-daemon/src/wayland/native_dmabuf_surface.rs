@@ -1218,7 +1218,7 @@ pub(crate) fn present_native_frame(
 ) -> bool {
     use crate::observability::video_backend::VideoBackendMetricKind;
 
-    if !renderer.can_present_native_wayland_surface() {
+    if !renderer.can_present_native_wayland_surface() || renderer.frame_crosses_video_loop(frame) {
         return false;
     }
     // This ladder owns decoder-native DMA-BUF surfaces only. CPU frames and
@@ -1231,6 +1231,7 @@ pub(crate) fn present_native_frame(
 
     // 1. The decoder surface itself, when the compositor accepts its modifier.
     if backend.try_present_native_dmabuf(qh, output, frame, output_size) {
+        renderer.observe_video_loop(frame);
         renderer.record_native_present_path(VideoBackendMetricKind::NativeDirectSurfacePresent);
         renderer.retain_native_wayland_snapshot(frame);
         renderer.record_native_wayland_surface_presented();
@@ -1261,6 +1262,7 @@ pub(crate) fn present_native_frame(
             _ => VideoBackendMetricKind::NativeBlockingSyncPresent,
         };
         if backend.try_present_native_dmabuf(qh, output, &bridged, output_size) {
+            renderer.observe_video_loop(frame);
             renderer.record_native_present_path(VideoBackendMetricKind::NativeLinearBridgePresent);
             renderer.record_native_present_path(sync_tier);
             renderer.retain_native_wayland_snapshot(&bridged);
@@ -1278,6 +1280,7 @@ pub(crate) fn present_native_frame(
         && renderer.try_present_native_gl_surface(frame, display_ptr, surface_id, output_size)
     {
         backend.mark_native_gl_surface_presented(output);
+        renderer.observe_video_loop(frame);
         renderer.retain_native_wayland_snapshot(frame);
         renderer.record_native_wayland_surface_presented();
         return true;

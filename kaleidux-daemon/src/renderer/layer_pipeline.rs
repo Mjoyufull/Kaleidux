@@ -20,6 +20,7 @@ pub(super) struct LayerFrame {
 
 pub(crate) struct LayerPipelines {
     pub(crate) names: Vec<String>,
+    pub(super) asset_bytes: usize,
     pub(super) fps: u16,
     pub(super) start: Instant,
     pub(super) pipelines: Vec<wgpu::RenderPipeline>,
@@ -33,7 +34,7 @@ pub(crate) struct LayerPipelines {
     depth: Option<wgpu::TextureView>,
     pub(super) morph_bindings: Vec<wgpu::BindGroup>,
     pub(super) rectangles: Vec<Option<[f32; 4]>>,
-    pub(super) actions: Vec<Option<String>>,
+    pub(super) actions: Vec<[Option<String>; 4]>,
     pub(super) pointer_regions: Vec<[f32; 4]>,
     pub(super) uses_audio: bool,
     pub(super) feedback: Option<super::layer_feedback::Feedback>,
@@ -158,6 +159,11 @@ impl LayerPipelines {
                 Vec::new()
             };
         Self {
+            asset_bytes: prepared
+                .shaders
+                .iter()
+                .map(|layer| layer.texture_bytes())
+                .sum(),
             names: if let Some(toy) = &prepared.feedback {
                 toy.passes
                     .iter()
@@ -190,12 +196,12 @@ impl LayerPipelines {
             actions: prepared
                 .shaders
                 .iter()
-                .map(|layer| layer.action.clone())
+                .map(|layer| layer.actions.clone())
                 .collect(),
             pointer_regions: prepared
                 .shaders
                 .iter()
-                .filter(|layer| layer.track_pointer || layer.action.is_some())
+                .filter(|layer| layer.track_pointer || layer.actions.iter().any(Option::is_some))
                 .map(|layer| layer.rectangle.unwrap_or([0.0, 0.0, 1.0, 1.0]))
                 .collect(),
             uses_audio: prepared.shaders.iter().any(|layer| layer.track_audio)
@@ -226,7 +232,7 @@ impl LayerPipelines {
                 fragment_only: false,
                 assets: [None, None, None, None],
                 rectangle: None,
-                action: None,
+                actions: Default::default(),
                 track_pointer: false,
                 track_audio: false,
             }],

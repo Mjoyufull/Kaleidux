@@ -43,6 +43,7 @@ impl super::Renderer {
         }
 
         let is_first_frame_after_switch = self.content_swap_pending || !self.has_current_texture();
+        self.observe_video_loop(frame);
 
         if is_first_frame_after_switch && self.video_first_frame_time.is_none() {
             self.video_first_frame_time = Some(std::time::Instant::now());

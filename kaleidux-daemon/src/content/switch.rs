@@ -199,7 +199,15 @@ pub(crate) fn switch_wallpaper_content(
     let hold_video = monitor_manager
         .get_output_config(&name)
         .is_some_and(|config| !config.play_during_transition);
-    let requires_composed_video = transition_override.is_some() || hold_video;
+    let requires_composed_video = transition_override.is_some()
+        || hold_video
+        || monitor_manager
+            .get_output_config(&name)
+            .is_some_and(|config| config.smooth_loop.is_some())
+        || renderers
+            .get(&name)
+            .is_some_and(renderer::Renderer::has_composed_layers)
+        || crate::runtime::layer_rules::requires_composition(monitor_manager.layer_rules(), &path);
     let (resolved_transition, transition_asset) = match transition_override {
         Some(TransitionOverride::Asset(asset)) => (Transition::Fade, Some(asset)),
         Some(TransitionOverride::Named(transition)) => (transition, None),

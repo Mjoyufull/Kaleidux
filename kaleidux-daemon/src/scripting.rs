@@ -277,6 +277,23 @@ fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
             })?;
         tx.submit(Request::LayerInputs(signals))
     });
+    let tx = commands.clone();
+    engine.register_fn("morph_group", move |input: &str| {
+        let selection =
+            serde_json::from_str::<kaleidux_common::LayerSelection>(input).map_err(|error| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    error.to_string().into(),
+                    Position::NONE,
+                ))
+            })?;
+        if selection.stage != kaleidux_common::LayerStage::Morph || selection.group.is_none() {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                "Use stage=morph and a group name".into(),
+                Position::NONE,
+            )));
+        }
+        tx.submit(Request::LayersSet(selection))
+    });
     for (name, stage) in [
         ("filters", kaleidux_common::LayerStage::Filter),
         ("shaders", kaleidux_common::LayerStage::Filter),
@@ -287,12 +304,8 @@ fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
         engine.register_fn(name, move |names: rhai::Array, fps: i64, output: String| {
             let invalid =
                 |reason: &str| Box::new(EvalAltResult::ErrorRuntime(reason.into(), Position::NONE));
-            if names.len() > kaleidux_common::MAX_LAYERS_PER_STAGE
-                || !(-1..=i64::from(u16::MAX - 1)).contains(&fps)
-            {
-                return Err(invalid(
-                    "Use at most eight layers and a frame rate of -1 (unlimited), 0 or higher",
-                ));
+            if !(-1..=i64::from(u16::MAX - 1)).contains(&fps) {
+                return Err(invalid("Use a frame rate of -1 (unlimited), 0 or higher"));
             }
             let layers = names
                 .into_iter()
@@ -312,6 +325,8 @@ fn register_layer_commands(engine: &mut Engine, commands: &ScriptCommands) {
                 } else {
                     fps as u16
                 },
+                group: None,
+                layout: None,
             }))
         });
     }

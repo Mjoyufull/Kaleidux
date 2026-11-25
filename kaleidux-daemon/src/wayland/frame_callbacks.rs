@@ -87,6 +87,7 @@ pub(crate) fn process_frame_callbacks(
                     *callback_flush_needed = true;
                 }
                 if !native_surface_presented && !r.transition_playback_is_held() {
+                    *callback_flush_needed |= backend.hide_native_dmabuf(&name);
                     let upload_start = std::time::Instant::now();
                     r.upload_frame(&frame);
                     r.pause_incoming_after_upload(ctx.video_players.get(&name), frame.pts_ns);

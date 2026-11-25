@@ -11,9 +11,13 @@
 # Show a brief heart when loving the current wallpaper.
 love-heart = true
 love-heart-position = [0.91, 0.88]
+love-heart-animate-on-show = true
 
 # Set false to hold the incoming video's first frame during its transition.
 play-during-transition = true
+# Blend at video loop seams using the wallpaper's transhader, or set transition.
+# smooth-loop = { duration-ms = 450, transition = "fade" }
+# Use duration-ms = 0 on an output to disable an inherited setting.
 # Default command target: largest active output, then name; use -o all for all.
 main-monitor = "auto"
 # main-monitor = "HDMI-A-1"

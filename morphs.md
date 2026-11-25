@@ -14,15 +14,18 @@ kldctl shader -o DP-1
 kldctl morph -o all
 ```
 
-Each command replaces its stage on the main output by default. A stage can
-hold up to eight passes. Use `--fps 0` for passive layers that only redraw on
+Commands target the main output by default. Shaders can hold up to eight
+passes. An output can have up to 64 morphs sharing a 96 MiB texture budget.
+Use `--fps 0` for passive layers that only redraw on
 input or wallpaper changes. A positive rate requests periodic redraws.
 `--fps unlimited` follows display callbacks on Wayland. `pause` freezes
 shader clocks and `resume` continues from the held time.
 
-The built-in `heart` morph is persistent. `kldctl love` adds the selected
-wallpaper to the love list and briefly shows a glass heart by default.
-Configure `love-heart` and `love-heart-position` in `[global]`.
+The bottom-right glass heart marks the current wallpaper as a favorite.
+Click to toggle it. When loved, it plays the animation and settles pink.
+The animation also plays on arrival at a loved wallpaper by default.
+Use `love-heart`, `love-heart-position` and `love-heart-animate-on-show` in
+`[global]` to configure it. `kldctl love` and `kldctl unlove` update it too.
 
 Use `rect=x,y,width,height` to place a morph in normalized output
 coordinates. Shader morphs receive local UVs. Use `font=` for a Pango system
@@ -30,16 +33,30 @@ font description and `colour=#RRGGBB` for text colour. System fonts and
 Unicode text use `pango-view`. Simple ASCII labels can use the built-in VGA
 bitmap from [font8x8](https://github.com/dhepper/font8x8).
 
-On Wayland and X11, a morph with `rect=` and `action=` accepts primary clicks.
-Overlapping buttons use the topmost matching morph. Clicks outside the
-buttons pass through the wallpaper. A press and release must land inside
-the same button. Run `kldctl morph-watch` to read the action, output name
-and coordinates within the button as JSON lines.
+Use `--group NAME` to update a widget independently. Groups draw in
+alphabetical order above the default stack. Run `kldctl morph --group NAME`
+to clear one group. A layout arranges the supplied layers in order. Explicit
+`rect=` values override their cells. Layouts accept `row`, `column` or
+`grid:COLUMNS`, with optional normalized `--bounds` and `--gap`.
+
+On Wayland and X11, `action=` binds primary clicks, `secondary=` binds right
+clicks, and `scroll-up=` and `scroll-down=` bind vertical scroll. A binding
+uses its morph's rectangle or layout cell. Overlapping buttons use the topmost
+matching morph. A press and release must land inside the same button.
+`kldctl morph-watch` emits the action, gesture, output and local coordinates
+as JSON lines.
 
 ```sh
-kldctl morph 'text=Next|font=Sans Bold 24|rect=0.05,0.8,0.15,0.07|action=next'
+kldctl morph --group controls --layout row --bounds 0.05,0.8,0.3,0.07 \
+    'text=Previous|action=previous' 'text=Next|action=next|secondary=menu'
 kldctl morph-watch -o DP-1
 ```
+
+`morph_group(json)` in Rhai accepts a layer selection with `stage` set to
+`"morph"`, a `group` name and the `layers` array. Its optional `layout` has
+`columns`, `bounds` and `gap`. Zero columns uses a row and one uses a column.
+Use the existing `on_morph_action(action, output, x, y)` hook or
+`morph-watch` to act on your bindings.
 
 ## Wallpaper rules
 
@@ -91,6 +108,7 @@ fn layer(uv: vec2<f32>) -> vec4<f32> {
 - `frame.seconds` is the animation time. `frame.timing.xy` holds the delta and frame number.
 - `frame.progress` is the transhader position, from 0 to 1. It is 1 in steady state.
 - `frame.pointer` holds x, y and primary and secondary button states. `frame.data` holds four provider-defined numbers.
+- `control(0u)` through `control(31u)` read 32 additional values. Update them together with `kldctl react '{"controls":[0.2,0.6]}'`. Missing elements in a supplied array reset to zero.
 - `frame.date` holds the year, month, day and seconds since local midnight. `audio_band(0u)` through `audio_band(63u)` read the spectrum.
 - A shader in the effects stack can read the previous image with `sample(uv)`. Morphs return linear RGB and straight alpha.
 
@@ -99,8 +117,14 @@ inputs include `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`,
 `iMouse`, and `iDate`. On the effects stack, `iChannel0` is the previous
 image. Shader wallpapers and GLSL morphs can bind four local image
 channels. Paths in `channel0=` through `channel3=` are relative to the shader
-file or absolute. `kldPointer`, `kldData`, and `kldAudio(index)` are available
+file or absolute. `kldPointer`, `kldData`, `kldAudio(index)` and
+`kldControl(index)` are available
 in both modes.
+
+`kldctl set` also recognizes screen shaders that declare `uniform sampler2D tex`
+and runs them over the active wallpaper. The adapter provides `tex`,
+`v_texcoord`, `time` and `full_size`. Set an explicit animation rate with
+`kldctl shader --fps unlimited /path/to/shader.frag` when the shader uses time.
 
 ```sh
 kldctl shader-wallpaper 'desktop.frag|channel0=sky.png|channel1=clouds.png'
@@ -133,7 +157,9 @@ Use `kldctl shader /path/to/preset.glslp` for same-size Libretro GLSL
 passes. The fragment ABI includes `Texture`, `TextureSize`, `InputSize`,
 `OutputSize`, `FrameCount` and a single UV varying. Presets with custom
 vertex math, LUTs, feedback, scaling or parameter overrides
-need a port. The opt-in native mpv GL overlay bypasses the layer renderer.
+need a port. If you use the diagnostic native mpv GL overlay, enable your
+layers before setting the video so it starts with composed GL. The glass
+heart has its own Wayland surface and also works with the native overlay.
 
 ## Input providers and player morph
 
@@ -142,9 +168,11 @@ kldctl shader 'parallax=/home/me/depth.png|pointer=true'
 kldctl shader 'pan|pointer=true'
 kldctl react '{"pointer":[0.7,0.4,0,0],"data":[1,0,0,0]}'
 kldctl morph spectrum
+kldctl morph --group visualizer 'audio-orbit|rect=0.1,0.64,0.19,0.3' --fps unlimited
+kldctl morph --group status 'pulse|rect=0.8,0.7,0.1,0.18' --fps 60
 python3 examples/reactivity.py --audio -o DP-1
 python3 examples/reactivity.py --pointer -o DP-1
-python3 examples/player-morph.py --lyrics song.lrc --font 'Sans 24'
+python3 examples/player-morph.py --font 'Sans 24'
 python3 examples/player-morph.py play-pause
 ```
 
@@ -170,11 +198,39 @@ properties. `kldctl react` sends the same pointer and audio data used by
 shaders. The audio bridge supplies 128 values by repeating the 64 bands
 for each channel.
 
-The player example reads MPRIS with `playerctl`, local album art, and a
-timed LRC file. It owns a single morph stack while running. Adjust
-`--rect`, `--font`, `--colour`, `--dim`, and `--art` for your desktop.
+The player example reads MPRIS with `playerctl` and local album art.
+Pass `--lyrics` with your own timed LRC file to show lyrics. It owns the
+`player` group by default. Adjust `--group`, `--rect`, `--font`, `--colour`,
+`--dim`, and `--art` for your desktop.
 Its `previous`, `play-pause` and `next` buttons use morph actions. Those
 actions are also available as commands for compositor bindings.
+
+## Weather effects
+
+Use `rain`, `snow`, `fog` and `lightning` independently or together. A
+local provider can call `examples/weather-morph.py` with its current
+condition. Supply your own condition-to-layer mapping with `--mapping` or
+use `morph --group weather` directly with any custom shaders.
+
+```sh
+python3 examples/weather-morph.py 'light rain'
+kldctl morph --group weather snow --fps 30
+python3 examples/weather-morph.py clear
+```
+
+`--mapping` takes a TOML file with a `[conditions]` table. Each condition
+maps to an array of ordered morphs. For example `rain = ["rain", "fog"]`.
+
+## Smooth video loops
+
+Set `smooth-loop = { duration-ms = 450 }` in `[global]`, `[any]`, or an
+output section to blend the last displayed frame into the next pass of
+the video. Add `transition = "fade"` to choose a different transhader.
+Set `reveal-map = "path/to/map.png"` to use a reveal map at the seam. Relative
+paths start in the config directory.
+Use `duration-ms = 0` to disable an inherited setting. Loop blends keep
+the current slideshow position and duration. This uses the composed
+libmpv path when libmpv renders the wallpaper.
 
 ## Rhai and IPC
 
@@ -201,4 +257,4 @@ layers and 65535 for unlimited animation.
 
 The watch connection replies with `"Ok"` and then one JSON event per line
 until it closes. Omit `output` to follow all outputs. For example, an event
-can be `{"output":"DP-1","action":"next","position":[0.5,0.25]}`.
+can be `{"output":"DP-1","action":"next","gesture":"primary","position":[0.5,0.25]}`.

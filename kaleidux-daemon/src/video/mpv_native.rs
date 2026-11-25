@@ -55,7 +55,7 @@ impl MpvRenderApiRequest {
     }
 
     pub(crate) fn enables_composed_gl(self) -> bool {
-        self == Self::ComposedGl
+        matches!(self, Self::ComposedGl | Self::NativeGlOverlayDiagnostic)
     }
 }
 
@@ -287,6 +287,7 @@ pub(crate) struct MpvComposedRenderThreadConfig {
     pub(crate) session_id: u64,
     pub(crate) target: MpvComposedVideoTarget,
     pub(crate) frame_mailbox: super::LatestFrameMailbox,
+    pub(crate) position_ns: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) stop_requested: Arc<AtomicBool>,
     pub(crate) first_frame_logged: Arc<AtomicBool>,
     pub(crate) metrics: Arc<PerformanceMetrics>,
@@ -327,8 +328,10 @@ pub(crate) fn run_composed_render_thread(config: MpvComposedRenderThreadConfig) 
             .min_render_interval
             .is_none_or(|interval| last_published.is_none_or(|last| last.elapsed() >= interval));
         match renderer.render_frame(config.session_id, publish) {
-            Ok(Some(frame)) => {
+            Ok(Some(mut frame)) => {
                 last_published = Some(Instant::now());
+                let position = config.position_ns.load(Ordering::Acquire);
+                frame.pts_ns = (position != u64::MAX).then_some(position);
                 if !config.first_frame_logged.swap(true, Ordering::SeqCst) {
                     info!(
                         "[ASSET] {}: First composed libmpv GL frame published in {:.3}ms",

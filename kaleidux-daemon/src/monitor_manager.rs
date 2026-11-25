@@ -95,15 +95,20 @@ impl MonitorManager {
 
     pub fn love_file(&mut self, path: String, multiplier: f32) -> Result<()> {
         let path = PathBuf::from(path);
+        anyhow::ensure!(
+            multiplier.is_finite() && multiplier > 0.0,
+            "Invalid love multiplier"
+        );
+        let original = self.cache.set_love_multiplier(&path, multiplier)?;
         if let Some(queue) = &mut self.shared_queue {
-            queue.love_file(path.clone(), multiplier)?;
+            queue.update_love_multiplier(&path, &original);
         }
         for queue in self.group_queues.values_mut() {
-            queue.love_file(path.clone(), multiplier)?;
+            queue.update_love_multiplier(&path, &original);
         }
         for orch in self.outputs.values_mut() {
             if let Some(queue) = &mut orch.queue {
-                queue.love_file(path.clone(), multiplier)?;
+                queue.update_love_multiplier(&path, &original);
             }
         }
         Ok(())
@@ -113,6 +118,14 @@ impl MonitorManager {
         self.love_file(path, 1.0)
     }
 
+    pub(crate) fn is_loved(&self, path: &std::path::Path) -> bool {
+        self.cache
+            .get_file_stats(path)
+            .ok()
+            .flatten()
+            .is_some_and(|stats| stats.love_multiplier > 1.0)
+    }
+
     pub(crate) fn love_heart_position(&self) -> Option<[f32; 2]> {
         let global = &self.config.global;
         let position = global.love_heart_position.unwrap_or([0.91, 0.88]);
@@ -120,38 +133,41 @@ impl MonitorManager {
             .then(|| position.map(|value| value.clamp(0.0, 1.0)))
     }
 
+    pub(crate) fn animate_loved_wallpapers(&self) -> bool {
+        self.config
+            .global
+            .love_heart_animate_on_show
+            .unwrap_or(true)
+    }
+
     pub fn get_loveitlist(&self) -> Vec<KEntry> {
-        let mut list = HashMap::new();
-        // Consolidate from all queues
-        if let Some(queue) = &self.shared_queue {
-            for (path, stats) in &queue.stats.files {
-                if stats.love_multiplier > 1.0 {
-                    list.insert(
-                        path.to_string_lossy().to_string(),
-                        (stats.love_multiplier, stats.count),
-                    );
-                }
-            }
-        }
-        for queue in self.group_queues.values() {
-            for (path, stats) in &queue.stats.files {
-                if stats.love_multiplier > 1.0 {
-                    list.insert(
-                        path.to_string_lossy().to_string(),
-                        (stats.love_multiplier, stats.count),
-                    );
-                }
-            }
-        }
-        for orch in self.outputs.values() {
-            if let Some(queue) = &orch.queue {
-                for (path, stats) in &queue.stats.files {
-                    if stats.love_multiplier > 1.0 {
-                        list.insert(
-                            path.to_string_lossy().to_string(),
-                            (stats.love_multiplier, stats.count),
-                        );
-                    }
+        let mut list: HashMap<_, _> = self
+            .cache
+            .get_all_file_stats()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, stats)| stats.love_multiplier > 1.0)
+            .map(|(path, stats)| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    (stats.love_multiplier, stats.count),
+                )
+            })
+            .collect();
+        for (path, (_, count)) in &mut list {
+            let path = std::path::Path::new(path.as_str());
+            for queue in self
+                .shared_queue
+                .iter()
+                .chain(self.group_queues.values())
+                .chain(
+                    self.outputs
+                        .values()
+                        .filter_map(|output| output.queue.as_ref()),
+                )
+            {
+                if let Some(stats) = queue.stats.files.peek(path) {
+                    *count = (*count).max(stats.count);
                 }
             }
         }

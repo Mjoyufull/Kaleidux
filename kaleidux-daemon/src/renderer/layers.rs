@@ -2,21 +2,28 @@
 
 use super::WgpuContext;
 use super::layer_pipeline::{FILTER_FORMAT, LayerFrame, LayerPipelines};
-use kaleidux_common::{LayerInputs, LayerStage, OutputLayers};
+use kaleidux_common::{
+    LayerInputs, LayerStage, MAX_MORPHS_PER_OUTPUT, MorphGesture, MorphGroup, OutputLayers,
+};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const LOVE_LIFETIME: Duration = Duration::from_millis(900);
+mod love;
+pub(crate) use love::{LOVE_FRAME_INTERVAL, LoveMark};
+use love::{LoveVisual, scissor_heart};
 
 #[derive(Default)]
 pub(super) struct Layers {
     wallpaper: Option<LayerPipelines>,
     filters: LayerSlot,
     morphs: LayerSlot,
+    morph_groups: BTreeMap<String, LayerPipelines>,
     rule_path: Option<PathBuf>,
     rule_ticket: u64,
     filter_targets: Option<FilterTargets>,
-    love: Option<LovePulse>,
+    love: Option<LoveMark>,
+    love_pipeline: Option<LayerPipelines>,
     signals: Signals,
     paused_at: Option<Instant>,
 }
@@ -52,6 +59,7 @@ pub(super) struct Signals {
     data: [f32; 4],
     date: [f32; 4],
     audio: [[f32; 4]; 16],
+    controls: [[f32; 4]; 8],
 }
 
 impl Default for Signals {
@@ -61,6 +69,7 @@ impl Default for Signals {
             data: [0.0; 4],
             date: [0.0; 4],
             audio: [[0.0; 4]; 16],
+            controls: [[0.0; 4]; 8],
         }
     }
 }
@@ -82,13 +91,14 @@ impl Signals {
                 self.audio[index / 4][index % 4] = *band;
             }
         }
+        if let Some(values) = &input.controls {
+            self.controls.fill([0.0; 4]);
+            for (index, value) in values.iter().enumerate() {
+                self.controls[index / 4][index % 4] = *value;
+            }
+        }
         self
     }
-}
-
-struct LovePulse {
-    pipeline: LayerPipelines,
-    position: [f32; 2],
 }
 
 struct FilterTargets {
@@ -115,7 +125,8 @@ impl Layers {
         self.wallpaper.is_some()
             || self.filters.active().is_some()
             || self.morphs.active().is_some()
-            || self.love.is_some()
+            || !self.morph_groups.is_empty()
+            || self.love.as_ref().is_some_and(|love| love.composed)
     }
 
     fn replace(&mut self, stage: LayerStage, next: Option<LayerPipelines>, rule: bool) {
@@ -176,16 +187,17 @@ impl Layers {
             targets.render(ctx, encoder, destination, filters);
         }
 
-        if self.love.as_ref().is_some_and(|pulse| {
-            now.saturating_duration_since(pulse.pipeline.start) >= LOVE_LIFETIME
-        }) {
-            self.love = None;
-        }
-        if self.morphs.active().is_none() && self.love.is_none() {
+        let love = LoveVisual::resolve(&mut self.love, now);
+        if self.morphs.active().is_none() && self.morph_groups.is_empty() && love.is_none() {
             return;
         }
         let mut pass = begin_pass(encoder, destination, wgpu::LoadOp::Load);
-        if let Some(morphs) = self.morphs.active_mut() {
+        for morphs in self
+            .morphs
+            .active_mut()
+            .into_iter()
+            .chain(self.morph_groups.values_mut())
+        {
             morphs.write_frame(
                 ctx,
                 layer_frame(size, morphs, animation_time, progress, self.signals),
@@ -201,15 +213,8 @@ impl Layers {
                 draw(&mut pass, pipeline, &morphs.morph_bindings[index]);
             }
         }
-        if let Some(pulse) = &mut self.love {
-            let mut frame = layer_frame(size, &pulse.pipeline, now, progress, self.signals);
-            frame.progress = frame.seconds / LOVE_LIFETIME.as_secs_f32();
-            frame.params = [pulse.position[0], pulse.position[1], 0.0, 1.0];
-            pulse.pipeline.write_frame(ctx, frame);
-            let binding = &pulse.pipeline.morph_bindings[0];
-            pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
-            scissor_heart(&mut pass, size, pulse.position);
-            draw(&mut pass, &pulse.pipeline.pipelines[0], binding);
+        if let (Some(love), Some(pipeline)) = (love, &mut self.love_pipeline) {
+            love.render(&mut pass, ctx, pipeline, size, now, self.signals);
         }
     }
 
@@ -218,12 +223,14 @@ impl Layers {
             .iter()
             .chain(self.filters.active())
             .chain(self.morphs.active())
+            .chain(self.morph_groups.values())
             .filter(|_| self.paused_at.is_none())
             .filter_map(LayerPipelines::frame_interval)
             .chain(
                 self.love
                     .as_ref()
-                    .and_then(|pulse| pulse.pipeline.frame_interval()),
+                    .filter(|mark| mark.composed && mark.animation.is_some())
+                    .map(|_| LOVE_FRAME_INTERVAL),
             )
             .min()
     }
@@ -291,16 +298,6 @@ fn set_rectangle(pass: &mut wgpu::RenderPass<'_>, size: [u32; 2], rect: [f32; 4]
         pass.set_viewport(x, y, right - x, bottom - y, 0.0, 1.0);
         pass.set_scissor_rect(x as u32, y as u32, (right - x) as u32, (bottom - y) as u32);
     }
-}
-
-fn scissor_heart(pass: &mut wgpu::RenderPass<'_>, size: [u32; 2], position: [f32; 2]) {
-    let radius = (size[0].min(size[1]) as f32 * 0.1).ceil();
-    let center = [position[0] * size[0] as f32, position[1] * size[1] as f32];
-    let x = (center[0] - radius).max(0.0) as u32;
-    let y = (center[1] - radius).max(0.0) as u32;
-    let width = ((center[0] + radius).ceil() as u32).min(size[0]) - x;
-    let height = ((center[1] + radius).ceil() as u32).min(size[1]) - y;
-    pass.set_scissor_rect(x, y, width, height);
 }
 
 fn layer_frame(
@@ -449,17 +446,75 @@ pub(super) fn draw(
 }
 
 impl super::Renderer {
+    pub(crate) fn has_composed_layers(&self) -> bool {
+        self.layers.requires_composition()
+    }
+
     pub(crate) fn replace_layers(
         &mut self,
         stage: LayerStage,
         next: Option<LayerPipelines>,
         rule: bool,
+        group: Option<&str>,
     ) {
         if next.is_some() {
             self.retain_native_frame_for_layers();
         }
-        self.layers.replace(stage, next, rule);
+        if let Some(group) = group {
+            if let Some(stack) = next {
+                self.layers.morph_groups.insert(group.to_owned(), stack);
+            } else {
+                self.layers.morph_groups.remove(group);
+            }
+        } else {
+            self.layers.replace(stage, next, rule);
+        }
         self.needs_redraw = true;
+    }
+
+    pub(crate) fn check_morph_budget(
+        &self,
+        next: &LayerPipelines,
+        rule: bool,
+        group: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let layers = &self.layers;
+        let manual = layers.morphs.manual.as_ref();
+        let selected = layers.morphs.selected.as_ref().and_then(Option::as_ref);
+        let (manual, selected) = match (group, rule) {
+            (None, false) => (Some(next), selected),
+            (None, true) => (manual, Some(next)),
+            (Some(_), _) => (manual, selected),
+        };
+        let base_count = [manual, selected]
+            .into_iter()
+            .flatten()
+            .map(|stack| stack.names.len())
+            .max()
+            .unwrap_or(0);
+        let base_bytes: usize = [manual, selected]
+            .into_iter()
+            .flatten()
+            .map(|stack| stack.asset_bytes)
+            .sum();
+        let (count, bytes) = layers
+            .morph_groups
+            .iter()
+            .filter(|(name, _)| Some(name.as_str()) != group)
+            .map(|(_, stack)| stack)
+            .chain(group.map(|_| next))
+            .fold((base_count, base_bytes), |(count, bytes), stack| {
+                (count + stack.names.len(), bytes + stack.asset_bytes)
+            });
+        anyhow::ensure!(
+            count <= MAX_MORPHS_PER_OUTPUT,
+            "An output supports at most {MAX_MORPHS_PER_OUTPUT} morphs across its groups"
+        );
+        anyhow::ensure!(
+            bytes <= super::layer_source::MAX_LAYER_TEXTURE_BYTES,
+            "Morph textures exceed 96 MiB on this output"
+        );
+        Ok(())
     }
 
     pub(crate) fn prepare_layer_rule(&mut self, path: Option<&Path>) -> Option<u64> {
@@ -500,14 +555,22 @@ impl super::Renderer {
 
     pub(crate) fn morph_buttons(
         &self,
+        gesture: MorphGesture,
     ) -> impl DoubleEndedIterator<Item = ([f32; 4], &str)> + Clone {
-        self.layers.morphs.active().into_iter().flat_map(|stack| {
-            stack
-                .rectangles
-                .iter()
-                .zip(&stack.actions)
-                .filter_map(|(rect, action)| Some(((*rect)?, action.as_deref()?)))
-        })
+        self.layers
+            .morphs
+            .active()
+            .into_iter()
+            .chain(self.layers.morph_groups.values())
+            .flat_map(move |stack| {
+                stack
+                    .rectangles
+                    .iter()
+                    .zip(&stack.actions)
+                    .filter_map(move |(rect, actions)| {
+                        Some(((*rect)?, actions[gesture.index()].as_deref()?))
+                    })
+            })
     }
 
     pub(crate) fn pointer_regions(&self) -> impl Iterator<Item = [f32; 4]> + Clone {
@@ -518,7 +581,9 @@ impl super::Renderer {
         ]
         .into_iter()
         .flatten()
+        .chain(self.layers.morph_groups.values())
         .flat_map(|stack| stack.pointer_regions.iter().copied())
+        .chain(self.composed_heart_bounds())
     }
 
     pub(crate) fn uses_desktop_audio(&self) -> bool {
@@ -527,6 +592,7 @@ impl super::Renderer {
             .iter()
             .chain(self.layers.filters.active())
             .chain(self.layers.morphs.active())
+            .chain(self.layers.morph_groups.values())
             .any(|stack| stack.uses_audio)
     }
 
@@ -544,22 +610,21 @@ impl super::Renderer {
             output: self.name.clone(),
             filters,
             morphs,
+            morph_groups: self
+                .layers
+                .morph_groups
+                .iter()
+                .map(|(name, stack)| MorphGroup {
+                    name: name.clone(),
+                    layers: stack.names.clone(),
+                    fps: stack.fps,
+                })
+                .collect(),
             filter_fps,
             morph_fps,
             wallpaper,
             wallpaper_fps,
         }
-    }
-
-    pub(crate) fn show_love(&mut self, position: [f32; 2]) {
-        self.retain_native_frame_for_layers();
-        let mut pipeline = self.layers.love.take().map_or_else(
-            || LayerPipelines::love(&self.ctx, self.config.format),
-            |pulse| pulse.pipeline,
-        );
-        pipeline.start = Instant::now();
-        self.layers.love = Some(LovePulse { pipeline, position });
-        self.needs_redraw = true;
     }
 
     fn retain_native_frame_for_layers(&mut self) {
@@ -610,6 +675,7 @@ impl super::Renderer {
             ]
             .into_iter()
             .flatten()
+            .chain(self.layers.morph_groups.values_mut())
             {
                 stack.start += now.saturating_duration_since(previous.max(stack.start));
             }

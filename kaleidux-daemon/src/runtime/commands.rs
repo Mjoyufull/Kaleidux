@@ -20,12 +20,16 @@ pub(crate) async fn handle_command(
 ) -> Response {
     let transition_override = command.transition_override;
     let req = match command.request {
-        Request::LayersSet(_) => {
+        Request::LayersSet(selection) => {
             let Some(layers) = command.compiled_layers else {
                 return Response::Error("Layers were not compiled".into());
             };
             return layers
-                .install(&mut ctx, command.layer_rule_ticket)
+                .install(
+                    &mut ctx,
+                    command.layer_rule_ticket,
+                    selection.group.as_deref(),
+                )
                 .map(|()| Response::Ok)
                 .unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         }
@@ -93,6 +97,9 @@ pub(crate) async fn handle_command(
     if let Request::LoveCurrent { output, multiplier } = req {
         return super::layer_commands::love_current(&mut ctx, output, multiplier)
             .unwrap_or_else(|error| Response::Error(error.to_string()));
+    }
+    if let Request::Unlove { path } = req {
+        return super::layer_commands::love(&mut ctx, path, 1.0);
     }
     let CommandContext {
         preview,
@@ -345,13 +352,10 @@ pub(crate) async fn handle_command(
         | Request::LayersQuery { .. }
         | Request::MorphWatch { .. }
         | Request::LoveCurrent { .. }
+        | Request::Unlove { .. }
         | Request::Love { .. } => {
             unreachable!("layer commands handled before dispatch")
         }
-        Request::Unlove { path } => monitor_manager
-            .unlove_file(path)
-            .map(|_| Response::Ok)
-            .unwrap_or_else(|e| Response::Error(e.to_string())),
         Request::History { output } => Response::History(monitor_manager.get_history(output)),
         Request::Reload => {
             info!("Reloading configuration...");

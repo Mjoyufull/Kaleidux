@@ -98,7 +98,7 @@ pub(super) fn prepare(path: &Path, fps: u16) -> Result<PreparedLayers> {
             fragment_only: false,
             assets: [None, None, None, None],
             rectangle: None,
-            action: None,
+            actions: Default::default(),
             track_pointer: false,
             track_audio: false,
         }],

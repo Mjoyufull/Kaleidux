@@ -271,7 +271,7 @@ fn parse(source: &str, root: &Path) -> Result<PreparedToy> {
                 fragment_only: true,
                 assets: [None, None, None, None],
                 rectangle: None,
-                action: None,
+                actions: Default::default(),
                 track_pointer: false,
                 track_audio,
             },

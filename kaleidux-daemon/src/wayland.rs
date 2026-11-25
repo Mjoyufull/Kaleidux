@@ -1,6 +1,7 @@
 pub(crate) mod color;
 pub(crate) mod frame_callbacks;
 pub(crate) mod hotplug;
+mod love_surface;
 pub(crate) mod native_dmabuf_surface;
 pub(crate) mod pointer;
 pub(crate) mod presentation;
@@ -107,6 +108,7 @@ pub struct WaylandBackend {
     transparent_surfaces: std::collections::HashSet<String>,
     seat_state: SeatState,
     pointer: pointer::DesktopPointer,
+    love_surfaces: std::collections::HashMap<String, love_surface::LoveSurface>,
     dmabuf_state: DmabufState,
     subcompositor_state: SubcompositorState,
     viewporter: SimpleGlobal<WpViewporter, 1>,
@@ -174,6 +176,7 @@ impl WaylandBackend {
             transparent_surfaces: std::collections::HashSet::new(),
             seat_state,
             pointer: pointer::DesktopPointer::default(),
+            love_surfaces: std::collections::HashMap::new(),
             dmabuf_state,
             subcompositor_state,
             viewporter,
@@ -326,6 +329,7 @@ impl WaylandBackend {
         self.preferred_fractional_scales.remove(name);
         self.logical_surface_sizes.remove(name);
         self.pointer.retire(name);
+        self.love_surfaces.remove(name);
         self.transparent_surfaces.remove(name);
         self.retire_color_surface(name);
     }
@@ -574,6 +578,9 @@ impl LayerShellHandler for WaylandBackend {
         _qh: &QueueHandle<Self>,
         layer_surface: &LayerSurface,
     ) {
+        if self.retire_closed_love_surface(layer_surface) {
+            return;
+        }
         let renderer_name = self.find_renderer_surface_name(layer_surface.wl_surface());
         let name = renderer_name
             .clone()
@@ -607,6 +614,9 @@ impl LayerShellHandler for WaylandBackend {
         config: LayerSurfaceConfigure,
         serial: u32,
     ) {
+        if self.configure_love_surface(layer_surface) {
+            return;
+        }
         let (width, height) = config.new_size;
 
         let renderer_name = self.find_renderer_surface_name(layer_surface.wl_surface());

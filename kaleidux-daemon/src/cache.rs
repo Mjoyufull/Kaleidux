@@ -329,9 +329,27 @@ impl FileCache {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn set_file_stats(&self, path: &Path, stats: &crate::queue::FileStats) -> Result<()> {
-        self.batch_set_file_stats(&[(path.to_path_buf(), stats.clone())])
+    pub(crate) fn set_love_multiplier(
+        &self,
+        path: &Path,
+        multiplier: f32,
+    ) -> Result<crate::queue::FileStats> {
+        let write_txn = self.db.begin_write()?;
+        let stats = {
+            let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
+            let key = path.as_os_str().as_encoded_bytes();
+            let mut stats = table
+                .get(key)?
+                .map(|row| postcard::from_bytes::<crate::queue::FileStats>(row.value()))
+                .transpose()?
+                .unwrap_or_default();
+            stats.love_multiplier = multiplier;
+            let encoded = postcard::to_allocvec(&stats)?;
+            table.insert(key, encoded.as_slice())?;
+            stats
+        };
+        write_txn.commit()?;
+        Ok(stats)
     }
 
     pub fn batch_set_file_stats(
@@ -346,7 +364,17 @@ impl FileCache {
             let mut table = write_txn.open_table(FILE_STATS_TABLE)?;
             for (path, stats) in updates {
                 let path_bytes = path.as_os_str().as_encoded_bytes();
-                let data = postcard::to_allocvec(stats)?;
+                let mut stats = stats.clone();
+                if let Some(old) = table.get(path_bytes)?.and_then(|row| {
+                    postcard::from_bytes::<crate::queue::FileStats>(row.value()).ok()
+                }) {
+                    stats.love_multiplier = old.love_multiplier;
+                    stats.count = stats.count.max(old.count);
+                    stats.last_seen = stats.last_seen.max(old.last_seen);
+                } else {
+                    stats.love_multiplier = 1.0;
+                }
+                let data = postcard::to_allocvec(&stats)?;
                 table.insert(path_bytes, data.as_slice())?;
             }
             usize::try_from(table.len()?).unwrap_or(usize::MAX) > STATS_PRUNE_TRIGGER
@@ -367,8 +395,14 @@ impl FileCache {
                 let mut rows = Vec::with_capacity(len);
                 for item in table.iter()? {
                     let (key, value) = item?;
-                    let last_seen = postcard::from_bytes::<crate::queue::FileStats>(value.value())
-                        .ok()
+                    let stats = postcard::from_bytes::<crate::queue::FileStats>(value.value()).ok();
+                    if stats
+                        .as_ref()
+                        .is_some_and(|stats| stats.love_multiplier > 1.0)
+                    {
+                        continue;
+                    }
+                    let last_seen = stats
                         .and_then(|stats| stats.last_seen)
                         .map_or(i64::MIN, |timestamp| timestamp.timestamp_millis());
                     rows.push((last_seen, key.value().to_vec()));
@@ -807,14 +841,14 @@ mod tests {
         let cache = test_cache("stats-bound");
         for second in 1..=3 {
             cache
-                .set_file_stats(
-                    Path::new(&format!("/media/{second}")),
-                    &crate::queue::FileStats {
+                .batch_set_file_stats(&[(
+                    PathBuf::from(format!("/media/{second}")),
+                    crate::queue::FileStats {
                         count: second,
                         last_seen: Utc.timestamp_opt(second.into(), 0).single(),
                         love_multiplier: 1.0,
                     },
-                )
+                )])
                 .expect("insert stats");
         }
         cache.prune_file_stats(2).expect("prune stats");
@@ -835,6 +869,38 @@ mod tests {
                 .get_file_stats(Path::new("/media/3"))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_playback_stats_keep_saved_favorite_after_pruning() {
+        let cache = test_cache("saved-favorite");
+        let path = PathBuf::from("/media/favorite");
+        cache.set_love_multiplier(&path, 2.0).unwrap();
+        cache
+            .batch_set_file_stats(&[(path.clone(), Default::default())])
+            .unwrap();
+        cache.prune_file_stats(0).unwrap();
+        assert_eq!(
+            cache
+                .get_file_stats(&path)
+                .unwrap()
+                .unwrap()
+                .love_multiplier,
+            2.0
+        );
+        let previous = cache.get_file_stats(&path).unwrap().unwrap();
+        cache.set_love_multiplier(&path, 1.0).unwrap();
+        cache
+            .batch_set_file_stats(&[(path.clone(), previous)])
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_file_stats(&path)
+                .unwrap()
+                .unwrap()
+                .love_multiplier,
+            1.0
         );
     }
 }

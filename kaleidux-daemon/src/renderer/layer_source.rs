@@ -1,7 +1,10 @@
 //! Reads bounded local layer sources and validates their ABI before rendering uses them.
 
 use anyhow::{Context, Result};
-use kaleidux_common::{LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE};
+use kaleidux_common::{
+    LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE, MAX_MORPHS_PER_OUTPUT, MorphGesture,
+    MorphLayout,
+};
 use std::io::Read;
 use std::path::Path;
 
@@ -27,7 +30,7 @@ pub(crate) struct PreparedLayer {
     pub(crate) fragment_only: bool,
     pub(crate) assets: [Option<image::RgbaImage>; 4],
     pub(crate) rectangle: Option<[f32; 4]>,
-    pub(super) action: Option<String>,
+    pub(super) actions: [Option<String>; 4],
     pub(super) track_pointer: bool,
     pub(super) track_audio: bool,
 }
@@ -52,15 +55,30 @@ impl PreparedLayers {
     }
 
     /// Read and validate sources on a bounded worker before sending the IPC command.
-    pub(crate) async fn load(selection: &LayerSelection) -> Result<Self> {
+    pub(crate) async fn load(
+        selection: &LayerSelection,
+        detect_screen_shader: bool,
+    ) -> Result<Self> {
         anyhow::ensure!(
             selection.stage != LayerStage::Wallpaper || selection.layers.len() <= 1,
             "Choose one shader wallpaper",
         );
+        let limit = layer_limit(selection.stage);
         anyhow::ensure!(
-            selection.layers.len() <= MAX_LAYERS_PER_STAGE,
-            "A stage supports at most {MAX_LAYERS_PER_STAGE} layers"
+            selection.layers.len() <= limit,
+            "This stage supports at most {limit} layers"
         );
+        anyhow::ensure!(
+            selection.stage == LayerStage::Morph
+                || (selection.group.is_none() && selection.layout.is_none()),
+            "Groups and automatic layouts apply to morphs"
+        );
+        if let Some(group) = &selection.group {
+            anyhow::ensure!(
+                short_identifier(group),
+                "Morph group must be a short identifier"
+            );
+        }
         if selection.layers.is_empty() {
             return Ok(Self {
                 stage: selection.stage,
@@ -75,7 +93,7 @@ impl PreparedLayers {
         let selection = selection.clone();
         crate::background::spawn_blocking_tracked_wait(
             crate::background::BackgroundWorkKind::RendererInit,
-            move || Self::read_and_validate(selection),
+            move || Self::read_and_validate(selection, detect_screen_shader),
         )
         .await
         .context("Renderer workers are shutting down")?
@@ -83,7 +101,19 @@ impl PreparedLayers {
         .context("Layer preparation did not complete")?
     }
 
-    fn read_and_validate(selection: LayerSelection) -> Result<Self> {
+    fn read_and_validate(
+        mut selection: LayerSelection,
+        detect_screen_shader: bool,
+    ) -> Result<Self> {
+        if detect_screen_shader
+            && selection.stage == LayerStage::Wallpaper
+            && let Some(path) = selection.layers.first().map(Path::new)
+            && is_fragment_file(path)
+            && super::layer_glsl::uses_screen_texture(&read_shader(path)?)
+        {
+            selection.stage = LayerStage::Filter;
+            selection.fps = 0;
+        }
         if selection.stage == LayerStage::Wallpaper
             && let Some(source) = selection.layers.first()
             && super::layer_shadertoy::is_manifest(Path::new(source))
@@ -123,7 +153,12 @@ impl PreparedLayers {
             }
         }
         let mut shaders = Vec::new();
-        for name in &selection.layers {
+        let cells = selection
+            .layout
+            .as_ref()
+            .map(|layout| layout_cells(layout, selection.layers.len()))
+            .transpose()?;
+        for (index, name) in selection.layers.iter().enumerate() {
             let path = Path::new(name);
             if selection.stage == LayerStage::Filter
                 && path.extension().is_some_and(|ext| ext == "glslp")
@@ -133,12 +168,16 @@ impl PreparedLayers {
                 }
             } else {
                 shaders.push(
-                    prepare_layer(selection.stage, name)
-                        .with_context(|| format!("Invalid layer {name:?}"))?,
+                    prepare_layer_in(
+                        selection.stage,
+                        name,
+                        cells.as_ref().map(|cells| cells[index]),
+                    )
+                    .with_context(|| format!("Invalid layer {name:?}"))?,
                 );
             }
             anyhow::ensure!(
-                shaders.len() <= MAX_LAYERS_PER_STAGE,
+                shaders.len() <= layer_limit(selection.stage),
                 "Too many shader passes"
             );
             anyhow::ensure!(
@@ -177,6 +216,14 @@ impl PreparedLayers {
 }
 
 pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLayer> {
+    prepare_layer_in(stage, spec, None)
+}
+
+fn prepare_layer_in(
+    stage: LayerStage,
+    spec: &str,
+    layout_rectangle: Option<[f32; 4]>,
+) -> Result<PreparedLayer> {
     let (name, options) = spec.split_once('|').unwrap_or((spec, ""));
     let shader_path = Path::new(name);
     let fragment_only = !["text=", "image=", "parallax="]
@@ -184,8 +231,8 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
         .any(|prefix| name.starts_with(prefix))
         && is_fragment_file(shader_path);
     let mut assets = [None, None, None, None];
-    let mut rectangle = None;
-    let mut action = None;
+    let mut rectangle = layout_rectangle;
+    let mut actions = [None, None, None, None];
     let mut track_pointer = stage == LayerStage::Morph && name == "pointer";
     let mut font = None;
     let mut colour = "#ffffff";
@@ -198,15 +245,18 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
             "pointer" => {
                 track_pointer = value.parse().context("Use pointer=true or pointer=false")?
             }
-            "action" if stage == LayerStage::Morph => {
+            "action" | "secondary" | "scroll-up" | "scroll-down" if stage == LayerStage::Morph => {
                 anyhow::ensure!(
-                    !value.is_empty()
-                        && value.len() <= 64
-                        && value.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'-' | b'_' | b'.')),
+                    short_identifier(value),
                     "Morph action must be a short identifier"
                 );
-                action = Some(value.to_owned());
+                let gesture = match key {
+                    "secondary" => MorphGesture::Secondary,
+                    "scroll-up" => MorphGesture::ScrollUp,
+                    "scroll-down" => MorphGesture::ScrollDown,
+                    _ => MorphGesture::Primary,
+                };
+                actions[gesture.index()] = Some(value.to_owned());
             }
             "font" if stage == LayerStage::Morph => font = Some(value),
             "colour" | "color" if stage == LayerStage::Morph => colour = value,
@@ -264,7 +314,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
     };
     validate_abi(stage, &source, fragment_only, assets[0].is_some())?;
     anyhow::ensure!(
-        action.is_none() || rectangle.is_some(),
+        actions.iter().all(Option::is_none) || rectangle.is_some(),
         "A morph action needs a rectangle"
     );
     Ok(PreparedLayer {
@@ -273,7 +323,7 @@ pub(crate) fn prepare_layer(stage: LayerStage, spec: &str) -> Result<PreparedLay
         fragment_only,
         assets,
         rectangle,
-        action,
+        actions,
         track_pointer,
         track_audio,
     })
@@ -293,7 +343,7 @@ pub(crate) fn prepare_bitmap_layer(
         fragment_only: false,
         assets: [Some(bitmap), None, None, None],
         rectangle,
-        action: None,
+        actions: Default::default(),
         track_pointer: false,
         track_audio: false,
     })
@@ -310,6 +360,11 @@ fn parse_rectangle(value: &str) -> Result<[f32; 4]> {
     let result: [f32; 4] = coordinates
         .try_into()
         .map_err(|_| anyhow::anyhow!("Use rect=x,y,width,height"))?;
+    validate_rectangle(result)?;
+    Ok(result)
+}
+
+fn validate_rectangle(result: [f32; 4]) -> Result<()> {
     let [x, y, w, h] = result;
     anyhow::ensure!(
         result
@@ -321,7 +376,58 @@ fn parse_rectangle(value: &str) -> Result<[f32; 4]> {
             && y + h <= 1.0,
         "Morph rectangle must fit inside the normalized output"
     );
-    Ok(result)
+    Ok(())
+}
+
+fn layer_limit(stage: LayerStage) -> usize {
+    if stage == LayerStage::Morph {
+        MAX_MORPHS_PER_OUTPUT
+    } else {
+        MAX_LAYERS_PER_STAGE
+    }
+}
+
+fn short_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn layout_cells(layout: &MorphLayout, count: usize) -> Result<Vec<[f32; 4]>> {
+    validate_rectangle(layout.bounds)?;
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&layout.gap),
+        "Morph layout gap must be in 0..=1"
+    );
+    anyhow::ensure!(
+        layout.columns <= MAX_MORPHS_PER_OUTPUT,
+        "Too many layout columns"
+    );
+    let columns = if layout.columns == 0 {
+        count
+    } else {
+        layout.columns.min(count)
+    };
+    let rows = count.div_ceil(columns);
+    let [x, y, width, height] = layout.bounds;
+    let cell_width = (width - layout.gap * (columns - 1) as f32) / columns as f32;
+    let cell_height = (height - layout.gap * (rows - 1) as f32) / rows as f32;
+    anyhow::ensure!(
+        cell_width > 0.0 && cell_height > 0.0,
+        "Morph layout gap leaves no room for its layers"
+    );
+    Ok((0..count)
+        .map(|index| {
+            [
+                x + (index % columns) as f32 * (cell_width + layout.gap),
+                y + (index / columns) as f32 * (cell_height + layout.gap),
+                cell_width,
+                cell_height,
+            ]
+        })
+        .collect())
 }
 
 pub(super) fn assemble(stage: LayerStage, body: &str) -> String {
@@ -382,6 +488,22 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
         (LayerStage::Filter, "pan") => return Ok(include_str!("../shaders/layers/pan.wgsl").into()),
         (LayerStage::Morph, "spectrum") => {
             return Ok(include_str!("../shaders/layers/spectrum.wgsl").into());
+        }
+        (LayerStage::Morph, "pulse") => {
+            return Ok(include_str!("../shaders/layers/pulse.wgsl").into());
+        }
+        (LayerStage::Morph, "audio-orbit") => {
+            return Ok(include_str!("../shaders/layers/audio_orbit.wgsl").into());
+        }
+        (LayerStage::Morph, "rain") => {
+            return Ok(include_str!("../shaders/layers/rain.wgsl").into());
+        }
+        (LayerStage::Morph, "snow") => {
+            return Ok(include_str!("../shaders/layers/snow.wgsl").into());
+        }
+        (LayerStage::Morph, "fog") => return Ok(include_str!("../shaders/layers/fog.wgsl").into()),
+        (LayerStage::Morph, "lightning") => {
+            return Ok(include_str!("../shaders/layers/lightning.wgsl").into());
         }
         (LayerStage::Morph, "heart") => return Ok(HEART.into()),
         (LayerStage::Morph, "pointer") => {

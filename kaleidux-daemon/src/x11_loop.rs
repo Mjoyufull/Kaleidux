@@ -434,6 +434,7 @@ pub async fn run(
         ctx.process_scheduled(loop_start);
         ctx.drain_commands(cmd_buf, loop_start).await;
         ctx.sync_layer_rules();
+        ctx.sync_love_buttons(true, loop_start);
         ctx.sync_desktop_audio();
         let input_changed =
             backend

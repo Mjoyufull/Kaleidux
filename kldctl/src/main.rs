@@ -69,6 +69,18 @@ enum Commands {
     /// Replace this output's ordered wallpaper overlays (no arguments clears)
     Morph {
         layers: Vec<String>,
+        /// Update or clear this morph group independently
+        #[arg(long)]
+        group: Option<String>,
+        /// Arrange layers in a row, column, or grid:COLUMNS
+        #[arg(long, value_parser = layers::layout_columns)]
+        layout: Option<usize>,
+        /// Output-relative layout bounds: x,y,width,height
+        #[arg(long, requires = "layout", value_parser = layers::layout_bounds)]
+        bounds: Option<[f32; 4]>,
+        /// Output-relative spacing between cells
+        #[arg(long, requires = "layout")]
+        gap: Option<f32>,
         /// Idle animation rate; zero leaves the overlays static
         #[arg(long, default_value_t = 0, value_parser = layers::parse_layer_fps)]
         fps: u16,
@@ -306,7 +318,17 @@ enum InhibitorSubcommand {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Handle local commands first (don't need daemon connection)
@@ -349,7 +371,23 @@ async fn main() -> anyhow::Result<()> {
             layers,
             fps,
             output,
-        } => layer_request(kaleidux_common::LayerStage::Morph, layers, fps, output)?,
+            group,
+            layout,
+            bounds,
+            gap,
+        } => {
+            let mut request =
+                layer_request(kaleidux_common::LayerStage::Morph, layers, fps, output)?;
+            if let Request::LayersSet(selection) = &mut request {
+                selection.group = group;
+                selection.layout = layout.map(|columns| kaleidux_common::MorphLayout {
+                    columns,
+                    bounds: bounds.unwrap_or([0.04, 0.04, 0.92, 0.2]),
+                    gap: gap.unwrap_or(0.01),
+                });
+            }
+            request
+        }
         Commands::ShaderWallpaper { path, fps, output } => layers::layer_request(
             kaleidux_common::LayerStage::Wallpaper,
             path.into_iter().collect(),

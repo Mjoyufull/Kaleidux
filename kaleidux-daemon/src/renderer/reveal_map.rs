@@ -151,7 +151,7 @@ impl Renderer {
         self.reveal_bind_group = Some(self.upload_reveal_map(map));
     }
 
-    fn upload_reveal_map(&self, map: &RevealMap) -> Arc<wgpu::BindGroup> {
+    pub(super) fn upload_reveal_map(&self, map: &RevealMap) -> Arc<wgpu::BindGroup> {
         let ctx = &self.ctx;
         let context = Arc::downgrade(ctx);
         let mut cache = map.cached_binding.lock();

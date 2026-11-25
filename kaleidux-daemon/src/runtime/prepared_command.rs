@@ -59,6 +59,7 @@ pub(crate) async fn prepare_command(request: Request) -> anyhow::Result<Prepared
     } else {
         request
     };
+    let detect_screen_shader = matches!(&request, Request::Set { .. });
     let request = match request {
         Request::Set { path, output }
             if !path.contains("://")
@@ -70,6 +71,8 @@ pub(crate) async fn prepare_command(request: Request) -> anyhow::Result<Prepared
                 stage: kaleidux_common::LayerStage::Wallpaper,
                 layers: vec![path],
                 fps: kaleidux_common::LAYER_FPS_UNLIMITED,
+                group: None,
+                layout: None,
             })
         }
         request => request,
@@ -94,7 +97,8 @@ pub(crate) async fn prepare_command(request: Request) -> anyhow::Result<Prepared
         command.transition_override = Some(job.await??);
     }
     if let Request::LayersSet(selection) = &command.request {
-        command.prepared_layers = Some(crate::renderer::PreparedLayers::load(selection).await?);
+        command.prepared_layers =
+            Some(crate::renderer::PreparedLayers::load(selection, detect_screen_shader).await?);
     }
     Ok(command)
 }

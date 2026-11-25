@@ -14,6 +14,7 @@ layout(set = 0, binding = 0, std140) uniform KldFrame {
     vec4 data;
     vec4 date;
     vec4 audio[16];
+    vec4 controls[8];
 } kld_frame;
 layout(location = 0) in vec2 kld_uv;
 #define iResolution vec3(kld_frame.size, 1.0)
@@ -27,6 +28,7 @@ layout(location = 0) in vec2 kld_uv;
 #define kldPointer kld_frame.pointer
 #define kldData kld_frame.data
 float kldAudio(int index) { int n = clamp(index, 0, 63); return kld_frame.audio[n / 4][n % 4]; }
+float kldControl(int index) { int n = clamp(index, 0, 31); return kld_frame.controls[n / 4][n % 4]; }
 #define u_resolution kld_frame.size
 #define u_time kld_frame.seconds
 #define v_uv kld_uv
@@ -69,6 +71,17 @@ const RETRO_FRAGMENT: &str = r#"
 layout(location = 0) out vec4 kld_retro_colour;
 "#;
 
+static SCREEN_UNIFORMS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[\t ]*uniform\s+(sampler2D\s+tex|float\s+time|vec2\s+full_size)\s*;")
+        .expect("fixed screen shader uniform pattern")
+});
+
+pub(super) fn uses_screen_texture(source: &str) -> bool {
+    SCREEN_UNIFORMS
+        .captures_iter(source)
+        .any(|value| value[1].starts_with("sampler2D"))
+}
+
 pub(super) fn translate(stage: LayerStage, source: &str) -> Result<String> {
     translate_fragment(stage, source, None)
 }
@@ -82,6 +95,31 @@ fn translate_fragment(
     source: &str,
     shadertoy_buffer: Option<bool>,
 ) -> Result<String> {
+    let mut screen = String::new();
+    let screen_shader = shadertoy_buffer.is_none() && uses_screen_texture(source);
+    let original = if screen_shader {
+        for uniform in SCREEN_UNIFORMS.captures_iter(source) {
+            if let Some(name) = uniform[1].split_whitespace().last() {
+                let alias = match name {
+                    "tex" => "#define tex iChannel0\n",
+                    "time" => "#define time kld_frame.seconds\n",
+                    "full_size" => "#define full_size kld_frame.size\n",
+                    _ => "",
+                };
+                if !screen.contains(alias) {
+                    screen.push_str(alias);
+                }
+            }
+        }
+        SCREEN_UNIFORMS.replace_all(source, |matches: &regex::Captures<'_>| {
+            matches[0]
+                .chars()
+                .map(|character| if character == '\n' { '\n' } else { ' ' })
+                .collect::<String>()
+        })
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    };
     // Preserve source line numbers when dropping declarations supplied by this ABI.
     static DECLARATIONS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
@@ -101,7 +139,7 @@ fn translate_fragment(
         regex::Regex::new(r"(?m)^[\t ]*uniform\s+\w+\s+(?:Texture|TextureSize|InputSize|OutputSize|FrameCount|FrameDirection)\s*;")
             .expect("fixed Libretro uniform declaration")
     });
-    let body = DECLARATIONS.replace_all(source, |captures: &regex::Captures<'_>| {
+    let body = DECLARATIONS.replace_all(&original, |captures: &regex::Captures<'_>| {
         captures[0]
             .chars()
             .map(|ch| if ch == '\n' { '\n' } else { ' ' })
@@ -165,7 +203,7 @@ void main() {{
         String::new()
     };
     let full = format!(
-        "#version 450\n{GLSL_FRAME}\n{GLSL_SAMPLE}\n{sample}\n{retro_prelude}\n{body}\n{entry}"
+        "#version 450\n{GLSL_FRAME}\n{GLSL_SAMPLE}\n{sample}\n{retro_prelude}\n{screen}\n{body}\n{entry}"
     );
     let module = naga::front::glsl::Frontend::default()
         .parse(

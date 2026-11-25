@@ -17,6 +17,14 @@ pub(crate) struct LayerRule {
     fps: u16,
 }
 
+pub(crate) fn requires_composition(rules: &[LayerRule], path: &Path) -> bool {
+    [LayerStage::Filter, LayerStage::Morph]
+        .into_iter()
+        .any(|stage| {
+            find_rule_stack(rules, path, stage).is_some_and(|(_, layers)| !layers.is_empty())
+        })
+}
+
 impl MainLoopContext {
     pub(crate) fn sync_layer_rules(&mut self) {
         let rules = self.monitor_manager.layer_rules();
@@ -44,6 +52,8 @@ impl MainLoopContext {
                 stage: LayerStage::Wallpaper,
                 layers: vec![path.to_string_lossy().into_owned()],
                 fps: kaleidux_common::LAYER_FPS_UNLIMITED,
+                group: None,
+                layout: None,
             });
             let matched = [LayerStage::Filter, LayerStage::Morph]
                 .into_iter()
@@ -80,6 +90,21 @@ fn find_rule(
     output: &str,
     stage: LayerStage,
 ) -> Option<LayerSelection> {
+    find_rule_stack(rules, source, stage).map(|(rule, layers)| LayerSelection {
+        output: Some(output.to_owned()),
+        stage,
+        layers: layers.clone(),
+        fps: rule.fps,
+        group: None,
+        layout: None,
+    })
+}
+
+fn find_rule_stack<'a>(
+    rules: &'a [LayerRule],
+    source: &Path,
+    stage: LayerStage,
+) -> Option<(&'a LayerRule, &'a Vec<String>)> {
     rules
         .iter()
         .filter(|rule| source.starts_with(&rule.path))
@@ -92,10 +117,4 @@ fn find_rule(
             Some((rule, names))
         })
         .max_by_key(|(rule, _)| rule.path.components().count())
-        .map(|(rule, layers)| LayerSelection {
-            output: Some(output.to_owned()),
-            stage,
-            layers: layers.clone(),
-            fps: rule.fps,
-        })
 }

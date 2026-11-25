@@ -15,7 +15,7 @@ use x11rb::{
 pub(crate) struct DesktopPointer {
     supported: bool,
     regions: HashMap<Window, Vec<[i32; 4]>>,
-    pressed: Option<(Window, [f32; 2])>,
+    pressed: [Option<(Window, [f32; 2])>; 2],
 }
 
 impl DesktopPointer {
@@ -28,7 +28,7 @@ impl DesktopPointer {
         Self {
             supported,
             regions: HashMap::new(),
-            pressed: None,
+            pressed: Default::default(),
         }
     }
 
@@ -57,8 +57,10 @@ impl DesktopPointer {
 
     pub(super) fn retire(&mut self, window: Window) {
         self.regions.remove(&window);
-        if self.pressed.is_some_and(|(origin, _)| origin == window) {
-            self.pressed = None;
+        for pressed in &mut self.pressed {
+            if pressed.is_some_and(|(origin, _)| origin == window) {
+                *pressed = None;
+            }
         }
     }
 
@@ -127,7 +129,7 @@ impl DesktopPointer {
                 (event.event, event.event_x, event.event_y, event.state, None)
             }
             Event::LeaveNotify(event) if event.mode == NotifyMode::NORMAL => {
-                self.pressed = None;
+                self.pressed = Default::default();
                 (
                     event.event,
                     event.event_x,
@@ -168,13 +170,28 @@ impl DesktopPointer {
             ],
         );
         match button {
-            Some((1, true)) => self.pressed = Some((window, [x, y])),
-            Some((1, false)) => {
-                if let Some((origin, pressed)) = self.pressed.take()
+            Some((key @ (1 | 3), true)) => {
+                self.pressed[usize::from(key == 3)] = Some((window, [x, y]))
+            }
+            Some((key @ (1 | 3), false)) => {
+                if let Some((origin, pressed)) = self.pressed[usize::from(key == 3)].take()
                     && origin == window
                 {
-                    morph_input::activate(ctx, output.clone(), pressed, [x, y]);
+                    let gesture = if key == 1 {
+                        kaleidux_common::MorphGesture::Primary
+                    } else {
+                        kaleidux_common::MorphGesture::Secondary
+                    };
+                    morph_input::activate(ctx, output.clone(), pressed, [x, y], gesture);
                 }
+            }
+            Some((key @ (4 | 5), true)) => {
+                let gesture = if key == 4 {
+                    kaleidux_common::MorphGesture::ScrollUp
+                } else {
+                    kaleidux_common::MorphGesture::ScrollDown
+                };
+                morph_input::activate(ctx, output.clone(), [x, y], [x, y], gesture);
             }
             _ => {}
         }

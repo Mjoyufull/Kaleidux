@@ -27,6 +27,10 @@ impl super::Renderer {
         encoder: &mut wgpu::CommandEncoder,
         frame_time: std::time::Instant,
     ) -> bool {
+        let duration = self
+            .loop_playback
+            .as_ref()
+            .map_or(self.transition_duration, |(_, duration)| *duration);
         // Update transition progress BEFORE checking if we should render transition
         // This ensures progress is accurate for the current frame
         // For image transitions: always advance progress once started (textures are always available)
@@ -35,15 +39,11 @@ impl super::Renderer {
             // Advance transition normally using frame_time for synchronization
             if let Some(start) = self.transition_start_time {
                 let elapsed = frame_time.saturating_duration_since(start).as_secs_f32();
-                let new_progress = (elapsed / self.transition_duration).min(1.0);
+                let new_progress = (elapsed / duration).min(1.0);
                 if new_progress != self.transition_progress && trace_transition_events_enabled() {
                     trace!(
                         "[TRANSITION] {}: Progress updated {:.3} -> {:.3} (elapsed={:.3}s, duration={:.3}s)",
-                        self.name,
-                        self.transition_progress,
-                        new_progress,
-                        elapsed,
-                        self.transition_duration
+                        self.name, self.transition_progress, new_progress, elapsed, duration
                     );
                 }
                 self.transition_progress = new_progress;
@@ -60,8 +60,10 @@ impl super::Renderer {
                         self.transition_active = false;
                         self.clear_transition_asset();
                         self.release_prev_texture("transition completed");
-                        self.transition_just_completed = true;
-                        self.arm_display_timer_on_present();
+                        if self.loop_playback.take().is_none() {
+                            self.transition_just_completed = true;
+                            self.arm_display_timer_on_present();
+                        }
 
                         // Log Audit Report and record metrics
                         if let Some(stats) = self.transition_stats.take() {
@@ -113,13 +115,17 @@ impl super::Renderer {
                 self.transition_stats = Some(TransitionStats {
                     start_time: start,
                     frame_count: 0,
-                    target_duration: self.transition_duration,
-                    batch_id: self.active_batch_id,
+                    target_duration: duration,
+                    batch_id: self
+                        .loop_playback
+                        .is_none()
+                        .then_some(self.active_batch_id)
+                        .flatten(),
                 });
 
                 info!(
                     "[TRANSITION] {}: Starting transition (duration={:.3}s, initial_progress={:.3})",
-                    self.name, self.transition_duration, self.transition_progress
+                    self.name, duration, self.transition_progress
                 );
             }
         }
@@ -148,18 +154,22 @@ impl super::Renderer {
         // These were causing 5-10% CPU overhead when called every frame
 
         if should_render_transition {
+            let transition = self
+                .loop_playback
+                .as_ref()
+                .map_or(&self.active_transition, |(transition, _)| transition);
             // 1. Get/Create pipeline (this will cache it if needed)
             let standard_pipeline = if self.reveal_bind_group.is_none() {
                 let pipeline = if let Some(shader) = &self.prepared_transition_shader {
                     Some(self.get_prepared_transition_pipeline(shader))
                 } else {
-                    self.get_transition_pipeline(&self.active_transition)
+                    self.get_transition_pipeline(transition)
                 };
                 if pipeline.is_none() {
                     warn!(
                         "[TRANSITION] {}: Failed to get/create transition pipeline for {}",
                         self.name,
-                        self.active_transition.name()
+                        transition.name()
                     );
                     return false;
                 }
@@ -169,7 +179,7 @@ impl super::Renderer {
             };
 
             // 2. Now we can do immutable borrows
-            let raw_params = self.active_transition.to_params();
+            let raw_params = transition.to_params();
             let uniforms = TransitionUniforms {
                 progress: self.transition_progress,
                 screen_aspect: self.content_size().0 as f32 / self.content_size().1 as f32,

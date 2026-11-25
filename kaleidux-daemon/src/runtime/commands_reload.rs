@@ -38,6 +38,12 @@ pub(super) fn apply(config: Config, ctx: CommandContext<'_>) {
                     return old.tile != output_config.tile;
                 }
                 old.video_fps != output_config.video_fps
+                    || (output_config.smooth_loop.is_some()
+                        && old.smooth_loop.is_none()
+                        && ctx
+                            .video_players
+                            .get(name)
+                            .is_some_and(crate::video::VideoPlayer::renders_natively))
                     || ((old.gif_speed != output_config.gif_speed
                         || old.gif_loop != output_config.gif_loop)
                         && path.is_some_and(|path| crate::video::is_gif_path(path)))

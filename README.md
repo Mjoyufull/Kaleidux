@@ -275,6 +275,9 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) and [PROJECT_STANDARDS.md](./PROJECT_ST
 - [Penguin Engine](https://github.com/ArjixWasTaken/penguin-engine)
 - [Libretro](https://docs.libretro.com/development/shader/glsl-shaders/)
 - [librashader](https://github.com/SnowflakePowered/librashader)
+- [Quickshell](https://quickshell.org/)
+- [Eww](https://github.com/elkowar/eww)
+- [KarmaViz](https://github.com/karmatripping/KarmaViz)
 
 ## License
 

@@ -88,10 +88,16 @@ impl SmartQueue {
         Ok(())
     }
 
-    pub fn love_file(&mut self, path: PathBuf, multiplier: f32) -> Result<()> {
-        let stat = self.stats.files.get_or_insert_mut(path, FileStats::default);
+    pub(crate) fn update_love_multiplier(&mut self, path: &Path, original: &FileStats) {
+        let stat = self
+            .stats
+            .files
+            .get_or_insert_mut(path.to_path_buf(), || original.clone());
+        let multiplier = original.love_multiplier;
         stat.love_multiplier = multiplier;
-        self.save_stats()
+        if let Some(pending) = self.pending_stats_updates.get_mut(path) {
+            pending.love_multiplier = multiplier;
+        }
     }
 
     pub fn set_playlist(&mut self, name: Option<String>) -> Result<()> {

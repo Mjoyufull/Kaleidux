@@ -1,7 +1,7 @@
 //! Sends platform pointer input to the shared morph and shader state.
 
 use crate::main_loop::MainLoopContext;
-use kaleidux_common::{LayerInputs, MorphEvent};
+use kaleidux_common::{LayerInputs, MorphEvent, MorphGesture};
 
 pub(crate) fn position(ctx: &mut MainLoopContext, output: &str, pointer: [f32; 4]) {
     if ctx.powered_off_outputs.contains(output) {
@@ -24,6 +24,7 @@ pub(crate) fn activate(
     output: String,
     pressed: [f32; 2],
     released: [f32; 2],
+    gesture: MorphGesture,
 ) {
     if ctx.powered_off_outputs.contains(&output) {
         return;
@@ -31,16 +32,32 @@ pub(crate) fn activate(
     let Some(renderer) = ctx.renderers.get(&output) else {
         return;
     };
-    if let Some((action, position)) = renderer.morph_buttons().rev().find_map(|(bounds, action)| {
-        local_position(bounds, pressed)?;
-        let position = local_position(bounds, released)?;
-        Some((action, position))
-    }) {
+    if gesture == MorphGesture::Primary
+        && let Some(bounds) = renderer.composed_heart_bounds()
+        && local_position(bounds, pressed).is_some()
+        && local_position(bounds, released).is_some()
+    {
+        if let Err(error) = super::love_button::toggle(ctx, &output) {
+            tracing::warn!("Love button failed: {error:#}");
+        }
+        return;
+    }
+    if let Some((action, position)) =
+        renderer
+            .morph_buttons(gesture)
+            .rev()
+            .find_map(|(bounds, action)| {
+                local_position(bounds, pressed)?;
+                let position = local_position(bounds, released)?;
+                Some((action, position))
+            })
+    {
         ctx.script_manager.morph_action(action, &output, position);
         if ctx.morph_events.receiver_count() != 0 {
             let _ = ctx.morph_events.send(MorphEvent {
                 output,
                 action: action.to_owned(),
+                gesture,
                 position,
             });
         }
