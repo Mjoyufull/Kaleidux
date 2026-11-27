@@ -45,19 +45,31 @@ def live_condition(url):
     return WMO[code]
 
 
+def frame_rate(value):
+    if value.casefold() == "unlimited":
+        return 65535
+    try:
+        rate = int(value)
+    except ValueError:
+        rate = -1
+    if not 0 <= rate <= 65535:
+        raise argparse.ArgumentTypeError("Use 0, a frame rate up to 65535, or unlimited")
+    return rate
+
+
 def apply_condition(kldctl, output, fps, profiles, condition):
     layers = profiles.get(condition.strip().casefold())
     if not isinstance(layers, list) or not all(isinstance(layer, str) for layer in layers):
         raise ValueError(f"No valid layer array for {condition!r}")
     outputs = json.loads(subprocess.check_output([kldctl, "layers", *output], timeout=9))
-    expected = (layers, 65535 if fps == "unlimited" else int(fps)) if layers else ([], 0)
+    expected = (layers, fps) if layers else ([], 0)
     if outputs and all(
         next(((group["layers"], group["fps"]) for group in target.get("morph_groups", [])
               if group["name"] == "weather"), ([], 0)) == expected
         for target in outputs
     ):
         return
-    subprocess.run([kldctl, "morph", "--group", "weather", "--fps", fps,
+    subprocess.run([kldctl, "morph", "--group", "weather", "--fps", str(fps),
                     *output, "--", *layers], check=True, timeout=9)
 
 
@@ -71,7 +83,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Apply one live update")
     parser.add_argument("--mapping", type=Path, help="TOML [conditions] table")
     parser.add_argument("--output", "-o")
-    parser.add_argument("--fps", default="30")
+    parser.add_argument("--fps", type=frame_rate, default=30)
     args = parser.parse_args()
     conditions = CONDITIONS
     if args.mapping:
