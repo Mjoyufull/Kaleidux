@@ -2,11 +2,13 @@
 
 use super::prepared_command::PreparedCommand;
 use crate::background::{BackgroundWorkKind, spawn_blocking_tracked_wait};
+use crate::content::sessions::PendingVideoSwitch;
 use crate::main_loop::{CmdMsg, CommandContext, CommandSender, MainLoopContext};
 use crate::monitor_manager::MonitorManager;
 use crate::renderer::PreparedLayers;
 use crate::renderer::layer_pipeline::LayerPipelines;
 use crate::renderer::{Renderer, WgpuContext};
+use crate::video::VideoPlayer;
 use kaleidux_common::{LayerInputs, LayerStage, Request, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,7 +61,11 @@ impl CompiledLayers {
                 target.name
             );
             anyhow::ensure!(
-                pipeline.is_none() || !is_overlay_target(ctx, &target.name),
+                pipeline.is_none()
+                    || !is_overlay_target(
+                        ctx.pending_video_switches.get(&target.name),
+                        ctx.video_players.get(&target.name)
+                    ),
                 "Layers require composed playback; disable the libmpv GL overlay"
             );
             if self.stage == LayerStage::Morph
@@ -233,10 +239,10 @@ impl MainLoopContext {
         let names = targets(&self.monitor_manager, &self.renderers, requested)?;
         anyhow::ensure!(
             prepared.is_empty()
-                || names.iter().all(|name| !self
-                    .video_players
-                    .get(name)
-                    .is_some_and(crate::video::VideoPlayer::renders_natively)),
+                || names.iter().all(|name| !is_overlay_target(
+                    self.pending_video_switches.get(name),
+                    self.video_players.get(name)
+                )),
             "Layers require composed playback; disable the libmpv GL overlay"
         );
         let targets = names
@@ -372,16 +378,9 @@ fn targets(
     Ok(names)
 }
 
-fn is_overlay_target(ctx: &CommandContext<'_>, name: &str) -> bool {
-    ctx.video_players
-        .get(name)
-        .is_some_and(crate::video::VideoPlayer::renders_natively)
-        || (ctx.pending_video_switches.contains_key(name)
-            && ctx
-                .mpv_native_targets
-                .is_some_and(|targets| targets.contains_key(name))
-            && ctx
-                .monitor_manager
-                .get_output_config(name)
-                .is_none_or(|config| config.smooth_loop.is_none()))
+fn is_overlay_target(pending: Option<&PendingVideoSwitch>, player: Option<&VideoPlayer>) -> bool {
+    pending.map_or_else(
+        || player.is_some_and(VideoPlayer::renders_natively),
+        |pending| pending.has_mpv_overlay_target,
+    )
 }

@@ -73,6 +73,8 @@ pub struct LayerInputs {
     pub output: Option<String>,
     /// Normalized x/y from the top left, followed by primary/secondary button state.
     pub pointer: Option<[f32; 4]>,
+    /// False when the cursor leaves. Supplying coordinates alone marks it active.
+    pub pointer_active: Option<bool>,
     /// Up to 64 normalized spectrum bands, from low to high frequency.
     pub audio: Option<Vec<f32>>,
     pub data: Option<[f32; 4]>,

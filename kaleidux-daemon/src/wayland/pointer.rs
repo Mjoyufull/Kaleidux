@@ -21,7 +21,8 @@ type Region = [i32; 4];
 pub(super) struct DesktopPointer {
     seats: HashMap<WlSeat, SeatPointer>,
     regions: HashMap<String, Vec<Region>>,
-    positions: HashMap<String, [f32; 4]>,
+    positions: HashMap<String, ([f32; 4], bool)>,
+    edges: Vec<(String, [f32; 4])>,
     activations: Vec<Activation>,
     love_activations: Vec<String>,
 }
@@ -44,6 +45,7 @@ impl DesktopPointer {
     pub(super) fn retire(&mut self, name: &str) {
         self.regions.remove(name);
         self.positions.remove(name);
+        self.edges.retain(|(output, _)| output != name);
         self.activations
             .retain(|activation| activation.output != name);
         self.love_activations.retain(|output| output != name);
@@ -105,8 +107,11 @@ impl WaylandBackend {
                 tracing::warn!("Love button failed: {error:#}");
             }
         }
-        for (name, position) in self.pointer.positions.drain() {
-            morph_input::position(ctx, &name, position);
+        for (output, edge) in self.pointer.edges.drain(..) {
+            morph_input::position(ctx, &output, edge, true);
+        }
+        for (name, (position, active)) in self.pointer.positions.drain() {
+            morph_input::position(ctx, &name, position, active);
         }
         for activation in self.pointer.activations.drain(..) {
             morph_input::activate(
@@ -227,6 +232,7 @@ impl PointerHandler for WaylandBackend {
             else {
                 continue;
             };
+            let was_pressed = seat.buttons;
             match event.kind {
                 PointerEventKind::Press { button, .. }
                     if matches!(button, BTN_LEFT | BTN_RIGHT) =>
@@ -285,15 +291,17 @@ impl PointerHandler for WaylandBackend {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {}
                 _ => continue,
             }
-            self.pointer.positions.insert(
-                output,
-                [
-                    position[0].clamp(0.0, 1.0),
-                    position[1].clamp(0.0, 1.0),
-                    f32::from(u8::from(seat.buttons[0])),
-                    f32::from(u8::from(seat.buttons[1])),
-                ],
-            );
+            let pointer = [
+                position[0].clamp(0.0, 1.0),
+                position[1].clamp(0.0, 1.0),
+                f32::from(u8::from(seat.buttons[0])),
+                f32::from(u8::from(seat.buttons[1])),
+            ];
+            if was_pressed != seat.buttons && self.pointer.edges.len() < 64 {
+                self.pointer.edges.push((output.clone(), pointer));
+            }
+            let active = !matches!(event.kind, PointerEventKind::Leave { .. });
+            self.pointer.positions.insert(output, (pointer, active));
         }
     }
 }

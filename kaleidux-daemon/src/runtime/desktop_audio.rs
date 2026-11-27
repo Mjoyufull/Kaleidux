@@ -9,6 +9,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread::{self, Thread};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 const BANDS: usize = 64;
@@ -16,7 +18,12 @@ const BANDS: usize = 64;
 #[derive(Default)]
 pub(crate) struct DesktopAudio {
     source: Option<String>,
-    stop: Option<Arc<AtomicBool>>,
+    worker: Option<DesktopCapture>,
+}
+
+struct DesktopCapture {
+    stop: Arc<AtomicBool>,
+    thread: Thread,
 }
 
 impl DesktopAudio {
@@ -26,30 +33,48 @@ impl DesktopAudio {
         }
         self.stop();
         let Some(source) = source else { return };
-        self.source = Some(source.to_owned());
         let stop = Arc::new(AtomicBool::new(false));
-        self.stop = Some(stop.clone());
-        let source = source.to_owned();
+        let worker_stop = stop.clone();
+        let device = source.to_owned();
         let commands = commands.clone();
-        if let Err(error) = std::thread::Builder::new()
+        match thread::Builder::new()
             .name("kld-spectrum".into())
             .spawn(move || {
-                if let Err(error) = capture(&source, &commands, &stop)
-                    && !stop.load(Ordering::Relaxed)
-                {
-                    tracing::warn!("Desktop audio capture stopped: {error:#}");
-                }
-            })
-        {
-            tracing::warn!("Could not start desktop audio capture: {error}");
+                retry_capture(&worker_stop, || {
+                    if commands.is_closed() {
+                        return Ok(());
+                    }
+                    capture(&device, &commands, &worker_stop)
+                });
+            }) {
+            Ok(handle) => {
+                self.source = Some(source.to_owned());
+                self.worker = Some(DesktopCapture {
+                    stop,
+                    thread: handle.thread().clone(),
+                });
+            }
+            Err(error) => tracing::warn!("Could not start desktop audio capture: {error}"),
         }
     }
 
     pub(crate) fn stop(&mut self) {
         self.source = None;
-        if let Some(stop) = self.stop.take() {
-            stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.stop.store(true, Ordering::Release);
+            worker.thread.unpark();
         }
+    }
+}
+
+fn retry_capture(stop: &AtomicBool, mut capture: impl FnMut() -> Result<()>) {
+    while !stop.load(Ordering::Acquire) {
+        let Err(error) = capture() else { break };
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        tracing::warn!("Desktop audio capture stopped: {error:#}");
+        thread::park_timeout(Duration::from_secs(2));
     }
 }
 
@@ -103,12 +128,17 @@ fn capture(source: &str, commands: &CommandSender, stop: &AtomicBool) -> Result<
 fn collect_spectrum(bus: &gst::Bus, commands: &CommandSender, stop: &AtomicBool) -> Result<()> {
     let mut last = None;
     let mut reply: Option<oneshot::Receiver<Response>> = None;
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Acquire) {
         let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else {
             continue;
         };
-        if let gst::MessageView::Error(error) = message.view() {
-            return Err(error.error().into());
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match message.view() {
+            gst::MessageView::Error(error) => return Err(error.error().into()),
+            gst::MessageView::Eos(_) => anyhow::bail!("Desktop audio source closed"),
+            _ => {}
         }
         let Some(structure) = message
             .structure()
@@ -147,4 +177,27 @@ fn collect_spectrum(bus: &gst::Bus, commands: &CommandSender, stop: &AtomicBool)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_retries_after_a_device_error() {
+        let (attempts, received) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut attempt = 0;
+            retry_capture(&AtomicBool::new(false), || {
+                attempt += 1;
+                let _ = attempts.send(attempt);
+                anyhow::ensure!(attempt != 1, "test device disconnected");
+                Ok(())
+            });
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        worker.thread().unpark();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        worker.join().unwrap();
+    }
 }

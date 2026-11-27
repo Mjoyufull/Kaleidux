@@ -101,6 +101,7 @@ pub(super) fn prepare(path: &Path, fps: u16) -> Result<PreparedLayers> {
             actions: Default::default(),
             track_pointer: false,
             track_audio: false,
+            track_cursor: false,
         }],
         feedback: None,
         retro: Some(PreparedPreset {

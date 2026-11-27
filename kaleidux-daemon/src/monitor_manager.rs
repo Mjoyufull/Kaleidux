@@ -93,6 +93,23 @@ impl MonitorManager {
         }
     }
 
+    pub(crate) fn native_decode_group(&self, output: &str, batch: u64) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut group = DefaultHasher::new();
+        (batch, self.excerpt_request(output).1).hash(&mut group);
+        let behavior = &self.config.global.monitor_behavior;
+        if *behavior == MonitorBehavior::Synchronized {
+            0_u8.hash(&mut group);
+        } else if matches!(behavior, MonitorBehavior::Grouped(_))
+            && let Some(id) = self.output_groups.get(output)
+        {
+            (1_u8, id).hash(&mut group);
+        } else {
+            (2_u8, output).hash(&mut group);
+        }
+        group.finish()
+    }
+
     pub fn love_file(&mut self, path: String, multiplier: f32) -> Result<()> {
         let path = PathBuf::from(path);
         anyhow::ensure!(

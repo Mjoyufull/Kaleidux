@@ -208,6 +208,13 @@ pub(crate) fn switch_wallpaper_content(
             .get(&name)
             .is_some_and(renderer::Renderer::has_composed_layers)
         || crate::runtime::layer_rules::requires_composition(monitor_manager.layer_rules(), &path);
+    let mpv_native_target = mpv_native_targets
+        .filter(|_| {
+            content_type == queue::ContentType::Video
+                && canvas.is_none()
+                && !requires_composed_video
+        })
+        .and_then(|targets| targets.get(&name).cloned());
     let (resolved_transition, transition_asset) = match transition_override {
         Some(TransitionOverride::Asset(asset)) => (Transition::Fade, Some(asset)),
         Some(TransitionOverride::Named(transition)) => (transition, None),
@@ -263,16 +270,8 @@ pub(crate) fn switch_wallpaper_content(
     let mut should_prepare_video = false;
     let mut backend_request = video::VideoBackendRequest::Auto;
     let mut broker_start_position_ns = None;
-    let mut native_decode_group_id = batch_id.map(|batch| {
-        use std::hash::{Hash, Hasher};
-        if let Some(length) = monitor_manager.excerpt_request(&name).1 {
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            (batch, length.as_nanos()).hash(&mut hash);
-            hash.finish()
-        } else {
-            batch
-        }
-    });
+    let mut native_decode_group_id =
+        batch_id.map(|batch| monitor_manager.native_decode_group(&name, batch));
     let mut video_render_size = None;
     if let Some(r) = renderers.get_mut(&name) {
         r.clear_shader_wallpaper();
@@ -456,7 +455,9 @@ pub(crate) fn switch_wallpaper_content(
                 .map(|(output, player)| (output.clone(), player))
             {
                 broker_start_position_ns = peer_player.current_position_ns();
-                native_decode_group_id = peer_player.native_decode_group_id().or(batch_id);
+                native_decode_group_id = peer_player
+                    .native_decode_group_id()
+                    .or(native_decode_group_id);
                 metrics.record_shared_broker_hit();
                 debug!(
                     "[VIDEO] {}: Shared broker prototype hit via peer {} (start_position_ms={:.1})",
@@ -477,6 +478,7 @@ pub(crate) fn switch_wallpaper_content(
                     transition: resolved_transition,
                     transition_asset,
                     hold_video,
+                    has_mpv_overlay_target: mpv_native_target.is_some(),
                 },
             );
             should_prepare_video = true;
@@ -513,9 +515,6 @@ pub(crate) fn switch_wallpaper_content(
             .outputs
             .get(&name)
             .and_then(|output| configured_max_publish_fps(output.config.video_fps));
-        let mpv_native_target = mpv_native_targets
-            .filter(|_| !requires_composed_video)
-            .and_then(|targets| targets.get(&name).cloned());
         let mpv_composed_target = mpv_composed_targets
             .and_then(|targets| targets.get(&name).cloned())
             .map(|target| {

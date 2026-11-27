@@ -108,6 +108,7 @@ fn layer(uv: vec2<f32>) -> vec4<f32> {
 - `frame.seconds` is the animation time. `frame.timing.xy` holds the delta and frame number.
 - `frame.progress` is the transhader position, from 0 to 1. It is 1 in steady state.
 - `frame.pointer` holds x, y and primary and secondary button states. `frame.data` holds four provider-defined numbers.
+- `frame.cursor.xy` glides toward the pointer. `.z` is the active amount and goes back to zero after leave. GLSL calls this `kldCursor`.
 - `control(0u)` through `control(31u)` read 32 additional values. Update them together with `kldctl react '{"controls":[0.2,0.6]}'`. Missing elements in a supplied array reset to zero.
 - `frame.date` holds the year, month, day and seconds since local midnight. `audio_band(0u)` through `audio_band(63u)` read the spectrum.
 - A shader in the effects stack can read the previous image with `sample(uv)`. Morphs return linear RGB and straight alpha.
@@ -164,8 +165,8 @@ heart has its own Wayland surface and also works with the native overlay.
 ## Input providers and player morph
 
 ```sh
-kldctl shader 'parallax=/home/me/depth.png|pointer=true'
-kldctl shader 'pan|pointer=true'
+kldctl shader 'parallax=/home/me/depth.png|intensity=0.7'
+kldctl shader 'auto-pan|intensity=0.6'
 kldctl react '{"pointer":[0.7,0.4,0,0],"data":[1,0,0,0]}'
 kldctl morph spectrum
 kldctl morph --group visualizer 'audio-orbit|rect=0.1,0.64,0.19,0.3' --fps unlimited
@@ -176,10 +177,16 @@ python3 examples/player-morph.py --font 'Sans 24'
 python3 examples/player-morph.py play-pause
 ```
 
-`pan` shifts a zoomed wallpaper with the pointer. `parallax=PATH` uses a
-16-bit grayscale depth image when one is available. Use `pointer=true` to
-receive local pointer events over the layer's rectangle or the whole
-wallpaper when it has no rectangle. `kldctl morph 'pointer|rect=0.2,0.2,0.6,0.6'`
+`auto-pan` and its alias `pan` ease a crop toward the pointer. `parallax`
+moves near and far parts at different speeds. Use `parallax=PATH` with a
+16-bit grayscale depth image for scene-specific depth. Both effects track
+the pointer over the wallpaper, ease back to center on leave and stop
+redrawing after settling. Use `intensity=0..1` to adjust the movement.
+Use `pointer=false` to drive these effects from an external provider.
+Send `{"pointer_active":false}` with `kldctl react` to recenter.
+For other layers, `pointer=true` receives local pointer events over the
+layer's rectangle or the whole wallpaper when it has no rectangle.
+`kldctl morph 'pointer|rect=0.2,0.2,0.6,0.6'`
 sets an input region without drawing artwork. The example provider can
 get desktop audio from a PulseAudio or PipeWire monitor via GStreamer.
 Other applications can send input through IPC.
@@ -216,10 +223,15 @@ use `morph --group weather` directly with any custom shaders.
 python3 examples/weather-morph.py 'light rain'
 kldctl morph --group weather snow --fps 30
 python3 examples/weather-morph.py clear
+python3 examples/weather-morph.py --location 51.5 -0.12
 ```
 
 `--mapping` takes a TOML file with a `[conditions]` table. Each condition
 maps to an array of ordered morphs. For example `rain = ["rain", "fog"]`.
+`--location` polls [Open-Meteo](https://open-meteo.com/en/docs) every 30
+minutes. Use `--source URL` for your own server with the same response
+format. The weather process keeps the last successful effect when the
+forecast is unavailable. `--once` applies a single update.
 
 ## Smooth video loops
 

@@ -33,6 +33,7 @@ pub(crate) struct PreparedLayer {
     pub(super) actions: [Option<String>; 4],
     pub(super) track_pointer: bool,
     pub(super) track_audio: bool,
+    pub(super) track_cursor: bool,
 }
 
 impl PreparedLayer {
@@ -233,7 +234,10 @@ fn prepare_layer_in(
     let mut assets = [None, None, None, None];
     let mut rectangle = layout_rectangle;
     let mut actions = [None, None, None, None];
-    let mut track_pointer = stage == LayerStage::Morph && name == "pointer";
+    let cursor_effect = stage == LayerStage::Filter
+        && (matches!(name, "pan" | "auto-pan" | "parallax") || name.starts_with("parallax="));
+    let mut track_pointer = cursor_effect || (stage == LayerStage::Morph && name == "pointer");
+    let mut intensity = 0.7f32;
     let mut font = None;
     let mut colour = "#ffffff";
     for option in options.split('|').filter(|option| !option.is_empty()) {
@@ -244,6 +248,13 @@ fn prepare_layer_in(
             "rect" if stage == LayerStage::Morph => rectangle = Some(parse_rectangle(value)?),
             "pointer" => {
                 track_pointer = value.parse().context("Use pointer=true or pointer=false")?
+            }
+            "intensity" if cursor_effect => {
+                intensity = value.parse().context("Use an intensity between 0 and 1")?;
+                anyhow::ensure!(
+                    (0.0..=1.0).contains(&intensity),
+                    "Use an intensity between 0 and 1"
+                );
             }
             "action" | "secondary" | "scroll-up" | "scroll-down" if stage == LayerStage::Morph => {
                 anyhow::ensure!(
@@ -307,6 +318,15 @@ fn prepare_layer_in(
         read_body(stage, name)?
     };
     let track_audio = uses_audio(&body);
+    let track_cursor = uses_cursor(&body);
+    let body = if cursor_effect {
+        format!(
+            "const CURSOR_STRENGTH: f32 = {intensity:.8};\nconst USE_DEPTH: bool = {};\n{body}",
+            assets[0].is_some()
+        )
+    } else {
+        body
+    };
     let source = if fragment_only {
         super::layer_glsl::translate(stage, &body)?
     } else {
@@ -326,6 +346,7 @@ fn prepare_layer_in(
         actions,
         track_pointer,
         track_audio,
+        track_cursor,
     })
 }
 
@@ -346,6 +367,7 @@ pub(crate) fn prepare_bitmap_layer(
         actions: Default::default(),
         track_pointer: false,
         track_audio: false,
+        track_cursor: false,
     })
 }
 
@@ -353,6 +375,10 @@ pub(super) fn uses_audio(source: &str) -> bool {
     ["audio_band(", "frame.audio", "kldAudio("]
         .iter()
         .any(|symbol| source.contains(symbol))
+}
+
+pub(super) fn uses_cursor(source: &str) -> bool {
+    source.contains("frame.cursor") || source.contains("kldCursor")
 }
 
 fn parse_rectangle(value: &str) -> Result<[f32; 4]> {
@@ -485,7 +511,9 @@ fn read_body(stage: LayerStage, name: &str) -> Result<String> {
         (LayerStage::Filter, "parallax") => {
             return Ok(include_str!("../shaders/layers/parallax.wgsl").into());
         }
-        (LayerStage::Filter, "pan") => return Ok(include_str!("../shaders/layers/pan.wgsl").into()),
+        (LayerStage::Filter, "pan" | "auto-pan") => {
+            return Ok(include_str!("../shaders/layers/pan.wgsl").into());
+        }
         (LayerStage::Morph, "spectrum") => {
             return Ok(include_str!("../shaders/layers/spectrum.wgsl").into());
         }
@@ -669,12 +697,18 @@ mod tests {
             (LayerStage::Filter, "crt"),
             (LayerStage::Filter, "mono"),
             (LayerStage::Filter, "pan"),
+            (LayerStage::Filter, "parallax|intensity=0.8"),
             (LayerStage::Morph, "spectrum"),
+            (LayerStage::Morph, "audio-orbit"),
+            (LayerStage::Morph, "rain"),
+            (LayerStage::Morph, "snow"),
+            (LayerStage::Morph, "fog"),
+            (LayerStage::Morph, "lightning"),
             (LayerStage::Morph, "heart"),
+            (LayerStage::Morph, "pulse"),
             (LayerStage::Morph, "text=Kaleidux"),
         ] {
-            let source = assemble(stage, &read_body(stage, name).unwrap());
-            validate_abi(stage, &source, false, false).unwrap();
+            prepare_layer(stage, name).unwrap();
         }
     }
 

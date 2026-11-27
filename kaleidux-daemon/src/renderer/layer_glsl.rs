@@ -15,6 +15,7 @@ layout(set = 0, binding = 0, std140) uniform KldFrame {
     vec4 date;
     vec4 audio[16];
     vec4 controls[8];
+    vec4 cursor;
 } kld_frame;
 layout(location = 0) in vec2 kld_uv;
 #define iResolution vec3(kld_frame.size, 1.0)
@@ -26,6 +27,7 @@ layout(location = 0) in vec2 kld_uv;
 #define iMouse vec4(vec2(kld_frame.pointer.x, 1.0-kld_frame.pointer.y)*kld_frame.size, kld_frame.pointer.zw)
 #define iDate kld_frame.date
 #define kldPointer kld_frame.pointer
+#define kldCursor kld_frame.cursor
 #define kldData kld_frame.data
 float kldAudio(int index) { int n = clamp(index, 0, 63); return kld_frame.audio[n / 4][n % 4]; }
 float kldControl(int index) { int n = clamp(index, 0, 31); return kld_frame.controls[n / 4][n % 4]; }

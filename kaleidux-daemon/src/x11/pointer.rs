@@ -168,6 +168,7 @@ impl DesktopPointer {
                 f32::from(u8::from(left)),
                 f32::from(u8::from(right)),
             ],
+            !matches!(event, Event::LeaveNotify(_)),
         );
         match button {
             Some((key @ (1 | 3), true)) => {

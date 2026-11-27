@@ -3,12 +3,13 @@
 use crate::main_loop::MainLoopContext;
 use kaleidux_common::{LayerInputs, MorphEvent, MorphGesture};
 
-pub(crate) fn position(ctx: &mut MainLoopContext, output: &str, pointer: [f32; 4]) {
+pub(crate) fn position(ctx: &mut MainLoopContext, output: &str, pointer: [f32; 4], active: bool) {
     if ctx.powered_off_outputs.contains(output) {
         return;
     }
     let inputs = LayerInputs {
         pointer: Some(pointer),
+        pointer_active: Some(active),
         ..Default::default()
     };
     if let Some(renderer) = ctx.renderers.get_mut(output) {

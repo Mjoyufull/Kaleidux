@@ -36,6 +36,8 @@ pub struct PendingVideoSwitch {
     pub transition: Transition,
     pub(crate) transition_asset: Option<crate::renderer::TransitionAsset>,
     pub(crate) hold_video: bool,
+    /// The new player received a native mpv surface rather than requiring composition.
+    pub(crate) has_mpv_overlay_target: bool,
 }
 
 pub(crate) fn stop_video_player_in_background(name: String, mut player: video::VideoPlayer) {

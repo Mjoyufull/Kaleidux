@@ -63,8 +63,9 @@
         pause(paused) {
             window.wallpaperPropertyListener?.setPaused?.(paused);
         },
-        input({audio, pointer}) {
+        input({audio, pointer, pointer_edges = []}) {
             if (audio) updateAudio(audio);
+            for (const edge of pointer_edges) updatePointer(edge);
             if (pointer) updatePointer(pointer);
         },
     };

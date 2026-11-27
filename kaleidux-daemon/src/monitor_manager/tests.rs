@@ -262,6 +262,57 @@ fn make_test_manager(
 }
 
 #[test]
+fn batch_decoder_ids_follow_playback_cohorts() {
+    let temp = unique_test_dir("native-decode-cohorts");
+    let cache = Arc::new(FileCache::new_test(&temp.join("cache.redb")).unwrap());
+    let output = test_output_config(Duration::from_secs(60));
+    let mut manager = make_test_manager(
+        "DP-1",
+        cache,
+        OutputOrchestrator {
+            _name: "DP-1".into(),
+            description: String::new(),
+            config: output.clone(),
+            queue: None,
+            current_path: None,
+            next_path: None,
+            next_content_type: None,
+            next_change: None,
+            display_start_time: None,
+            phase_offset: Duration::ZERO,
+        },
+        config_for_output("DP-1", &output),
+    );
+    assert_ne!(
+        manager.native_decode_group("DP-1", 7),
+        manager.native_decode_group("DP-2", 7)
+    );
+    manager.config.global.monitor_behavior = MonitorBehavior::Synchronized;
+    assert_eq!(
+        manager.native_decode_group("DP-1", 7),
+        manager.native_decode_group("DP-2", 7)
+    );
+    manager.config.global.monitor_behavior = MonitorBehavior::Grouped(vec![]);
+    manager
+        .output_groups
+        .extend([("DP-1".into(), 0), ("DP-2".into(), 0), ("DP-3".into(), 1)]);
+    assert_eq!(
+        manager.native_decode_group("DP-1", 7),
+        manager.native_decode_group("DP-2", 7)
+    );
+    assert_ne!(
+        manager.native_decode_group("DP-1", 7),
+        manager.native_decode_group("DP-3", 7)
+    );
+    assert_ne!(
+        manager.native_decode_group("DP-1", 7),
+        manager.native_decode_group("DP-1", 8)
+    );
+    drop(manager);
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn display_power_suspend_stops_and_rearms_content_deadlines() {
     let temp = unique_test_dir("display-power-deadline");
     let cache = Arc::new(

@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod cursor;
 mod love;
+use cursor::CursorMotion;
 pub(crate) use love::{LOVE_FRAME_INTERVAL, LoveMark};
 use love::{LoveVisual, scissor_heart};
 
@@ -25,6 +27,7 @@ pub(super) struct Layers {
     love: Option<LoveMark>,
     love_pipeline: Option<LayerPipelines>,
     signals: Signals,
+    cursor: CursorMotion,
     paused_at: Option<Instant>,
 }
 
@@ -60,6 +63,7 @@ pub(super) struct Signals {
     date: [f32; 4],
     audio: [[f32; 4]; 16],
     controls: [[f32; 4]; 8],
+    cursor: [f32; 4],
 }
 
 impl Default for Signals {
@@ -70,6 +74,7 @@ impl Default for Signals {
             date: [0.0; 4],
             audio: [[0.0; 4]; 16],
             controls: [[0.0; 4]; 8],
+            cursor: [0.5, 0.5, 0.0, 0.0],
         }
     }
 }
@@ -121,6 +126,15 @@ struct FilterTarget {
 }
 
 impl Layers {
+    fn uses_cursor(&self) -> bool {
+        self.wallpaper
+            .iter()
+            .chain(self.filters.active())
+            .chain(self.morphs.active())
+            .chain(self.morph_groups.values())
+            .any(|stack| stack.uses_cursor)
+    }
+
     pub(super) fn requires_composition(&self) -> bool {
         self.wallpaper.is_some()
             || self.filters.active().is_some()
@@ -167,6 +181,9 @@ impl Layers {
         progress: f32,
     ) {
         let animation_time = self.paused_at.unwrap_or(now);
+        if self.paused_at.is_none() && self.uses_cursor() {
+            self.signals.cursor = self.cursor.update(now);
+        }
         if let Some(wallpaper) = &mut self.wallpaper {
             let target = self
                 .filter_targets
@@ -226,6 +243,10 @@ impl Layers {
             .chain(self.morph_groups.values())
             .filter(|_| self.paused_at.is_none())
             .filter_map(LayerPipelines::frame_interval)
+            .chain(
+                (self.paused_at.is_none() && self.cursor.pending() && self.uses_cursor())
+                    .then_some(Duration::ZERO),
+            )
             .chain(
                 self.love
                     .as_ref()
@@ -547,6 +568,11 @@ impl super::Renderer {
 
     pub(crate) fn apply_layer_inputs(&mut self, inputs: &LayerInputs) {
         let signals = self.layers.signals.apply(inputs);
+        if let Some(active) = inputs.pointer_active.or(inputs.pointer.map(|_| true))
+            && self.layers.cursor.set(signals.pointer, active)
+        {
+            self.needs_redraw |= self.layers.uses_cursor() && self.layers.paused_at.is_none();
+        }
         if signals != self.layers.signals {
             self.layers.signals = signals;
             self.needs_redraw |= self.layers.requires_composition();

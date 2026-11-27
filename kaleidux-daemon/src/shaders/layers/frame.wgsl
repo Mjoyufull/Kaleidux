@@ -10,6 +10,7 @@ struct LayerFrame {
     date: vec4<f32>,
     audio: array<vec4<f32>, 16>,
     controls: array<vec4<f32>, 8>,
+    cursor: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: LayerFrame;

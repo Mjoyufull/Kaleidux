@@ -49,8 +49,13 @@ Replace the shader stack applied to the wallpaper. An empty list clears the stac
 .B shader-wallpaper [PATH] [--fps RATE] [-o OUTPUT]
 Display a procedural shader. Use unlimited for the display animation clock or 0 for a passive shader.
 .TP
-.B morph [LAYER ...] [--fps RATE] [-o OUTPUT]
-Replace the overlay stack. Text, image and shader morphs can have a normalized screen rectangle.
+.B morph [LAYER ...] [--group NAME] [--layout LAYOUT] [--bounds X,Y,W,H] [--gap GAP] [--fps RATE] [-o OUTPUT]
+Replace the default overlay stack or the named group selected with \fB\-\-group\fR.
+Omit layers to clear that stack or group. Layouts accept row, column, or grid:COLUMNS.
+Bounds and gap use normalized output coordinates. An explicit rectangle overrides a layer's layout cell.
+.TP
+.B morph-watch [-o OUTPUT]
+Print one JSON line per morph action, including its gesture and local position.
 .TP
 .B layers [-o OUTPUT]
 Report the active stacks and animation rates.

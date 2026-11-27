@@ -43,6 +43,8 @@ pub(super) struct FrameStream {
 pub(super) struct WebInputs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pointer: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "std::collections::VecDeque::is_empty")]
+    pub pointer_edges: std::collections::VecDeque<[f32; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<Vec<f32>>,
 }
@@ -78,7 +80,8 @@ impl FrameStream {
     pub(super) fn take_web_inputs(&self) -> Option<WebInputs> {
         let mut state = self.clock.state.lock();
         let pending = &mut state.web_inputs;
-        if pending.pointer.is_none() && pending.audio.is_none() {
+        if pending.pointer.is_none() && pending.audio.is_none() && pending.pointer_edges.is_empty()
+        {
             None
         } else {
             Some(std::mem::take(pending))
@@ -119,6 +122,8 @@ struct Playback {
     stopped: bool,
     #[cfg(feature = "wallpaper-web")]
     web_inputs: WebInputs,
+    #[cfg(feature = "wallpaper-web")]
+    web_buttons: [bool; 2],
 }
 
 impl CanvasPlayer {
@@ -139,6 +144,8 @@ impl CanvasPlayer {
                 stopped: false,
                 #[cfg(feature = "wallpaper-web")]
                 web_inputs: WebInputs::default(),
+                #[cfg(feature = "wallpaper-web")]
+                web_buttons: [false; 2],
             }),
             changed: Condvar::new(),
             position_ns: AtomicU64::new(0),
@@ -205,8 +212,18 @@ impl CanvasPlayer {
     #[cfg(feature = "wallpaper-web")]
     pub(super) fn apply_web_inputs(&self, input: &kaleidux_common::LayerInputs) {
         let mut state = self.control.state.lock();
-        if input.pointer.is_some() {
-            state.web_inputs.pointer = input.pointer;
+        if let Some(pointer) = input.pointer {
+            let buttons = [pointer[2] > 0.5, pointer[3] > 0.5];
+            if state.web_buttons != buttons {
+                state.web_buttons = buttons;
+                const MAX_PENDING_EDGES: usize = 32;
+                let edges = &mut state.web_inputs.pointer_edges;
+                if edges.len() == MAX_PENDING_EDGES {
+                    edges.pop_front();
+                }
+                edges.push_back(pointer);
+            }
+            state.web_inputs.pointer = Some(pointer);
         }
         if let Some(audio) = &input.audio {
             match &mut state.web_inputs.audio {

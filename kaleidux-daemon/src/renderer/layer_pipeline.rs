@@ -37,6 +37,7 @@ pub(crate) struct LayerPipelines {
     pub(super) actions: Vec<[Option<String>; 4]>,
     pub(super) pointer_regions: Vec<[f32; 4]>,
     pub(super) uses_audio: bool,
+    pub(super) uses_cursor: bool,
     pub(super) feedback: Option<super::layer_feedback::Feedback>,
     #[cfg(feature = "retroarch-shaders")]
     pub(super) retro: Option<super::layer_retro::Retro>,
@@ -209,6 +210,11 @@ impl LayerPipelines {
                     .feedback
                     .as_ref()
                     .is_some_and(|toy| toy.passes.iter().any(|pass| pass.layer.track_audio)),
+            uses_cursor: prepared.shaders.iter().any(|layer| layer.track_cursor)
+                || prepared
+                    .feedback
+                    .as_ref()
+                    .is_some_and(|toy| toy.passes.iter().any(|pass| pass.layer.track_cursor)),
             feedback: prepared
                 .feedback
                 .as_ref()
@@ -235,6 +241,7 @@ impl LayerPipelines {
                 actions: Default::default(),
                 track_pointer: false,
                 track_audio: false,
+                track_cursor: false,
             }],
         };
         Self::create(ctx, format, &prepared)
