@@ -12,6 +12,7 @@ pub(crate) mod ipc;
 pub(crate) mod layer_commands;
 pub(crate) mod layer_rules;
 pub(crate) mod love_button;
+pub(crate) mod media_player;
 pub(crate) mod morph_input;
 pub(crate) mod player_drain;
 pub(crate) mod player_events;

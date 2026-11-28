@@ -277,6 +277,8 @@ fn parse(source: &str, root: &Path) -> Result<PreparedToy> {
                 track_pointer: false,
                 track_audio,
                 track_cursor,
+                track_date: super::layer_source::uses_date(&pass.code)
+                    || super::layer_source::uses_date(code),
             },
             order,
             channels,

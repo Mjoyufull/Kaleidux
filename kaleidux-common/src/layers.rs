@@ -82,6 +82,9 @@ pub struct LayerInputs {
     pub controls: Option<Vec<f32>>,
     /// Year, month, day, and seconds since local midnight.
     pub date: Option<[f32; 4]>,
+    /// Restore the native clock when no date override is supplied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_date: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]

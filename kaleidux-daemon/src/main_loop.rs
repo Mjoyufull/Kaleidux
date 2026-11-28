@@ -340,6 +340,15 @@ impl MainLoopContext {
                                 .await;
                                 return;
                             }
+                            if let Request::MediaPlayer(request) = req {
+                                let response = crate::runtime::media_player::handle(request).await;
+                                let _ = tokio::time::timeout(
+                                    IPC_RESPONSE_TIMEOUT,
+                                    crate::runtime::ipc::write_response(&mut stream, response),
+                                )
+                                .await;
+                                return;
+                            }
                             let _frame_export = if matches!(req, Request::Frame(_)) {
                                 match frame_export.try_acquire() {
                                     Ok(permit) => Some(permit),

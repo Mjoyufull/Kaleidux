@@ -13,6 +13,7 @@ full = [
     "network-sources",
     "wallpaper-web",
     "retroarch-shaders",
+    "desktop-player",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -23,6 +24,7 @@ wayland-only = [
     "network-sources",
     "wallpaper-web",
     "retroarch-shaders",
+    "desktop-player",
     "backend-appsink",
     "backend-mpv",
     "backend-ffmpeg",
@@ -31,6 +33,7 @@ wayland-only = [
 minimal-static = ["display-wayland"]
 network-sources = []
 wallpaper-web = []
+desktop-player = ["dep:gio"]
 retroarch-shaders = [
     "dep:librashader-common",
     "dep:librashader-pack",
@@ -54,6 +57,7 @@ gstreamer-video = { workspace = true }
 gstreamer-app = { workspace = true }
 gstreamer-allocators = { workspace = true }
 glib = { workspace = true }
+gio = { version = "0.20", optional = true }
 ash = { workspace = true }
 naga = { workspace = true }
 # This runtime shares wgpu 23 with the renderer.

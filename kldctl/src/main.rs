@@ -7,7 +7,7 @@
     unused_attributes
 )]
 use clap::{Parser, Subcommand};
-use kaleidux_common::{Request, Response};
+use kaleidux_common::{MediaPlayerAction, MediaPlayerRequest, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 mod layers;
@@ -91,6 +91,14 @@ enum Commands {
     MorphWatch {
         #[arg(short, long)]
         output: Option<String>,
+    },
+    /// Read or control the active desktop media player
+    Player {
+        /// Target a specific MPRIS player by name or full bus name
+        #[arg(long, global = true)]
+        player: Option<String>,
+        #[command(subcommand)]
+        action: Option<PlayerSubcommand>,
     },
     /// Use one procedural shader as the wallpaper. No path clears it.
     ShaderWallpaper {
@@ -282,6 +290,23 @@ enum Commands {
         /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlayerSubcommand {
+    /// Show playback and track details as JSON (the default)
+    Status,
+    Play,
+    Pause,
+    PlayPause,
+    Stop,
+    Next,
+    Previous,
+    /// Seek relative to the current playback position
+    Seek {
+        #[arg(allow_negative_numbers = true)]
+        seconds: i64,
     },
 }
 
@@ -505,6 +530,23 @@ async fn run() -> anyhow::Result<()> {
         }),
         Commands::History { output } => Request::History { output },
         Commands::MorphWatch { output } => Request::MorphWatch { output },
+        Commands::Player { player, action } => Request::MediaPlayer(MediaPlayerRequest {
+            player,
+            action: match action.unwrap_or(PlayerSubcommand::Status) {
+                PlayerSubcommand::Status => MediaPlayerAction::Status,
+                PlayerSubcommand::Play => MediaPlayerAction::Play,
+                PlayerSubcommand::Pause => MediaPlayerAction::Pause,
+                PlayerSubcommand::PlayPause => MediaPlayerAction::PlayPause,
+                PlayerSubcommand::Stop => MediaPlayerAction::Stop,
+                PlayerSubcommand::Next => MediaPlayerAction::Next,
+                PlayerSubcommand::Previous => MediaPlayerAction::Previous,
+                PlayerSubcommand::Seek { seconds } => MediaPlayerAction::Seek {
+                    offset_us: seconds
+                        .checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Seek offset is out of range"))?,
+                },
+            },
+        }),
         Commands::PerfSnapshot => Request::PerfSnapshot,
     };
 
@@ -541,6 +583,9 @@ async fn run() -> anyhow::Result<()> {
                     match resp {
                         Response::WallpaperInfo(info) => {
                             println!("{}", serde_json::to_string_pretty(&info)?);
+                        }
+                        Response::MediaPlayer(status) => {
+                            println!("{}", serde_json::to_string_pretty(&status)?);
                         }
                         Response::FramePng(_) => anyhow::bail!("Unexpected PNG response"),
                         Response::Layers(layers) => {

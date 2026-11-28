@@ -110,7 +110,8 @@ fn layer(uv: vec2<f32>) -> vec4<f32> {
 - `frame.pointer` holds x, y and primary and secondary button states. `frame.data` holds four provider-defined numbers.
 - `frame.cursor.xy` glides toward the pointer. `.z` is the active amount and goes back to zero after leave. GLSL calls this `kldCursor`.
 - `control(0u)` through `control(31u)` read 32 additional values. Update them together with `kldctl react '{"controls":[0.2,0.6]}'`. Missing elements in a supplied array reset to zero.
-- `frame.date` holds the year, month, day and seconds since local midnight. `audio_band(0u)` through `audio_band(63u)` read the spectrum.
+- `frame.date` holds the local year, month (1–12), day and seconds since midnight. It updates on rendered frames. Use `kldctl react '{"date":[2026,11,27,43200]}'` to override it and `kldctl react '{"live_date":true}'` to return to the local clock.
+- `audio_band(0u)` through `audio_band(63u)` read the spectrum.
 - A shader in the effects stack can read the previous image with `sample(uv)`. Morphs return linear RGB and straight alpha.
 
 GLSL accepts a fragment `main()` or Shadertoy's `mainImage()`. Shadertoy
@@ -184,6 +185,24 @@ the pointer over the wallpaper, ease back to center on leave and stop
 redrawing after settling. Use `intensity=0..1` to adjust the movement.
 Use `pointer=false` to drive these effects from an external provider.
 Send `{"pointer_active":false}` with `kldctl react` to recenter.
+
+To bake depth for a still image, use the [shiftpaper CLI](https://github.com/CPritch/shiftpaper).
+`fetch-model` downloads a model once. `bake` prints the matching colour
+PNG first and the 16-bit depth PNG second. Use those two paths together.
+
+```sh
+shiftpaper fetch-model
+shiftpaper bake ~/Pictures/forest.jpg --out ~/.cache/kaleidux-depth
+kldctl set ~/.cache/kaleidux-depth/HASH.color.png
+kldctl shader "parallax=$HOME/.cache/kaleidux-depth/HASH.depth16.png|intensity=0.7"
+```
+
+Keep the depth maps outside scanned wallpaper directories. The shader
+samples the depth map in screen coordinates, so use a pair with the same
+aspect ratio as the output for alignment, or crop both to match in advance.
+For another depth provider, save its map as a grayscale 16-bit PNG with
+white for near objects and black for far objects.
+
 For other layers, `pointer=true` receives local pointer events over the
 layer's rectangle or the whole wallpaper when it has no rectangle.
 `kldctl morph 'pointer|rect=0.2,0.2,0.6,0.6'`
@@ -205,12 +224,26 @@ properties. `kldctl react` sends the same pointer and audio data used by
 shaders. The audio bridge supplies 128 values by repeating the 64 bands
 for each channel.
 
-The player example reads MPRIS with `playerctl` and local album art.
-Pass `--lyrics` with your own timed LRC file to show lyrics. It owns the
-`player` group by default. Adjust `--group`, `--rect`, `--font`, `--colour`,
-`--dim`, and `--art` for your desktop.
-Its `previous`, `play-pause` and `next` buttons use morph actions. Those
-actions are also available as commands for compositor bindings.
+The player example uses Kaleidux's MPRIS API for track info, local album
+art and playback controls. Pass `--lyrics PATH` for a timed LRC file or
+`--lyrics-dir DIR` to select `Artist - Title.lrc` or `Title.lrc` by track.
+It shows the surrounding lines and highlights the current lyric. Adjust
+`--group`, `--rect`, `--font`, `--lyrics-font`, `--colour`, `--dim` and
+`--art` for your desktop. The buttons control the player shown in the card.
+
+```sh
+kldctl player
+kldctl player --player mpv play-pause
+kldctl player seek -10
+python3 examples/player-morph.py --lyrics-dir ~/Music/Lyrics --lyrics-font 'Sans 24'
+```
+
+`kldctl player` prints JSON with track info, position, duration, artwork
+references and supported controls, or `null` when no player matches. It
+prefers playing players, then paused players. Use `--player` to choose
+one. An artwork URL is available to clients. Only local file artwork is
+shown by the example. The `desktop-player` Cargo feature is enabled in
+the default and Wayland builds.
 
 ## Weather effects
 
@@ -265,8 +298,11 @@ layers and 65535 for unlimited animation.
 {"method":"layer_inputs","params":{"output":"eDP-1","audio":[0.1,0.2],"data":[1,0,0,0]}}
 {"method":"layers_query","params":{"output":"all"}}
 {"method":"morph_watch","params":{"output":"DP-1"}}
+{"method":"media_player","params":{"player":null,"action":{"type":"status"}}}
 ```
 
 The watch connection replies with `"Ok"` and then one JSON event per line
 until it closes. Omit `output` to follow all outputs. For example, an event
 can be `{"output":"DP-1","action":"next","gesture":"primary","position":[0.5,0.25]}`.
+The media player request returns `{"MediaPlayer":null}` or a status object
+under the same key. Relative seek uses `{"type":"seek","offset_us":-10000000}`.

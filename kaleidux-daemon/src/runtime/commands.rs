@@ -351,6 +351,7 @@ pub(crate) async fn handle_command(
         | Request::LayerInputs(_)
         | Request::LayersQuery { .. }
         | Request::MorphWatch { .. }
+        | Request::MediaPlayer(_)
         | Request::LoveCurrent { .. }
         | Request::Unlove { .. }
         | Request::Love { .. } => {

@@ -10,7 +10,7 @@ import re
 import secrets
 import selectors
 import subprocess
-from urllib.parse import unquote, urlparse
+import sys
 
 
 def lyrics(path):
@@ -28,31 +28,36 @@ def lyrics(path):
     return [when + offset for when, _ in rows], [text for _, text in rows]
 
 
-def media(player, *args):
-    command = ["playerctl"]
+def media(kldctl, player, *args):
+    command = [kldctl, "player"]
     if player:
         command.extend(["--player", player])
     return subprocess.run([*command, *args], text=True, capture_output=True, timeout=4)
 
 
-def snapshot(player):
-    keys = ("artist", "title", "mpris:artUrl", "status", "position")
-    pattern = "\x1f".join("{{" + key + "}}" for key in keys)
-    reply = media(player, "metadata", "--format", pattern)
+def snapshot(kldctl, player):
+    reply = media(kldctl, player)
     if reply.returncode:
-        return None
-    fields = reply.stdout.strip("\n").split("\x1f")
-    if len(fields) != len(keys):
-        return None
-    artist, title, album, state, position = fields
-    try:
-        # playerctl exposes MPRIS time as microseconds in a format string.
-        position = float(position) / 1_000_000
-    except ValueError:
-        position = 0
-    url = urlparse(album)
-    art = Path(unquote(url.path)) if url.scheme == "file" and not url.netloc else None
-    return artist, title, art, state, position
+        raise ValueError(reply.stderr.strip().split("\n", 1)[0] or "Cannot read desktop player")
+    status = json.loads(reply.stdout)
+    if status is not None and not isinstance(status, dict):
+        raise ValueError("Unexpected desktop player response")
+    return status
+
+
+def track_lyrics(directory, title, artists):
+    if not directory or not title:
+        return [], []
+    artist = ", ".join(artists)
+    names = [f"{artist} - {title}", title] if artist else [title]
+    for name in names:
+        if "/" in name or "\x00" in name:
+            continue
+        try:
+            return lyrics(directory / f"{name}.lrc")
+        except (OSError, UnicodeError):
+            continue
+    return [], []
 
 
 def rect_arg(value):
@@ -66,38 +71,48 @@ def rect_arg(value):
         raise argparse.ArgumentTypeError("Use a rectangle x,y,width,height within the output") from error
 
 
-def layers(args, track, when, lines):
+def layers(args, track, when, lines, action_prefix):
     if not track:
         return []
-    artist, title, art, state, position = track
+    artist = ", ".join(track["artists"])
+    title = track["title"] or ""
+    playing = track["state"] == "playing"
+    position = (track["position_us"] or 0) / 1_000_000
+    art = args.art or (Path(track["artwork_path"]) if track["artwork_path"] else None)
     left, top, width, height = args.rect
 
     def rect(x, y, w, h):
         values = left + x * width, top + y * height, w * width, h * height
         return ",".join(f"{value:.6f}" for value in values)
 
-    def label(value, box, colour, action=None):
+    def label(value, box, colour, action=None, font=None):
         text = " ".join(value.replace("|", " ").split())[:120]
         if not text:
             return None
-        layer = f"text={text}|font={args.font}|colour={colour}|rect={box}"
-        return f"{layer}|action={args.action_prefix}{action}" if action else layer
+        layer = f"text={text}|font={font or args.font}|colour={colour}|rect={box}"
+        return f"{layer}|action={action_prefix}{action}" if action else layer
 
-    art = args.art or art
     layers = []
     if art and art.is_file() and "|" not in str(art):
-        layers.append(f"image={art.resolve()}|rect={rect(0, 0.34, .25, .54)}")
+        layers.append(f"image={art.resolve()}|rect={rect(0, .44, .25, .48)}")
     line = bisect_right(when, position) - 1
     previous = lines[line - 1] if line > 0 else ""
     current = lines[line] if line >= 0 else ""
+    upcoming = lines[line + 1] if line + 1 < len(lines) else ""
+    toggle = None
+    if playing and track["can_pause"]:
+        toggle = label("Ⅱ", rect(.49, .81, .12, .13), args.colour, "pause")
+    elif not playing and track["can_play"]:
+        toggle = label("▶", rect(.49, .81, .12, .13), args.colour, "play")
     labels = (
-        label(previous, rect(0, 0, 1, .12), args.dim),
-        label(current, rect(0, .14, 1, .17), args.colour),
-        label(artist, rect(.28, .34, .72, .13), args.dim),
-        label(title, rect(.28, .49, .72, .19), args.colour),
-        label("◀", rect(.34, .74, .12, .13), args.colour, "previous"),
-        label("Ⅱ" if state == "Playing" else "▶", rect(.49, .74, .12, .13), args.colour, "play-pause"),
-        label("▶▏", rect(.64, .74, .12, .13), args.colour, "next"),
+        label(previous, rect(0, 0, 1, .1), args.dim, font=args.lyrics_font),
+        label(current, rect(0, .11, 1, .16), args.colour, font=args.lyrics_font),
+        label(upcoming, rect(0, .28, 1, .1), args.dim, font=args.lyrics_font),
+        label(artist, rect(.28, .44, .72, .13), args.dim),
+        label(title, rect(.28, .58, .72, .19), args.colour),
+        label("◀", rect(.34, .81, .12, .13), args.colour, "previous") if track["can_previous"] else None,
+        toggle,
+        label("▶▏", rect(.64, .81, .12, .13), args.colour, "next") if track["can_next"] else None,
     )
     return layers + [value for value in labels if value is not None]
 
@@ -106,38 +121,66 @@ def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--player")
     cli.add_argument("-o", "--output")
-    cli.add_argument("--lyrics", type=Path, help="Timed LRC file for the current track")
+    lyric_source = cli.add_mutually_exclusive_group()
+    lyric_source.add_argument("--lyrics", type=Path, help="Timed LRC file for the current track")
+    lyric_source.add_argument("--lyrics-dir", type=Path, help="Directory of Artist - Title.lrc or Title.lrc files")
     cli.add_argument("--art", type=Path, help="Override the local album art")
     cli.add_argument("--font", default="Sans 22")
+    cli.add_argument("--lyrics-font", help="Use a different font for lyrics")
     cli.add_argument("--group", default="player", help="Independent name for the player morphs")
     cli.add_argument("--colour", default="#ffffff")
     cli.add_argument("--dim", default="#aeb3c2")
     cli.add_argument("--rect", type=rect_arg, default="0.06,0.55,0.33,0.35")
-    actions = ("previous", "play-pause", "next")
+    actions = ("previous", "play-pause", "next", "play", "pause")
     cli.add_argument("action", choices=("show", *actions), default="show", nargs="?")
     args = cli.parse_args()
-    if "|" in args.font:
+    if "|" in args.font or "|" in (args.lyrics_font or ""):
         cli.error("The font description cannot contain |")
-    if args.action != "show":
-        return media(args.player, args.action).returncode
+    if args.lyrics_dir and not args.lyrics_dir.is_dir():
+        cli.error(f"Lyrics directory does not exist: {args.lyrics_dir}")
     kldctl = os.environ.get("KLDCTL", "kldctl")
+    if args.action != "show":
+        reply = media(kldctl, args.player, args.action)
+        if reply.returncode:
+            cli.exit(reply.returncode, reply.stderr)
+        return 0
     command = [kldctl, "morph", "--group", args.group]
     watch = [kldctl, "morph-watch"]
     if args.output:
         command.extend(["-o", args.output])
         watch.extend(["-o", args.output])
-    args.action_prefix = "player-" + secrets.token_hex(4) + "."
     try:
         when, lines = lyrics(args.lyrics)
     except (OSError, UnicodeError) as error:
         cli.error(str(error))
     previous = None
+    player = None
+    track_key = None
+    action_prefix = ""
+    track = None
+    status_error = None
     with subprocess.Popen(watch, stdout=subprocess.PIPE) as watcher, selectors.DefaultSelector() as events:
         events.register(watcher.stdout, selectors.EVENT_READ)
         pending = b""
         try:
             while True:
-                current = layers(args, snapshot(args.player), when, lines)
+                try:
+                    track = snapshot(kldctl, args.player)
+                    status_error = None
+                except (ValueError, subprocess.TimeoutExpired) as error:
+                    if str(error) != status_error:
+                        status_error = str(error)
+                        print(status_error, file=sys.stderr)
+                next_player = track["player"] if track else None
+                if next_player != player:
+                    player = next_player
+                    action_prefix = "player-" + secrets.token_hex(4) + "."
+                if args.lyrics_dir and track:
+                    key = player, track["track_id"], track["title"], track["artists"]
+                    if key != track_key:
+                        track_key = key
+                        when, lines = track_lyrics(args.lyrics_dir, track["title"], track["artists"])
+                current = layers(args, track, when, lines, action_prefix)
                 if current != previous:
                     subprocess.run([*command, *current], check=True, timeout=9)
                     previous = current
@@ -150,10 +193,10 @@ def main():
                 for line in complete:
                     event = json.loads(line)
                     action = event["action"]
-                    if action.startswith(args.action_prefix):
-                        action = action.removeprefix(args.action_prefix)
+                    if player and action.startswith(action_prefix):
+                        action = action.removeprefix(action_prefix)
                         if action in actions:
-                            media(args.player, action)
+                            media(kldctl, player, action)
         except KeyboardInterrupt:
             pass
         finally:

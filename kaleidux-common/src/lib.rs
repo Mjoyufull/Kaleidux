@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 mod layers;
+mod media_player;
 mod protocol;
 mod transition_defaults;
 mod transition_impl;
@@ -22,6 +23,7 @@ pub use layers::{
     LAYER_FPS_UNLIMITED, LayerInputs, LayerSelection, LayerStage, MAX_LAYERS_PER_STAGE,
     MAX_MORPHS_PER_OUTPUT, MorphEvent, MorphGesture, MorphGroup, MorphLayout, OutputLayers,
 };
+pub use media_player::{MediaPlayerAction, MediaPlayerRequest, MediaPlayerStatus, PlaybackState};
 pub use protocol::{
     BlacklistCommand, KEntry, MAX_INHIBITOR_REASON_LEN, MAX_INHIBITORS, OutputInfo,
     PlaylistCommand, Request, Response, validate_inhibit_reason,

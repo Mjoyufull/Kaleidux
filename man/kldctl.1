@@ -57,6 +57,11 @@ Bounds and gap use normalized output coordinates. An explicit rectangle override
 .B morph-watch [-o OUTPUT]
 Print one JSON line per morph action, including its gesture and local position.
 .TP
+.B player [--player NAME] [ACTION]
+Read desktop media player status, track metadata, position and artwork as JSON.
+Actions include play, pause, play-pause, stop, next, previous and seek SECONDS.
+Seek is relative and accepts negative seconds.
+.TP
 .B layers [-o OUTPUT]
 Report the active stacks and animation rates.
 .TP

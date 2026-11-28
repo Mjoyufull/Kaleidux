@@ -34,6 +34,7 @@ pub(crate) struct PreparedLayer {
     pub(super) track_pointer: bool,
     pub(super) track_audio: bool,
     pub(super) track_cursor: bool,
+    pub(super) track_date: bool,
 }
 
 impl PreparedLayer {
@@ -319,6 +320,7 @@ fn prepare_layer_in(
     };
     let track_audio = uses_audio(&body);
     let track_cursor = uses_cursor(&body);
+    let track_date = uses_date(&body);
     let body = if cursor_effect {
         format!(
             "const CURSOR_STRENGTH: f32 = {intensity:.8};\nconst USE_DEPTH: bool = {};\n{body}",
@@ -347,6 +349,7 @@ fn prepare_layer_in(
         track_pointer,
         track_audio,
         track_cursor,
+        track_date,
     })
 }
 
@@ -368,6 +371,7 @@ pub(crate) fn prepare_bitmap_layer(
         track_pointer: false,
         track_audio: false,
         track_cursor: false,
+        track_date: false,
     })
 }
 
@@ -379,6 +383,12 @@ pub(super) fn uses_audio(source: &str) -> bool {
 
 pub(super) fn uses_cursor(source: &str) -> bool {
     source.contains("frame.cursor") || source.contains("kldCursor")
+}
+
+pub(super) fn uses_date(source: &str) -> bool {
+    source
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|word| matches!(word, "date" | "iDate"))
 }
 
 fn parse_rectangle(value: &str) -> Result<[f32; 4]> {

@@ -2,6 +2,7 @@
 
 use super::WgpuContext;
 use super::layer_pipeline::{FILTER_FORMAT, LayerFrame, LayerPipelines};
+use chrono::{Datelike, Local, Timelike};
 use kaleidux_common::{
     LayerInputs, LayerStage, MAX_MORPHS_PER_OUTPUT, MorphGesture, MorphGroup, OutputLayers,
 };
@@ -27,6 +28,7 @@ pub(super) struct Layers {
     love: Option<LoveMark>,
     love_pipeline: Option<LayerPipelines>,
     signals: Signals,
+    date_override: Option<[f32; 4]>,
     cursor: CursorMotion,
     paused_at: Option<Instant>,
 }
@@ -87,9 +89,6 @@ impl Signals {
         if let Some(data) = input.data {
             self.data = data;
         }
-        if let Some(date) = input.date {
-            self.date = date;
-        }
         if let Some(bands) = &input.audio {
             self.audio.fill([0.0; 4]);
             for (index, band) in bands.iter().enumerate() {
@@ -126,13 +125,20 @@ struct FilterTarget {
 }
 
 impl Layers {
-    fn uses_cursor(&self) -> bool {
+    fn active_stacks(&self) -> impl Iterator<Item = &LayerPipelines> {
         self.wallpaper
             .iter()
             .chain(self.filters.active())
             .chain(self.morphs.active())
             .chain(self.morph_groups.values())
-            .any(|stack| stack.uses_cursor)
+    }
+
+    fn uses_cursor(&self) -> bool {
+        self.active_stacks().any(|stack| stack.uses_cursor)
+    }
+
+    fn uses_date(&self) -> bool {
+        self.active_stacks().any(|stack| stack.uses_date)
     }
 
     pub(super) fn requires_composition(&self) -> bool {
@@ -184,12 +190,16 @@ impl Layers {
         if self.paused_at.is_none() && self.uses_cursor() {
             self.signals.cursor = self.cursor.update(now);
         }
+        let mut signals = self.signals;
+        if self.uses_date() {
+            signals.date = self.date_override.unwrap_or_else(local_date);
+        }
         if let Some(wallpaper) = &mut self.wallpaper {
             let target = self
                 .filter_targets
                 .as_ref()
                 .map_or(destination, |targets| &targets.targets[0].view);
-            let frame = layer_frame(size, wallpaper, animation_time, progress, self.signals);
+            let frame = layer_frame(size, wallpaper, animation_time, progress, signals);
             let intermediate = self.filter_targets.is_some();
             if let Some(feedback) = &mut wallpaper.feedback {
                 feedback.render(ctx, encoder, target, frame, wallpaper.fps, intermediate);
@@ -199,7 +209,7 @@ impl Layers {
             }
         }
         if let (Some(filters), Some(targets)) = (self.filters.active_mut(), &self.filter_targets) {
-            let frame = layer_frame(size, filters, animation_time, progress, self.signals);
+            let frame = layer_frame(size, filters, animation_time, progress, signals);
             filters.write_frame(ctx, frame);
             targets.render(ctx, encoder, destination, filters);
         }
@@ -217,7 +227,7 @@ impl Layers {
         {
             morphs.write_frame(
                 ctx,
-                layer_frame(size, morphs, animation_time, progress, self.signals),
+                layer_frame(size, morphs, animation_time, progress, signals),
             );
             for (index, pipeline) in morphs.pipelines.iter().enumerate() {
                 pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
@@ -326,8 +336,11 @@ fn layer_frame(
     layers: &LayerPipelines,
     now: Instant,
     progress: f32,
-    signals: Signals,
+    mut signals: Signals,
 ) -> LayerFrame {
+    if !layers.uses_date {
+        signals.date = [0.0; 4];
+    }
     LayerFrame {
         size: [size[0] as f32, size[1] as f32],
         seconds: if layers.fps != 0 {
@@ -340,6 +353,16 @@ fn layer_frame(
         timing: [0.0; 4],
         signals,
     }
+}
+
+fn local_date() -> [f32; 4] {
+    let now = Local::now();
+    [
+        now.year() as f32,
+        now.month() as f32,
+        now.day() as f32,
+        now.num_seconds_from_midnight() as f32 + now.nanosecond() as f32 / 1_000_000_000.0,
+    ]
 }
 
 impl FilterTargets {
@@ -568,6 +591,10 @@ impl super::Renderer {
 
     pub(crate) fn apply_layer_inputs(&mut self, inputs: &LayerInputs) {
         let signals = self.layers.signals.apply(inputs);
+        if inputs.date.is_some() || inputs.live_date {
+            let previous = std::mem::replace(&mut self.layers.date_override, inputs.date);
+            self.needs_redraw |= previous != inputs.date && self.layers.uses_date();
+        }
         if let Some(active) = inputs.pointer_active.or(inputs.pointer.map(|_| true))
             && self.layers.cursor.set(signals.pointer, active)
         {
@@ -613,13 +640,7 @@ impl super::Renderer {
     }
 
     pub(crate) fn uses_desktop_audio(&self) -> bool {
-        self.layers
-            .wallpaper
-            .iter()
-            .chain(self.layers.filters.active())
-            .chain(self.layers.morphs.active())
-            .chain(self.layers.morph_groups.values())
-            .any(|stack| stack.uses_audio)
+        self.layers.active_stacks().any(|stack| stack.uses_audio)
     }
 
     pub(crate) fn output_layers(&self) -> OutputLayers {

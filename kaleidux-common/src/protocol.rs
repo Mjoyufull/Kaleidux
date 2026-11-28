@@ -23,6 +23,8 @@ pub enum Request {
     LayersQuery { output: Option<String> },
     #[serde(rename = "morph_watch")]
     MorphWatch { output: Option<String> },
+    #[serde(rename = "media_player")]
+    MediaPlayer(crate::MediaPlayerRequest),
     #[serde(rename = "query_outputs")]
     QueryOutputs,
     #[serde(rename = "next")]
@@ -159,6 +161,7 @@ pub enum BlacklistCommand {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     WallpaperInfo(WallpaperInfo),
+    MediaPlayer(Option<crate::MediaPlayerStatus>),
     /// The Unix socket sends these bytes directly. Errors remain JSON.
     #[serde(skip)]
     FramePng(Vec<u8>),
