@@ -5,13 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kaleidux-common = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "io-std", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1.0"
 dirs = { workspace = true }
 toml = { workspace = true }
+
+[lints]
+workspace = true

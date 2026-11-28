@@ -7,9 +7,12 @@
     unused_attributes
 )]
 use clap::{Parser, Subcommand};
-use kaleidux_common::{Request, Response};
+use kaleidux_common::{MediaPlayerAction, MediaPlayerRequest, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+mod layers;
+mod wallpaper_data;
+use layers::layer_request;
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +56,124 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Replace this output's shader stack (no arguments clears)
+    #[command(name = "shader", alias = "filter")]
+    Filter {
+        layers: Vec<String>,
+        /// Idle animation rate; zero waits for new wallpaper frames
+        #[arg(long, default_value_t = 0, value_parser = layers::parse_layer_fps)]
+        fps: u16,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Replace this output's ordered wallpaper overlays (no arguments clears)
+    Morph {
+        layers: Vec<String>,
+        /// Update or clear this morph group independently
+        #[arg(long)]
+        group: Option<String>,
+        /// Arrange layers in a row, column, or grid:COLUMNS
+        #[arg(long, value_parser = layers::layout_columns)]
+        layout: Option<usize>,
+        /// Output-relative layout bounds: x,y,width,height
+        #[arg(long, requires = "layout", value_parser = layers::layout_bounds)]
+        bounds: Option<[f32; 4]>,
+        /// Output-relative spacing between cells
+        #[arg(long, requires = "layout")]
+        gap: Option<f32>,
+        /// Idle animation rate; zero leaves the overlays static
+        #[arg(long, default_value_t = 0, value_parser = layers::parse_layer_fps)]
+        fps: u16,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Print morph activations as JSON lines
+    MorphWatch {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Read or control the active desktop media player
+    Player {
+        /// Target a specific MPRIS player by name or full bus name
+        #[arg(long, global = true)]
+        player: Option<String>,
+        #[command(subcommand)]
+        action: Option<PlayerSubcommand>,
+    },
+    /// Use one procedural shader as the wallpaper. No path clears it.
+    ShaderWallpaper {
+        path: Option<String>,
+        #[arg(long, default_value = "unlimited", value_parser = layers::parse_layer_fps)]
+        fps: u16,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Send pointer, audio, date and custom values to the active shaders (JSON)
+    React {
+        values: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Print the configured shader and morph order as JSON
+    Layers {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show wallpaper and scene timing on one output
+    Info {
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Export a PNG of the current wallpaper frame or the start of a scene
+    Frame(wallpaper_data::FrameArgs),
+    /// Show a candidate while preserving the current wallpaper and queue
+    Preview {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Restore the original wallpaper, or keep the preview with --apply
+    PreviewEnd {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Set a solid wallpaper colour (#RRGGBB or #RRGGBBAA)
+    #[command(name = "colour", alias = "color")]
+    Colour {
+        colour: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Jump to a wallpaper inside the slideshow directory
+    Jump {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Insert an image or video into the queue and display it now
+    Set {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+        /// PNG with per-pixel transition timing
+        #[arg(long, value_name = "PNG", conflicts_with = "transition")]
+        reveal_map: Option<std::path::PathBuf>,
+        /// Built-in transition name or custom:NAME for this switch
+        #[arg(long = "transhader", alias = "transition", value_name = "NAME")]
+        transition: Option<String>,
+    },
+    /// Open a local Wallpaper Engine project, package or installed Workshop item
+    Workshop {
+        item: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Display an image or video from the slideshow or an external path
+    Img {
+        path: std::path::PathBuf,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Show current daemon status and playback state
     #[command(visible_alias = "st")]
     Status,
@@ -60,7 +181,7 @@ enum Commands {
     /// Switch to the next wallpaper in the queue
     #[command(visible_alias = "n")]
     Next {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -68,7 +189,7 @@ enum Commands {
     /// Switch to the previous wallpaper (if history exists)
     #[command(visible_alias = "p")]
     Prev {
-        /// Target output (omit for all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -78,8 +199,12 @@ enum Commands {
     /// Loved files appear more often based on their multiplier.
     /// A multiplier of 2.0 means 2x more likely to be picked.
     Love {
-        /// Path to the file
-        path: String,
+        /// Path to the file (defaults to the current wallpaper)
+        path: Option<std::path::PathBuf>,
+
+        /// Output to read the current wallpaper from
+        #[arg(short, long, conflicts_with = "path")]
+        output: Option<String>,
 
         /// Frequency multiplier (e.g., 2.0 = 2x more likely)
         #[arg(short, long, default_value = "2.0")]
@@ -96,11 +221,29 @@ enum Commands {
     #[command(visible_alias = "ll")]
     Lovelist,
 
-    /// Pause video playback (images unaffected)
+    /// Pause video playback and automatic wallpaper rotation
     Pause,
 
-    /// Resume video playback
+    /// Clear manual pause (named inhibitors still apply)
     Resume,
+
+    /// Inhibit wallpaper playback with a named reason
+    Inhibit {
+        /// Reason for inhibiting playback
+        reason: String,
+    },
+
+    /// Uninhibit wallpaper playback for a named reason
+    Uninhibit {
+        /// Reason to remove
+        reason: String,
+    },
+
+    /// List active pause inhibitors
+    Inhibitors {
+        #[command(subcommand)]
+        command: Option<InhibitorSubcommand>,
+    },
 
     /// Stop the current wallpaper
     Stop,
@@ -121,7 +264,7 @@ enum Commands {
 
     /// Clear wallpaper on output(s) - show black screen
     Clear {
-        /// Target output or omit for all
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -138,11 +281,32 @@ enum Commands {
         command: BlacklistSubcommand,
     },
 
+    /// Dump current performance counters from the daemon
+    #[command(name = "perf-snapshot")]
+    PerfSnapshot,
+
     /// Show recently played wallpapers
     History {
-        /// Target output (omit for default/all)
+        /// Target output (default: main monitor; use all for every output)
         #[arg(short, long)]
         output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlayerSubcommand {
+    /// Show playback and track details as JSON (the default)
+    Status,
+    Play,
+    Pause,
+    PlayPause,
+    Stop,
+    Next,
+    Previous,
+    /// Seek relative to the current playback position
+    Seek {
+        #[arg(allow_negative_numbers = true)]
+        seconds: i64,
     },
 }
 
@@ -172,8 +336,24 @@ enum BlacklistSubcommand {
     List,
 }
 
+#[derive(Subcommand)]
+enum InhibitorSubcommand {
+    /// List active pause inhibitors
+    List,
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Handle local commands first (don't need daemon connection)
@@ -202,15 +382,122 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let frame_file = match &cli.command {
+        Commands::Frame(args) => Some(args.file.clone()),
+        _ => None,
+    };
     let request = match cli.command {
+        Commands::Filter {
+            layers,
+            fps,
+            output,
+        } => layer_request(kaleidux_common::LayerStage::Filter, layers, fps, output)?,
+        Commands::Morph {
+            layers,
+            fps,
+            output,
+            group,
+            layout,
+            bounds,
+            gap,
+        } => {
+            let mut request =
+                layer_request(kaleidux_common::LayerStage::Morph, layers, fps, output)?;
+            if let Request::LayersSet(selection) = &mut request {
+                selection.group = group;
+                selection.layout = layout.map(|columns| kaleidux_common::MorphLayout {
+                    columns,
+                    bounds: bounds.unwrap_or([0.04, 0.04, 0.92, 0.2]),
+                    gap: gap.unwrap_or(0.01),
+                });
+            }
+            request
+        }
+        Commands::ShaderWallpaper { path, fps, output } => layers::layer_request(
+            kaleidux_common::LayerStage::Wallpaper,
+            path.into_iter().collect(),
+            fps,
+            output,
+        )?,
+        Commands::React { values, output } => {
+            let mut inputs: kaleidux_common::LayerInputs = serde_json::from_str(&values)?;
+            if output.is_some() {
+                inputs.output = output;
+            }
+            Request::LayerInputs(inputs)
+        }
+        Commands::Layers { output } => Request::LayersQuery { output },
+        Commands::Info { output } => Request::WallpaperInfo { output },
+        Commands::Frame(args) => Request::Frame(args.request()?),
+        Commands::Preview { path, output } => Request::Preview {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::PreviewEnd { apply } => Request::PreviewEnd { apply },
+        Commands::Colour { colour, output } => Request::Set {
+            path: format!("colour:{colour}"),
+            output,
+        },
         Commands::Status => Request::QueryOutputs,
         Commands::Next { output } => Request::Next { output },
+        Commands::Jump { path, output } => Request::Jump {
+            path: media_locator(path)?,
+            output,
+        },
+        Commands::Set {
+            path,
+            output,
+            reveal_map,
+            transition,
+        } => {
+            let path = media_locator(path)?;
+            if let Some(map) = reveal_map {
+                Request::SetReveal {
+                    path,
+                    output,
+                    map: map.canonicalize()?.to_string_lossy().into_owned(),
+                }
+            } else if let Some(transition) = transition {
+                Request::SetTransition {
+                    path,
+                    output,
+                    transition,
+                }
+            } else {
+                Request::Set { path, output }
+            }
+        }
+        Commands::Workshop { item, output } => {
+            let item = if item.bytes().all(|byte| byte.is_ascii_digit()) {
+                item
+            } else {
+                media_locator(item.into())?
+            };
+            Request::Workshop { item, output }
+        }
+        Commands::Img { path, output } => Request::Img {
+            path: media_locator(path)?,
+            output,
+        },
         Commands::Prev { output } => Request::Prev { output },
-        Commands::Love { path, multiplier } => Request::Love { path, multiplier },
+        Commands::Love {
+            path,
+            output,
+            multiplier,
+        } => match path {
+            Some(path) => Request::Love {
+                path: media_locator(path)?,
+                multiplier,
+            },
+            None => Request::LoveCurrent { output, multiplier },
+        },
         Commands::Unlove { path } => Request::Unlove { path },
         Commands::Lovelist => Request::LoveitList,
         Commands::Pause => Request::Pause,
         Commands::Resume => Request::Resume,
+        Commands::Inhibit { reason } => Request::Inhibit { reason },
+        Commands::Uninhibit { reason } => Request::Uninhibit { reason },
+        Commands::Inhibitors { .. } => Request::Inhibitors,
         Commands::Stop => Request::Stop,
         Commands::Query => Request::QueryOutputs,
         Commands::Reload => Request::Reload,
@@ -242,6 +529,25 @@ async fn main() -> anyhow::Result<()> {
             BlacklistSubcommand::List => kaleidux_common::BlacklistCommand::List,
         }),
         Commands::History { output } => Request::History { output },
+        Commands::MorphWatch { output } => Request::MorphWatch { output },
+        Commands::Player { player, action } => Request::MediaPlayer(MediaPlayerRequest {
+            player,
+            action: match action.unwrap_or(PlayerSubcommand::Status) {
+                PlayerSubcommand::Status => MediaPlayerAction::Status,
+                PlayerSubcommand::Play => MediaPlayerAction::Play,
+                PlayerSubcommand::Pause => MediaPlayerAction::Pause,
+                PlayerSubcommand::PlayPause => MediaPlayerAction::PlayPause,
+                PlayerSubcommand::Stop => MediaPlayerAction::Stop,
+                PlayerSubcommand::Next => MediaPlayerAction::Next,
+                PlayerSubcommand::Previous => MediaPlayerAction::Previous,
+                PlayerSubcommand::Seek { seconds } => MediaPlayerAction::Seek {
+                    offset_us: seconds
+                        .checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Seek offset is out of range"))?,
+                },
+            },
+        }),
+        Commands::PerfSnapshot => Request::PerfSnapshot,
     };
 
     // Determine socket path (use provided or default)
@@ -260,6 +566,12 @@ async fn main() -> anyhow::Result<()> {
             let req_json = serde_json::to_string(&request)?;
             stream.write_all(req_json.as_bytes()).await?;
             stream.write_all(b"\n").await?;
+            if matches!(request, Request::MorphWatch { .. }) {
+                return layers::watch_morphs(stream).await;
+            }
+            if let Some(file) = frame_file {
+                return wallpaper_data::read_png(stream, file).await;
+            }
 
             // Read response
             let mut response = String::new();
@@ -269,6 +581,16 @@ async fn main() -> anyhow::Result<()> {
                 // Try to parse as Response to pretty print if it's a list
                 if let Ok(resp) = serde_json::from_str::<Response>(&response) {
                     match resp {
+                        Response::WallpaperInfo(info) => {
+                            println!("{}", serde_json::to_string_pretty(&info)?);
+                        }
+                        Response::MediaPlayer(status) => {
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                        }
+                        Response::FramePng(_) => anyhow::bail!("Unexpected PNG response"),
+                        Response::Layers(layers) => {
+                            println!("{}", serde_json::to_string_pretty(&layers)?)
+                        }
                         Response::LoveitList(entries) => {
                             println!("{:<50} | {:<5} | {:<5}", "Path", "Loveit", "Uses");
                             println!("{}", "-".repeat(66));
@@ -295,7 +617,7 @@ async fn main() -> anyhow::Result<()> {
                                 );
                             }
                         }
-                        Response::Error(e) => eprintln!("Error: {}", e),
+                        Response::Error(e) => anyhow::bail!("{e}"),
                         Response::Ok => println!("OK"),
                         Response::Playlists(names) => {
                             println!("Playlists:");
@@ -315,6 +637,13 @@ async fn main() -> anyhow::Result<()> {
                                 println!(" {:>2}. {}", i + 1, path);
                             }
                         }
+                        Response::PerfSnapshot(snapshot) => println!("{}", snapshot),
+                        Response::Inhibitors(reasons) => {
+                            println!("Inhibitors:");
+                            for reason in reasons {
+                                println!(" - {}", reason);
+                            }
+                        }
                     }
                 } else {
                     println!("{}", response);
@@ -331,4 +660,67 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn media_locator(path: std::path::PathBuf) -> anyhow::Result<String> {
+    let input = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Media source must be UTF-8"))?;
+    if input.contains("://")
+        || input.starts_with('#')
+        || input.starts_with("colour:")
+        || input.starts_with("color:")
+        || [
+            "youtube.com/",
+            "www.youtube.com/",
+            "m.youtube.com/",
+            "youtu.be/",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+    {
+        return Ok(input.to_owned());
+    }
+    Ok(std::fs::canonicalize(path)?.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_inhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibit", "game"]).expect("parse inhibit");
+        match cli.command {
+            Commands::Inhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_uninhibit_command() {
+        let cli = Cli::try_parse_from(["kldctl", "uninhibit", "game"]).expect("parse uninhibit");
+        match cli.command {
+            Commands::Uninhibit { reason } => assert_eq!(reason, "game"),
+            _ => panic!("wrong command parsed"),
+        }
+    }
+
+    #[test]
+    fn parse_inhibitors_command_default_and_list() {
+        let cli = Cli::try_parse_from(["kldctl", "inhibitors"]).expect("parse inhibitors");
+        match cli.command {
+            Commands::Inhibitors { command } => assert!(command.is_none()),
+            _ => panic!("wrong command parsed"),
+        }
+
+        let cli_list =
+            Cli::try_parse_from(["kldctl", "inhibitors", "list"]).expect("parse inhibitors list");
+        match cli_list.command {
+            Commands::Inhibitors { command } => {
+                assert!(matches!(command, Some(InhibitorSubcommand::List)))
+            }
+            _ => panic!("wrong command parsed"),
+        }
+    }
 }

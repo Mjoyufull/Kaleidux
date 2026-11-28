@@ -31,6 +31,7 @@ struct TransitionUniforms {
     // params is array<vec4<f32>, 7>.
     // But WGSL array stride rules apply (16 bytes). vec4 is 16 bytes.
     params: array<vec4<f32>, 7>,
+    placement: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: TransitionUniforms;
@@ -76,7 +77,11 @@ fn fs_blit(in: VertexOutput) -> @location(0) vec4<f32> {
     var uv = in.uv;
     if (uniforms.progress >= 1.0) {
         // Blitting raw content (image/video), apply cover
-        uv = cover(uv, uniforms.screen_aspect, uniforms.next_aspect);
+        if (uniforms.placement.w > 0.5) {
+            uv = fract(uv * uniforms.placement.xy / vec2<f32>(textureDimensions(t_diffuse)));
+        } else {
+            uv = cover(uv, uniforms.screen_aspect, uniforms.next_aspect);
+        }
     } 
     // Else: Blitting composition texture. UV 0..1 maps 1:1. No cover needed.
     // Note: Transition pass handles cover logic internally via glsl prelude.

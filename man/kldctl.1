@@ -21,6 +21,59 @@ Show version information.
 Print help information.
 .SH COMMANDS
 .TP
+.B info [-o OUTPUT]
+Report the current selection and scene-relative playback position as JSON. Times are in nanoseconds.
+.TP
+.B frame [--first] [--source PATH] [--at SECONDS] [--max-size PIXELS] [--file PATH] [-o OUTPUT]
+Export the ready base wallpaper frame as PNG. With --first, use FFmpeg to open a local file at the start of its selected scene. Use --source to prepare a frame before setting the wallpaper. The default destination is standard output.
+.TP
+.B preview PATH [-o OUTPUT]
+Display a candidate while retaining the original wallpaper, queue and slideshow timer. Accepts local media, supported URLs and colours. Wait for pending wallpaper loads to complete before previewing.
+.TP
+.B preview-end [--apply]
+Restore the original wallpaper and remaining display time. With --apply, retain the candidate and start its display duration. End a preview before issuing another selection command.
+.TP
+.B colour "#RRGGBB" [-o OUTPUT]
+Set a solid colour. Also accepts #RRGGBBAA and the alias color.
+.TP
+.B jump PATH [-o OUTPUT]
+Display an image inside the slideshow directory using the normal transition and history.
+.TP
+.B set PATH [-o OUTPUT] [--transhader NAME | --reveal-map MAP.png]
+Insert supported media into the current in-memory queue and advance to it immediately.
+The optional override applies for this switch. Use custom:NAME for shaders/NAME.glsl in the Kaleidux config directory. A reveal map encodes when each pixel changes in the PNG's red channel. Set also accepts native GIF, GLSL or WGSL wallpapers, local HTML, and Kaleidux scene recipes.
+.TP
+.B shader [PASS ...] [--fps RATE] [-o OUTPUT]
+Replace the shader stack applied to the wallpaper. An empty list clears the stack.
+.TP
+.B shader-wallpaper [PATH] [--fps RATE] [-o OUTPUT]
+Display a procedural shader. Use unlimited for the display animation clock or 0 for a passive shader.
+.TP
+.B morph [LAYER ...] [--group NAME] [--layout LAYOUT] [--bounds X,Y,W,H] [--gap GAP] [--fps RATE] [-o OUTPUT]
+Replace the default overlay stack or the named group selected with \fB\-\-group\fR.
+Omit layers to clear that stack or group. Layouts accept row, column, or grid:COLUMNS.
+Bounds and gap use normalized output coordinates. An explicit rectangle overrides a layer's layout cell.
+.TP
+.B morph-watch [-o OUTPUT]
+Print one JSON line per morph action, including its gesture and local position.
+.TP
+.B player [--player NAME] [ACTION]
+Read desktop media player status, track metadata, position and artwork as JSON.
+Actions include play, pause, play-pause, stop, next, previous and seek SECONDS.
+Seek is relative and accepts negative seconds.
+.TP
+.B layers [-o OUTPUT]
+Report the active stacks and animation rates.
+.TP
+.B react JSON [-o OUTPUT]
+Send pointer coordinates, audio bands, date and user data to the shader inputs.
+.TP
+.B workshop ITEM [-o OUTPUT]
+Set a supported Wallpaper Engine project from a local path or Steam Workshop ID.
+.TP
+.B img PATH [-o OUTPUT]
+Select slideshow media or insert external media and display it. Existing entries are not duplicated. Relative paths use the client working directory. All three commands accept supported images and videos and honor output groups; omitted output uses main-monitor. Use -o all for every output. Queue rebuilds can discard external entries.
+.TP
 .B status \fR(alias: \fBst\fR)
 Display the current status of the daemon, including active wallpapers and playback state.
 .TP
@@ -30,8 +83,8 @@ Force the daemon to skip to the next wallpaper in the queue.
 .B prev \fR(alias: \fBp\fR)
 Switch back to the previously displayed wallpaper if history is available.
 .TP
-.B love \fI<PATH>\fR [\fI-m MULTIPLIER\fR]
-Mark the specified file as "loved", increasing its selection frequency in the "loveit" sorting strategy.
+.B love [\fIPATH\fR] [-o OUTPUT] [-m MULTIPLIER]
+Mark the current wallpaper or the specified file as loved and increase its selection frequency. Loving the active wallpaper shows a heart when enabled.
 .TP
 .B unlove \fI<PATH>\fR
 Remove the love status from a file, resetting its selection weight.
@@ -40,10 +93,23 @@ Remove the love status from a file, resetting its selection weight.
 List all files currently in the love list.
 .TP
 .B pause
-Pause video wallpaper playback.
+Pause video playback and automatic wallpaper rotation independently of named inhibitors.
 .TP
 .B resume
-Resume paused video playback.
+Clear manual pause. Playback remains paused while named inhibitors are active.
+.TP
+.B inhibit \fI<REASON>\fR
+Inhibit wallpaper playback and rotation with a named reason. Playback remains paused as long as any inhibitor is active or manual pause is engaged.
+.TP
+.B uninhibit \fI<REASON>\fR
+Remove a named pause inhibitor. Removing an inhibitor will not resume playback if other inhibitors or manual pause remain active.
+.TP
+.B inhibitors \fR[\fBlist\fR]
+List all currently active pause inhibitors.
+Names are case-sensitive, at most 64 UTF-8 bytes, nonblank, and cannot contain control characters. Up to 64 names may be active. Duplicate acquisition is idempotent, not reference-counted. Reasons remain until released or the daemon exits; they do not expire when the calling process exits.
+.TP
+.B clear \fR[\fI-o OUTPUT\fR]
+Clear wallpaper on the main monitor by default. Use -o OUTPUT to target one output, or -o all to clear every output.
 .TP
 .B query \fR(alias: \fBq\fR)
 Query connected outputs and their current content state.
@@ -59,6 +125,8 @@ Manage content playlists. Subcommands include: \fBcreate\fR, \fBadd\fR, \fBremov
 .TP
 .B blacklist \fI<SUBCOMMAND>\fR
 Manage the blacklist of files to exclude from rotation. Subcommands include: \fBadd\fR, \fBremove\fR, \fBlist\fR.
+.SH EXIT STATUS
+Zero indicates success. Connection failures, invalid arguments, and errors reported by the daemon return a nonzero status.
 .SH SEE ALSO
 .BR kaleidux-daemon (1)
 .SH AUTHOR

@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Bridge basic scene, video and HTML selection from a linux-wallpaperengine GUI."""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import time
+
+
+def main():
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--screen-root", metavar="OUTPUT")
+    cli.add_argument("--bg", metavar="PROJECT")
+    cli.add_argument("-l", "--list-properties", metavar="PROJECT")
+    args = cli.parse_args()
+    if args.list_properties:
+        # The supported image-layer subset exposes no mutable Workshop properties.
+        return 0
+    if not args.bg:
+        cli.error("Select a Workshop ID or project with --bg")
+    ctl = os.environ.get("KLDCTL", "kldctl")
+    target = ["-o", args.screen_root] if args.screen_root else []
+    child = subprocess.run([ctl, "workshop", args.bg, *target], timeout=9)
+    if child.returncode:
+        return child.returncode
+    latest = None
+    end = time.monotonic() + 8
+    while time.monotonic() < end:
+        info = subprocess.check_output([ctl, "info", *target], timeout=4)
+        latest = json.loads(info)
+        if latest["source"] and not latest["loading"]:
+            break
+        time.sleep(.1)
+    if not latest or latest["loading"] or not latest["source"]:
+        cli.exit(1, "The selected wallpaper did not finish loading\n")
+    def stop(*_):
+        current = json.loads(subprocess.check_output([ctl, "info", *target], timeout=3))
+        if current["source"] == latest["source"]:
+            subprocess.run([ctl, "clear", *target], timeout=3)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        signal.pause()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
